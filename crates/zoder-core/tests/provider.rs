@@ -7,8 +7,8 @@ use zoder_core::{
     HealthStore, Message, OpenAiProvider, Provider, ProviderError,
 };
 
-fn provider(base_url: &str) -> OpenAiProvider {
-    let cfg = Provider {
+fn provider_cfg(base_url: &str) -> Provider {
+    Provider {
         id: "test".into(),
         engine_provider_ref: None,
         base_url: base_url.to_string(),
@@ -27,8 +27,36 @@ fn provider(base_url: &str) -> OpenAiProvider {
         max_concurrent: None,
         max_requests_per_minute: None,
         model_aliases: Vec::new(),
+    }
+}
+
+fn provider(base_url: &str) -> OpenAiProvider {
+    OpenAiProvider::new(&provider_cfg(base_url)).unwrap()
+}
+
+/// A provider whose endpoint is still the host-free unset sentinel has no
+/// reachable endpoint. zoder must refuse to build a client for it rather
+/// than send a request to a name that cannot resolve, and it must not treat
+/// it as a local route.
+#[test]
+fn an_unset_provider_endpoint_is_never_dialed() {
+    let cfg = provider_cfg(zoder_core::config::UNSET_PROVIDER_ENDPOINT);
+    assert!(
+        !cfg.endpoint_is_configured(),
+        "the unset sentinel is not a configured endpoint"
+    );
+    assert!(
+        !cfg.is_local_route(),
+        "an unset endpoint names no host, so it is not a local route"
+    );
+    let Err(err) = OpenAiProvider::new(&cfg) else {
+        panic!("an unset endpoint must never be dialed");
     };
-    OpenAiProvider::new(&cfg).unwrap()
+    let message = err.to_string();
+    assert!(
+        message.contains("no endpoint configured"),
+        "the operator must be told to set base_url: {message}"
+    );
 }
 
 fn req(model: &str, stream: bool) -> ChatRequest {

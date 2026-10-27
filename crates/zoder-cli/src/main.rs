@@ -4508,9 +4508,13 @@ fn provider_for_resolved_model<'a>(
                 })
             })
             .filter(|provider| {
-                !provider
-                    .base_url
-                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                // A pin must not select a provider that cannot be dialed:
+                // the built-in placeholder and the host-free unset sentinel
+                // both name no reachable endpoint.
+                provider.endpoint_is_configured()
+                    && !provider
+                        .base_url
+                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
             }),
         None => routing.real_provider_for_model(cfg, model),
     }
@@ -10991,6 +10995,28 @@ mod cli_tier_reasoning_parse_tests {
         assert!(local.is_local_route(), "a vllm engine profile is local");
     }
 
+    /// The Goose bridge hands the provider's endpoint to the spawned child as
+    /// OPENAI_BASE_URL / OPENAI_HOST, and that path never builds a zoder
+    /// provider client — so the refusal has to live where the bridge is
+    /// built. Without it the child would dial the host-free unset sentinel.
+    #[test]
+    fn the_goose_bridge_refuses_an_unset_endpoint() {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "unset-provider",
+            "base_url": zoder_core::config::UNSET_PROVIDER_ENDPOINT,
+            "kind": "openai-chat",
+            "auth": { "type": "none" },
+        }))
+        .expect("the provider must deserialize");
+        let err = goose_provider_env(&provider)
+            .expect_err("an unset endpoint must never be bridged to goose");
+        let message = err.to_string();
+        assert!(
+            message.contains("no endpoint configured"),
+            "the operator must be told to set base_url: {message}"
+        );
+    }
+
     #[test]
     fn a_lan_gpu_box_is_a_local_route_and_a_public_host_is_not() {
         let provider = |url: &str| -> Provider {
@@ -11866,6 +11892,36 @@ fn resolve_engine_session_id(
     Ok(EngineSessionChoice::StoredOrFresh)
 }
 
+/// Build the Goose provider bridge for the routed provider.
+///
+/// The bridge hands the provider's endpoint to the spawned `goose acp` child
+/// as `OPENAI_BASE_URL` / `OPENAI_HOST`, so a provider whose endpoint is
+/// still the host-free unset sentinel must be refused HERE. This path never
+/// constructs a zoder provider client, so the provider layer's own refusal
+/// never runs on it — without this guard the child would dial a name that
+/// cannot resolve.
+fn goose_provider_env(routed_provider: &Provider) -> anyhow::Result<GooseProviderEnv> {
+    if !routed_provider.endpoint_is_configured() {
+        anyhow::bail!(
+            "provider {:?} has no endpoint configured: set its `base_url` to the API base your \
+             provider publishes (the shipped template leaves it as the host-free {:?} sentinel \
+             until you do)",
+            routed_provider.id,
+            zoder_core::config::UNSET_PROVIDER_ENDPOINT
+        );
+    }
+    Ok(GooseProviderEnv {
+        provider_id: routed_provider.id.clone(),
+        kind: routed_provider.kind.clone(),
+        base_url: routed_provider.base_url.clone(),
+        // Resolve the credential the SAME way the engine bridge
+        // does (auth.resolve() reads env vars or returns the
+        // inline bearer — never log this value; it is redacted
+        // by `GooseProviderEnv`'s Debug impl above).
+        api_key: routed_provider.auth.resolve(),
+    })
+}
+
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
@@ -12190,16 +12246,7 @@ pub(crate) async fn agentic_turn(
     // We only build this on the goose path — zeroclaw handles its own
     // auth and never sees these vars.
     let goose_provider = if matches!(engine_kind, EngineKind::Goose) {
-        Some(GooseProviderEnv {
-            provider_id: routed_provider.id.clone(),
-            kind: routed_provider.kind.clone(),
-            base_url: routed_provider.base_url.clone(),
-            // Resolve the credential the SAME way the engine bridge
-            // does (auth.resolve() reads env vars or returns the
-            // inline bearer — never log this value; it is redacted
-            // by `GooseProviderEnv`'s Debug impl above).
-            api_key: routed_provider.auth.resolve(),
-        })
+        Some(goose_provider_env(&routed_provider)?)
     } else {
         None
     };
@@ -16455,6 +16502,47 @@ fn billing_label(b: BillingMode) -> &'static str {
     }
 }
 
+/// Pick the provider `zoder quota minimax` refreshes its plan quota from.
+///
+/// The candidates are the providers that actually serve MiniMax (their id or
+/// their endpoint names it), minus the built-in placeholder. A candidate that
+/// has not been given an endpoint yet cannot be asked for its quota: this
+/// command asks the provider's OWN usage API, so it dials the endpoint
+/// directly and never builds a zoder provider client — the refusal that
+/// client carries would never run on this path. Such a candidate is skipped
+/// so a configured sibling is still used, and when no candidate has an
+/// endpoint the operator gets a configuration error that names the setting to
+/// fill in instead of a failed request.
+fn select_quota_provider(providers: &[Provider]) -> anyhow::Result<&Provider> {
+    let candidates: Vec<&Provider> = providers
+        .iter()
+        .filter(|p| {
+            let id = p.id.to_ascii_lowercase();
+            let url = p.base_url.to_ascii_lowercase();
+            (id.contains("minimax") || url.contains("minimax"))
+                && !p
+                    .base_url
+                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        })
+        .collect();
+    if let Some(p) = candidates.iter().find(|p| p.endpoint_is_configured()) {
+        return Ok(p);
+    }
+    if let Some(p) = candidates.first() {
+        anyhow::bail!(
+            "MiniMax provider {:?} has no endpoint configured: set its `base_url` to the API base \
+             your provider publishes (the shipped template leaves it as the host-free {:?} \
+             sentinel until you do)",
+            p.id,
+            zoder_core::config::UNSET_PROVIDER_ENDPOINT
+        );
+    }
+    anyhow::bail!(
+        "no MiniMax provider configured (looked for a provider id or base_url \
+         naming 'minimax'); configure one in ~/.zoder/config.toml"
+    )
+}
+
 /// `zoder quota minimax` — live M Plan (Token Plan) quota via the provider's
 /// own usage API (`GET /v1/token_plan/remains`), plus the last observed
 /// quota-wall state persisted when the 429/2056 was hit.
@@ -16471,23 +16559,7 @@ async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()
         );
     }
     let eng = Engine::load()?;
-    // Find a provider that actually serves MiniMax (id or base_url naming
-    // minimax) and is not a placeholder. Only the first one is refreshed;
-    // a second MiniMax account keeps its own state until it hits a wall.
-    let minimax_provider = eng.cfg.providers.iter().find(|p| {
-        let id = p.id.to_ascii_lowercase();
-        let url = p.base_url.to_ascii_lowercase();
-        (id.contains("minimax") || url.contains("minimax"))
-            && !p
-                .base_url
-                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-    });
-    let Some(p) = minimax_provider else {
-        anyhow::bail!(
-            "no MiniMax provider configured (looked for a provider id or base_url \
-             naming 'minimax'); configure one in ~/.zoder/config.toml"
-        )
-    };
+    let p = select_quota_provider(&eng.cfg.providers)?;
     let token = match p.auth.resolve() {
         Some(t) if !t.is_empty() => t,
         _ => anyhow::bail!(
@@ -20139,6 +20211,44 @@ model_provider = "custom.groq"
             Some("custom.missing"),
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_pin_does_not_select_a_provider_with_an_unset_endpoint() {
+        // A pin resolves the provider by its engine-profile reference. When
+        // that provider's endpoint is still the host-free unset sentinel it
+        // names no reachable endpoint, so the pin must not select it: the
+        // route would resolve to something that can never be dialed.
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
+            id: "unset-pinned".into(),
+            engine_provider_ref: Some("unset-pinned".into()),
+            base_url: zoder_core::config::UNSET_PROVIDER_ENDPOINT.into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["unset/".into()],
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        });
+        let routing = RoutingContext {
+            entries: Vec::new(),
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        assert!(
+            provider_for_resolved_model(&routing, &cfg, "unset/model", Some("unset-pinned"),)
+                .is_none(),
+            "a pin must not select a provider whose endpoint names no host"
+        );
     }
 
     #[test]

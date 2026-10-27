@@ -1469,6 +1469,15 @@ impl OpenAiProvider {
         p: &Provider,
         request_timeout_s: Option<u64>,
     ) -> anyhow::Result<Self> {
+        if !p.endpoint_is_configured() {
+            anyhow::bail!(
+                "provider {:?} has no endpoint configured: set its `base_url` to the API base your \
+                 provider publishes (the shipped template leaves it as the host-free {:?} \
+                 sentinel until you do)",
+                p.id,
+                crate::config::UNSET_PROVIDER_ENDPOINT
+            );
+        }
         if request_timeout_s.is_some_and(|secs| secs == 0) {
             anyhow::bail!("request_timeout_s must be greater than zero");
         }

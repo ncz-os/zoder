@@ -27,9 +27,15 @@ primary_model = "deepseek-chat"
 reviewer_model = "MiniMax-M3,deepseek-chat"
 
 # --- Hosted routes: environment-variable auth only. Never inline a key. ---
+# Every base_url below is the host-free "unset" sentinel: this file names no
+# provider endpoint, because a public tree carries no host name and no URL.
+# Replace each sentinel with the OpenAI-compatible API base your provider
+# publishes (the "API base" shown in your provider's dashboard) before making
+# a real call. zoder resolves these providers when it plans a route and
+# refuses to send a request while the sentinel is still in place.
 [[providers]]
 id = "deepseek"
-base_url = "https://api.deepseek.com/v1"
+base_url = "unset"  # REPLACE with your provider's API base
 kind = "openai-chat"
 auth = { type = "env", var = "DEEPSEEK_API_KEY" }
 paid = true
@@ -40,7 +46,7 @@ max_context_tokens = 65536
 
 [[providers]]
 id = "minimax"
-base_url = "https://api.minimax.io/v1"
+base_url = "unset"  # REPLACE with your provider's API base
 kind = "openai-chat"
 auth = { type = "env", var = "MINIMAX_API_KEY" }
 paid = true
@@ -50,12 +56,12 @@ max_context_tokens = 131072
 
 # --- Optional local OpenAI-compatible endpoint. ---
 # Uncomment one block and point primary_model at a model it serves. A local
-# route is $0 marginal, so it does not need --allow-paid.
+# route is $0 marginal, so it does not need --allow-paid. Fill in the API
+# base of the server you run locally; this file names no address for it.
 #
 # [[providers]]
 # id = "local"
-# base_url = "http://localhost:8080/v1"     # llama.cpp default
-# # base_url = "http://localhost:11434/v1"  # Ollama default
+# base_url = "unset"  # REPLACE with your local server's API base
 # kind = "openai-chat"
 # auth = { type = "none" }
 # paid = false
