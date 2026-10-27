@@ -904,78 +904,86 @@ pub(crate) fn select_confirmers(
 // Aggregation.
 // ---------------------------------------------------------------------------
 
-/// Aggregate the confirmation results into a review decision.
+/// How a finding's confirmation SETTLED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Settlement {
+    /// A confirm settled it: the finding is real and stays blocking.
+    Confirmed,
+    /// Enough independent rejects demoted it.
+    Demoted,
+    /// Neither: the finding is undecided and may still be confirmed.
+    Undecided,
+}
+
+/// Whether a CONFIRM settled the finding.
 ///
-/// `jobs` are processed in order; `limits.confirmations` bounds the total
-/// number of confirmer CALLS (not findings). A confirmer already attempted on
-/// a finding is never offered again (one call per finding per confirmer),
-/// until either the finding is decided or the budget runs out. A blocking
-/// finding with no call left is `not_run` and stays blocking.
+/// A confirm means the finding is real: it stays blocking, and no further
+/// confirmer can change that.
+fn confirmed_verdict(attempts: &[ConfirmerAttempt]) -> bool {
+    attempts.iter().any(|a| {
+        a.outcome == ConfirmerOutcome::Ok
+            && a.verdict
+                .as_ref()
+                .is_some_and(|v| v.disposition == ParsedDisposition::Confirm)
+    })
+}
+
+/// Whether enough INDEPENDENT rejects demote the finding.
+fn demoted_by_rejects(attempts: &[ConfirmerAttempt], requires: usize) -> bool {
+    independent_rejects(attempts) >= requires
+}
+
+/// The SETTLEMENT rule, in ONE place.
 ///
-/// `run_confirmer` is the injected I/O: given a confirmer model and the
-/// finding plan it returns one attempt. The pure core never calls a model
-/// itself, so the whole matrix is unit-testable offline.
+/// The driver uses it to decide whether another confirmer call is worth
+/// spending; the aggregator uses it to derive the disposition. The two can
+/// never disagree about the same attempts, because there is only one rule.
+pub(crate) fn settlement(attempts: &[ConfirmerAttempt], requires: usize) -> Settlement {
+    if confirmed_verdict(attempts) {
+        Settlement::Confirmed
+    } else if demoted_by_rejects(attempts, requires) {
+        Settlement::Demoted
+    } else {
+        Settlement::Undecided
+    }
+}
+
+/// Aggregate the recorded confirmation attempts into a review decision.
+///
+/// `jobs` are processed in order. `attempts_for` returns the attempts the
+/// driver recorded for a finding: EVERY attempt that completed, in dispatch
+/// order. A finding with no attempt (no confirmer could be resolved, or the
+/// budget ran out) is `not_run` and stays blocking.
+///
+/// The budget, the rounds and the calls are the DRIVER's business ([`run`]):
+/// this function only reads what was recorded and derives the disposition,
+/// so the whole matrix is unit-testable offline.
 pub(crate) fn aggregate(
     jobs: &[ConfirmationJob],
     limits: &ConfirmLimits,
-    run_confirmer: &mut dyn FnMut(&str, &FindingPlan) -> ConfirmerAttempt,
+    attempts_for: &mut dyn FnMut(&FindingPlan) -> Vec<ConfirmerAttempt>,
 ) -> ConfirmedReview {
     let mut decisions = Vec::with_capacity(jobs.len());
     let mut demoted = Vec::new();
-    let mut budget = limits.confirmations;
     let mut reached_confirmation = 0usize;
     let mut demoted_count = 0usize;
 
     for job in jobs {
         let severity = job.plan.finding.severity.clone();
         let requires = limits.rejects_required(&severity);
-        let mut attempts: Vec<ConfirmerAttempt> = Vec::new();
-        let mut used: Vec<String> = Vec::new();
-
-        for confirmer in &job.confirmers {
-            // Decide as soon as the finding is settled, and never overrun the
-            // per-review budget.
-            if budget == 0 {
-                break;
-            }
-            // One call per finding per confirmer. `select_confirmers` is the
-            // single source of truth for that rule: a confirmer already used
-            // on THIS finding is never offered again.
-            let remaining = select_confirmers(
-                std::slice::from_ref(confirmer),
-                &job.plan.reviewer_family,
-                &[],
-                &used,
-                &|_m| Some(String::new()),
-            );
-            if remaining.is_empty() {
-                continue;
-            }
-            // Stop once the finding is decided: a confirm settles it, and
-            // enough independent rejects demote it.
-            let decided = attempts.iter().any(|a| {
-                a.outcome == ConfirmerOutcome::Ok
-                    && a.verdict
-                        .as_ref()
-                        .is_some_and(|v| v.disposition == ParsedDisposition::Confirm)
-            }) || independent_rejects(&attempts) >= requires;
-            if decided {
-                break;
-            }
-            budget -= 1;
-            used.push(confirmer.clone());
-            attempts.push(run_confirmer(confirmer, &job.plan));
-        }
+        // The attempts the driver recorded for this finding: EVERY attempt
+        // that completed, in dispatch order, including the second member
+        // of the primary pair when the first one settled the finding.
+        let attempts = attempts_for(&job.plan);
 
         // Walk the recorded attempts (exactly what the record shows) to
         // derive the disposition.
-        let mut confirmed = false;
         let mut insufficient_seen = false;
         let mut failure_seen = false;
         for attempt in &attempts {
             match attempt.outcome {
                 ConfirmerOutcome::Ok => match attempt.verdict.as_ref().map(|v| v.disposition) {
-                    Some(ParsedDisposition::Confirm) => confirmed = true,
+                    Some(ParsedDisposition::Confirm) => {}
                     Some(ParsedDisposition::Reject) => {}
                     Some(ParsedDisposition::Insufficient) | None => insufficient_seen = true,
                 },
@@ -984,7 +992,8 @@ pub(crate) fn aggregate(
             }
         }
         let reject_ids = reject_models(&attempts);
-        let enough_rejects = independent_rejects(&attempts) >= requires;
+        // ONE settlement rule, shared with the driver.
+        let settled = settlement(&attempts, requires);
         // Only a finding that a confirmer actually looked at "reached
         // confirmation"; a finding with no attempt (empty chain, budget
         // exhausted) stays out of the recall denominator.
@@ -992,24 +1001,27 @@ pub(crate) fn aggregate(
             reached_confirmation += 1;
         }
 
-        let (disposition, blocking) = if confirmed {
-            (Disposition::Confirmed, true)
-        } else if enough_rejects {
-            (Disposition::Rejected, false)
-        } else if failure_seen {
-            // A failed confirmer keeps the finding blocking and flags it
-            // unconfirmed. It is NEVER a rejection.
-            (Disposition::ConfirmerFailed, true)
-        } else if insufficient_seen || !attempts.is_empty() {
-            // A confirmer ran but the thresholds were not met (e.g. one reject
-            // on a critical). Undecided, so it keeps blocking and is recorded
-            // insufficient — a confirmer DID run, so this is not `not_run`.
-            (Disposition::Insufficient, true)
-        } else {
-            // Nothing ran: no confirmer could be resolved, or the review ran
-            // out of confirmation budget. The finding keeps blocking and is
-            // unconfirmed — never demoted.
-            (Disposition::NotRun, true)
+        let (disposition, blocking) = match settled {
+            Settlement::Confirmed => (Disposition::Confirmed, true),
+            Settlement::Demoted => (Disposition::Rejected, false),
+            Settlement::Undecided if failure_seen => {
+                // A failed confirmer keeps the finding blocking and flags it
+                // unconfirmed. It is NEVER a rejection.
+                (Disposition::ConfirmerFailed, true)
+            }
+            Settlement::Undecided if insufficient_seen || !attempts.is_empty() => {
+                // A confirmer ran but the thresholds were not met (e.g. one
+                // reject on a critical). Undecided, so it keeps blocking and
+                // is recorded insufficient -- a confirmer DID run, so this is
+                // not `not_run`.
+                (Disposition::Insufficient, true)
+            }
+            Settlement::Undecided => {
+                // Nothing ran: no confirmer could be resolved, or the review
+                // ran out of confirmation budget. The finding keeps blocking
+                // and is unconfirmed -- never demoted.
+                (Disposition::NotRun, true)
+            }
         };
 
         let reason = if disposition == Disposition::Rejected {
@@ -1562,57 +1574,46 @@ finding-id: {finding_id}"
 // I/O driver: perform the async confirmer calls the aggregator plans.
 // ---------------------------------------------------------------------------
 
-/// One planned confirmer call: (finding id, confirmer model, finding plan).
-pub(crate) fn plan_calls(
-    jobs: &[ConfirmationJob],
-    limits: &ConfirmLimits,
-) -> Vec<(String, String, FindingPlan)> {
-    let mut calls = Vec::new();
-    let mut budget = limits.confirmations;
-    for job in jobs {
-        let requires = limits.rejects_required(&job.plan.finding.severity);
-        let mut used: Vec<String> = Vec::new();
-        let mut attempts: Vec<ConfirmerAttempt> = Vec::new();
-        for confirmer in &job.confirmers {
-            if budget == 0 {
-                break;
-            }
-            if used.iter().any(|m| m == confirmer) {
-                continue;
-            }
-            let decided = attempts.iter().any(|a| {
-                a.outcome == ConfirmerOutcome::Ok
-                    && a.verdict
-                        .as_ref()
-                        .is_some_and(|v| v.disposition == ParsedDisposition::Confirm)
-            }) || independent_rejects(&attempts) >= requires;
-            if decided {
-                break;
-            }
-            budget -= 1;
-            used.push(confirmer.clone());
-            attempts.push(ConfirmerAttempt {
-                model: confirmer.clone(),
-                family: String::new(),
-                outcome: ConfirmerOutcome::Empty,
-                latency_ms: 0,
-                tokens_in: 0,
-                tokens_out: 0,
-                verdict: None,
-            });
-            calls.push((
-                job.plan.finding.id.clone(),
-                confirmer.clone(),
-                job.plan.clone(),
-            ));
-        }
+/// The number of confirmers dispatched together in the FIRST round.
+///
+/// The primary pair: two independent families, asked at the same time,
+/// because a confirmation is a race to a decisive answer -- one confirm
+/// settles the finding, and two serial calls cost twice the wall clock for
+/// one answer. Every later round is ONE tiebreaker.
+pub(crate) const PRIMARY_PAIR: usize = 2;
+
+/// The attempt recorded for a call that exceeded the per-call timeout.
+///
+/// A timeout is a FAILURE, never a rejection: the finding keeps blocking.
+fn timeout_attempt(model: &str, limits: &ConfirmLimits) -> ConfirmerAttempt {
+    ConfirmerAttempt {
+        model: model.to_string(),
+        family: String::new(),
+        outcome: ConfirmerOutcome::Timeout,
+        latency_ms: limits.timeout_s.saturating_mul(1_000),
+        tokens_in: 0,
+        tokens_out: 0,
+        verdict: None,
     }
-    calls
 }
 
-/// Run the planned confirmer calls concurrently through `call`, honouring the
-/// per-call timeout, then aggregate. A call that exceeds `limits.timeout_s`
-/// records a `Timeout` attempt; the finding keeps blocking.
+/// Run the confirmer calls for every finding, then aggregate the answers.
+///
+/// The driver spends the budget in ROUNDS:
+///
+/// * round 0 is the PRIMARY PAIR: the first two confirmers of the chain,
+///   dispatched CONCURRENTLY, each under the per-call timeout;
+/// * every later round is ONE tiebreaker, and a round is only entered while
+///   the finding is still UNSETTLED.
+///
+/// A finding a confirm settles, or that enough independent rejects demote,
+/// never reaches another round: the budget is not spent on calls whose
+/// answers would be discarded. Every attempt that COMPLETED is recorded,
+/// including the second member of the primary pair when the first one
+/// settled the finding.
+///
+/// `limits.confirmations` bounds the number of CALLS for the whole review,
+/// and one confirmer is called at most once per finding.
 pub(crate) async fn run<F, Fut>(
     jobs: &[ConfirmationJob],
     limits: &ConfirmLimits,
@@ -1623,45 +1624,85 @@ where
     Fut: std::future::Future<Output = ConfirmerAttempt>,
 {
     use std::collections::HashMap;
-    let calls = plan_calls(jobs, limits);
-    let mut results: Vec<(String, String, ConfirmerAttempt)> = Vec::with_capacity(calls.len());
-    for (finding_id, model, plan) in calls {
-        let attempt = match tokio::time::timeout(
-            std::time::Duration::from_secs(limits.timeout_s.max(1)),
-            call(model.clone(), plan),
-        )
-        .await
-        {
-            Ok(attempt) => attempt,
-            Err(_) => ConfirmerAttempt {
-                model: model.clone(),
-                family: String::new(),
-                outcome: ConfirmerOutcome::Timeout,
-                latency_ms: limits.timeout_s.saturating_mul(1_000),
-                tokens_in: 0,
-                tokens_out: 0,
-                verdict: None,
-            },
-        };
-        results.push((finding_id, model, attempt));
+    let timeout = std::time::Duration::from_secs(limits.timeout_s.max(1));
+    // The budget is the number of confirmer CALLS for the whole review.
+    let mut budget = limits.confirmations;
+    // The attempts recorded per finding, in dispatch order.
+    let mut recorded: HashMap<String, Vec<ConfirmerAttempt>> = HashMap::new();
+    // The confirmers already dispatched for a finding: one call per finding
+    // per confirmer.
+    let mut used: HashMap<String, Vec<String>> = HashMap::new();
+
+    for job in jobs {
+        let requires = limits.rejects_required(&job.plan.finding.severity);
+        let id = job.plan.finding.id.clone();
+        let mut attempts: Vec<ConfirmerAttempt> = Vec::new();
+        let mut round = 0usize;
+        loop {
+            // The confirmers this round dispatches: the primary pair in
+            // round 0, one tiebreaker afterwards.
+            let want = if round == 0 { PRIMARY_PAIR } else { 1 };
+            let mut batch: Vec<String> = Vec::new();
+            for confirmer in &job.confirmers {
+                if batch.len() >= want || batch.len() >= budget {
+                    break;
+                }
+                // One call per finding per confirmer: the same model is
+                // never asked twice about the same finding.
+                if batch.iter().any(|m| m == confirmer)
+                    || used
+                        .get(&id)
+                        .is_some_and(|u| u.iter().any(|m| m == confirmer))
+                {
+                    continue;
+                }
+                batch.push(confirmer.clone());
+            }
+            if batch.is_empty() {
+                break;
+            }
+            budget -= batch.len();
+            used.entry(id.clone())
+                .or_default()
+                .extend(batch.iter().cloned());
+
+            if batch.len() == 1 {
+                let model = batch[0].clone();
+                let attempt = match tokio::time::timeout(
+                    timeout,
+                    call(model.clone(), job.plan.clone()),
+                )
+                .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(_) => timeout_attempt(&model, limits),
+                };
+                attempts.push(attempt);
+            } else {
+                // The PRIMARY PAIR runs CONCURRENTLY: both calls are in
+                // flight before either answer is read.
+                let first = call(batch[0].clone(), job.plan.clone());
+                let second = call(batch[1].clone(), job.plan.clone());
+                let (a, b) = tokio::join!(
+                    tokio::time::timeout(timeout, first),
+                    tokio::time::timeout(timeout, second)
+                );
+                attempts.push(a.unwrap_or_else(|_| timeout_attempt(&batch[0], limits)));
+                attempts.push(b.unwrap_or_else(|_| timeout_attempt(&batch[1], limits)));
+            }
+
+            round += 1;
+            // A settled finding never reaches another round: the budget is
+            // not spent on calls whose answers would be discarded.
+            if settlement(&attempts, requires) != Settlement::Undecided {
+                break;
+            }
+        }
+        recorded.insert(id, attempts);
     }
 
-    let mut by_key: HashMap<(String, String), ConfirmerAttempt> = HashMap::new();
-    for (finding_id, model, attempt) in results {
-        by_key.insert((finding_id, model), attempt);
-    }
-    aggregate(jobs, limits, &mut |model, plan| {
-        by_key
-            .remove(&(plan.finding.id.clone(), model.to_string()))
-            .unwrap_or_else(|| ConfirmerAttempt {
-                model: model.to_string(),
-                family: String::new(),
-                outcome: ConfirmerOutcome::Timeout,
-                latency_ms: 0,
-                tokens_in: 0,
-                tokens_out: 0,
-                verdict: None,
-            })
+    aggregate(jobs, limits, &mut |plan| {
+        recorded.remove(&plan.finding.id).unwrap_or_default()
     })
 }
 
@@ -1777,6 +1818,32 @@ mod tests {
         ConfirmLimits::default()
     }
 
+    /// Drive the REAL driver with a scripted confirmer, and report what it
+    /// dispatched.
+    ///
+    /// `script` answers with the attempt for a confirmer model. The models
+    /// are recorded in dispatch order, so a test can assert what the driver
+    /// SPENT, not only what it concluded.
+    async fn drive(
+        jobs: &[ConfirmationJob],
+        limits: &ConfirmLimits,
+        script: impl Fn(&str) -> ConfirmerAttempt,
+    ) -> (ConfirmedReview, Vec<String>) {
+        let dispatched = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = dispatched.clone();
+        let review = run(jobs, limits, move |model, _plan| {
+            let seen = seen.clone();
+            let attempt = script(&model);
+            async move {
+                seen.lock().unwrap().push(model.clone());
+                attempt
+            }
+        })
+        .await;
+        let seen = dispatched.lock().unwrap().clone();
+        (review, seen)
+    }
+
     // ---- pre-check: an UNGROUNDED finding drops with ZERO model calls ---
 
     /// A finding that quotes NO code is NOT dropped.
@@ -1861,8 +1928,8 @@ mod tests {
 
     /// The dropped finding costs NO model call, and the kept one costs
     /// exactly one.
-    #[test]
-    fn a_dropped_finding_costs_no_model_call() {
+    #[tokio::test]
+    async fn a_dropped_finding_costs_no_model_call() {
         let quoted = finding("high", "x is unused", Some("let x = 1"), CTX);
         let ungrounded = finding("critical", "y is wrong", Some("not_in_the_code"), CTX);
         let (checks, pending) = precheck(&[quoted.clone(), ungrounded.clone()]);
@@ -1874,15 +1941,18 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, quoted.id);
 
-        // And end to end: building jobs from the pending set and aggregating
-        // makes NO call for the dropped one.
-        let mut calls = 0usize;
+        // And end to end: building jobs from the pending set and running the
+        // driver makes NO call for the dropped one.
         let jobs: Vec<ConfirmationJob> = pending.iter().map(|p| job(p.clone(), &["c1"])).collect();
-        let review = aggregate(&jobs, &limits(), &mut |m, _p| {
-            calls += 1;
+        let (review, dispatched) = drive(&jobs, &limits(), |m| {
             attempt(m, "other", ParsedDisposition::Confirm)
-        });
-        assert_eq!(calls, 1, "zero calls may be made for the dropped finding");
+        })
+        .await;
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "zero calls may be made for the dropped finding"
+        );
         assert!(review.effective_blocking);
         let _ = ungrounded;
     }
@@ -2051,8 +2121,8 @@ mod tests {
     #[test]
     fn confirm_keeps_blocking() {
         let j = job(finding("high", "c", Some("let x = 1"), CTX), &["c1", "c2"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Confirm)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Confirm)]
         });
         assert!(review.effective_blocking);
         assert_eq!(review.decisions[0].disposition, Disposition::Confirmed);
@@ -2062,8 +2132,8 @@ mod tests {
     #[test]
     fn one_high_reject_demotes() {
         let j = job(finding("high", "h", Some("let x = 1"), CTX), &["c1"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Reject)]
         });
         assert!(!review.effective_blocking);
         assert_eq!(review.decisions[0].disposition, Disposition::Rejected);
@@ -2075,8 +2145,8 @@ mod tests {
     #[test]
     fn one_critical_reject_does_not_demote() {
         let j = job(finding("critical", "cr", Some("let x = 1"), CTX), &["c1"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Reject)]
         });
         // Only one reject: a critical needs two independent ones.
         assert!(review.effective_blocking);
@@ -2090,9 +2160,11 @@ mod tests {
             finding("critical", "cr2", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            let fam = if m == "c1" { "famA" } else { "famB" };
-            attempt(m, fam, ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![
+                attempt("c1", "famA", ParsedDisposition::Reject),
+                attempt("c2", "famB", ParsedDisposition::Reject),
+            ]
         });
         assert!(!review.effective_blocking);
         assert_eq!(review.decisions[0].disposition, Disposition::Rejected);
@@ -2111,8 +2183,11 @@ mod tests {
             finding("critical", "cr3", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "same", ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![
+                attempt("c1", "same", ParsedDisposition::Reject),
+                attempt("c2", "same", ParsedDisposition::Reject),
+            ]
         });
         assert!(review.effective_blocking);
         assert_ne!(review.decisions[0].disposition, Disposition::Rejected);
@@ -2128,7 +2203,9 @@ mod tests {
             ConfirmerOutcome::Unparsed,
         ] {
             let j = job(finding("high", "f", Some("let x = 1"), CTX), &["c1"]);
-            let review = aggregate(&[j], &limits(), &mut |m, _| failed(m, "other", outcome));
+            let review = aggregate(&[j], &limits(), &mut |_p| {
+                vec![failed("c1", "other", outcome)]
+            });
             assert!(
                 review.effective_blocking,
                 "{:?} must keep the finding blocking",
@@ -2149,8 +2226,8 @@ mod tests {
     #[test]
     fn insufficient_verdict_keeps_blocking() {
         let j = job(finding("high", "i", Some("let x = 1"), CTX), &["c1"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Insufficient)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Insufficient)]
         });
         assert!(review.effective_blocking);
         assert_eq!(review.decisions[0].disposition, Disposition::Insufficient);
@@ -2166,11 +2243,14 @@ mod tests {
                 &["c1", "c2"],
             ),
         ];
-        let review = aggregate(&jobs, &limits(), &mut |m, _| {
-            if m == "c1" {
-                attempt(m, "f1", ParsedDisposition::Confirm)
+        let review = aggregate(&jobs, &limits(), &mut |p| {
+            if p.finding.severity == "high" {
+                vec![attempt("c1", "f1", ParsedDisposition::Confirm)]
             } else {
-                failed(m, "f2", ConfirmerOutcome::Timeout)
+                vec![
+                    attempt("c1", "f1", ParsedDisposition::Confirm),
+                    failed("c2", "f2", ConfirmerOutcome::Timeout),
+                ]
             }
         });
         assert!(review.effective_blocking);
@@ -2179,8 +2259,8 @@ mod tests {
 
     // ---- limits ---------------------------------------------------------
 
-    #[test]
-    fn eight_finding_cap_is_enforced() {
+    #[tokio::test]
+    async fn eight_finding_cap_is_enforced() {
         // Nine distinct findings, one confirmer each: only eight calls.
         let jobs: Vec<ConfirmationJob> = (0..9)
             .map(|i| {
@@ -2188,13 +2268,12 @@ mod tests {
                 job(finding("high", &claim, Some("let x = 1"), CTX), &["c1"])
             })
             .collect();
-        let mut calls = 0usize;
-        let review = aggregate(&jobs, &limits(), &mut |m, _| {
-            calls += 1;
+        let (review, dispatched) = drive(&jobs, &limits(), |m| {
             attempt(m, "other", ParsedDisposition::Confirm)
-        });
+        })
+        .await;
         assert_eq!(limits().confirmations, 8);
-        assert_eq!(calls, 8, "at most 8 confirmations per review");
+        assert_eq!(dispatched.len(), 8, "at most 8 confirmations per review");
         // The ninth finding was never confirmed: recorded not_run, still blocks.
         assert_eq!(review.decisions[8].disposition, Disposition::NotRun);
         assert!(review.decisions[8].blocking);
@@ -2210,8 +2289,12 @@ mod tests {
             plan: plan(finding("high", "unreached", Some("let x = 1"), CTX), &[]),
             confirmers: Vec::new(),
         };
-        let review = aggregate(&[demoted_job, unreached_job], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Reject)
+        let review = aggregate(&[demoted_job, unreached_job], &limits(), &mut |p| {
+            if p.confirmer_chain.is_empty() {
+                Vec::new()
+            } else {
+                vec![attempt("c1", "other", ParsedDisposition::Reject)]
+            }
         });
         assert_eq!(review.demoted.len(), 1);
         assert_eq!(
@@ -2223,8 +2306,8 @@ mod tests {
         assert!(review.effective_blocking);
     }
 
-    #[test]
-    fn budget_exhausted_finding_is_not_run_and_still_blocks() {
+    #[tokio::test]
+    async fn budget_exhausted_finding_is_not_run_and_still_blocks() {
         // The spec (§7): unconfirmed findings keep blocking. A finding that
         // never got a confirmation call because the budget ran out is
         // `not_run` and MUST still block — it is not a demotion.
@@ -2236,9 +2319,10 @@ mod tests {
                 )
             })
             .collect();
-        let review = aggregate(&jobs, &limits(), &mut |m, _| {
+        let (review, _dispatched) = drive(&jobs, &limits(), |m| {
             attempt(m, "other", ParsedDisposition::Confirm)
-        });
+        })
+        .await;
         let last = review.decisions.last().unwrap();
         assert_eq!(last.disposition, Disposition::NotRun);
         assert!(
@@ -2276,8 +2360,8 @@ mod tests {
         assert_eq!(review.effective_verdict(), "comment");
     }
 
-    #[test]
-    fn one_call_per_finding_per_confirmer() {
+    #[tokio::test]
+    async fn one_call_per_finding_per_confirmer() {
         // The same confirmer repeated in the chain must be called once.
         let j = ConfirmationJob {
             plan: plan(
@@ -2286,12 +2370,15 @@ mod tests {
             ),
             confirmers: vec!["c1".into(), "c1".into(), "c1".into()],
         };
-        let mut calls = 0usize;
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            calls += 1;
+        let (review, dispatched) = drive(&[j], &limits(), |m| {
             attempt(m, "famA", ParsedDisposition::Reject)
-        });
-        assert_eq!(calls, 1, "one call per finding per confirmer");
+        })
+        .await;
+        assert_eq!(
+            dispatched,
+            vec!["c1".to_string()],
+            "one call per finding per confirmer"
+        );
         // One critical reject is not enough, so the finding still blocks.
         assert!(review.effective_blocking);
     }
@@ -2422,8 +2509,8 @@ mod tests {
     #[test]
     fn record_shape_v1_round_trips() {
         let j = job(finding("high", "rt", Some("let x = 1"), CTX), &["c1"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Reject)]
         });
         let value = record(
             &review,
@@ -2475,9 +2562,11 @@ mod tests {
             finding("critical", "fields", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            let fam = if m == "c1" { "a" } else { "b" };
-            attempt(m, fam, ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![
+                attempt("c1", "a", ParsedDisposition::Reject),
+                attempt("c2", "b", ParsedDisposition::Reject),
+            ]
         });
         let value = record(
             &review,
@@ -2735,7 +2824,7 @@ mod tests {
                 verdict,
             };
             let j = job(finding("critical", "f", Some("let x = 1"), CTX), &["c1"]);
-            let review = aggregate(&[j], &limits(), &mut |_m, _| attempt.clone());
+            let review = aggregate(&[j], &limits(), &mut |_p| vec![attempt.clone()]);
             assert!(
                 review.effective_blocking,
                 "a reply that breaks the contract must keep the finding blocking: {raw}"
@@ -2770,8 +2859,8 @@ mod tests {
     #[test]
     fn the_record_separates_the_recall_from_the_evaluation_it_refers_to() {
         let j = job(finding("high", "rt", Some("let x = 1"), CTX), &["c1"]);
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            attempt(m, "other", ParsedDisposition::Reject)
+        let review = aggregate(&[j], &limits(), &mut |_p| {
+            vec![attempt("c1", "other", ParsedDisposition::Reject)]
         });
         let value = record(
             &review,
@@ -2809,15 +2898,20 @@ mod tests {
     /// The measured recall is `None` when nothing reached a confirmer, and
     /// the ref still names the evaluation it would have been measured
     /// against.
-    #[test]
-    fn the_measured_recall_is_absent_when_nothing_reached_a_confirmer() {
+    #[tokio::test]
+    async fn the_measured_recall_is_absent_when_nothing_reached_a_confirmer() {
         // No confirmer chain: the finding is never put to a model, so it
         // never reached a confirmation and it must stay out of the
         // denominator.
-        let j = job(finding("high", "rt", Some("let x = 1"), CTX), &[]);
-        let review = aggregate(&[j], &limits(), &mut |_m, _| {
-            failed("c1", "fam", ConfirmerOutcome::Timeout)
-        });
+        let j = ConfirmationJob {
+            plan: plan(finding("high", "rt", Some("let x = 1"), CTX), &[]),
+            confirmers: Vec::new(),
+        };
+        let (review, dispatched) = drive(&[j], &limits(), |m| {
+            failed(m, "fam", ConfirmerOutcome::Timeout)
+        })
+        .await;
+        assert!(dispatched.is_empty(), "no confirmer may be called");
         let value = record(
             &review,
             "rev-model",
@@ -2905,20 +2999,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finding_with_no_confirmers_stays_blocking() {
+    #[tokio::test]
+    async fn finding_with_no_confirmers_stays_blocking() {
         // No confirmer could be resolved (empty chain). The finding is not_run
         // but MUST still block, and the review must still request changes.
         let j = ConfirmationJob {
             plan: plan(finding("critical", "no chain", Some("let x = 1"), CTX), &[]),
             confirmers: Vec::new(),
         };
-        let mut calls = 0usize;
-        let review = aggregate(&[j], &limits(), &mut |m, _| {
-            calls += 1;
+        let (review, dispatched) = drive(&[j], &limits(), |m| {
             attempt(m, "other", ParsedDisposition::Confirm)
-        });
-        assert_eq!(calls, 0, "no confirmer may be called for an empty chain");
+        })
+        .await;
+        assert!(
+            dispatched.is_empty(),
+            "no confirmer may be called for an empty chain"
+        );
         assert_eq!(review.decisions[0].disposition, Disposition::NotRun);
         assert!(review.decisions[0].blocking);
         assert!(
@@ -2946,5 +3042,127 @@ mod tests {
         assert_eq!(a, b);
         let c = finding_id("other", "src/a.rs", "foo bar baz");
         assert_ne!(a, c);
+    }
+
+    // ---- the driver: rounds, the concurrent pair, the real timeout -------
+
+    /// The PRIMARY PAIR is dispatched CONCURRENTLY.
+    ///
+    /// A confirmation is a race to a decisive answer: one confirm settles
+    /// the finding, so asking two independent families at the same time
+    /// halves the wall clock for the same answer. The driver used to plan
+    /// every call up front and run them one after another, so the pair was
+    /// never in flight together.
+    #[tokio::test]
+    async fn the_primary_pair_runs_concurrently() {
+        let jobs = vec![job(
+            finding("high", "pair", Some("let x = 1"), CTX),
+            &["c1", "c2", "c3"],
+        )];
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = in_flight.clone();
+        let high = peak.clone();
+        let review = run(&jobs, &limits(), move |model, _plan| {
+            let counter = counter.clone();
+            let high = high.clone();
+            async move {
+                let now = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                high.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                attempt(&model, "fam", ParsedDisposition::Insufficient)
+            }
+        })
+        .await;
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the primary pair must be in flight at the same time"
+        );
+        // Neither answered decisively, so the third confirmer did run.
+        assert!(review.effective_blocking);
+    }
+
+    /// A decisive answer STOPS the chain.
+    ///
+    /// The budget is not spent on confirmers whose answers would be
+    /// discarded: once the finding is settled, no later round is entered.
+    #[tokio::test]
+    async fn a_decisive_answer_stops_the_further_confirmers() {
+        let jobs = vec![job(
+            finding("high", "decisive", Some("let x = 1"), CTX),
+            &["c1", "c2", "c3", "c4"],
+        )];
+        let (review, dispatched) = drive(&jobs, &limits(), |m| {
+            attempt(m, "fam", ParsedDisposition::Confirm)
+        })
+        .await;
+        assert_eq!(
+            dispatched,
+            vec!["c1".to_string(), "c2".to_string()],
+            "only the primary pair may be dispatched once the finding is settled"
+        );
+        assert_eq!(review.decisions[0].disposition, Disposition::Confirmed);
+        assert!(review.effective_blocking);
+    }
+
+    /// The per-call timeout is REAL.
+    ///
+    /// A call that never answers is recorded as a timeout, and a timeout is
+    /// a failure, never a rejection: the finding keeps blocking.
+    #[tokio::test]
+    async fn a_call_that_never_answers_is_recorded_as_a_timeout() {
+        let mut limits = limits();
+        limits.timeout_s = 1;
+        let jobs = vec![job(
+            finding("high", "slow", Some("let x = 1"), CTX),
+            &["c1"],
+        )];
+        let review = run(&jobs, &limits, |_model, _plan| async {
+            // Longer than the timeout: only the timeout wrapper can end it.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            attempt("c1", "fam", ParsedDisposition::Reject)
+        })
+        .await;
+        let decision = &review.decisions[0];
+        assert_eq!(decision.attempts.len(), 1, "the attempt must be recorded");
+        assert_eq!(
+            decision.attempts[0].outcome,
+            ConfirmerOutcome::Timeout,
+            "a call that never answers must be recorded as a timeout"
+        );
+        assert!(
+            decision.blocking,
+            "a timeout is a failure, never a rejection"
+        );
+        assert_eq!(decision.disposition, Disposition::ConfirmerFailed);
+    }
+
+    /// EVERY completed attempt is recorded, including the second member of
+    /// the primary pair when the first one settled the finding.
+    ///
+    /// The pair runs concurrently, so its second answer exists whether or
+    /// not the finding was already settled when it landed. Dropping it
+    /// would hide a disagreement between the two families.
+    #[tokio::test]
+    async fn both_members_of_the_primary_pair_are_recorded() {
+        let jobs = vec![job(
+            finding("high", "pair-record", Some("let x = 1"), CTX),
+            &["c1", "c2", "c3"],
+        )];
+        let (review, dispatched) = drive(&jobs, &limits(), |m| {
+            attempt(m, "fam", ParsedDisposition::Confirm)
+        })
+        .await;
+        assert_eq!(dispatched.len(), 2, "only the primary pair may run");
+        let decision = &review.decisions[0];
+        assert_eq!(
+            decision.attempts.len(),
+            2,
+            "both answers of the pair must be recorded"
+        );
+        let models: Vec<&str> = decision.attempts.iter().map(|a| a.model.as_str()).collect();
+        assert_eq!(models, vec!["c1", "c2"]);
     }
 }
