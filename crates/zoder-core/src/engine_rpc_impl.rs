@@ -2,18 +2,28 @@
 //! and who must leave it running for its siblings.
 //!
 //! The invariant this module enforces: a zoder process may stop a daemon only
-//! if it started it (it is the holder of the EARLIEST live lease) AND no
-//! other live zoder process is using it; it must never delete a socket a
-//! live daemon is serving. An unacknowledged `session/cancel` abandons the
-//! session and reaps the caller's workspace processes — it does not kill a
-//! shared daemon out from under every other loop on the host.
+//! if it is the daemon's recorded OWNER — the process that started it, and
+//! the only one that can prove it — AND no other live zoder process is using
+//! it; a daemon whose owner is gone may be taken over by its only remaining
+//! live consumer, but only while that consumer's own registration is
+//! current. A client must never delete a socket a live daemon is serving. An
+//! unacknowledged `session/cancel` abandons the session and reaps the
+//! caller's workspace processes — it does not kill a shared daemon out from
+//! under every other loop on the host.
+//!
+//! The lease ORDER says who arrived first, which is NOT the same question as
+//! who started the daemon: the first client to reach a shared daemon is
+//! often a short-lived one that has already gone by the time the daemon
+//! needs stopping. Ownership is therefore a separate fact, recorded by the
+//! spawner in the daemon's own record (`<daemon pid> <start ticks> <owner
+//! pid> <owner ticks>`), and the decision reads both.
 //!
 //! The mechanism is a per-client lease file under `<socket_dir>/daemons/`:
-//! each client writes one the first time it reaches the daemon and refreshes
-//! it on every later connection, so "who is using this daemon" is a question
-//! about live pids, not about timing. The lease API below is small and pure
-//! enough to unit-test; the policy decision that consumes it lives in
-//! `zoder-cli` (`reaper::settle_unconfirmed_cancel`) and `main.rs`
+//! each client writes one when it first reaches for the daemon, and
+//! re-acquires it whenever it reconnects, so "who is using this daemon" is
+//! a question about live pids, not about timing. The lease API below is
+//! small and pure enough to unit-test; the policy decision that consumes it
+//! lives in `zoder-cli` (`reaper::settle_unconfirmed_cancel`) and `main.rs`
 //! (`ensure_engine_daemon` / `reap_ephemeral_daemons`).
 //!
 //! The agentic turn driver itself is NOT part of this module: it lives in the
@@ -730,7 +740,7 @@ mod lease_tests {
         // A second, live consumer's lease file on disk blocks the stop —
         // the reader, not the test, is what notices it.
         let sibling = spawn_live_sleeper();
-        write_test_lease(&socket, sibling, daemon_pid, now, now);
+        write_test_lease(&socket, sibling.pid(), daemon_pid, now, now);
         assert!(
             !client_may_stop_daemon(&socket, me, daemon_pid, ttl),
             "a live sibling's lease file on disk must block the stop"
@@ -845,25 +855,34 @@ mod lease_tests {
 
     /// A disposable, live process whose pid the liveness check can see.
     ///
-    /// The child is killed when it goes out of scope, so the pid does not
-    /// linger as a zombie and the test does not leak a process.
-    fn spawn_live_sleeper() -> u32 {
-        struct Sleeper(std::process::Child);
-        impl Drop for Sleeper {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
+    /// The guard is handed back WITH the pid, so the CALLER owns it: dropping
+    /// the guard kills the child and reaps it, so no sleeper outlives the
+    /// test and no pid is left holding a zombie slot. The old version forgot
+    /// the guard on purpose (`mem::forget`), which defeated its own `Drop`
+    /// and leaked every child this helper spawned.
+    struct LiveSleeper(std::process::Child);
+
+    impl LiveSleeper {
+        /// The pid of the live child.
+        fn pid(&self) -> u32 {
+            self.0.id()
         }
+    }
+
+    impl Drop for LiveSleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn a live child process and return the guard that owns it.
+    fn spawn_live_sleeper() -> LiveSleeper {
         let child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn a live child process");
-        let pid = child.id();
-        // The child must stay alive for the whole test, and it must be
-        // killed when the test ends: the handle is kept alive on purpose.
-        std::mem::forget(Sleeper(child));
-        pid
+        LiveSleeper(child)
     }
 
     /// The owner may stop the daemon it started, when nobody else is using
@@ -887,7 +906,8 @@ mod lease_tests {
     #[test]
     fn the_first_lease_holder_is_not_the_owner_and_may_not_stop_the_daemon() {
         let me = std::process::id();
-        let owner_pid = spawn_live_sleeper();
+        let owner = spawn_live_sleeper();
+        let owner_pid = owner.pid();
         // WE hold the only lease, acquired FIRST — and we are still not the
         // owner: the daemon was started by a process that is still alive.
         let mut ours = live_fresh_lease(me, 4242);
@@ -925,7 +945,10 @@ mod lease_tests {
     fn a_live_sibling_blocks_the_stop_even_for_the_owner() {
         let me = std::process::id();
         let sibling = spawn_live_sleeper();
-        let leases = vec![live_fresh_lease(me, 4242), live_fresh_lease(sibling, 4242)];
+        let leases = vec![
+            live_fresh_lease(me, 4242),
+            live_fresh_lease(sibling.pid(), 4242),
+        ];
         assert_eq!(
             daemon_stop_authority(&leases, me, Some(live_owner(me)), true, DAEMON_LEASE_TTL),
             DaemonStopAuthority::NotAuthorized,
@@ -934,7 +957,7 @@ mod lease_tests {
         assert_eq!(
             daemon_stop_authority(
                 &leases,
-                sibling,
+                sibling.pid(),
                 Some(live_owner(me)),
                 true,
                 DAEMON_LEASE_TTL
@@ -973,7 +996,7 @@ mod lease_tests {
         let me = std::process::id();
         let sibling = spawn_live_sleeper();
         // The census names the SIBLING but not us: we never registered.
-        let leases = vec![live_fresh_lease(sibling, 4242)];
+        let leases = vec![live_fresh_lease(sibling.pid(), 4242)];
         assert_eq!(
             daemon_stop_authority(&leases, me, None, false, DAEMON_LEASE_TTL),
             DaemonStopAuthority::NotAuthorized,
