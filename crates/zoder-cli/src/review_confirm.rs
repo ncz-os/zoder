@@ -1120,7 +1120,9 @@ pub(crate) struct ConfirmationJob {
 /// carries `model`, `family`, `role`, `outcome`, `latency_ms`, `tokens_in`,
 /// `tokens_out`. At review level: `effective_blocking`, `demoted` (with both
 /// confirmer ids for a critical), `verdict_basis`, `verdict`, and
-/// `reviewer_family_recall_ref`.
+/// `reviewer_family_recall_ref`, and the `author_families` that were
+/// excluded from the confirmer chain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     confirmed: &ConfirmedReview,
     reviewer_model: &str,
@@ -1130,6 +1132,7 @@ pub(crate) fn record(
     reviewer_tokens_in: u64,
     reviewer_tokens_out: u64,
     recall_eval_ref: &str,
+    author_families: &[String],
 ) -> Value {
     // reviewers[0] is the reviewer, so the dashboard keeps its anchor. Every
     // confirmer attempt follows, in finding order.
@@ -1203,6 +1206,11 @@ pub(crate) fn record(
         // measured against; the measured fraction lives in its own field.
         "reviewer_family_recall_ref": recall_eval_ref,
         "reviewer_family_recall": confirmed.reviewer_family_recall,
+        // The families excluded from the confirmer chain because they
+        // authored the code under review. An EMPTY list is recorded as an
+        // empty list: it says no author model was known, so the confirmer
+        // was excluded from the reviewer's family only.
+        "author_families": author_families,
         "findings": findings,
         "reviewers": reviewers,
     })
@@ -2418,6 +2426,7 @@ mod tests {
             100,
             40,
             "gptoss-review-eval-20261026",
+            &[],
         );
         let parsed = parse_record(&value);
         assert_eq!(parsed.version, 1);
@@ -2471,6 +2480,7 @@ mod tests {
             0,
             0,
             "gptoss-review-eval-20261026",
+            &[],
         );
         let f = &value["findings"][0];
         for key in [
@@ -2764,6 +2774,7 @@ mod tests {
             0,
             0,
             "gptoss-review-eval-20261026",
+            &[],
         );
         let r = value
             .get("reviewer_family_recall_ref")
@@ -2808,6 +2819,7 @@ mod tests {
             0,
             0,
             "gptoss-review-eval-20261026",
+            &[],
         );
         let measured = value
             .get("reviewer_family_recall")

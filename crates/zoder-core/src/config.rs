@@ -2864,6 +2864,17 @@ pub struct ReviewConfirmConfig {
     /// skipped, so a family never confirms its own finding.
     #[serde(default = "default_confirm_models")]
     pub models: Vec<String>,
+    /// Model ids that authored the code under review.
+    ///
+    /// A confirmer whose family matches an author family is skipped: a
+    /// family never confirms its own finding. A standalone `zoder review`
+    /// of somebody else's commit has no author model in zoder's own
+    /// record, so the operator declares one here. The PINNED primary
+    /// author model (the `-m` override, the selected agent's `model` pin,
+    /// or `Config::primary_model`) is an author model too, and the review
+    /// path adds it to this list.
+    #[serde(default)]
+    pub author_models: Vec<String>,
     /// Maximum confirmation CALLS per review (across all findings). Default 8.
     /// A finding with no call left is recorded `not_run` and keeps blocking.
     #[serde(default = "default_confirm_max_per_review")]
@@ -2943,6 +2954,7 @@ impl Default for ReviewConfirmConfig {
     fn default() -> Self {
         Self {
             models: default_confirm_models(),
+            author_models: Vec::new(),
             max_per_review: default_confirm_max_per_review(),
             timeout_s: default_confirm_timeout_s(),
             reasoning_effort: default_confirm_reasoning_effort(),
