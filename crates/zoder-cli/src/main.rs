@@ -208,10 +208,12 @@ impl From<&Provider> for BillingPosture {
 /// prices are only relevant when the serving provider is actually metered.
 /// The cost to record for one call, and whether the cost is unknown.
 ///
-/// The provider's own cost telemetry wins when it reports a charge: it is
+/// The provider's own cost telemetry wins when it reports a cost: it is
 /// what the provider actually billed, and it applies to a cost-neutral
 /// route too (an overage past a free tier is a real charge that must feed
-/// the paid guard). Otherwise:
+/// the paid guard). An explicit $0 is a cost the provider REPORTED, not a
+/// missing one: it is recorded as a known $0 and never re-priced from the
+/// catalog. Otherwise:
 ///
 /// - a COST-NEUTRAL provider (a flat plan or a free route) records $0: the
 ///   plan is paid for monthly and the free route costs nothing to serve, so
@@ -240,7 +242,13 @@ pub(crate) fn ledger_call_cost(
     ts: Option<DateTime<Utc>>,
 ) -> (f64, bool) {
     if let Some(cost) = telemetry_cost_usd {
-        if cost.is_finite() && cost > 0.0 {
+        // A finite, non-negative cost is the provider's own bill for THIS
+        // call, and that includes an explicit zero: a provider that reports
+        // $0 for a metered model has said the call cost nothing, so
+        // re-pricing it from the catalog would invent a charge the provider
+        // never made. Only a MISSING cost (None) or a non-finite one says
+        // nothing about the price and falls through to the catalog.
+        if cost.is_finite() && cost >= 0.0 {
             return (cost, false);
         }
     }
@@ -22017,6 +22025,55 @@ mod ledger_call_cost_tests {
         );
         assert!(!unknown);
         assert!((cost - 0.25).abs() < 1e-9, "cost was {cost}");
+    }
+
+    /// An explicit $0 in the provider's telemetry is a COST the provider
+    /// reported, not a missing one.
+    ///
+    /// The telemetry is what the provider actually billed, so a provider
+    /// that says $0 for a metered model has said the call cost nothing.
+    /// Re-pricing it from the catalog would invent a charge the provider
+    /// never made — and on a metered route that charge is exactly what the
+    /// month-to-date gate and the paid guard act on.
+    #[test]
+    fn an_explicit_zero_telemetry_is_authoritative() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            Some(0.0),
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 500_000,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!unknown, "a reported $0 is a known cost");
+        assert_eq!(cost, 0.0, "the catalog must not re-price a reported $0");
+    }
+
+    /// A MISSING cost is not a reported $0: with no telemetry and no usage
+    /// at all, a metered call stays unknown, so the month-to-date gate
+    /// fails closed instead of passing an unpriced call as free.
+    #[test]
+    fn a_missing_cost_with_no_usage_stays_unknown() {
+        let cat = catalog();
+        let (cost, unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(unknown, "an unpriced metered call must stay unknown");
+        assert_eq!(cost, 0.0);
     }
 
     /// Positive telemetry on a COST-NEUTRAL route is still recorded: a
