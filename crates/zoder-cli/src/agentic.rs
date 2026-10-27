@@ -6058,7 +6058,7 @@ async fn confirm_review(
             &[],
             family_of,
         );
-        let context = build_context(&f, hunk, read, limits.max_context_lines);
+        let context = build_context(&f, hunk, read, limits.max_context_lines, &touched);
         jobs.push(ConfirmationJob {
             plan: FindingPlan {
                 finding: f,
