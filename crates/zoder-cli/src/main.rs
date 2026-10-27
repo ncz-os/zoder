@@ -16502,6 +16502,47 @@ fn billing_label(b: BillingMode) -> &'static str {
     }
 }
 
+/// Pick the provider `zoder quota minimax` refreshes its plan quota from.
+///
+/// The candidates are the providers that actually serve MiniMax (their id or
+/// their endpoint names it), minus the built-in placeholder. A candidate that
+/// has not been given an endpoint yet cannot be asked for its quota: this
+/// command asks the provider's OWN usage API, so it dials the endpoint
+/// directly and never builds a zoder provider client — the refusal that
+/// client carries would never run on this path. Such a candidate is skipped
+/// so a configured sibling is still used, and when no candidate has an
+/// endpoint the operator gets a configuration error that names the setting to
+/// fill in instead of a failed request.
+fn select_quota_provider<'a>(providers: &'a [Provider]) -> anyhow::Result<&'a Provider> {
+    let candidates: Vec<&Provider> = providers
+        .iter()
+        .filter(|p| {
+            let id = p.id.to_ascii_lowercase();
+            let url = p.base_url.to_ascii_lowercase();
+            (id.contains("minimax") || url.contains("minimax"))
+                && !p
+                    .base_url
+                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+        })
+        .collect();
+    if let Some(p) = candidates.iter().find(|p| p.endpoint_is_configured()) {
+        return Ok(p);
+    }
+    if let Some(p) = candidates.first() {
+        anyhow::bail!(
+            "MiniMax provider {:?} has no endpoint configured: set its `base_url` to the API base \
+             your provider publishes (the shipped template leaves it as the host-free {:?} \
+             sentinel until you do)",
+            p.id,
+            zoder_core::config::UNSET_PROVIDER_ENDPOINT
+        );
+    }
+    anyhow::bail!(
+        "no MiniMax provider configured (looked for a provider id or base_url \
+         naming 'minimax'); configure one in ~/.zoder/config.toml"
+    )
+}
+
 /// `zoder quota minimax` — live M Plan (Token Plan) quota via the provider's
 /// own usage API (`GET /v1/token_plan/remains`), plus the last observed
 /// quota-wall state persisted when the 429/2056 was hit.
@@ -16518,23 +16559,7 @@ async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()
         );
     }
     let eng = Engine::load()?;
-    // Find a provider that actually serves MiniMax (id or base_url naming
-    // minimax) and is not a placeholder. Only the first one is refreshed;
-    // a second MiniMax account keeps its own state until it hits a wall.
-    let minimax_provider = eng.cfg.providers.iter().find(|p| {
-        let id = p.id.to_ascii_lowercase();
-        let url = p.base_url.to_ascii_lowercase();
-        (id.contains("minimax") || url.contains("minimax"))
-            && !p
-                .base_url
-                .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-    });
-    let Some(p) = minimax_provider else {
-        anyhow::bail!(
-            "no MiniMax provider configured (looked for a provider id or base_url \
-             naming 'minimax'); configure one in ~/.zoder/config.toml"
-        )
-    };
+    let p = select_quota_provider(&eng.cfg.providers)?;
     let token = match p.auth.resolve() {
         Some(t) if !t.is_empty() => t,
         _ => anyhow::bail!(
