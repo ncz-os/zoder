@@ -16513,7 +16513,7 @@ fn billing_label(b: BillingMode) -> &'static str {
 /// so a configured sibling is still used, and when no candidate has an
 /// endpoint the operator gets a configuration error that names the setting to
 /// fill in instead of a failed request.
-fn select_quota_provider<'a>(providers: &'a [Provider]) -> anyhow::Result<&'a Provider> {
+fn select_quota_provider(providers: &[Provider]) -> anyhow::Result<&Provider> {
     let candidates: Vec<&Provider> = providers
         .iter()
         .filter(|p| {
