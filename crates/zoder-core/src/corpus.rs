@@ -1706,6 +1706,17 @@ impl Corpus {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // Pin the corpus file's mode: `fs::write` inherits the process
+        // umask, so a lax umask (0002, as on many fleet hosts) would leave
+        // the corpus group-writable for whoever else is in the group. If the
+        // mode cannot be made safe the temp is removed and the rename never
+        // happens, so a corpus nobody may safely replace is never installed.
+        if let Err(e) = crate::pricing::harden_catalog_mode(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(
+                e.context("the corpus could not be made safe to write; refusing to install it")
+            );
+        }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
@@ -2054,6 +2065,37 @@ mod corpus_io_tests {
         }
         // Belt-and-suspenders: the legacy deterministic temp path never exists.
         assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The corpus file's mode is pinned by the save: `fs::write` inherits the
+    // process umask, so a lax umask (0002, as on many fleet hosts) would
+    // leave the corpus group-writable for everyone else in the group.
+    #[test]
+    fn saved_corpus_is_not_group_or_world_writable() {
+        let _env = AliasEnvGuard::none();
+        let dir = tmpdir();
+        let path = dir.join("corpus.json");
+        let c = Corpus {
+            source: "test".into(),
+            models: vec![ModelEntry {
+                id: "vendor/m".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "a saved corpus must never be group- or world-writable"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
