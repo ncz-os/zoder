@@ -279,3 +279,31 @@ fn exec_dry_run_resolves_a_route_with_either_provider_key() {
         );
     }
 }
+
+/// A fresh standalone install has no endpoint yet: the shipped template names
+/// no provider endpoint. zoder must refuse the call and say which setting is
+/// missing, instead of sending a request to a name that cannot resolve.
+#[test]
+fn a_fresh_standalone_install_refuses_to_dial_an_unset_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_corpus(dir.path());
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .args(["init", "--profile", "standalone"]));
+    assert_ok(&output, "init");
+
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .args(["exec", "--allow-paid", "smoke"]));
+    assert!(
+        !output.status.success(),
+        "an unset endpoint must not be dialed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("no endpoint configured"),
+        "the operator must be told to set base_url\nstderr:\n{err}"
+    );
+}
