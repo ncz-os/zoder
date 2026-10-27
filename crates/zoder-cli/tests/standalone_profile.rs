@@ -280,6 +280,47 @@ fn exec_dry_run_resolves_a_route_with_either_provider_key() {
     }
 }
 
+/// `zoder quota minimax` asks the provider's OWN usage API for the plan
+/// quota, so it dials the provider's endpoint directly and never builds a
+/// zoder provider client — the refusal that client carries never runs on
+/// this path. A fresh standalone install ships the host-free unset sentinel,
+/// so the command must refuse HERE and name the setting to fill in, instead
+/// of sending a request to a name that resolves nowhere.
+///
+/// The test drives the real binary, so it exercises the whole production
+/// path: the provider selection, the endpoint refusal and the operator-facing
+/// message.
+#[test]
+fn quota_refuses_an_unset_provider_endpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_corpus(dir.path());
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .env("MINIMAX_API_KEY", "smoke-key")
+        .args(["init", "--profile", "standalone"]));
+    assert_ok(&output, "init");
+
+    let output = run(zoder(dir.path())
+        .env("MINIMAX_API_KEY", "smoke-key")
+        .args(["quota", "minimax"]));
+    assert!(
+        !output.status.success(),
+        "an unset endpoint must not be dialed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("no endpoint configured"),
+        "the operator must be told to set base_url\nstderr:\n{err}"
+    );
+    assert!(
+        !err.contains("token_plan/remains request failed"),
+        "the refusal must happen before the request is sent, not after it \
+         failed\nstderr:\n{err}"
+    );
+}
+
 /// A fresh standalone install has no endpoint yet: the shipped template names
 /// no provider endpoint. The Goose engine hands the routed provider's endpoint
 /// to a spawned child process as OPENAI_BASE_URL / OPENAI_HOST, and that path
