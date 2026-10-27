@@ -21439,7 +21439,20 @@ mod pricing_source_file_tests {
 
     fn write_pricing(home: &Path, body: &str) {
         std::fs::create_dir_all(home).unwrap();
-        std::fs::write(home.join("pricing.json"), body).unwrap();
+        write_secure(&home.join("pricing.json"), body);
+    }
+
+    /// Write a file with an owner-only mode, independent of the process
+    /// umask. `PricingCatalog::load` refuses a catalog that is group- or
+    /// world-writable, so a test that writes one and then loads it must not
+    /// let the umask decide whether the loader accepts the file.
+    fn write_secure(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     fn with_env_home<F: FnOnce()>(home: &Path, extra: &[(&str, &str)], f: F) {
@@ -21627,7 +21640,7 @@ mod pricing_source_file_tests {
             "source": "an internal price database",
             "models": {}
         }"#;
-        std::fs::write(&pricing, installed).unwrap();
+        write_secure(&pricing, installed);
         with_env_home(home.path(), &[], || {
             let cfg = Config::load_unvalidated().unwrap();
             let switch = pricing_source_switch(&cfg);
