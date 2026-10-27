@@ -14070,7 +14070,7 @@ async fn cmd_refresh(cli: &Cli, force: bool) -> anyhow::Result<()> {
     // two writes (the reconciled corpus save and the alias-overlay rows it
     // carried in from `<home>/model-aliases.json`, which are persisted inside
     // that same save) are gated.
-    let switch = pricing_source_switch(&eng.cfg);
+    let switch = effective_pricing_source_switch();
     save_reconciled_corpus(&corpus, &eng.cfg.corpus_path, &switch, force)?;
 
     if cli.json {
@@ -14496,10 +14496,12 @@ fn pricing_source_switch_with(config_wants_file: bool) -> FileSwitch {
 /// so an unrelated validation problem elsewhere must not switch the
 /// protection off.
 fn effective_pricing_source_switch() -> FileSwitch {
-    let config_wants_file = Config::load_unvalidated()
-        .map(|cfg| cfg.pricing.wants_file())
-        .unwrap_or(false);
-    pricing_source_switch_with(config_wants_file)
+    match Config::load_unvalidated() {
+        Ok(cfg) => pricing_source_switch(&cfg),
+        // A config that cannot even be parsed has no `[pricing] source` to
+        // honour: the env var and the `managed` marker still decide.
+        Err(_) => pricing_source_switch_with(false),
+    }
 }
 
 /// Print the age warning for one installed data file, if its data (by its
@@ -14513,7 +14515,7 @@ fn warn_data_age(
     generated_at: Option<&str>,
     source: &str,
 ) {
-    warn_data_age_at(
+    let _ = warn_data_age_at(
         which,
         path,
         zoder_core::pricing::data_date(generated, generated_at.unwrap_or("")),
@@ -14528,43 +14530,72 @@ fn warn_data_age(
 /// prefers `generated` over `arena_date`, and honours `generated_at` above
 /// both) can be warned about without the warning code second-guessing that
 /// rule: the caller passes the date it already computed.
-fn warn_data_age_at(which: &str, path: &Path, date: Option<chrono::NaiveDate>, source: &str) {
+///
+/// Returns the line it printed, so a caller (and a test) can see exactly
+/// what the operator was told.
+fn warn_data_age_at(
+    which: &str,
+    path: &Path,
+    date: Option<chrono::NaiveDate>,
+    source: &str,
+) -> Option<String> {
     let path_display = path.display().to_string();
     let Some(date) = date else {
         let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
-        if state.warned.insert(which.to_string()) {
+        if state.warned.insert(data_age_warn_key(which, path)) {
             let days = stale_threshold_days();
             if days > 0 {
-                eprintln!(
-                    "zoder: warning: installed {which} data has no parseable date ({}); age unknown",
-                    path_display
+                let line = format!(
+                    "zoder: warning: installed {which} data has no parseable date ({path_display}); age unknown"
                 );
+                eprintln!("{line}");
+                return Some(line);
             }
         }
-        return;
+        return None;
     };
     let days = stale_threshold_days();
     if days == 0 {
-        return;
+        return None;
     }
     let today = chrono::Utc::now().date_naive();
     let age = (today - date).num_days();
     if age <= days {
-        return;
+        return None;
     }
     let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
-    if !state.warned.insert(which.to_string()) {
-        return;
+    if !state.warned.insert(data_age_warn_key(which, path)) {
+        return None;
     }
     let src = source.to_string();
-    let hint = if pricing_source_is_file() {
+    // The hint must AGREE with the production overwrite gate.
+    //
+    // The gate that refuses `zoder pricing refresh` resolves its switch with
+    // `effective_pricing_source_switch`, which does NOT need a loadable
+    // config: a config that fails validation must not be a way to switch the
+    // protection off. Resolving the hint from a validated config instead
+    // made the two disagree — the warning told the operator to run a
+    // refresh that the gate then refused, so the installed file stayed
+    // stale with the operator none the wiser. One resolver, one answer.
+    let hint = if effective_pricing_source_switch().is_file() {
         "it is installed by your installer and zoder will not re-pull it while the pricing source is 'file' — update it there"
     } else {
         "run `zoder pricing refresh` to update it"
     };
-    eprintln!(
+    let line = format!(
         "zoder: warning: installed {which} data is {age} days old (generated {date}, source {src}); {hint}"
     );
+    eprintln!("{line}");
+    Some(line)
+}
+
+/// The key that marks one installed file as already warned about.
+///
+/// Keyed by the FILE, not just by its kind: `pricing` names two different
+/// files (the engine copy in the data dir and the installed catalog in the
+/// zoder home), and warning about one of them must not silence the other.
+fn data_age_warn_key(which: &str, path: &Path) -> String {
+    format!("{which}:{}", path.display())
 }
 
 /// One installed data file the operator should hear the age of.
@@ -14616,7 +14647,7 @@ fn installed_data_files(cfg: &Config, pricing: &PricingCatalog) -> Vec<Installed
 /// Print the age warning for every installed data file, one line per file.
 fn warn_installed_data_age(cfg: &Config, pricing: &PricingCatalog) {
     for file in installed_data_files(cfg, pricing) {
-        warn_data_age_at(file.which, &file.path, file.date, &file.source);
+        let _ = warn_data_age_at(file.which, &file.path, file.date, &file.source);
     }
 }
 
@@ -14635,18 +14666,6 @@ fn data_age_state() -> &'static std::sync::Mutex<DataAgeState> {
         std::sync::Mutex::new(DataAgeState {
             warned: std::collections::HashSet::new(),
         })
-    })
-}
-
-/// Cheap process-lifetime flag: has any `warn_data_age` call already seen
-/// file mode, so callers that build the `hint` text stay consistent without
-/// re-resolving the config.
-fn pricing_source_is_file() -> bool {
-    static IS_FILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *IS_FILE.get_or_init(|| {
-        let cfg = Config::load().ok();
-        cfg.map(|c| pricing_source_switch(&c).is_file())
-            .unwrap_or(false)
     })
 }
 
@@ -21969,6 +21988,138 @@ mod pricing_source_file_tests {
                 "the corpus date must be its own generated date, not the arena snapshot"
             );
             assert_eq!(corpus_file.source, "public: test");
+        });
+    }
+
+    /// A config that PARSES but fails validation: the default provider is
+    /// unknown. `Config::load()` must reject it, `Config::load_unvalidated()`
+    /// must still read it — that gap is what the switch has to survive.
+    fn write_config_that_fails_validation(home: &Path) {
+        let mut body: serde_json::Value = serde_json::from_str(CONFIG_JSON).unwrap();
+        body["default_provider"] = serde_json::json!("does-not-exist");
+        std::fs::write(home.join("config.json"), body.to_string()).unwrap();
+    }
+
+    /// The age warning's hint must agree with the production overwrite gate.
+    ///
+    /// The hint tells the operator how to fix stale installed data. If it
+    /// says "run `zoder pricing refresh`" while the refresh gate refuses the
+    /// refresh, the operator is told to run a command that cannot work: the
+    /// installed file stays stale forever and the warning repeats with no
+    /// way out.
+    ///
+    /// The gate resolves its switch WITHOUT a validated config (a config
+    /// that fails validation must not switch the protection off), so the
+    /// hint has to resolve it the same way. This test drives the real
+    /// warning path — the function that builds the line the operator reads —
+    /// with a config that fails validation and an installer-owned catalog.
+    #[test]
+    fn the_age_warning_hint_agrees_with_the_overwrite_gate() {
+        let home = tempfile::tempdir().unwrap();
+        write_config_that_fails_validation(home.path());
+        // The installer owns the installed catalog.
+        write_pricing(
+            home.path(),
+            r#"{"managed": true, "generated": "2020-01-01", "models": {}}"#,
+        );
+        with_env_home(home.path(), &[], || {
+            assert!(
+                Config::load().is_err(),
+                "the fixture must be a config that fails validation"
+            );
+            // The gate's own switch: the refresh must be refused.
+            let switch = effective_pricing_source_switch();
+            assert!(
+                switch.is_file(),
+                "the managed marker must keep the gate closed even when the config fails validation"
+            );
+            assert!(
+                !pricing_refresh_allowed(&switch, false),
+                "the gate must refuse the refresh the hint would suggest"
+            );
+            // The warning the operator actually sees.
+            let line = warn_data_age_at(
+                "pricing",
+                &home.path().join("pricing.json"),
+                chrono::NaiveDate::from_ymd_opt(2020, 1, 1),
+                "managed",
+            )
+            .expect("a 2020 catalog must be warned about");
+            assert!(
+                !line.contains("zoder pricing refresh"),
+                "the hint must not tell the operator to run a command the gate refuses: {line}"
+            );
+            assert!(
+                line.contains("will not re-pull"),
+                "the hint must say the installer owns the file: {line}"
+            );
+        });
+    }
+
+    /// The complement of the gate agreement: with nothing in file mode the
+    /// hint must still tell the operator to refresh, because the refresh
+    /// will work.
+    #[test]
+    fn the_age_warning_hint_says_refresh_when_the_gate_allows_it() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.json"), CONFIG_JSON).unwrap();
+        // An installer-free catalog: nothing claims it.
+        write_pricing(
+            home.path(),
+            r#"{"managed": false, "generated": "2020-01-01", "models": {}}"#,
+        );
+        with_env_home(home.path(), &[], || {
+            let switch = effective_pricing_source_switch();
+            assert!(
+                pricing_refresh_allowed(&switch, false),
+                "auto mode must let the refresh through"
+            );
+            let line = warn_data_age_at(
+                "pricing",
+                &home.path().join("pricing.json"),
+                chrono::NaiveDate::from_ymd_opt(2020, 1, 1),
+                "public",
+            )
+            .expect("a 2020 catalog must be warned about");
+            assert!(
+                line.contains("zoder pricing refresh"),
+                "the hint must tell the operator to refresh when the refresh works: {line}"
+            );
+        });
+    }
+
+    /// The env var alone puts zoder in file mode — with or without a
+    /// loadable config — so the hint has to follow it too.
+    #[test]
+    fn the_age_warning_hint_follows_the_env_var() {
+        let home = tempfile::tempdir().unwrap();
+        write_config_that_fails_validation(home.path());
+        write_pricing(
+            home.path(),
+            r#"{"managed": false, "generated": "2020-01-01", "models": {}}"#,
+        );
+        with_env_home(home.path(), &[("ZODER_PRICING_SOURCE", "file")], || {
+            let switch = effective_pricing_source_switch();
+            assert_eq!(switch, FileSwitch::Env);
+            assert!(
+                !pricing_refresh_allowed(&switch, false),
+                "the env var alone must close the gate"
+            );
+            let line = warn_data_age_at(
+                "pricing",
+                &home.path().join("pricing.json"),
+                chrono::NaiveDate::from_ymd_opt(2020, 1, 1),
+                "public",
+            )
+            .expect("a 2020 catalog must be warned about");
+            assert!(
+                !line.contains("zoder pricing refresh"),
+                "the hint must follow the env var, not the config: {line}"
+            );
+            assert!(
+                line.contains("will not re-pull"),
+                "the hint must say the installer owns the file: {line}"
+            );
         });
     }
 
