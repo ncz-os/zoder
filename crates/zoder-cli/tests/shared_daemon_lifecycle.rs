@@ -1,4 +1,3 @@
-#![cfg(target_os = "linux")]
 //! Integration tests for the shared engine daemon lifecycle.
 //!
 //! The regression these tests guard:
@@ -40,6 +39,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Where the built `zoder` binary lives, relative to this test binary.
+#[cfg(target_os = "linux")]
 fn zoder_binary() -> PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let dep_dir = exe.parent().expect("deps dir");
@@ -70,6 +70,7 @@ fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 
 /// True if `pid` names a live (non-zombie) process.
 fn pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
     {
         // A zombie holds its pid but runs nothing, and the daemon fixtures
         // are reaped by their parent, so the state field is what decides.
@@ -279,6 +280,7 @@ struct FakeDaemon {
     child: Child,
     pid: u32,
     /// Only the shared-daemon test reads it, and that test is Linux only.
+    #[cfg(target_os = "linux")]
     cancel_count_file: PathBuf,
     signal_count_file: PathBuf,
 }
@@ -304,12 +306,14 @@ fn start_fake_daemon(data_dir: &Path, socket: &Path, model: &str) -> FakeDaemon 
     FakeDaemon {
         pid: child.id(),
         child,
+        #[cfg(target_os = "linux")]
         cancel_count_file: count_file,
         signal_count_file: signal_file,
     }
 }
 
 /// Read the fake daemon's cancel count from its side file.
+#[cfg(target_os = "linux")]
 fn cancel_count(count_file: &Path) -> usize {
     std::fs::read_to_string(count_file)
         .map(|s| s.trim().parse().unwrap_or(0))
@@ -331,6 +335,7 @@ fn signal_count(signal_file: &Path) -> usize {
 /// against the fake daemon. The client acquires its lease in
 /// `ensure_engine_daemon` before `session/new`, so the lease file appears
 /// while the turn is in flight.
+#[cfg(target_os = "linux")]
 fn spawn_client(
     zoder_bin: &Path,
     scratch_dir: &Path,
@@ -378,6 +383,7 @@ fn spawn_client(
 /// the only live consumer left, and a daemon that outlives every user of it
 /// is a leak).
 #[test]
+#[cfg(target_os = "linux")]
 fn two_clients_share_one_daemon_and_the_first_exit_does_not_kill_it() {
     let dir = tempfile::tempdir().expect("scratch dir");
 
@@ -626,4 +632,109 @@ uri = "http://127.0.0.1:1"
 
     // Clean up: the daemon is already gone; the reaper thread (which owns
     // the Child) collects it.
+}
+
+/// A socket with no live daemon (stale) is the shape the stale-socket
+/// cleanup handles: the path is there, nothing answers on it.
+///
+/// The test drives the PRODUCTION cleanup entry point — the same function
+/// `ensure_engine_daemon` calls — so the probe, the identity capture, the
+/// daemon lock and the removal are exercised together. A test that only
+/// unlinked the file would keep passing if the product stopped calling the
+/// cleanup at all.
+#[tokio::test]
+async fn a_stale_socket_is_removed_by_the_production_cleanup() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let socket = data_dir.join("daemon.sock");
+
+    // A real daemon that dies without unbinding its socket: the shape of a
+    // stale socket left behind by a daemon that was killed.
+    let mut daemon = start_fake_daemon(&data_dir, &socket, "codestral/codestral-2405");
+    assert!(
+        wait_for_file(&socket, Duration::from_secs(15)),
+        "the fake daemon must bind the socket"
+    );
+    let daemon_pid = daemon.pid;
+    // SIGKILL: the daemon gets no chance to clean up, which is exactly the
+    // shape of a socket left behind by a daemon that died.
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(daemon_pid.to_string())
+        .output();
+    let _ = daemon.child.wait();
+    assert!(
+        !pid_alive(daemon_pid),
+        "the daemon fixture must be gone before the cleanup runs"
+    );
+    assert!(
+        socket.exists(),
+        "precondition: the dead daemon's socket file is still on disk"
+    );
+
+    let outcome = zoder_core::cleanup_stale_socket_if_dead(&socket).await;
+    assert_eq!(
+        outcome,
+        zoder_core::StaleSocketOutcome::Removed,
+        "a socket with nothing listening on it must be cleaned up"
+    );
+    assert!(
+        !socket.exists(),
+        "the stale socket must be gone: the next bind would fail with \
+         EADDRINUSE otherwise"
+    );
+}
+
+/// A LIVE daemon's socket survives the cleanup.
+///
+/// The cleanup unlinks a socket only when it has proved that nothing answers
+/// on it. A daemon that is running — even one that does not answer the
+/// handshake — keeps its socket: unlinking it would leave a daemon that
+/// nothing can reach any more.
+#[tokio::test]
+async fn a_live_daemons_socket_survives_the_production_cleanup() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let socket = data_dir.join("daemon.sock");
+
+    // A real daemon that answers the handshake: the shape of a healthy
+    // shared daemon.
+    let mut daemon = start_fake_daemon(&data_dir, &socket, "codestral/codestral-2405");
+    assert!(
+        wait_for_file(&socket, Duration::from_secs(15)),
+        "the fake daemon must bind the socket"
+    );
+
+    let outcome = zoder_core::cleanup_stale_socket_if_dead(&socket).await;
+    assert_eq!(
+        outcome,
+        zoder_core::StaleSocketOutcome::Ready,
+        "a daemon that answers the handshake must be reported as ready"
+    );
+    assert!(
+        socket.exists(),
+        "a live daemon's socket must survive the cleanup"
+    );
+    match UnixStream::connect(&socket) {
+        Ok(_) => {}
+        Err(e) => panic!("the live daemon must still accept connections: {e}"),
+    }
+
+    // Clean up: stop the fixture by exact pid and reap it. The daemon
+    // counts the SIGTERM it receives, which is the same observation the
+    // shared-daemon test uses to prove the daemon was stopped exactly once.
+    let _ = Command::new("kill").arg(daemon.pid.to_string()).output();
+    let _ = daemon.child.wait();
+    assert!(
+        wait_for_exit(daemon.pid, Duration::from_secs(5)),
+        "the daemon fixture must be gone"
+    );
+    assert_eq!(
+        signal_count(&daemon.signal_count_file),
+        1,
+        "the fixture must count the SIGTERM it received: the shared-daemon \
+         test reads this counter to prove the daemon was stopped exactly once"
+    );
 }

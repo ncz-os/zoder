@@ -9,6 +9,13 @@ pub mod config;
 pub mod consultant;
 pub mod context_opt;
 pub mod corpus;
+/// The stale-socket cleanup: the one decision that may unlink a daemon's
+/// socket.
+///
+/// The socket is the daemon's only name, so unlinking it while the daemon
+/// is alive leaves a daemon that nothing can reach any more. Every arm of
+/// the policy therefore fails towards "leave the socket alone".
+pub mod daemon_socket;
 pub mod engine_cost;
 pub use acp_client as engine_rpc;
 /// Shared engine-daemon lifecycle: the per-client daemon LEASES that let
@@ -114,6 +121,9 @@ pub use config::{
 pub use corpus::{
     AliasOverlay, Corpus, ModelEntry, OverlayModel, OverlayReport, RefreshReport,
     MODEL_ALIASES_ENV, MODEL_ALIASES_FILE, OVERLAY_SOURCE,
+};
+pub use daemon_socket::{
+    cleanup_stale_socket_if_dead, remove_stale_socket, socket_identity, StaleSocketOutcome,
 };
 pub use engine_cost::{
     fetch_engine_cost, AgentStats as EngineAgentStats, CostSummary as EngineCostSummary,
