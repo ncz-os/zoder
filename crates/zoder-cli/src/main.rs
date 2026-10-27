@@ -21575,11 +21575,17 @@ mod pricing_source_file_tests {
     use super::*;
 
     /// Minimal valid config.json with a placeholder-free provider.
+    ///
+    /// The base_url is NOT the built-in placeholder host
+    /// (`api.example.com`): a provider on the placeholder has no real
+    /// backing, so a test that believes it configured a real provider would
+    /// be exercising the placeholder path instead. `prov-a.invalid` is
+    /// reserved by RFC 2606 and can never resolve.
     const CONFIG_JSON: &str = r#"{
         "providers": [
             {
                 "id": "prov-a",
-                "base_url": "https://api.example.com/v1",
+                "base_url": "https://prov-a.invalid/v1",
                 "kind": "openai-chat",
                 "auth": { "type": "none" },
                 "paid": false,
