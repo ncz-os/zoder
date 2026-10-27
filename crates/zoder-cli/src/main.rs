@@ -14675,6 +14675,30 @@ fn maybe_spawn_daily_refresh() {
     }
 }
 
+/// Carry the installed catalog's provenance into a refreshed catalog.
+///
+/// In `file` pricing-source mode the installed file is authoritative and
+/// only its installer may update it. An explicit `--force` re-pull replaces
+/// the *data* (the model rows) but must not drop the file's identity --
+/// `source`, `generated`, `generated_at` and the `managed` marker -- or a
+/// public repull would relabel a managed file as public data and unmanage
+/// it. The installed values win over the refreshed ones.
+///
+/// The carry lives here, in the command path, so the test can exercise the
+/// same code the command runs instead of restating it.
+fn carry_installed_provenance(cat: &mut PricingCatalog, installed: &PricingCatalog) {
+    if let Some(src) = installed.source.clone() {
+        cat.source = Some(src);
+    }
+    if installed.generated_at.is_some() {
+        cat.generated_at = installed.generated_at.clone();
+    }
+    if !installed.generated.is_empty() {
+        cat.generated = installed.generated.clone();
+    }
+    cat.managed = installed.managed;
+}
+
 async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
     let path = Config::home().join("pricing.json");
     match action {
@@ -14712,16 +14736,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             // Carry the installed values into the refreshed catalog.
             if switch.is_file() {
                 let installed = PricingCatalog::load(&path);
-                if let Some(src) = installed.source.clone() {
-                    cat.source = Some(src);
-                }
-                if installed.generated_at.is_some() {
-                    cat.generated_at = installed.generated_at.clone();
-                }
-                if !installed.generated.is_empty() {
-                    cat.generated = installed.generated.clone();
-                }
-                cat.managed = installed.managed;
+                carry_installed_provenance(&mut cat, &installed);
             }
             cat.save(&path)?;
             publish_engine_catalog(&cat, *external, *force, json)?;
@@ -21630,6 +21645,11 @@ mod pricing_source_file_tests {
     /// catalog replaces the *data* (the model rows) but the file keeps the
     /// identity its installer gave it. Without this the `--force` save would
     /// relabel a managed file as public data and unmanage it.
+    ///
+    /// The test runs the production carry helper and then saves and reloads
+    /// the catalog, so it fails if the command ever stops carrying the
+    /// provenance -- a test that restated the carry in its own body would
+    /// keep passing after the production block was deleted.
     #[test]
     fn pricing_refresh_force_keeps_installed_provenance() {
         let home = tempfile::tempdir().unwrap();
@@ -21637,6 +21657,7 @@ mod pricing_source_file_tests {
         let installed = r#"{
             "managed": true,
             "generated": "2026-10-14",
+            "generated_at": "2026-10-14T05:00:00Z",
             "source": "an internal price database",
             "models": {}
         }"#;
@@ -21645,9 +21666,8 @@ mod pricing_source_file_tests {
             let cfg = Config::load_unvalidated().unwrap();
             let switch = pricing_source_switch(&cfg);
             assert!(switch.is_file());
-            // Simulate the exact carry step of the forced save: a fresh
-            // public catalog (as `sync_catalog` builds one) is what would be
-            // written; in file mode the installed provenance wins.
+            // The installed catalog the command loads before the forced
+            // save, and the fresh public catalog `sync_catalog` builds.
             let installed_cat = zoder_core::PricingCatalog::load(&pricing);
             assert!(installed_cat.managed);
             let mut cat = zoder_core::PricingCatalog {
@@ -21655,31 +21675,30 @@ mod pricing_source_file_tests {
                 window: "live".into(),
                 ..zoder_core::PricingCatalog::default()
             };
-            if switch.is_file() {
-                let installed = zoder_core::PricingCatalog::load(&pricing);
-                if let Some(src) = installed.source.clone() {
-                    cat.source = Some(src);
-                }
-                if installed.generated_at.is_some() {
-                    cat.generated_at = installed.generated_at.clone();
-                }
-                if !installed.generated.is_empty() {
-                    cat.generated = installed.generated.clone();
-                }
-                cat.managed = installed.managed;
-            }
+            // The production carry step of the forced save: in file mode the
+            // installed provenance wins over the refreshed catalog's.
+            carry_installed_provenance(&mut cat, &installed_cat);
+            // Write it the way the command does, then read it back: the
+            // provenance has to survive the save, not just the assignment.
+            cat.save(&pricing).unwrap();
+            let saved = zoder_core::PricingCatalog::load(&pricing);
             assert!(
-                cat.managed,
+                saved.managed,
                 "the managed marker must survive the forced re-pull"
             );
             assert_eq!(
-                cat.source.as_deref(),
+                saved.source.as_deref(),
                 Some("an internal price database"),
                 "the installer's source label must survive"
             );
             assert_eq!(
-                cat.generated, "2026-10-14",
+                saved.generated, "2026-10-14",
                 "the file's own date must survive, not the pull date"
+            );
+            assert_eq!(
+                saved.generated_at.as_deref(),
+                Some("2026-10-14T05:00:00Z"),
+                "the installer's timestamp must survive"
             );
         });
     }
