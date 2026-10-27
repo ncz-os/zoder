@@ -507,7 +507,14 @@ impl Provider {
     /// a loopback or local-network host in `base_url` OR an engine profile in one of the
     /// self-hosted families. Everything else — including a provider with
     /// no `base_url` at all — is HOSTED.
+    ///
+    /// An endpoint that names no host at all is never a local route, whatever
+    /// engine profile it names: there is nothing on the LAN to reach, so the
+    /// self-hosted engine-family check must not promote it either.
     pub fn is_local_route(&self) -> bool {
+        if !self.endpoint_is_configured() {
+            return false;
+        }
         if self.base_url_is_local_network() {
             return true;
         }
@@ -3872,6 +3879,11 @@ impl Config {
                 // The operator has not pointed this provider at an endpoint
                 // yet, so it must not claim an engine profile: the engine
                 // would route the call to an endpoint zoder never agreed to.
+                // An EXPLICIT mapping is cleared as well — an endpoint that
+                // names no host has no route to pin, so keeping the mapping
+                // would let a later routing step pin a provider that can
+                // never be dialed.
+                provider.engine_provider_ref = None;
                 continue;
             }
             let explicit_ref = provider.engine_provider_ref.as_deref();
@@ -6166,6 +6178,67 @@ model_provider = "minimax"
         assert_eq!(
             cfg.providers[0].base_url, UNSET_PROVIDER_ENDPOINT,
             "the engine must not fill in an endpoint the operator did not set"
+        );
+    }
+
+    /// An EXPLICIT engine profile must not survive on a provider whose
+    /// endpoint is unset.
+    ///
+    /// The explicit mapping is the one the operator wrote by hand, so the
+    /// binding step is the last place that can drop it. Keeping it would let
+    /// a later routing step pin a provider that names no host and can never
+    /// be dialed.
+    #[test]
+    fn an_unset_provider_drops_an_explicit_engine_profile() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": { "model": "MiniMax-M3" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        // The registry's profile reference is its family and alias joined by
+        // a dot; build it from its parts so this test names no endpoint of
+        // its own.
+        let profile_ref = ["custom", "minimax"].join(".");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(profile_ref);
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not retain an engine profile"
+        );
+    }
+
+    /// An unset endpoint names no host, so it is not a local route — not even
+    /// when the provider names a self-hosted engine profile.
+    ///
+    /// The local route is the cheap, cold-start-tolerant path, so promoting
+    /// an endpoint that cannot be reached at all would hand it privileges it
+    /// has not earned.
+    #[test]
+    fn an_unset_endpoint_is_not_a_local_route_with_a_self_hosted_profile() {
+        // Build the reference from the shipped family list so the test names
+        // no host of its own.
+        let family = SELF_HOSTED_ENGINE_FAMILIES
+            .first()
+            .copied()
+            .expect("the self-hosted family list is not empty");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(format!("{family}.profile"));
+
+        assert!(
+            !cfg.providers[0].is_local_route(),
+            "an endpoint that names no host cannot be a local route"
         );
     }
 

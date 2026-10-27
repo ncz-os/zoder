@@ -4508,9 +4508,13 @@ fn provider_for_resolved_model<'a>(
                 })
             })
             .filter(|provider| {
-                !provider
-                    .base_url
-                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                // A pin must not select a provider that cannot be dialed:
+                // the built-in placeholder and the host-free unset sentinel
+                // both name no reachable endpoint.
+                provider.endpoint_is_configured()
+                    && !provider
+                        .base_url
+                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
             }),
         None => routing.real_provider_for_model(cfg, model),
     }
@@ -20182,6 +20186,44 @@ model_provider = "custom.groq"
             Some("custom.missing"),
         )
         .is_none());
+    }
+
+    #[test]
+    fn a_pin_does_not_select_a_provider_with_an_unset_endpoint() {
+        // A pin resolves the provider by its engine-profile reference. When
+        // that provider's endpoint is still the host-free unset sentinel it
+        // names no reachable endpoint, so the pin must not select it: the
+        // route would resolve to something that can never be dialed.
+        let mut cfg = fixture_cfg(None, None);
+        cfg.providers.push(Provider {
+            model_aliases: Vec::new(),
+            id: "unset-pinned".into(),
+            engine_provider_ref: Some("unset-pinned".into()),
+            base_url: zoder_core::config::UNSET_PROVIDER_ENDPOINT.into(),
+            kind: "openai-chat".into(),
+            auth: ProviderAuth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec!["unset/".into()],
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        });
+        let routing = RoutingContext {
+            entries: Vec::new(),
+            catalog: zoder_core::subscription_tiers::TierCatalog::empty(),
+        };
+        assert!(
+            provider_for_resolved_model(&routing, &cfg, "unset/model", Some("unset-pinned"),)
+                .is_none(),
+            "a pin must not select a provider whose endpoint names no host"
+        );
     }
 
     #[test]
