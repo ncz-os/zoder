@@ -281,8 +281,17 @@ fn exec_dry_run_resolves_a_route_with_either_provider_key() {
 }
 
 /// A fresh standalone install has no endpoint yet: the shipped template names
-/// no provider endpoint. zoder must refuse the call and say which setting is
-/// missing, instead of sending a request to a name that cannot resolve.
+/// no provider endpoint. The Goose engine hands the routed provider's endpoint
+/// to a spawned child process as OPENAI_BASE_URL / OPENAI_HOST, and that path
+/// never builds a zoder provider client — so zoder must refuse HERE, before
+/// the child is started, instead of handing it a name that cannot resolve.
+///
+/// The Goose path is the one that is deterministic on every host: it never
+/// touches the zeroclaw daemon, and a missing `goose` binary is not an
+/// "engine unavailable" error, so the run cannot silently downgrade to the
+/// single-shot path and produce the same refusal from there. The assertions
+/// below therefore distinguish "refused before dispatch" from "refused later
+/// by accident".
 #[test]
 fn a_fresh_standalone_install_refuses_to_dial_an_unset_endpoint() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -294,7 +303,7 @@ fn a_fresh_standalone_install_refuses_to_dial_an_unset_endpoint() {
 
     let output = run(zoder(dir.path())
         .env("DEEPSEEK_API_KEY", "smoke-key")
-        .args(["exec", "--allow-paid", "smoke"]));
+        .args(["exec", "--engine", "goose", "--allow-paid", "smoke"]));
     assert!(
         !output.status.success(),
         "an unset endpoint must not be dialed\nstdout:\n{}\nstderr:\n{}",
@@ -305,5 +314,10 @@ fn a_fresh_standalone_install_refuses_to_dial_an_unset_endpoint() {
     assert!(
         err.contains("no endpoint configured"),
         "the operator must be told to set base_url\nstderr:\n{err}"
+    );
+    assert!(
+        !err.contains("falling back to single-shot"),
+        "the refusal must happen before the engine is contacted, not after a \
+         failed dispatch\nstderr:\n{err}"
     );
 }

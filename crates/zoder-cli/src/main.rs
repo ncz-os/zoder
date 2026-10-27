@@ -10991,6 +10991,28 @@ mod cli_tier_reasoning_parse_tests {
         assert!(local.is_local_route(), "a vllm engine profile is local");
     }
 
+    /// The Goose bridge hands the provider's endpoint to the spawned child as
+    /// OPENAI_BASE_URL / OPENAI_HOST, and that path never builds a zoder
+    /// provider client — so the refusal has to live where the bridge is
+    /// built. Without it the child would dial the host-free unset sentinel.
+    #[test]
+    fn the_goose_bridge_refuses_an_unset_endpoint() {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id": "unset-provider",
+            "base_url": zoder_core::config::UNSET_PROVIDER_ENDPOINT,
+            "kind": "openai-chat",
+            "auth": { "type": "none" },
+        }))
+        .expect("the provider must deserialize");
+        let err = goose_provider_env(&provider)
+            .expect_err("an unset endpoint must never be bridged to goose");
+        let message = err.to_string();
+        assert!(
+            message.contains("no endpoint configured"),
+            "the operator must be told to set base_url: {message}"
+        );
+    }
+
     #[test]
     fn a_lan_gpu_box_is_a_local_route_and_a_public_host_is_not() {
         let provider = |url: &str| -> Provider {
@@ -11866,6 +11888,36 @@ fn resolve_engine_session_id(
     Ok(EngineSessionChoice::StoredOrFresh)
 }
 
+/// Build the Goose provider bridge for the routed provider.
+///
+/// The bridge hands the provider's endpoint to the spawned `goose acp` child
+/// as `OPENAI_BASE_URL` / `OPENAI_HOST`, so a provider whose endpoint is
+/// still the host-free unset sentinel must be refused HERE. This path never
+/// constructs a zoder provider client, so the provider layer's own refusal
+/// never runs on it — without this guard the child would dial a name that
+/// cannot resolve.
+fn goose_provider_env(routed_provider: &Provider) -> anyhow::Result<GooseProviderEnv> {
+    if !routed_provider.endpoint_is_configured() {
+        anyhow::bail!(
+            "provider {:?} has no endpoint configured: set its `base_url` to the API base your \
+             provider publishes (the shipped template leaves it as the host-free {:?} sentinel \
+             until you do)",
+            routed_provider.id,
+            zoder_core::config::UNSET_PROVIDER_ENDPOINT
+        );
+    }
+    Ok(GooseProviderEnv {
+        provider_id: routed_provider.id.clone(),
+        kind: routed_provider.kind.clone(),
+        base_url: routed_provider.base_url.clone(),
+        // Resolve the credential the SAME way the engine bridge
+        // does (auth.resolve() reads env vars or returns the
+        // inline bearer — never log this value; it is redacted
+        // by `GooseProviderEnv`'s Debug impl above).
+        api_key: routed_provider.auth.resolve(),
+    })
+}
+
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
@@ -12190,16 +12242,7 @@ pub(crate) async fn agentic_turn(
     // We only build this on the goose path — zeroclaw handles its own
     // auth and never sees these vars.
     let goose_provider = if matches!(engine_kind, EngineKind::Goose) {
-        Some(GooseProviderEnv {
-            provider_id: routed_provider.id.clone(),
-            kind: routed_provider.kind.clone(),
-            base_url: routed_provider.base_url.clone(),
-            // Resolve the credential the SAME way the engine bridge
-            // does (auth.resolve() reads env vars or returns the
-            // inline bearer — never log this value; it is redacted
-            // by `GooseProviderEnv`'s Debug impl above).
-            api_key: routed_provider.auth.resolve(),
-        })
+        Some(goose_provider_env(&routed_provider)?)
     } else {
         None
     };

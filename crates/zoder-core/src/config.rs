@@ -6132,6 +6132,43 @@ model_provider = "minimax"
         assert!(error.contains("no explicit endpoint"), "{error}");
     }
 
+    /// A provider whose endpoint is still the host-free unset sentinel must
+    /// not claim an engine profile.
+    ///
+    /// The engine profile carries its own endpoint; binding one to a
+    /// provider that has no endpoint would silently point the call at an
+    /// address the operator never configured. The provider is left exactly
+    /// as the operator wrote it — unset — so the refusal happens at the
+    /// dial site instead.
+    #[test]
+    fn an_unset_provider_claims_no_engine_profile() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": { "model": "MiniMax-M3" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not claim an engine profile"
+        );
+        assert_eq!(
+            cfg.providers[0].base_url, UNSET_PROVIDER_ENDPOINT,
+            "the engine must not fill in an endpoint the operator did not set"
+        );
+    }
+
     #[test]
     fn engine_model_registry_projects_full_provider_fallback_closure() {
         let registry = EngineModelRegistry::from_toml(
