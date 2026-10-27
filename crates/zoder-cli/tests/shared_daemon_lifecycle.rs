@@ -259,7 +259,7 @@ def handle(conn, sid):
                         "agents": {"default": {"model": MODEL, "model_provider": "fake.default"}},
                         "providers": {
                             "models": {"fake.default": {"model": MODEL, "kind": "openai",
-                                "uri": "http://127.0.0.1:1"}}
+                                "uri": "https://gateway.example.invalid/v1"}}
                         },
                         "acp": {"default_agent": "default"},
                     })
@@ -526,7 +526,7 @@ fn write_scratch_home(cfg_dir: &Path, zoder_home: &Path) -> &'static str {
     {{
       "id": "fake",
       "kind": "openai-chat",
-      "base_url": "http://127.0.0.1:1",
+      "base_url": "https://gateway.example.invalid/v1",
       "serves": ["{model}"],
       "billing": "free",
       "auth": {{ "type": "none" }}
@@ -557,7 +557,7 @@ model_provider = "fake.default"
 [providers.models."fake.default"]
 model = "{model}"
 kind = "openai"
-uri = "http://127.0.0.1:1"
+uri = "https://gateway.example.invalid/v1"
 "#
     );
     std::fs::write(cfg_dir.join("config.toml"), engine_config).expect("write the engine config");
