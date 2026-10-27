@@ -441,42 +441,87 @@ fn is_noise_symbol(name: &str) -> bool {
 
 /// Names imported by one line: Rust `use` (including braces and `as`),
 /// Python/JS `import`/`from ... import`, and C `#include` stems.
+///
+/// The alias form and the dotted module form both count:
+/// `import datetime as dt` binds `datetime` AND `dt`, `import urllib.request`
+/// binds `urllib` AND `urllib.request`, and `from x import (y, z)` lists the
+/// parenthesised names. A trailing `,` or a dangling `(` (a Python import that
+/// continues on the next line) is tolerated: the `from x import (` line binds
+/// `x`, and `from x import (y, z)` binds `y` and `z`.
 pub(crate) fn imported_names(line: &str) -> Vec<String> {
-    let t = line.trim().trim_end_matches(';');
+    let t = line.trim().trim_end_matches([';', ',', '(', ')']);
     let mut out: Vec<String> = Vec::new();
-    let mut add = |word: &str| {
+    fn push_unique(out: &mut Vec<String>, word: &str) {
+        let word = word.trim();
         if word.len() >= 2 && !is_noise_symbol(word) && !out.iter().any(|w| w == word) {
             out.push(word.to_string());
         }
-    };
+    }
+    // A Python module path binds each dotted prefix (`a.b` -> `a`, `a.b`) and
+    // its alias (`import a.b as c` -> `c`).
+    fn add_python_target(target: &str, out: &mut Vec<String>) {
+        let target = target.trim();
+        let (module, alias) = match target.split_once(" as ") {
+            Some((module, alias)) => (module.trim(), Some(alias.trim())),
+            None => (target, None),
+        };
+        let mut prefix = String::new();
+        for segment in module.split('.') {
+            let segment = segment.trim();
+            if segment.is_empty() || segment == "*" {
+                continue;
+            }
+            if !prefix.is_empty() {
+                prefix.push('.');
+            }
+            prefix.push_str(segment);
+            if !out.iter().any(|w| w == &prefix) {
+                out.push(prefix.clone());
+            }
+        }
+        if let Some(alias) = alias {
+            push_unique(out, alias);
+        }
+    }
     if let Some(rest) = t
         .strip_prefix("pub use ")
         .or_else(|| t.strip_prefix("use "))
         .or_else(|| t.strip_prefix("extern crate "))
     {
         for word in identifiers(rest) {
-            add(word);
+            push_unique(&mut out, word);
         }
     } else if let Some(rest) = t.strip_prefix("from ") {
         let (module, names) = rest.split_once(" import ").unwrap_or((rest, ""));
         for word in identifiers(module) {
-            add(word);
+            push_unique(&mut out, word);
         }
-        for word in identifiers(names) {
-            add(word);
+        for name in names.split(',') {
+            add_python_target(name.trim_matches(['(', ')', '[', ']']), &mut out);
         }
     } else if let Some(rest) = t.strip_prefix("import ") {
-        for word in identifiers(rest) {
-            add(word);
+        // `import a.b` binds `a` and `a.b`; `import a.b as c` also binds `c`.
+        // The trailing segment (`b`) is NOT a binding in Python, so a dotted
+        // target contributes only its prefixes. A JS import list
+        // (`import { build, run as go } from './x'`) is braced, and there the
+        // named bindings (including `as` aliases) all count.
+        let braced = rest.contains('{');
+        for target in rest.split(',') {
+            add_python_target(target, &mut out);
+        }
+        if braced {
+            for word in identifiers(rest) {
+                push_unique(&mut out, word);
+            }
         }
     } else if let Some(rest) = t.strip_prefix("#include") {
         let rest = rest.trim().trim_matches(['<', '>', '"']);
         let stem = rest.rsplit('/').next().unwrap_or(rest);
         let stem = stem.split('.').next().unwrap_or(stem);
-        add(stem);
+        push_unique(&mut out, stem);
     } else if let Some(rest) = t.strip_prefix("using ") {
         for word in identifiers(rest) {
-            add(word);
+            push_unique(&mut out, word);
         }
     }
     out

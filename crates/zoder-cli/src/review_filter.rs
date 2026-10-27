@@ -32,6 +32,7 @@ const CLAIM_PHRASES: &[&str] = &[
     "not imported",
     "isn't imported",
     "missing import",
+    "missing imports",
     "missing definition",
     "no definition",
     "cannot find",
@@ -179,7 +180,144 @@ fn without_non_claims(lower: &str) -> String {
 
 fn claims_undefined(text: &str) -> bool {
     let lower = without_non_claims(&text.to_ascii_lowercase());
-    CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase))
+    // A "missing return" phrase alone is NOT an undefined-name claim: it is a
+    // claim about a function's body, checked by `claimed_missing_return` +
+    // `function_return_evidence` alone. Only a real undefined-name phrase or
+    // a missing-import phrase makes the finding an undefined-name claim.
+    CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase)) || claims_missing_import(&lower)
+}
+
+/// True when the finding's ONLY claim is a missing return: a "missing return"
+/// family phrase is present and there is NO undefined-name phrase and NO
+/// missing-import phrase. Such a finding is never dropped by the range check
+/// and never contributes an extracted symbol; it is disproved only by
+/// `function_return_evidence` for a code-shaped function it names.
+fn claims_return_only(text: &str) -> bool {
+    let lower = without_non_claims(&text.to_ascii_lowercase());
+    claims_missing_return(&lower)
+        && !CLAIM_PHRASES.iter().any(|phrase| lower.contains(phrase))
+        && !claims_missing_import(&lower)
+}
+
+/// True when `lower` makes a claim that a function is missing its return:
+/// "<fn> missing return", "<fn> has no return", "does not return a value",
+/// "never returns". This is a claim about a function's BODY (checked by
+/// `claimed_missing_return` + `function_return_evidence`), not about a
+/// missing definition: it must NOT make the finding an undefined-name claim,
+/// or any code name mentioned in it could be "disproved" just by existing.
+fn claims_missing_return(lower: &str) -> bool {
+    lower.contains("missing return")
+        || lower.contains("no return")
+        || lower.contains("does not return")
+        || lower.contains("never returns")
+}
+
+/// The "missing import" family, beyond the literal `missing import` phrase:
+///
+/// * `missing import of X [module]` / `potential|possible missing import of X`
+/// * `<fn> missing return and X import` (an import noun as the object)
+/// * `missing imports` (plural, no named symbol)
+/// * `X is not imported` / `X module is not imported` / `import of X is missing`
+///
+/// These are matched on the raw lowercase text (NOT through `CLAIM_PHRASES`,
+/// where a bare `import of` would turn any description of an import into a
+/// claim). The filter still requires the named symbol to be found in the file
+/// at the head before anything is dropped.
+fn claims_missing_import(lower: &str) -> bool {
+    const PREAMBLE: &[&str] = &["", "potential ", "possible ", "likely ", "an ", "a "];
+    for head in PREAMBLE {
+        for tail in ["", " missing", " is missing", " omitted"] {
+            if lower.contains(&format!("{head}missing import{tail}")) {
+                return true;
+            }
+        }
+    }
+    // A "missing return" / "no return" / "does not return" / "never returns"
+    // phrase is NOT a missing-definition claim: it is a claim about a
+    // function's body, checked by `claimed_missing_return` +
+    // `function_return_evidence` alone. Treating it as an undefined-name
+    // claim let any code name mentioned in such a finding be dropped just by
+    // existing ("foo has no return value" was dropped because `foo` is
+    // defined). "<something> ... import" as a noun object of "missing"
+    // ("missing return and urllib.request import", "a missing
+    // urllib.request import") IS still an import claim; the import-noun
+    // check below covers it.
+    let has_import_noun = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "import" || word == "imports");
+    if has_import_noun && lower.contains("missing") {
+        return true;
+    }
+    lower.contains("not imported")
+        || lower.contains("isn't imported")
+        || lower.contains("never imports")
+        || lower.contains("never imported")
+        || lower.contains("unresolved")
+        || lower.contains("are imported")
+}
+
+/// Words a claim uses that are never the symbol: auxiliaries, the claim's own
+/// nouns, and generic code nouns a reviewer's prose is built from.
+const CLAIM_NOUNS: &[&str] = &[
+    "has", "have", "had", "is", "does", "did", "was", "were", "missing", "return", "returns",
+    "value", "body", "code", "function", "method", "line", "lines", "file", "chunk", "diff", "the",
+    "and", "or", "no", "not", "never",
+];
+
+/// Words that name the KIND of a symbol, not the symbol: "missing import of
+/// json module" names `json`, not `module`.
+const SYMBOL_KINDS: &[&str] = &[
+    "module",
+    "modules",
+    "package",
+    "packages",
+    "library",
+    "libraries",
+    "lib",
+    "import",
+    "imports",
+    "constant",
+    "constants",
+    "variable",
+    "variables",
+    "symbol",
+    "symbols",
+    "helper",
+    "helpers",
+    "types",
+    "names",
+    "values",
+    "members",
+    "references",
+];
+
+fn strip_symbol_kind(name: &str) -> &str {
+    let name = name.trim();
+    // A bare kind word ("module", "package") is never a symbol.
+    if SYMBOL_KINDS.contains(&name.to_ascii_lowercase().as_str()) {
+        return "";
+    }
+    // Only a SEPARATE trailing kind word is stripped ("gzip module" -> "gzip",
+    // "the re package" -> "the re" handled by the caller). A kind word that is
+    // a SUFFIX INSIDE an identifier is part of the name: "mymodule" stays
+    // "mymodule", "json_module" stays "json_module".
+    if let Some((head, tail)) = name.rsplit_once(' ') {
+        let tail = tail.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if SYMBOL_KINDS.contains(&tail.to_ascii_lowercase().as_str()) {
+            return head.trim();
+        }
+    }
+    name
+}
+
+/// True when `name` is a dotted module path (`a.b`, `urllib.request`) rather
+/// than a `Class.member` reference: every segment is lowercase-ish and the
+/// first is a known-import-shaped module name.
+fn looks_like_module_path(name: &str) -> bool {
+    name.contains('.')
+        && name.split('.').all(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 /// Source-file extensions: a token ending in one is a path, and its stem
@@ -203,19 +341,39 @@ fn is_path_like(raw: &str) -> bool {
             .any(|ext| w.len() > ext.len() && w.ends_with(ext))
 }
 
-/// A token that reads as code rather than prose: snake_case, an upper-case
-/// letter, a digit, `::`, a call or a backtick.
+/// A token that reads as code rather than prose: an underscore, a digit, a
+/// dot, `::`, a backtick, a call, or mixed case.
 fn code_shaped(raw: &str) -> bool {
-    let word = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let word = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
     raw.contains('_')
         || raw.contains("::")
         || raw.contains('(')
         || raw.contains('`')
+        // Check `raw` for a dot: `trim_matches` strips edge punctuation, so
+        // `word.contains('.')` would miss a leading or trailing dot
+        // (".rs" or "main.rs" style tokens).
+        || raw.contains('.')
         || word
             .chars()
             .skip(1)
             .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        || word.chars().any(|c| c.is_ascii_uppercase())
+            && word.chars().any(|c| c.is_ascii_lowercase())
 }
+
+/// Names that are never symbols a finding can claim: runtime exception type
+/// names a reviewer quotes ("raises a NameError") and prose words. A claimed
+/// name must be something the reviewed file could import or define.
+const NEVER_CLAIMED: &[&str] = &[
+    "nameerror",
+    "importerror",
+    "modulenotfounderror",
+    "keyerror",
+    "attributeerror",
+    "valueerror",
+    "typeerror",
+    "so",
+];
 
 fn looks_like_symbol(word: &str) -> bool {
     if word.len() < 2 || STOPWORDS.contains(&word.to_ascii_lowercase().as_str()) {
@@ -243,23 +401,16 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
     let text = format!("{title}\n{body}");
     let mut out: Vec<String> = Vec::new();
     let mut add = |raw: &str| {
-        if is_path_like(raw) {
+        let raw = raw.trim();
+        // `X as Y` (an aliased import claim): either name satisfies it, so
+        // both are candidates. The file must bind at least one of them.
+        if let Some(alias) = alias_of(raw) {
+            add_one(alias, &mut out);
+            let module = raw.split_whitespace().next().unwrap_or("");
+            add_one(module, &mut out);
             return;
         }
-        let raw = raw
-            .trim()
-            .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | '.' | ':' | ';'));
-        let raw = raw.split(['(', '[', '<']).next().unwrap_or(raw);
-        let raw = raw.rsplit("::").next().unwrap_or(raw);
-        let raw = raw.rsplit('.').next().unwrap_or(raw);
-        if raw.len() >= 2
-            && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && looks_like_symbol(raw)
-            && !STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
-            && !out.iter().any(|w| w == raw)
-        {
-            out.push(raw.to_string());
-        }
+        add_one(raw, &mut out);
     };
     let sentences = text
         .replace(". ", ".\n")
@@ -267,8 +418,20 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
         .replace("? ", "?\n")
         .replace("! ", "!\n");
     for sentence in sentences.lines() {
-        let lower = without_non_claims(&sentence.to_ascii_lowercase());
-        if !CLAIM_PHRASES.iter().any(|p| lower.contains(p)) {
+        // A sentence only claims when the claim phrase appears OUTSIDE quoted
+        // text: quoting an example ("e.g., 'foo is not defined'") is not a
+        // claim about `foo`. The claim is tested on the text with all quoted
+        // spans removed.
+        let lower: String = sentence
+            .split(['"', '\''])
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, s)| s.to_ascii_lowercase())
+            .collect();
+        let lower = without_non_claims(&lower);
+        let is_claim =
+            CLAIM_PHRASES.iter().any(|p| lower.contains(p)) || claims_missing_import(&lower);
+        if !is_claim {
             continue;
         }
         // Quoted or backticked names in a claiming sentence.
@@ -304,51 +467,395 @@ pub(crate) fn claimed_symbols(title: &str, body: &str) -> Vec<String> {
                 // gzip). Do not collect arbitrary neighbours or the subject of
                 // "does not define", which is the defining code, not the name.
                 if !phrase.starts_with("does not") && *phrase != "nameerror" {
-                    let mut subject = start;
-                    while subject > 0
-                        && start - subject < 3
-                        && STOPWORDS.contains(&norm[subject - 1].as_str())
-                    {
-                        subject -= 1;
-                    }
-                    while subject > 0 {
-                        let word = words[subject - 1];
-                        if code_shaped(word) || word.chars().all(|c| c.is_ascii_lowercase()) {
-                            add(word);
-                        }
-                        subject -= 1;
-                        if subject > 0 && ["and", "or"].contains(&norm[subject - 1].as_str()) {
-                            subject -= 1;
-                        } else if subject == 0 || !words[subject - 1].ends_with(',') {
-                            break;
-                        }
-                    }
+                    collect_subject(&words, &norm, start, &mut add);
                 }
-                let mut named = false;
-                for word in words.iter().skip(end) {
-                    let plain = word
-                        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                        .to_ascii_lowercase();
-                    if ["in", "from", "at", "when", "by"].contains(&plain.as_str()) {
-                        break;
-                    }
-                    if STOPWORDS.contains(&plain.as_str()) {
-                        if named && !["and", "or"].contains(&plain.as_str()) {
-                            break;
+                collect_object(&words, end, &mut add);
+            }
+        }
+        // "missing import of X [as Y] [module]" and "missing imports": the
+        // name follows the phrase. A plural claim without a name is handled by
+        // the no-symbol path in `false_undefined_record_at`.
+        collect_after(&words, &norm, &["missing", "import"], &mut add);
+        collect_after(&words, &norm, &["missing", "imports"], &mut add);
+        // "import of X is missing" / "the import of X is missing".
+        collect_after(&words, &norm, &["import", "of"], &mut add);
+        // "X is never imported" / "the gzip module is never imported" /
+        // "gzip is never imported in this file": walk back from "never
+        // imported" over the article, kind word and copula to the name. The
+        // name is always BEFORE "never"; "in <file>" after it is the place
+        // the import is missing from, not a symbol. Here a BARE LOWERCASE
+        // token is a valid module name (`gzip`), so we accept any token that
+        // is not a stopword or kind word.
+        for at in 0..=norm.len().saturating_sub(2) {
+            if !(norm[at] == "never" && norm[at + 1] == "imported") {
+                continue;
+            }
+            let mut b = at.saturating_sub(1);
+            for _ in 0..5 {
+                let w = norm[b].as_str();
+                if w == "module" || SYMBOL_KINDS.contains(&w) {
+                    b = b.saturating_sub(1);
+                    if let Some(x) = norm.get(b) {
+                        if x.len() >= 2
+                            && !STOPWORDS.contains(&x.as_str())
+                            && !SYMBOL_KINDS.contains(&x.as_str())
+                        {
+                            add(words[b]);
                         }
-                        continue;
                     }
-                    if code_shaped(word) {
-                        add(word);
-                        named = true;
-                    } else {
-                        break;
-                    }
+                    break;
                 }
+                if ["the", "a", "an", "is", "that", "this", "which"].contains(&w) {
+                    b = b.saturating_sub(1);
+                    continue;
+                }
+                if !STOPWORDS.contains(&w) && !SYMBOL_KINDS.contains(&w) && w.len() >= 2 {
+                    add(words[b]);
+                }
+                break;
+            }
+        }
+        // "never imports pathlib.Path": the object of the verb.
+        for at in 0..=norm.len().saturating_sub(2) {
+            if !(norm[at] == "never" && norm[at + 1] == "imports") {
+                continue;
+            }
+            let mut at2 = at + 2;
+            if norm.get(at2).is_some_and(|w| w == "the") {
+                at2 += 1;
+            }
+            if claimable_name(&norm, at2) {
+                add(words[at2]);
+            }
+        }
+        // "X is unresolved": the name before the phrase. "Unresolved types:
+        // Alpha, Beta, Gamma" claims every name in the list that follows:
+        // scan from the "unresolved" noun to the end of the sentence, taking
+        // each non-stopword token as a claimed type. Type names are often
+        // capitalized (Alpha, Beta), which `claimable_name` would reject as
+        // "not code-shaped", so we accept any alphabetic token here.
+        for at in 1..=norm.len().saturating_sub(2) {
+            if norm[at] == "is" && norm[at + 1] == "unresolved" {
+                // The name before "is unresolved" is the claimed symbol.
+                // Accept any token that looks like an identifier (not a
+                // stopword or kind word).
+                let w = &norm[at - 1];
+                if w.len() >= 2
+                    && !STOPWORDS.contains(&w.as_str())
+                    && !SYMBOL_KINDS.contains(&w.as_str())
+                    && !NEVER_CLAIMED.contains(&w.as_str())
+                    && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    add(words[at - 1]);
+                }
+            }
+        }
+        if let Some(pos) = norm.iter().position(|w| w == "unresolved") {
+            let mut after_types = false;
+            for (idx, w) in norm.iter().enumerate().skip(pos + 1) {
+                if *w == "types" {
+                    after_types = true;
+                    continue;
+                }
+                if !after_types {
+                    continue;
+                }
+                if STOPWORDS.contains(&w.as_str()) {
+                    continue;
+                }
+                // Accept any token that looks like an identifier name. Norm
+                // words are already punctuation-trimmed, but strip again here
+                // so a stray comma/period on a token can never block the
+                // claim.
+                let clean = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                if clean.len() >= 2 && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    add(words[idx]);
+                }
+            }
+        }
+        if let Some(pos) = lower.find("unresolved types") {
+            let rest = &lower[pos + "unresolved types".len()..];
+            for item in rest.split(',') {
+                let item = item
+                    .trim()
+                    .trim_matches([':', '.', ';', ' ', '(', ')', '`', '"', '\'']);
+                if item.is_empty() || item.len() > 80 || item.contains(' ') {
+                    continue;
+                }
+                if code_shaped(item) {
+                    add(item);
+                }
+            }
+        }
+        // "none of these helpers are imported" / "none of these ... are
+        // imported" names NOTHING: no collector below extracts a symbol from
+        // this shape (the names are indefinite — "these"), so the symbol set
+        // stays empty. The phrase still makes the sentence an import claim
+        // (see `claims_missing_import`), which the no-symbol range check may
+        // then disprove when every identifier in the cited range is bound.
+        // The finding is never dropped by this sentence alone: with no range
+        // the check has nothing to look at.
+        // "<fn> missing return and X import": the import noun ends the
+        // sentence and its module is the name right before it.
+        collect_before_import_noun(&words, &norm, &mut add);
+        // "<fn> missing return": the function name is the claim's subject.
+        if let Some(at) = norm.iter().position(|w| w == "return") {
+            if at > 0 && ["missing", "no"].contains(&norm[at - 1].as_str()) && at >= 2 {
+                add(words[at - 2]);
             }
         }
     }
     out
+}
+
+/// `X as Y` -> `Some("Y")` for a single-token alias claim.
+fn alias_of(raw: &str) -> Option<&str> {
+    let mut parts = raw.split_whitespace();
+    let module = parts.next()?;
+    if parts.next()? != "as" {
+        return None;
+    }
+    let alias = parts.next()?;
+    if module.is_empty() || alias.is_empty() {
+        return None;
+    }
+    Some(alias)
+}
+
+/// The `(module, alias)` pairs a claim names in its `X as Y` forms. Either
+/// member proves an aliased import, so the disprove loop treats each pair as
+/// one OR condition rather than two independent names.
+pub(crate) fn claimed_alias_pairs(title: &str, body: &str) -> Vec<(String, String)> {
+    let text = format!("{title}\n{body}");
+    let mut out: Vec<(String, String)> = Vec::new();
+    // Scan word triples: `module as alias`.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for at in 0..words.len().saturating_sub(2) {
+        if words[at + 1].trim_matches(|c: char| !c.is_ascii_alphanumeric()) != "as" {
+            continue;
+        }
+        let clean = |w: &str| {
+            w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .to_string()
+        };
+        let module = clean(words[at]);
+        let alias = clean(words[at + 2]);
+        if module.is_empty() || alias.is_empty() || module == alias {
+            continue;
+        }
+        if !out.iter().any(|(m, a)| m == &module && a == &alias) {
+            out.push((module, alias));
+        }
+    }
+    out
+}
+
+/// Normalize one candidate token and push it when it is a plausible symbol.
+fn add_one(raw: &str, out: &mut Vec<String>) {
+    let raw = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | '.' | ':' | ';'));
+    let raw = raw.split(['(', '[', '<']).next().unwrap_or(raw);
+    let raw = raw.rsplit("::").next().unwrap_or(raw);
+    let raw = strip_symbol_kind(raw);
+    // Auxiliary verbs and the claim's own nouns are never symbols
+    // ("build_rows has no return" names `build_rows`, not `has`).
+    if raw.is_empty()
+        || is_path_like(raw)
+        || STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
+        || CLAIM_NOUNS.contains(&raw.to_ascii_lowercase().as_str())
+        || NEVER_CLAIMED.contains(&raw.to_ascii_lowercase().as_str())
+    {
+        return;
+    }
+    // The leading NAME of a dotted chain is all a claim can be about: a claim
+    // is about an import or a definition, and an attribute (`stat.S_ISREG`)
+    // or a library member (`json.load`, `os.environ`) can never be "defined"
+    // in the file. Claiming the member too would keep an otherwise disproved
+    // finding alive — the member is never bound, so the all-must-disprove
+    // loop fails. `urllib.request` is claimed WHOLE, not just `urllib`: it
+    // is a dotted module path that `import urllib.request` binds, and the
+    // claim is about that path.
+    let raw = if raw.contains('.') && looks_like_module_path(raw) {
+        module_path_of(raw)
+    } else if let Some((head, _)) = raw.split_once('.') {
+        head
+    } else {
+        raw
+    };
+    if raw.len() >= 2
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && looks_like_symbol(raw.split('.').next().unwrap_or(raw))
+        && !STOPWORDS.contains(&raw.to_ascii_lowercase().as_str())
+        && !NEVER_CLAIMED.contains(&raw.to_ascii_lowercase().as_str())
+        && !out.iter().any(|w| w == raw)
+    {
+        out.push(raw.to_string());
+    }
+}
+
+/// The longest all-lowercase dotted prefix of a module path:
+/// `urllib.request.urlopen` -> `urllib.request`.
+fn module_path_of(raw: &str) -> &str {
+    if !raw.contains('.') {
+        return raw;
+    }
+    let mut len = 0;
+    let mut best = 0;
+    for seg in raw.split('.') {
+        if !seg.starts_with(|c: char| c.is_ascii_lowercase()) {
+            break;
+        }
+        len += seg.len() + 1;
+        best = len - 1;
+    }
+    if best == 0 {
+        return raw.split('.').next().unwrap_or(raw);
+    }
+    &raw[..best]
+}
+
+/// Names before a claim phrase: the subject ("helper_name is not defined").
+fn collect_subject(words: &[&str], norm: &[String], start: usize, add: &mut impl FnMut(&str)) {
+    let mut subject = start;
+    while subject > 0 && start - subject < 3 && STOPWORDS.contains(&norm[subject - 1].as_str()) {
+        subject -= 1;
+    }
+    while subject > 0 {
+        let word = words[subject - 1];
+        // A claimed subject is a code name: it has a code character (an
+        // underscore, a digit, a dot, a backtick, a call, `::`) or it is a
+        // BARE LOWERCASE name — the shape of a module (`gzip module is not
+        // defined` names `gzip`). Mixed-case prose words are NOT code names:
+        // "Potential missing import" / "Possible missing import of json"
+        // name `json` only, and a `NameError`-style exception type quoted in
+        // the prose is not the symbol the file must import or define. Generic
+        // code nouns ("types", "names", "values") are prose, not symbols.
+        let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let lower = word.to_ascii_lowercase();
+        if SYMBOL_KINDS.contains(&lower.as_str()) {
+            subject -= 1;
+            continue;
+        }
+        let code = word.contains('_')
+            || word.contains('(')
+            || word.contains('`')
+            || word.contains('.')
+            || word.contains("::")
+            || word.chars().any(|c| c.is_ascii_digit())
+            || word.chars().all(|c| c.is_ascii_lowercase());
+        if code {
+            add(word);
+        }
+        subject -= 1;
+        if subject > 0 && ["and", "or"].contains(&norm[subject - 1].as_str()) {
+            subject -= 1;
+        } else if subject == 0 || !words[subject - 1].ends_with(',') {
+            break;
+        }
+    }
+}
+
+/// Names after a claim phrase, up to the first joining word ("missing import
+/// of json module in build_report" -> `json`).
+fn collect_object(words: &[&str], end: usize, add: &mut impl FnMut(&str)) {
+    let mut named = false;
+    for word in words.iter().skip(end) {
+        let plain = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+        if [
+            "in", "from", "at", "when", "by", "into", "on", "of", "to", "for", "within",
+        ]
+        .contains(&plain.as_str())
+        {
+            break;
+        }
+        if STOPWORDS.contains(&plain.as_str()) {
+            if named && !["and", "or", "as"].contains(&plain.as_str()) {
+                break;
+            }
+            continue;
+        }
+        let dotted = word
+            .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .contains('.');
+        if code_shaped(word) || dotted || plain.chars().all(|c| c.is_ascii_lowercase()) {
+            add(word);
+            named = true;
+        } else {
+            break;
+        }
+    }
+}
+
+/// `<fn> missing return and urllib.request import`: the import noun is last
+/// and the module it is about sits immediately before it.
+fn collect_before_import_noun(words: &[&str], norm: &[String], add: &mut impl FnMut(&str)) {
+    for (idx, word) in norm.iter().enumerate() {
+        if !(word == "import" || word == "imports") || idx == 0 {
+            continue;
+        }
+        let mut at = idx;
+        if at > 0 && ["the", "a", "an", "and", "missing"].contains(&norm[at - 1].as_str()) {
+            at -= 1;
+            if at > 0 && norm[at] == "missing" {
+                at -= 1;
+            }
+            if at > 0 && norm[at] == "and" {
+                at -= 1;
+            }
+        }
+        if at > 0 && at == idx {
+            // `... X import`: the token right before the noun is the module.
+            add(words[idx - 1]);
+        }
+    }
+}
+
+/// Collect the name(s) that follow one specific phrase shape. Used for the
+/// "missing import"-family phrasings that `CLAIM_PHRASES` does not spell out
+/// word for word ("missing import of X", "import of X is missing").
+fn collect_after(words: &[&str], norm: &[String], phrase: &[&str], add: &mut impl FnMut(&str)) {
+    if phrase.len() > norm.len() {
+        return;
+    }
+    for start in 0..=norm.len() - phrase.len() {
+        if phrase.iter().zip(&norm[start..]).all(|(p, w)| p == w) {
+            collect_object(words, start + phrase.len(), add);
+        }
+    }
+}
+
+/// A token at index `i` of the normalised words is a claimable code name: it
+/// is non-empty, not a stopword/claim noun, not in `NEVER_CLAIMED`, and
+/// code-shaped (an underscore, a digit, a dot, or mixed case). Plain
+/// lowercase prose words are not claimable; bare lowercase module names are
+/// claimed only where a specific phrase shape means a module ("import of
+/// json", "`gzip` module"), which those collectors reach on their own paths.
+fn claimable_name(norm: &[String], i: usize) -> bool {
+    let Some(w) = norm.get(i) else {
+        return false;
+    };
+    if w.is_empty() || w.len() < 2 {
+        return false;
+    }
+    let lower = w.as_str();
+    if STOPWORDS.contains(&lower) || CLAIM_NOUNS.contains(&lower) {
+        return false;
+    }
+    if NEVER_CLAIMED.contains(&lower) {
+        return false;
+    }
+    // Code-shaped: underscore, digit, dot, or a mix of upper and lower case.
+    w.contains('_')
+        || w.chars().any(|c| c.is_ascii_digit())
+        || w.contains('.')
+        || (w.chars().any(|c: char| c.is_ascii_uppercase())
+            && w.chars().any(|c: char| c.is_ascii_lowercase()))
 }
 
 /// Option tokens only count in sentences that explicitly claim rejection or
@@ -736,6 +1243,7 @@ fn false_undefined_record(
     false_undefined_record_at(title, body, path, None, read)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn false_undefined_record_at(
     title: &str,
     body: &str,
@@ -743,19 +1251,56 @@ pub(crate) fn false_undefined_record_at(
     target_line: Option<usize>,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<Value> {
+    false_undefined_record_with_location(title, body, path, None, target_line, read)
+}
+
+/// Like [`false_undefined_record_at`], with the finding's raw location so a
+/// `path:A-B` / `path (lines A-B)` / `path#LA-LB` range can be read. The
+/// caller passes the whole location string; the path is still the argument
+/// the file is resolved by.
+pub(crate) fn false_undefined_record_with_location(
+    title: &str,
+    body: &str,
+    path: &str,
+    location: Option<&str>,
+    target_line: Option<usize>,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<Value> {
     let options = claimed_options(title, body);
-    if path.trim().is_empty()
-        || (!claims_undefined(&format!("{title}\n{body}")) && options.is_empty())
-    {
+    let text = format!("{title}\n{body}");
+    let return_only = claims_return_only(&text);
+    if path.trim().is_empty() || (!claims_undefined(&text) && options.is_empty() && !return_only) {
         return None;
     }
     let path = path.trim().trim_start_matches("./");
     let source = read(path)?;
+    let lines: Vec<&str> = source.lines().collect();
+    let range = cited_range(title, body, location, target_line, lines.len());
     let mut symbols = claimed_symbols(title, body);
     symbols.extend(options);
+    let mut disproved: Vec<(String, String, String)> = Vec::new();
+    // An `X as Y` claim names ONE thing, so binding EITHER member proves it.
+    // Collapse each pair to a single representative: the member the file
+    // actually binds, or the module name when neither binds (so the finding is
+    // kept and the evidence still names what is missing).
+    let mut collapsed: Vec<String> = symbols;
+    for (module, alias) in claimed_alias_pairs(title, body) {
+        let bound_member = if name_evidence(path, &source, &module, target_line, read).is_some() {
+            Some(module.clone())
+        } else if name_evidence(path, &source, &alias, target_line, read).is_some() {
+            Some(alias.clone())
+        } else {
+            None
+        };
+        let representative = bound_member.unwrap_or_else(|| module.clone());
+        collapsed.retain(|s| s != &module && s != &alias);
+        if !collapsed.iter().any(|s| s == &representative) {
+            collapsed.push(representative);
+        }
+    }
+    symbols = collapsed;
     // Every claimed name must be disproved. One name the file really lacks
     // keeps the finding: dropping it would hide a real defect.
-    let mut disproved: Vec<(String, String, String)> = Vec::new();
     for symbol in &symbols {
         let (reason, evidence) = if symbol.starts_with('-') {
             (
@@ -763,12 +1308,73 @@ pub(crate) fn false_undefined_record_at(
                 option_evidence(path, &source, symbol)?,
             )
         } else {
-            definition_evidence_at(path, &source, symbol, target_line, read)?
+            // An alias claim ("datetime as dt") is satisfied by EITHER name.
+            let found = name_evidence(path, &source, symbol, target_line, read);
+            found?
         };
         disproved.push((symbol.clone(), reason, evidence));
     }
+    // Mixed claim (`_fetch_json missing return and urllib.request import`):
+    // every part must be disproved before the finding is dropped. The import
+    // part is above; the return part is checked against the named function.
+    let mut extra: Vec<String> = Vec::new();
+    for function in claimed_missing_return(title, body) {
+        let evidence = function_return_evidence(path, &source, &function)?;
+        extra.push(evidence);
+    }
+    // A no-symbol claim ("Undefined constants and missing imports") is only
+    // disproved by checking every identifier the cited range uses. The range
+    // check may run ONLY for a finding that actually makes an undefined-name
+    // or missing-import claim: a finding whose only claim is a missing return
+    // (`return_only`) has no undefined name to look for in the range, and
+    // dropping it because every identifier in the range happens to be bound
+    // would hide a real "no return" defect.
+    if symbols.is_empty() && extra.is_empty() && !return_only {
+        let mut bound = range_binding_evidence(path, &lines, range?)?;
+        if bound.is_empty() {
+            return None;
+        }
+        let (symbol, reason, evidence) = bound.remove(0);
+        return Some(json!({
+            "severity": "",
+            "title": title,
+            "location": path,
+            "symbol": symbol,
+            "symbols": bound
+                .iter()
+                .map(|(name, _, _)| json!(name))
+                .chain(std::iter::once(json!(symbol)))
+                .collect::<Vec<_>>(),
+            "reason": reason,
+            "evidence": evidence,
+            "evidence_lines": bound
+                .iter()
+                .map(|(_, _, line)| json!(line))
+                .chain(std::iter::once(json!(evidence)))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    // A finding whose ONLY part is "<fn> missing return" has no symbol to
+    // disprove, but `extra` disproves it: the function returns. Every part is
+    // disproved, so the finding is dropped with the return line as evidence.
+    if disproved.is_empty() {
+        let functions = claimed_missing_return(title, body);
+        if functions.is_empty() || extra.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "severity": "",
+            "title": title,
+            "location": path,
+            "symbol": functions[0],
+            "symbols": functions,
+            "reason": "function returns a value in the file at the reviewed head",
+            "evidence": extra[0],
+            "evidence_lines": extra,
+        }));
+    }
     let (symbol, reason, evidence) = disproved.first().cloned()?;
-    Some(json!({
+    let mut record = json!({
         "severity": "",
         "title": title,
         "location": path,
@@ -776,7 +1382,372 @@ pub(crate) fn false_undefined_record_at(
         "symbols": symbols,
         "reason": reason,
         "evidence": evidence,
-    }))
+    });
+    if !extra.is_empty() {
+        // The import/name evidence first, then the return lines.
+        let mut lines = vec![json!(evidence)];
+        lines.extend(extra.iter().map(|line| json!(line)));
+        record["evidence_lines"] = json!(lines);
+    }
+    Some(record)
+}
+
+/// Evidence that `symbol` is bound: the definition/import line for a plain
+/// name, or, for a dotted module path, any import that binds it.
+fn name_evidence(
+    path: &str,
+    source: &str,
+    symbol: &str,
+    target_line: Option<usize>,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    if let Some(found) = definition_evidence_at(path, source, symbol, target_line, read) {
+        return Some(found);
+    }
+    // `urllib.request` is bound by `import urllib.request` (and by
+    // `import urllib` for the `urllib` prefix); a `Class.member` chain
+    // (`dt.datetime.now`) is bound by the import of its leading name. The
+    // exact import line is the evidence.
+    let mut prefix = symbol.to_string();
+    loop {
+        for (idx, line) in source.lines().enumerate() {
+            if !is_import_line(line) {
+                continue;
+            }
+            if imported_names(line).iter().any(|name| name == &prefix) {
+                return Some((
+                    "symbol is imported in the file at the reviewed head".to_string(),
+                    format!("{path}:{}: {}", idx + 1, line.trim()),
+                ));
+            }
+        }
+        match prefix.rfind('.') {
+            Some(cut) => prefix.truncate(cut),
+            None => return None,
+        }
+    }
+}
+
+/// `(start, end)` 1-based, inclusive, of the lines a finding cites: from the
+/// location field (`path:A`, `path:A-B`, `path:line A`, `path:lines A-B`,
+/// `path (lines A-B)`, `path#LA-LB`) or from "lines A-B" in the body when the
+/// location carries only a path.
+pub(crate) fn cited_range(
+    title: &str,
+    body: &str,
+    location: Option<&str>,
+    target_line: Option<usize>,
+    line_count: usize,
+) -> Option<(usize, usize)> {
+    let mut found: Option<(usize, usize)> = None;
+    // The location field first (`path:A-B`, `path (lines A-B)`, `path#LA-LB`),
+    // then the title and body ("lines A-B in ...").
+    for text in location.into_iter().chain([title, body]) {
+        if found.is_some() {
+            break;
+        }
+        for (start, end) in range_specs(text) {
+            if start >= 1 && start <= line_count {
+                let end = end.min(line_count).max(start);
+                found = Some((start, end));
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        // The location's single line (`path:122`) still names the range a
+        // no-symbol claim ranges over: that line alone.
+        found = target_line
+            .filter(|line| *line >= 1 && *line <= line_count)
+            .map(|line| (line, line));
+    }
+    found
+}
+
+/// Every `A-B` (or `A-B` with an en dash / comma / `L` prefix) digit range in
+/// `text`, in order.
+fn range_specs(text: &str) -> Vec<(usize, usize)> {
+    let lower: String = text
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if matches!(c, '\u{2013}' | '\u{2014}') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // An `L` prefix (`#L398-L452`) belongs to the number, not to the text.
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let first_at = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let first: usize = chars[first_at..i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        let mut j = i;
+        while j < chars.len() && matches!(chars[j], '-' | ',' | ' ') {
+            j += 1;
+        }
+        if j < chars.len() && chars[j] == 'l' && j > i && matches!(chars[j - 1], '-' | ',' | ' ') {
+            j += 1;
+        }
+        if j == i {
+            continue;
+        }
+        let second_at = j;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        if second_at == j {
+            continue;
+        }
+        let second: usize = chars[second_at..j]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        if first >= 1 && second >= first {
+            out.push((first, second));
+        }
+        i = j.max(first_at + 1);
+    }
+    out
+}
+
+/// Names a no-symbol claim could be about, taken from the cited line range:
+/// every UPPER_CASE constant and the leading module of each dotted
+/// attribute/call (`json.loads` -> `json`, `urllib.request.urlopen` ->
+/// `urllib.request`). Locals bound in the range are skipped (they are the
+/// enclosing function's own names). Returns every name with its binding line,
+/// or `None` when any name is unbound (the finding must then be kept).
+fn range_binding_evidence(
+    path: &str,
+    lines: &[&str],
+    (start, end): (usize, usize),
+) -> Option<Vec<(String, String, String)>> {
+    let start = start.saturating_sub(1);
+    let end = end.min(lines.len());
+    if start >= end {
+        return None;
+    }
+    let full = lines.join("\n");
+    let range = &lines[start..end];
+    let mut names: Vec<String> = Vec::new();
+    for line in range {
+        let code = line.split(" #").next().unwrap_or(line);
+        for word in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')) {
+            let word = word.trim_matches('.');
+            if word.is_empty() {
+                continue;
+            }
+            let head = word.split('.').next().unwrap_or(word);
+            let is_constant = head
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && head.chars().any(|c| c.is_ascii_uppercase())
+                && head.len() >= 2;
+            let is_module = word.contains('.')
+                && !is_constant
+                && word
+                    .split('.')
+                    .next()
+                    .is_some_and(|h| h.chars().all(|c| c.is_ascii_lowercase()));
+            if !(is_constant || is_module) || PY_BUILTINS.contains(&head) {
+                continue;
+            }
+            // The LEADING name of the chain is what a binding is looked up
+            // by: `json.loads` -> `json`, `urllib.request.urlopen` ->
+            // `urllib` (whose import of `urllib.request` also binds the
+            // dotted path), `dt.datetime.now` -> `dt`. `name_evidence` tries
+            // every shorter prefix of a dotted name, so an import of either
+            // `urllib` or `urllib.request` proves it.
+            let name = head.to_string();
+            if !names.iter().any(|n| n == &name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for name in names {
+        // A name the range itself binds (its enclosing function's parameter
+        // or local) needs no module-level binding.
+        if range.iter().any(|line| {
+            params_of(line).iter().any(|p| p == &name)
+                || bindings_in(line).iter().any(|b| b == &name)
+        }) {
+            continue;
+        }
+        // One unbound name is enough to keep the finding: return `None` (the
+        // caller keeps it unchanged) rather than collecting partial evidence.
+        // The read closure intentionally returns `None` for EVERY file: the
+        // range check is same-file-only ON PURPOSE. Cross-file bindings were
+        // considered and rejected — a name bound in a sibling module the
+        // range's file cannot see is not a binding the reviewer could rely
+        // on either, and consulting it only widens the drop path. The
+        // conservative consequence: a name bound only in an imported sibling
+        // keeps the finding. That is the safe direction; the filter must
+        // never drop a finding because of a binding it could not see.
+        // Written as an explicit match so the no-panic contract is visible:
+        // `name_evidence` answers `None` for every name the file does not
+        // bind, and this never unwraps or panics.
+        #[allow(clippy::question_mark)] // explicit `None` documents the no-panic contract
+        let evidence = match name_evidence(path, &full, &name, Some(start + 1), &|_| None) {
+            Some(evidence) => evidence,
+            None => return None,
+        };
+        out.push((name, evidence.0, evidence.1));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Python builtins a module may use without importing them.
+const PY_BUILTINS: &[&str] = &[
+    "self",
+    "cls",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "bytes",
+    "len",
+    "range",
+    "print",
+    "isinstance",
+    "getattr",
+    "setattr",
+    "hasattr",
+    "super",
+    "enumerate",
+    "zip",
+    "sorted",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "round",
+    "open",
+    "repr",
+    "format",
+    "type",
+    "object",
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "KeyError",
+    "RuntimeError",
+    "None",
+    "True",
+    "False",
+];
+
+/// The function a "<fn> missing return" / "<fn> has no return" claim names.
+fn claimed_missing_return(title: &str, body: &str) -> Vec<String> {
+    let text = format!("{title}\n{body}");
+    let mut out: Vec<String> = Vec::new();
+    for sentence in text.split(['.', ';', '\n']) {
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        let norm: Vec<String> = words
+            .iter()
+            .map(|w| {
+                w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .to_ascii_lowercase()
+            })
+            .collect();
+        for at in 0..norm.len() {
+            let is_return_claim = norm[at] == "return"
+                && at >= 1
+                && ["missing", "no"].contains(&norm[at - 1].as_str())
+                || (norm[at] == "return" && at >= 2 && norm[at - 1] == "and");
+            if !is_return_claim {
+                continue;
+            }
+            // The subject is the token before the claim ("_fetch_json missing
+            // return"); the verb "has" ("_fetch_json has no return") is skipped.
+            let mut subject = at - 1;
+            while subject > 0
+                && (STOPWORDS.contains(&norm[subject - 1].as_str())
+                    || ["has", "have", "had", "is", "does", "did"]
+                        .contains(&norm[subject - 1].as_str()))
+            {
+                subject -= 1;
+            }
+            if subject == 0 {
+                continue;
+            }
+            let name =
+                words[subject - 1].trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            // The subject must read as a code name: an article or plain prose
+            // word ("the" in "the example", "value" in "no return value") is
+            // not the function the claim is about. A sentence whose subject
+            // is not a code name is skipped (no subject to check), so a
+            // "no return" finding whose subject is prose can never be
+            // disproved -- it keeps the finding.
+            let name_is_code = name.contains('_') || name.chars().any(|c| c.is_ascii_uppercase());
+            if name.len() >= 2
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && name_is_code
+                && !out.iter().any(|n| n == name)
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Evidence that the body of function `name` contains a `return <expr>`.
+fn function_return_evidence(path: &str, source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.iter().position(|line| {
+        is_def_line(line)
+            && crate::review_diff::extract_defs(line)
+                .iter()
+                .any(|d| d == name)
+    })?;
+    let indent = lines[start].len() - lines[start].trim_start().len();
+    for (idx, line) in lines.iter().enumerate().skip(start + 1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let this_indent = line.len() - line.trim_start().len();
+        if this_indent <= indent && !trimmed.starts_with(')') && is_def_line(line) {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("return") {
+            let rest = rest.trim();
+            if !rest.is_empty() && rest != ";" {
+                return Some(format!("{path}:{}: {}", idx + 1, trimmed));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1233,5 +2204,996 @@ pub(crate) mod tests {
         );
         assert!(got.contains(&"verify_sig".to_string()), "{got:?}");
         assert!(!got.iter().any(|w| w == "main" || w == "rs"), "{got:?}");
+    }
+    // ---- "missing import" claim shapes and range locations (F1-F4) ----
+
+    /// A generic ~600-line Python report module: every import and constant a
+    /// reviewer might call "missing" exists at the reviewed head.
+    pub(crate) fn report_module(with_imports: bool) -> String {
+        let mut lines: Vec<String> = vec![
+            "#!/usr/bin/env python3".into(),
+            "\"\"\"Report generator (fixture).\"\"\"".into(),
+            String::new(),
+        ];
+        if with_imports {
+            lines.push("import json".into()); // 4
+            lines.push("import datetime as dt".into()); // 5
+            lines.push("import urllib.request".into()); // 6
+            lines.push("import os".into()); // 7
+        } else {
+            lines.push("import os".into());
+        }
+        while lines.len() < 44 {
+            lines.push(String::new());
+        }
+        lines.push("REPORT_MODE = \"full\"".into()); // 45
+        lines.push("MAX_ROWS = 100".into()); // 46
+        lines.push("TABLE_NAME = \"reports\"".into()); // 47
+        lines.push(String::new());
+        lines.push("def _fetch_json(url, timeout=10):".into()); // 49
+        lines.push("    response = urllib.request.urlopen(url, timeout=timeout)".into());
+        lines.push("    return json.loads(response.read())".into());
+        lines.push(String::new());
+        while lines.len() < 396 {
+            lines.push(format!("# filler line {}", lines.len() + 1));
+        }
+        lines.push("def build_report(path):".into()); // 397
+        lines.push("    stamp = dt.datetime.now().isoformat()".into()); // 398
+        lines.push("    rows = json.loads(open(path).read())".into()); // 399
+        lines.push("    if len(rows) > MAX_ROWS:".into()); // 400
+        lines.push("        rows = rows[:MAX_ROWS]".into()); // 401
+        lines.push("    return {\"mode\": REPORT_MODE, \"stamp\": stamp, \"rows\": rows}".into()); // 402
+        lines.push(String::new());
+        while lines.len() < 566 {
+            lines.push(format!("# filler line {}", lines.len() + 1));
+        }
+        lines.push("def run(argv):".into()); // 567
+        lines.push("    payload = _fetch_json(argv[1])".into()); // 568
+        lines.push("    return build_report(payload), TABLE_NAME".into()); // 569
+        while lines.len() < 600 {
+            lines.push(String::new());
+        }
+        lines.join("\n")
+    }
+
+    /// The four false findings a small reviewer raised on the module. Each
+    /// names a claim shape or a location form the filter used to skip.
+    pub(crate) fn import_shapes() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            (
+                "Missing import of json module",
+                "build_report calls json.loads but the chunk does not show the import.",
+                "tools/report.py:122-150",
+            ),
+            (
+                "Potential missing import of datetime as dt",
+                "dt is used at line 398 without an import in this chunk.",
+                "tools/report.py:122-150",
+            ),
+            (
+                "_fetch_json missing return and urllib.request import",
+                "The helper binds response and never returns a value; urllib.request is never imported.",
+                "tools/report.py:566-571",
+            ),
+            (
+                "Undefined constants and missing imports",
+                "lines 398-402 use REPORT_MODE, MAX_ROWS and the json module but nothing in the diff defines them.",
+                "tools/report.py:398-452",
+            ),
+        ]
+    }
+
+    pub(crate) fn import_shape_read(with_imports: bool) -> impl Fn(&str) -> Option<String> {
+        let source = report_module(with_imports);
+        move |path: &str| (path == "tools/report.py").then(|| source.clone())
+    }
+
+    /// F1: "missing import of X module" over a `path:A-B` range.
+    #[test]
+    fn missing_import_of_a_module_is_disproved_by_its_import() {
+        let read = import_shape_read(true);
+        let record = false_undefined_record(
+            "Missing import of json module",
+            "build_report calls json.loads but the chunk does not show the import.",
+            "tools/report.py",
+            &read,
+        )
+        .expect("the module imports json at the head");
+        assert_eq!(record["symbol"], "json");
+        assert!(
+            record["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("tools/report.py:4:"),
+            "{record}"
+        );
+    }
+
+    /// F2: "potential missing import of X as Y" — the alias or the module name
+    /// satisfies it.
+    #[test]
+    fn potential_missing_import_of_an_alias_is_disproved() {
+        let read = import_shape_read(true);
+        let record = false_undefined_record(
+            "Potential missing import of datetime as dt",
+            "dt is used at line 398 without an import in this chunk.",
+            "tools/report.py",
+            &read,
+        )
+        .expect("the module imports datetime as dt at the head");
+        assert!(
+            record["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("tools/report.py:5:"),
+            "{record}"
+        );
+    }
+
+    /// F3: a mixed claim — missing return AND a dotted module import. Both are
+    /// disproved (`_fetch_json` returns, `import urllib.request` exists).
+    #[test]
+    fn a_mixed_return_and_import_claim_is_disproved_only_when_both_parts_are() {
+        let read = import_shape_read(true);
+        let record = false_undefined_record_with_location(
+            "_fetch_json missing return and urllib.request import",
+            "The helper binds response and never returns a value; urllib.request is never imported.",
+            "tools/report.py",
+            Some("tools/report.py:566-571"),
+            Some(566),
+            &read,
+        )
+        .expect("the helper returns and the module is imported");
+        let evidence = record["evidence"].as_str().unwrap();
+        assert!(
+            evidence.starts_with("tools/report.py:6:") || evidence.contains("urllib.request"),
+            "{record}"
+        );
+        assert!(
+            record["evidence_lines"]
+                .as_array()
+                .is_some_and(|lines| lines
+                    .iter()
+                    .any(|l| l.as_str().unwrap_or("").contains("return json.loads"))),
+            "the return line is evidence too: {record}"
+        );
+    }
+
+    /// F3 negative: the import removed -> the finding is kept.
+    #[test]
+    fn a_mixed_claim_with_an_unimported_module_is_kept() {
+        let read = import_shape_read(false);
+        assert!(false_undefined_record(
+            "_fetch_json missing return and urllib.request import",
+            "The helper binds response and never returns a value; urllib.request is never imported.",
+            "tools/report.py",
+            &read,
+        )
+        .is_none());
+    }
+
+    /// F3 negative: the function really has no return -> kept.
+    #[test]
+    fn a_missing_return_that_is_real_keeps_the_finding() {
+        let source = "import urllib.request\n\n\ndef _fetch_json(url):\n    response = urllib.request.urlopen(url)\n    json.loads(response.read())\n";
+        let read = read_from(vec![("tools/report.py", source)]);
+        assert!(false_undefined_record(
+            "_fetch_json missing return and urllib.request import",
+            "The helper never returns a value.",
+            "tools/report.py",
+            &read,
+        )
+        .is_none());
+    }
+
+    /// F4: a no-symbol claim over a range — every constant and module the range
+    /// uses is bound at module level.
+    #[test]
+    fn a_no_symbol_range_claim_is_disproved_when_every_used_name_is_bound() {
+        let read = import_shape_read(true);
+        let record = false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "lines 398-402 use REPORT_MODE, MAX_ROWS and the json module but nothing in the diff defines them.",
+            "tools/report.py",
+            Some("tools/report.py:398-452"),
+            Some(398),
+            &read,
+        )
+        .expect("every name in the range is bound at the head");
+        assert!(
+            record["evidence_lines"]
+                .as_array()
+                .is_some_and(|l| !l.is_empty()),
+            "{record}"
+        );
+        let symbols = record["symbols"].as_array().unwrap();
+        assert!(symbols.contains(&json!("REPORT_MODE")), "{record}");
+        assert!(symbols.contains(&json!("MAX_ROWS")), "{record}");
+    }
+
+    /// F4 negative: one constant the range USES is not defined -> kept.
+    #[test]
+    fn a_no_symbol_range_claim_with_one_unbound_constant_is_kept() {
+        let mut source = report_module(true);
+        // The range uses UNDEFINED_LIMIT, which the module never defines.
+        source = source.replacen(
+            "    rows = json.loads(open(path).read())",
+            "    rows = json.loads(open(path).read())[:UNDEFINED_LIMIT]",
+            1,
+        );
+        let read = move |path: &str| (path == "tools/report.py").then(|| source.clone());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "lines 398-402 use UNDEFINED_LIMIT that nothing defines.",
+            "tools/report.py",
+            Some("tools/report.py:398-452"),
+            Some(398),
+            &read,
+        )
+        .is_none());
+    }
+
+    /// F1-F4 negative: the same claim text with the imports removed keeps every
+    /// finding.
+    #[test]
+    fn every_import_claim_shape_is_kept_when_the_import_is_absent() {
+        let read = import_shape_read(false);
+        for (title, body, location) in import_shapes() {
+            let path = location.split(':').next().unwrap();
+            assert!(
+                false_undefined_record(title, body, path, &read).is_none(),
+                "a claim whose import is really missing must be kept: {title}"
+            );
+        }
+    }
+
+    /// The location forms the reviewer uses for the same range all parse.
+    #[test]
+    fn cited_range_accepts_every_location_form() {
+        for location in [
+            "tools/report.py:398-452",
+            "tools/report.py:line 398-452",
+            "tools/report.py:lines 398-452",
+            "tools/report.py (lines 398-452)",
+            "tools/report.py#L398-L452",
+        ] {
+            assert_eq!(
+                cited_range("Undefined constants", "", Some(location), Some(398), 600),
+                Some((398, 452)),
+                "{location}"
+            );
+        }
+        // A path-only location falls back to "lines A-B" in the body.
+        assert_eq!(
+            cited_range(
+                "Undefined constants",
+                "lines 398-452 are undefined.",
+                Some("tools/report.py"),
+                None,
+                600
+            ),
+            Some((398, 452))
+        );
+        // A single line stays a single-line range; no range at all is None.
+        assert_eq!(
+            cited_range(
+                "Undefined name",
+                "x is undefined",
+                Some("tools/report.py:12"),
+                Some(12),
+                600
+            ),
+            Some((12, 12))
+        );
+        assert_eq!(
+            cited_range(
+                "Undefined name",
+                "x is undefined",
+                Some("tools/report.py"),
+                None,
+                600
+            ),
+            None
+        );
+    }
+
+    /// Import forms: aliases, dotted modules, multi-line and relative imports.
+    #[test]
+    fn python_import_forms_bind_every_name_they_introduce() {
+        for (line, names) in [
+            ("import json", vec!["json"]),
+            ("import os, sys", vec!["os", "sys"]),
+            (
+                "import json, datetime as dt",
+                vec!["json", "datetime", "dt"],
+            ),
+            ("import urllib.request", vec!["urllib", "urllib.request"]),
+            (
+                "import urllib.request as urlreq",
+                vec!["urllib", "urllib.request", "urlreq"],
+            ),
+            ("from utils import helper", vec!["utils", "helper"]),
+            (
+                "from utils import (helper, other)",
+                vec!["utils", "helper", "other"],
+            ),
+            ("from utils import (", vec!["utils"]),
+            ("from . import helper", vec!["helper"]),
+            (
+                "from pkg.mod import thing as other",
+                vec!["pkg", "thing", "other"],
+            ),
+        ] {
+            let got = crate::review_context::imported_names(line);
+            for name in names {
+                assert!(
+                    got.iter().any(|g| g == name),
+                    "{line}: {name} not in {got:?}"
+                );
+            }
+        }
+        // Existing forms are unchanged.
+        assert!(
+            crate::review_context::imported_names("use crate::limits::MAX_RETRIES;")
+                .contains(&"MAX_RETRIES".to_string())
+        );
+        assert!(
+            crate::review_context::imported_names("const LIMIT = require('limits')").is_empty()
+        );
+        // A JS `require` is not a Python import line: nothing is bound.
+        assert!(crate::review_context::imported_names("const n = require('limits')").is_empty());
+    }
+
+    /// `X is not imported` / `import of X is missing` are claims too.
+    #[test]
+    fn other_import_claim_phrasings_are_recognized() {
+        for text in [
+            "json is not imported",
+            "the json module is not imported",
+            "the import of json is missing",
+            "Possible missing import of json",
+        ] {
+            assert!(claims_undefined(text), "{text}");
+            assert!(
+                claimed_symbols(text, "").iter().any(|s| s == "json"),
+                "{text}: {:?}",
+                claimed_symbols(text, "")
+            );
+        }
+    }
+
+    /// The module/package/library kind word is not part of the symbol.
+    #[test]
+    fn a_trailing_symbol_kind_word_is_stripped() {
+        assert_eq!(
+            claimed_symbols("Missing import of json module", ""),
+            vec!["json"]
+        );
+        assert_eq!(
+            claimed_symbols("Missing import of the re package", ""),
+            vec!["re"]
+        );
+    }
+    /// An unbound identifier in the cited range must make the function return
+    /// `None` (never panic), whatever combination of bound and unbound names
+    /// the range uses.
+    #[test]
+    fn an_unbound_name_in_the_range_returns_none_without_panicking() {
+        let lines = [
+            "import json",
+            "MAX_ROWS = 10",
+            "def run(path):",
+            "    rows = json.loads(path)",
+            "    return rows[:UNDEFINED_LIMIT]",
+        ];
+        // Every name `range_binding_evidence` collects, checked one at a time:
+        // the bound ones prove, the unbound one only ever answers `None`.
+        assert!(range_binding_evidence("tools/report.py", &lines, (4, 5)).is_none());
+        assert!(range_binding_evidence("tools/report.py", &lines, (3, 5)).is_none());
+        // A range whose names are all bound still proves.
+        assert!(range_binding_evidence("tools/report.py", &lines, (2, 2)).is_some());
+        // An empty or out-of-file range is not a range at all.
+        assert!(range_binding_evidence("tools/report.py", &lines, (9, 12)).is_none());
+        assert!(range_binding_evidence("tools/report.py", &lines, (3, 3)).is_none());
+    }
+
+    /// The same through the public entry point: the filter keeps the finding
+    /// and does not panic when the range mixes bound and unbound names.
+    #[test]
+    fn a_range_with_a_mixed_boundness_keeps_the_finding() {
+        let source = format!(
+            "{}\n",
+            [
+                "import json",
+                "MAX_ROWS = 10",
+                "def run(path):",
+                "    rows = json.loads(path)",
+                "    return rows[:UNDEFINED_LIMIT]",
+            ]
+            .join("\n")
+        );
+        let read = move |path: &str| (path == "tools/report.py").then(|| source.clone());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "lines 4-5 use UNDEFINED_LIMIT and the json module.",
+            "tools/report.py",
+            Some("tools/report.py:4-5"),
+            Some(4),
+            &read,
+        )
+        .is_none());
+    }
+    /// The wrapper that passes no location (`false_undefined_record_at`) takes
+    /// the no-symbol path with `cited_range == None`. It must return `None`
+    /// (keep the finding) and never panic.
+    #[test]
+    fn a_no_location_no_symbol_claim_returns_none_and_never_panics() {
+        let source = "import json\nMAX_ROWS = 10\n";
+        let read = read_from(vec![("tools/report.py", source)]);
+        assert!(false_undefined_record_at(
+            "Undefined constants and missing imports",
+            "the module uses names nothing defines.",
+            "tools/report.py",
+            None,
+            &read,
+        )
+        .is_none());
+        // And with a location but no range at all.
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the module uses names nothing defines.",
+            "tools/report.py",
+            Some("tools/report.py"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+    /// A dotted module name is proved by an import of the full path OR of any
+    /// shorter prefix of it.
+    #[test]
+    fn a_dotted_module_is_proved_by_the_import_of_any_prefix() {
+        let dotted = "import urllib.request\n\nurllib.request.urlopen(u)\n";
+        let head_only = "import urllib\n\nurllib.request.urlopen(u)\n";
+        for source in [dotted, head_only] {
+            let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                "Undefined constants and missing imports",
+                "the range uses the urllib module but nothing imports it.",
+                "tools/report.py",
+                Some("tools/report.py:3-3"),
+                None,
+                &read,
+            )
+            .expect("an import of the module or its prefix proves it");
+            assert!(record["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("import urllib"));
+        }
+        // No import of any prefix -> kept.
+        let bare = "urllib.request.urlopen(u)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the urllib module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:1-1"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+    /// A finding whose only part is "<fn> missing return" is dropped when the
+    /// function returns; kept when it really does not.
+    #[test]
+    fn a_return_only_claim_is_disproved_by_a_return_statement() {
+        let source = "def build_rows(path):\n    return load(path)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+        let record = false_undefined_record_with_location(
+            "build_rows has no return",
+            "The helper binds a loader and never returns a value.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .expect("the function returns");
+        assert_eq!(record["symbol"], "build_rows");
+        assert!(record["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("return load(path)"));
+
+        let bare = "def build_rows(path):\n    load(path)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "build_rows has no return",
+            "The helper binds a loader and never returns a value.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+
+    /// A stdlib module is bound only by an import, never by the builtin list:
+    /// an unimported `os.path` in the range keeps the finding.
+    #[test]
+    fn a_stdlib_module_is_not_treated_as_a_builtin() {
+        let unimported = "def run():\n    return os.path.join(\"a\", \"b\")\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| unimported.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the os module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:1-2"),
+            None,
+            &read,
+        )
+        .is_none());
+
+        let imported = "import os\n\ndef run():\n    return os.path.join(\"a\", \"b\")\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| imported.to_string());
+        assert!(false_undefined_record_with_location(
+            "Undefined constants and missing imports",
+            "the range uses the os module but nothing imports it.",
+            "tools/report.py",
+            Some("tools/report.py:3-4"),
+            None,
+            &read,
+        )
+        .is_some());
+    }
+    /// An `X as Y` claim is disproved when EITHER member is bound, not both.
+    #[test]
+    fn an_alias_claim_is_disproved_by_either_member_alone() {
+        // Only the alias binds as a standalone name: `import dt` style.
+        let alias_only = "import dt\n\nX = dt.now\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| alias_only.to_string());
+        let record = false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:3-3"),
+            None,
+            &read,
+        )
+        .expect("the alias alone proves the claim wrong");
+        assert!(record["evidence"].as_str().unwrap().contains("import dt"));
+
+        // Only the module binds: `from datetime import timedelta`-style.
+        let module_only = "from datetime import timedelta\n\nX = timedelta(days=1)\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| module_only.to_string());
+        assert!(false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:3-3"),
+            None,
+            &read,
+        )
+        .is_some());
+    }
+
+    /// Neither member bound: the claim stands, and the record would name the
+    /// module rather than inventing a binding.
+    #[test]
+    fn an_alias_claim_with_neither_member_bound_is_kept() {
+        let bare = "DT_LIMIT = 3\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| bare.to_string());
+        assert!(false_undefined_record_with_location(
+            "Potential missing import of datetime as dt",
+            "dt is used without an import in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:1-1"),
+            None,
+            &read,
+        )
+        .is_none());
+    }
+
+    // ---- round 2: new claim shapes, non-code tokens, attributes, returns ---
+
+    /// A finding whose ONLY claim is about a missing return must never be
+    /// `claims_return_only` must be true exactly when the finding makes a
+    /// missing-return claim and NO undefined-name / missing-import claim.
+    /// This pins the gate that keeps return-only findings out of the
+    /// no-symbol range check.
+    #[test]
+    fn claims_return_only_is_true_only_for_pure_return_claims() {
+        // Pure return claim: no undefined-name or missing-import phrase.
+        assert!(claims_return_only("build_rows has no return"), "no return");
+        assert!(
+            claims_return_only("_fetch_json missing return"),
+            "missing return"
+        );
+        assert!(
+            claims_return_only("The helper never returns a value."),
+            "never returns"
+        );
+        assert!(
+            claims_return_only("build_rows does not return a value"),
+            "does not return"
+        );
+        // Mixed claim: a real import claim too -> NOT return-only.
+        assert!(
+            !claims_return_only("_fetch_json missing return and urllib.request import"),
+            "mixed return + import"
+        );
+        assert!(
+            !claims_return_only("build_rows has no return; json is not imported"),
+            "return + not imported"
+        );
+        // No return phrase at all -> not return-only.
+        assert!(!claims_return_only("json is not imported"));
+        assert!(!claims_return_only("build_rows is undefined"));
+    }
+
+    /// A finding whose ONLY claim is about a missing return must never be
+    /// dropped by the range check, even when it cites a range and every
+    /// identifier in it is bound. The range check may only run for a finding
+    /// that makes an undefined-name / missing-import claim. Here the function
+    /// really does not return, so `function_return_evidence` answers `None`
+    /// and the finding is kept.
+    #[test]
+    fn a_return_only_claim_is_kept_even_when_the_range_names_are_all_bound() {
+        // The function does NOT return — the finding is real.
+        let source = "def make_tarball(path):\n    open(path, \"rb\").read()\n";
+        let read = move |p: &str| (p == "tools/archive.py").then(|| source.to_string());
+        // The cited range uses `make_tarball` (bound) — the finding must be
+        // KEPT because it claims no undefined name at all and the function
+        // really has no return.
+        assert!(
+            false_undefined_record_with_location(
+                "make_tarball has no return",
+                "the helper builds the payload and never returns it; see lines 1-2.",
+                "tools/archive.py",
+                Some("tools/archive.py:1-2"),
+                None,
+                &read,
+            )
+            .is_none(),
+            "a return-only finding with a real missing return must be kept"
+        );
+        // No cited range at all: also kept (nothing to disprove).
+        let read2 = move |p: &str| (p == "tools/archive.py").then(|| source.to_string());
+        assert!(
+            false_undefined_record_with_location(
+                "make_tarball has no return",
+                "the helper binds the payload and never returns a value.",
+                "tools/archive.py",
+                Some("tools/archive.py"),
+                None,
+                &read2,
+            )
+            .is_none(),
+            "a return-only finding with no range must be kept"
+        );
+        // Contrast: the SAME text but the function DOES return -> dropped.
+        let returns = "def make_tarball(path):\n    return open(path, \"rb\").read()\n";
+        let read3 = move |p: &str| (p == "tools/archive.py").then(|| returns.to_string());
+        assert!(
+            false_undefined_record_with_location(
+                "make_tarball has no return",
+                "the helper builds the payload and never returns it; see lines 1-2.",
+                "tools/archive.py",
+                Some("tools/archive.py:1-2"),
+                None,
+                &read3,
+            )
+            .is_some(),
+            "the same finding is dropped when the function returns"
+        );
+    }
+
+    /// "X is never imported" / "the module `gzip` is never imported" /
+    /// "never imports pathlib.Path" name the module; dropped with the import
+    /// line as evidence, kept when the import is really absent.
+    #[test]
+    fn never_imported_claims_are_dropped_when_the_import_exists() {
+        let imported = "import gzip\nimport pathlib\n\nPAYLOAD = b\"x\"\n";
+        let bare = "PAYLOAD = b\"x\"\n";
+        for (title, body, has) in [
+            (
+                "gzip is never imported",
+                "the helper reads the compressed payload but gzip is never imported.",
+                true,
+            ),
+            (
+                "the module `gzip` is never imported",
+                "make_tarball uses the module `gzip` but the module `gzip` is never imported.",
+                true,
+            ),
+            (
+                "gzip is never imported",
+                "make_tarball reads the archive but gzip is never imported.",
+                false,
+            ),
+            (
+                "never imports pathlib.Path",
+                "the helper never imports pathlib.Path, so Path is used without a binding.",
+                true,
+            ),
+        ] {
+            let source = if has { imported } else { bare };
+            let read = move |p: &str| (p == "tools/archive.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                title,
+                body,
+                "tools/archive.py",
+                Some("tools/archive.py:3-3"),
+                None,
+                &read,
+            );
+            if has {
+                let record = record.expect("the import exists at the head");
+                let evidence = record["evidence"].as_str().unwrap();
+                assert!(evidence.contains("import"), "{record}");
+            } else {
+                assert!(
+                    record.is_none(),
+                    "really missing import must be kept: {title}"
+                );
+            }
+        }
+    }
+
+    /// "Unresolved types: Alpha, Beta, Gamma" claims EVERY listed name; all
+    /// must be bound for the finding to drop.
+    #[test]
+    fn unresolved_type_lists_claim_every_listed_name() {
+        let all = "class Alpha:\n    pass\n\nclass Beta:\n    pass\n\nclass Gamma:\n    pass\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| all.to_string());
+        let record = false_undefined_record_with_location(
+            "Unresolved types: Alpha, Beta, Gamma",
+            "The diff references types that are not defined anywhere. Unresolved types: Alpha, Beta, Gamma.",
+            "tools/report.py",
+            Some("tools/report.py:1-9"),
+            None,
+            &read,
+        )
+        .expect("all three types are defined at the head");
+        assert!(
+            record["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == &json!("Alpha")),
+            "{record}"
+        );
+        // Drop one of the definitions -> KEPT.
+        let missing_gamma = "class Alpha:\n    pass\n\nclass Beta:\n    pass\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| missing_gamma.to_string());
+        assert!(false_undefined_record_with_location(
+            "Unresolved types: Alpha, Beta, Gamma",
+            "The diff references types that are not defined anywhere. Unresolved types: Alpha, Beta, Gamma.",
+            "tools/report.py",
+            Some("tools/report.py:1-5"),
+            None,
+            &read,
+        )
+        .is_none(), "one really missing type keeps the finding");
+        // "X is unresolved" names the token before the phrase.
+        let with_alpha = "class Alpha:\n    pass\n\nPAYLOAD = 1\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| with_alpha.to_string());
+        let record = false_undefined_record_with_location(
+            "Alpha is unresolved",
+            "The name Alpha is unresolved in this chunk.",
+            "tools/report.py",
+            Some("tools/report.py:4-4"),
+            None,
+            &read,
+        )
+        .expect("Alpha is defined at the head");
+        assert_eq!(record["symbol"], "Alpha");
+    }
+
+    /// Punctuated type lists (commas, periods, sentence ends) claim every
+    /// listed name: trailing punctuation on a token must not prevent the
+    /// claim.
+    #[test]
+    fn punctuated_unresolved_type_lists_claim_every_name() {
+        for (title, body) in [
+            (
+                "Unresolved types: Alpha, Beta, Gamma",
+                "The diff references these types. Unresolved types: Alpha, Beta, Gamma.",
+            ),
+            (
+                "Unresolved types: Alpha, Beta, Gamma.",
+                "Unresolved types: Alpha, Beta, Gamma.",
+            ),
+            (
+                "Unresolved types: Alpha Beta Gamma",
+                "Unresolved types: Alpha Beta Gamma",
+            ),
+        ] {
+            let syms = claimed_symbols(title, body);
+            for name in ["Alpha", "Beta", "Gamma"] {
+                assert!(
+                    syms.iter().any(|s| s == name),
+                    "{title} / {body}: {name} not claimed: {syms:?}"
+                );
+            }
+        }
+    }
+
+    /// "none of these helpers are imported" names NOTHING: it must never drop
+    /// a finding by itself, but it does make the finding an import claim, so
+    /// the no-symbol range check may run and disprove it when every name in
+    /// the cited range is bound.
+    #[test]
+    fn a_none_of_these_import_claim_names_nothing() {
+        assert!(
+            claimed_symbols(
+                "none of these helpers are imported",
+                "the helpers are used but never imported."
+            )
+            .is_empty(),
+            "the phrase names no symbol"
+        );
+        assert!(
+            claims_undefined("none of these helpers are imported"),
+            "it is an import claim"
+        );
+        // No range: nothing to check -> kept.
+        let source = "def helper_a():\n    return 1\n";
+        let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+        assert!(
+            false_undefined_record_with_location(
+                "none of these helpers are imported",
+                "the helpers are used but never imported.",
+                "tools/report.py",
+                Some("tools/report.py"),
+                None,
+                &read,
+            )
+            .is_none(),
+            "with no range it must be kept"
+        );
+        // With a range whose names are all bound: disproved.
+        let read = import_shape_read(true);
+        let record = false_undefined_record_with_location(
+            "none of these helpers are imported",
+            "the helpers are used but never imported.",
+            "tools/report.py",
+            Some("tools/report.py:398-402"),
+            Some(398),
+            &read,
+        )
+        .expect("every name in the range is bound at the head");
+        assert!(
+            record["evidence_lines"]
+                .as_array()
+                .is_some_and(|l| !l.is_empty()),
+            "{record}"
+        );
+    }
+
+    /// Attribute names: a claim about `module.attr` claims only `module`.
+    /// Never claim the attribute or library member taken from the body —
+    /// those can never be "defined" in the file.
+    #[test]
+    fn a_module_attr_claim_claims_only_the_module() {
+        let with_stat =
+            "import stat\n\ndef check(path):\n    return stat.S_ISREG(os.stat(path).st_mode)\n";
+        let without_stat = "def check(path):\n    return stat.S_ISREG(os.stat(path).st_mode)\n";
+        let title = "Missing import for `stat` module";
+        let body = "check() calls stat.S_ISREG(...) but stat is never imported in this file.";
+        for (source, expect) in [(with_stat, true), (without_stat, false)] {
+            let read = move |p: &str| (p == "tools/report.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                title,
+                body,
+                "tools/report.py",
+                Some("tools/report.py:3-3"),
+                None,
+                &read,
+            );
+            if expect {
+                let record = record.expect("import stat exists at the head");
+                assert_eq!(
+                    record["symbol"], "stat",
+                    "claims only `stat`, not S_ISREG: {record}"
+                );
+            } else {
+                assert!(
+                    record.is_none(),
+                    "really missing `stat` keeps the finding: {record:?}"
+                );
+            }
+        }
+    }
+
+    /// A `NameError` quoted in the finding is never a claimed symbol:
+    /// "raises NameError" must not keep the finding alive when the real
+    /// module IS imported.
+    #[test]
+    fn a_name_error_in_the_prose_is_not_claimed() {
+        let with_gzip = "import gzip\n\nPAYLOAD = b\"x\"\n";
+        let without_gzip = "PAYLOAD = b\"x\"\n";
+        let title = "Missing import of gzip module";
+        let body = "make_tarball calls gzip.compress() but the module is not imported, so this raises NameError at runtime.";
+        for (source, expect) in [(with_gzip, true), (without_gzip, false)] {
+            let read = move |p: &str| (p == "tools/archive.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                title,
+                body,
+                "tools/archive.py",
+                Some("tools/archive.py:3-3"),
+                None,
+                &read,
+            );
+            if expect {
+                let record = record.expect("import gzip exists at the head");
+                assert_eq!(record["symbol"], "gzip", "{record}");
+            } else {
+                assert!(record.is_none(), "really missing gzip keeps the finding");
+            }
+        }
+    }
+
+    /// A bare lowercase prose word ("so") is never a claimed symbol, even
+    /// when it directly precedes "missing import".
+    #[test]
+    fn a_so_in_the_prose_is_not_claimed() {
+        let with_def =
+            "def _looks_like_tar(data: bytes) -> bool:\n    return data.startswith(b\"tar\")\n";
+        let without_def = "PAYLOAD = b\"x\"\n";
+        let title = "Missing import of _looks_like_tar";
+        let body = "scan_payload calls _looks_like_tar(head) but the helper is not defined or imported, so this missing import raises a NameError at runtime.";
+        for (source, expect) in [(with_def, true), (without_def, false)] {
+            let read = move |p: &str| (p == "tools/scan.py").then(|| source.to_string());
+            let record = false_undefined_record_with_location(
+                title,
+                body,
+                "tools/scan.py",
+                Some("tools/scan.py:3-3"),
+                None,
+                &read,
+            );
+            if expect {
+                let record = record.expect("def _looks_like_tar exists at the head");
+                assert_eq!(record["symbol"], "_looks_like_tar", "{record}");
+            } else {
+                assert!(record.is_none(), "really missing helper keeps the finding");
+            }
+        }
+        // The exception names and prose words are never claimed, on their own.
+        assert!(
+            !claimed_symbols(
+                "Missing import of gzip module",
+                "this raises NameError and ImportError at runtime."
+            )
+            .iter()
+            .any(|s| s == "NameError" || s == "ImportError"),
+            "exception types are not symbols"
+        );
+        assert!(
+            !claimed_symbols(
+                "Missing import of gzip module",
+                "so this missing import breaks the scan."
+            )
+            .iter()
+            .any(|s| s == "so"),
+            "`so` is not a symbol"
+        );
+    }
+
+    /// `strip_symbol_kind` strips only a SEPARATE trailing kind word; a kind
+    /// word fused into the identifier is part of the name.
+    #[test]
+    fn a_fused_symbol_kind_is_never_stripped() {
+        assert_eq!(strip_symbol_kind("mymodule"), "mymodule");
+        assert_eq!(strip_symbol_kind("json_module"), "json_module");
+        assert_eq!(strip_symbol_kind("my_module_lib"), "my_module_lib");
+        assert_eq!(strip_symbol_kind("gzip module"), "gzip");
+        assert_eq!(strip_symbol_kind("the re package"), "the re");
+        assert_eq!(strip_symbol_kind("module"), "");
+        // A claim about `json_module` names the whole identifier.
+        assert!(claimed_symbols("Missing import of json_module", "")
+            .iter()
+            .any(|s| s == "json_module"));
     }
 }
