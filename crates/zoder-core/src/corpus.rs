@@ -730,6 +730,17 @@ enum OverlayRead {
 pub struct Corpus {
     #[serde(default)]
     pub source: String,
+    /// Top-level `"managed": true` in the corpus file: the file is managed by
+    /// its installer and must not be re-pulled or overwritten by zoder. It is
+    /// the same marker the pricing catalog carries, and the file-source
+    /// switch reads it from EITHER file, so a corpus that drops the marker on
+    /// save would silently unprotect the managed file it was protecting.
+    /// Carried through load and save: a refresh re-saves the corpus it
+    /// loaded, so the marker survives it. Omitted from the serialized form
+    /// when false, so a corpus written before the field existed stays
+    /// byte-identical to one written now.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
     /// The date this corpus was BUILT (`YYYY-MM-DD`), as the builder writes it.
     /// Optional: a corpus produced before the field existed simply has it
     /// empty, and `skip_serializing_if` keeps such a corpus byte-identical to
@@ -771,6 +782,8 @@ struct CorpusWire {
     #[serde(default)]
     source: String,
     #[serde(default)]
+    managed: bool,
+    #[serde(default)]
     generated: String,
     #[serde(default)]
     arena_date: String,
@@ -786,6 +799,7 @@ impl From<CorpusWire> for Corpus {
     fn from(wire: CorpusWire) -> Self {
         let mut corpus = Corpus {
             source: wire.source,
+            managed: wire.managed,
             generated: wire.generated,
             arena_date: wire.arena_date,
             count: wire.count,
@@ -796,6 +810,13 @@ impl From<CorpusWire> for Corpus {
         corpus.rebuild_aliases_from_models();
         corpus
     }
+}
+
+/// `skip_serializing_if` helper: a false `managed` marker is omitted from
+/// the serialized corpus, so a corpus written before the field existed stays
+/// byte-identical to one written now.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for Corpus {
@@ -1069,6 +1090,15 @@ impl Corpus {
 
         let mut corpus = Corpus {
             source: str_field("source"),
+            // The installer-managed marker is read here so a corpus that
+            // carries it keeps it through the load/save round trip a forced
+            // refresh performs. A non-boolean or absent marker is simply
+            // "not managed" -- the same reading `file_is_managed` applies to
+            // the raw file.
+            managed: root
+                .get("managed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             generated: str_field("generated"),
             arena_date: str_field("arena_date"),
             count: models.len(),
@@ -3399,5 +3429,72 @@ mod corpus_source_metadata_tests {
         assert!(crate::pricing::file_is_managed(&path));
         let c = Corpus::load_without_overlay(&path).unwrap();
         assert_eq!(c.data_date(), None);
+    }
+}
+
+#[cfg(test)]
+mod corpus_managed_marker_tests {
+    use super::*;
+
+    /// A corpus that carries the installer's `"managed": true` marker must
+    /// keep it across the load/save round trip a forced refresh performs.
+    /// The file-source switch reads the marker off the raw file, so a save
+    /// that dropped it would silently unprotect the very file the marker was
+    /// protecting: the next refresh would overwrite the installed corpus.
+    #[test]
+    fn managed_marker_survives_a_load_save_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"managed": true, "source": "an internal corpus", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        assert!(crate::pricing::file_is_managed(&path));
+
+        let loaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(
+            loaded.managed,
+            "the loader must carry the managed marker into the corpus"
+        );
+
+        loaded.save(&path).unwrap();
+
+        assert!(
+            crate::pricing::file_is_managed(&path),
+            "the managed marker must survive the save: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        let reloaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(
+            reloaded.managed,
+            "the marker must survive a load/save/load round trip"
+        );
+    }
+
+    /// The converse: a corpus that was never managed must not acquire the
+    /// marker by being saved. `skip_serializing_if` keeps the serialized
+    /// form byte-identical to what an older build wrote.
+    #[test]
+    fn unmanaged_corpus_gains_no_managed_key_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"source": "public: test", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(!loaded.managed);
+        loaded.save(&path).unwrap();
+
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&resaved).unwrap();
+        assert!(
+            root.get("managed").is_none(),
+            "an unmanaged corpus must not gain a managed key: {resaved}"
+        );
+        assert!(!crate::pricing::file_is_managed(&path));
     }
 }
