@@ -45,16 +45,16 @@ use zoder_core::utilization::{
 use zoder_core::{
     amortized_per_call, anthropic_costs, backoff_delay, build_report, build_report_from_entries,
     cap_targets, chain_for_role, chain_for_role_with_account, classify_err, classify_provider,
-    estimate_tokens, fetch_catalog_models, fetch_engine_cost, finops_cli,
-    load_project_instructions, merge_or_degrade, openai_costs, parse_mcp_servers_file,
+    cleanup_stale_socket_if_dead, estimate_tokens, fetch_catalog_models, fetch_engine_cost,
+    finops_cli, load_project_instructions, merge_or_degrade, openai_costs, parse_mcp_servers_file,
     probe_request, run_agent_dispatch, sync_catalog, to_acp_mcp_servers, AgentEvent, AgentOptions,
     AgentStatusEntry, AgentsStatusResult, ApprovalPolicy, BillableReservation, BillingMode,
     BudgetVerdict, ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot,
     CostVerdict, DaemonReadiness, Decision, EngineKind, EngineModelRegistry, EngineProviderRoute,
     EnrichmentOutcome, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
     OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
-    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, State,
-    SubscriptionPlan, Theme, Tier, OVERLAY_SOURCE, PROBE_MAX_MODELS_PER_PROVIDER,
+    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, StaleSocketOutcome,
+    State, SubscriptionPlan, Theme, Tier, OVERLAY_SOURCE, PROBE_MAX_MODELS_PER_PROVIDER,
     PROBE_PING_TIMEOUT_SECS,
 };
 use zoder_mcp_server::{run_server, RoutingContext as McpRoutingContext};
@@ -965,6 +965,14 @@ fn cmd_init(profile: InitProfile, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Subcommands for [`Cmd::Daemon`].
+#[derive(Subcommand, Clone)]
+enum DaemonProbe {
+    /// Report daemon reachability and the live lease census for the engine
+    /// socket. JSON when `--json` is set.
+    Check,
+}
+
 /// Named reporting windows for `zoder report` (all period-to-date).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ReportPeriod {
@@ -1009,6 +1017,15 @@ enum Cmd {
         /// Agent alias to inspect.
         #[arg(value_name = "NAME")]
         name: Option<String>,
+    },
+    /// Probe the engine-daemon lifecycle: report whether a daemon is
+    /// reachable at the engine socket, whether this process holds a live
+    /// lease on it, and how many live leases the daemon directory holds.
+    /// Read-only — it acquires no lease and stops nothing. Used by
+    /// regression tests to watch two processes share one daemon.
+    Daemon {
+        #[command(subcommand)]
+        probe: DaemonProbe,
     },
     /// Check for a newer zoder release and update to it. Without `--check`,
     /// re-runs the official installer to self-replace this binary.
@@ -2469,6 +2486,9 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(Cmd::Agents { name }) => cmd_agents(name.as_deref(), cli.json).await,
         Some(Cmd::Update { check }) => cmd_update(*check).await,
+        Some(Cmd::Daemon {
+            probe: DaemonProbe::Check,
+        }) => cmd_daemon_probe_check(cli.json).await,
         Some(Cmd::Route { prompt }) => cmd_route(&cli, prompt.clone()).await,
         Some(Cmd::Consult { free_only, limit }) => cmd_consult(&cli, *free_only, *limit).await,
         Some(Cmd::Spend {
@@ -7641,16 +7661,42 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
     // outcome and short-circuit. A `TrulyStale` / `PossiblyAlive`
     // falls through to the cleanup logic below.
     if socket.exists() {
-        match zoder_core::probe_ready(&socket, std::time::Duration::from_secs(2)).await {
-            DaemonReadiness::Ready => return Ok(socket),
-            DaemonReadiness::TrulyStale { reason } => {
-                eprintln!(
-                    "zoder: daemon socket {} is stale ({reason}); removing before respawn",
-                    socket.display()
-                );
-                remove_stale_socket(&socket);
+        // Register this client as a consumer of the daemon BEFORE it can
+        // talk to it. A client that registers only after the handshake has a
+        // window in which it is connected but invisible to the census, and
+        // that window is exactly where a sibling's stop decision would fail
+        // to see it. A client whose lease cannot be written is a client that
+        // cannot prove it is a consumer, so it must never stop the daemon —
+        // and that follows from the decision itself (no lease, no
+        // authority), which is why the failure is reported rather than
+        // swallowed.
+        // The record that belongs to THIS socket: when the socket lives
+        // somewhere else than the default data directory, the record next to
+        // the socket is the one that describes the daemon serving it.
+        let daemon_pid = read_daemon_record(&daemon_record_path_next_to(&socket))
+            .map(|(pid, _ticks)| pid)
+            .unwrap_or(0);
+        let lease = zoder_core::engine_rpc_impl::acquire_daemon_lease(
+            &socket,
+            std::process::id(),
+            daemon_pid,
+        );
+        match cleanup_stale_socket_if_dead(&socket).await {
+            StaleSocketOutcome::Ready => {
+                // Acquire (or refresh) this client's lease on the shared
+                // daemon so the sibling processes' teardown can tell "a live
+                // client is using this daemon" from live state.
+                if let Err(e) = &lease {
+                    eprintln!(
+                        "zoder: could not record this client's lease for the daemon at {} \
+                         ({e}); the daemon is still usable, but this process will not stop it, \
+                         because it cannot prove that nobody else is using it",
+                        socket.display()
+                    );
+                }
+                return Ok(socket);
             }
-            DaemonReadiness::PossiblyAlive { reason } => {
+            StaleSocketOutcome::PossiblyAlive { reason } => {
                 // RELIABILITY-AUDIT GUARD: never remove the socket on a
                 // PossiblyAlive probe. The previous guard removed it when
                 // the inode mtime was older than a fixed threshold, on the
@@ -7682,6 +7728,16 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
                     "engine daemon at {} is unresponsive and its socket is still bound",
                     socket.display()
                 )));
+            }
+            StaleSocketOutcome::Removed => {
+                // Nothing was listening and the stale entry is gone: fall
+                // through and start a fresh daemon.
+            }
+            StaleSocketOutcome::NotRemoved => {
+                // Nothing was listening, but the entry was not removed: it
+                // changed under us (a daemon bound it in the meantime) or the
+                // daemon lock could not be taken. Either way the spawn below
+                // reports the bind failure, and nothing live was unlinked.
             }
         }
     }
@@ -7735,7 +7791,7 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
     // Record the daemon's identity the moment it exists — not after the
     // handshake — so no reap scope can ever select it (see
     // `reaper::note_daemon_identity` and `record_daemon_pid`).
-    let daemon_identity = record_daemon_pid(child.id());
+    let daemon_identity = record_daemon_pid(child.id(), &socket);
 
     // Poll readiness with the initialize handshake. Bail early if the child
     // exits during startup; on timeout, kill and reap it before returning.
@@ -7765,6 +7821,25 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
         let last_probe =
             match zoder_core::probe_ready(&socket, std::time::Duration::from_secs(2)).await {
                 DaemonReadiness::Ready => {
+                    // This process STARTED the daemon: it is the daemon's
+                    // owner, and the ownership record written at spawn time
+                    // (`record_daemon_pid`) is what proves it. The lease is
+                    // acquired BEFORE `child` is moved into the registry,
+                    // so the census already names this client when the
+                    // daemon becomes reachable.
+                    if let Err(e) = zoder_core::engine_rpc_impl::acquire_daemon_lease(
+                        &socket,
+                        std::process::id(),
+                        child.id(),
+                    ) {
+                        eprintln!(
+                            "zoder: started the daemon at {} but could not record this \
+                             client's lease ({e}); the daemon is usable, and this process \
+                             still owns it, but it will not stop it while another client \
+                             may be using it",
+                            socket.display()
+                        );
+                    }
                     register_ephemeral_daemon(child);
                     return Ok(socket);
                 }
@@ -7786,6 +7861,52 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
     }
 }
 
+/// `zoder daemon check`: report, for the engine socket, whether a daemon is
+/// answering RPC (a full `initialize` handshake, not just a connect), how many
+/// live lease holders the daemon directory holds, and whether THIS process
+/// holds one. Read-only: it writes no lease and stops nothing, so a test
+/// harness can watch two processes share one daemon without perturbing it.
+async fn cmd_daemon_probe_check(json_out: bool) -> anyhow::Result<()> {
+    let socket = engine_socket_path();
+    let ready = matches!(
+        zoder_core::engine_rpc::probe_ready(&socket, std::time::Duration::from_secs(2)).await,
+        zoder_core::engine_rpc::DaemonReadiness::Ready
+    );
+    // `read_daemon_leases` returns only the LEASES OF LIVE CLIENTS (dead
+    // holders' files are pruned as a side effect), so the count IS the live
+    // census.
+    let leases = zoder_core::engine_rpc_impl::read_daemon_leases(&socket);
+    let own = leases.iter().any(|l| l.client_pid == std::process::id());
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({
+                "socket": socket.to_string_lossy(),
+                "daemon_ready": ready,
+                "live_leases": leases.len(),
+                "this_process_leased": own,
+                "lease_clients": leases.iter().map(|l| l.client_pid).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        println!("socket:        {}", socket.display());
+        println!(
+            "daemon:        {}",
+            if ready {
+                "ready (initialize handshake ok)"
+            } else {
+                "not reachable"
+            }
+        );
+        println!("live leases:   {}", leases.len());
+        println!(
+            "this process:  {}",
+            if own { "holds a lease" } else { "has no lease" }
+        );
+    }
+    Ok(())
+}
+
 /// Best-effort: return the last ~1.5KB of the daemon log for error context.
 /// Tails on a UTF-8 boundary (logs may contain multibyte chars).
 fn read_log_tail(path: &std::path::Path) -> String {
@@ -7800,23 +7921,6 @@ fn read_log_tail(path: &std::path::Path) -> String {
         }
         Err(_) => "(no daemon log available)".to_string(),
     }
-}
-
-/// Race-free stale-socket cleanup. Atomically removes the socket file
-/// at `socket` if and only if it currently exists. The call is
-/// deliberately tolerant of a missing file (concurrent deletion by
-/// another zoder process is benign and matches the desired post-state)
-/// and tolerant of any other removal error (the spawn-time bind will
-/// surface the underlying cause with a clearer error chain).
-///
-/// **Why this is a separate function:** the call site is in the
-/// [`ensure_engine_daemon`] hot path, which boots a real daemon and
-/// waits for its handshake. Unit-testing that path requires a mock
-/// daemon binary, which is overkill for a one-line `unlink`. The
-/// helper exists so the policy decision ("the socket is stale, remove
-/// it before the spawn races") is captured in a testable seam.
-fn remove_stale_socket(socket: &std::path::Path) {
-    let _ = std::fs::remove_file(socket);
 }
 
 /// Path to the per-daemon stderr log. Lives under `Config::home()/logs/`
@@ -7846,6 +7950,18 @@ pub(crate) fn daemon_pid_file_path() -> PathBuf {
     zeroclaw_data_dir().join("daemon.pid")
 }
 
+/// The daemon record that belongs to `socket`'s directory.
+///
+/// The socket lives at `<data dir>/daemon.sock` and its record at
+/// `<data dir>/daemon.pid`, so the two are the same file in the default
+/// layout. When `ZEROCLAW_SOCKET` points somewhere else, the record next to
+/// THAT socket is the one that describes the daemon serving it, and it is
+/// the one every decision about that socket has to read: the record of a
+/// different socket's daemon says nothing about this one.
+pub(crate) fn daemon_record_path_next_to(socket: &Path) -> PathBuf {
+    socket.with_file_name("daemon.pid")
+}
+
 /// A daemon identity: pid plus the boot-relative clock tick the process
 /// started at. Both halves must match before a reader spares anything.
 pub(crate) type DaemonIdentity = (u32, u64);
@@ -7858,7 +7974,7 @@ pub(crate) type DaemonIdentity = (u32, u64);
 /// a daemon with no record is merely harder for a reaper to recognise, and
 /// the reaper ALSO exempts any process whose `/proc/<pid>/exe` is the
 /// zeroclaw binary, so the exemption never rests on this file alone.
-fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
+fn record_daemon_pid(pid: u32, socket: &Path) -> Option<DaemonIdentity> {
     if pid == 0 {
         return None;
     }
@@ -7866,14 +7982,29 @@ fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
     // In-process first: it needs no filesystem and it is the arm that covers
     // the window between spawn and the first reap scan.
     crate::reaper::note_daemon_identity(identity);
-    let path = daemon_pid_file_path();
-    if let Err(e) = write_daemon_record(&path, identity) {
+    // The OWNER is this process: it is the one that spawned the daemon, and
+    // it is the only process that can prove it. The record is written by the
+    // spawner, so the owner is known here and nowhere else.
+    let owner = crate::reaper::live_identity(std::process::id())
+        .map(|(pid, start_ticks)| zoder_core::DaemonOwner { pid, start_ticks });
+    // The record is written next to the socket the daemon was started on:
+    // that is the file every decision about THAT socket reads.
+    let path = daemon_record_path_next_to(socket);
+    if let Err(e) = write_daemon_record(&path, identity, owner) {
         eprintln!(
             "[zoder] could not record the daemon identity at {} ({e}); the reap scope \
              will still spare this daemon by executable identity, and any other zoder \
              process may not",
             path.display()
         );
+    }
+    // The default location is the same file; when the socket lives
+    // elsewhere, the default record is written too, because the reap scope
+    // reads THAT one and a daemon with no record is one that another
+    // process's reap may select.
+    let default_path = daemon_pid_file_path();
+    if default_path != path {
+        let _ = write_daemon_record(&default_path, identity, owner);
     }
     Some(identity)
 }
@@ -7886,7 +8017,11 @@ fn record_daemon_pid(pid: u32) -> Option<DaemonIdentity> {
 /// to SIGTERM the daemon and kill this one's agent. Write a sibling temp file
 /// and `rename(2)` it over the target: same directory, so the same
 /// filesystem, and the replacement is atomic.
-fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result<()> {
+fn write_daemon_record(
+    path: &Path,
+    identity: DaemonIdentity,
+    owner: Option<zoder_core::DaemonOwner>,
+) -> std::io::Result<()> {
     let write = || {
         // `unwrap_or`, never `unwrap`: an odd path must not turn a daemon
         // spawn into a panic.
@@ -7897,7 +8032,18 @@ fn write_daemon_record(path: &Path, identity: DaemonIdentity) -> std::io::Result
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         let tmp = parent.join(format!(".daemon.pid.{}.{}", std::process::id(), nanos));
-        let body = format!("{} {}\n", identity.0, identity.1);
+        // The record carries the daemon identity AND, when the spawner knows
+        // it, the identity of the process that STARTED the daemon. The owner
+        // is what a stop decision needs: "who is using this daemon" is a
+        // question about leases, but "may I stop it" is a question about
+        // ownership, and the two are not the same thing.
+        let body = match owner {
+            Some(o) => format!(
+                "{} {} {} {}\n",
+                identity.0, identity.1, o.pid, o.start_ticks
+            ),
+            None => format!("{} {}\n", identity.0, identity.1),
+        };
         let written = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -7923,13 +8069,54 @@ pub(crate) fn read_daemon_record(path: &Path) -> Option<DaemonIdentity> {
         return None;
     }
     let start_ticks = fields.next()?.parse::<u64>().ok()?;
-    // Exactly two fields, written by this build and nothing else. A record
-    // with trailing junk was not written by `record_daemon_pid`, so nothing
-    // about it can be assumed.
-    if fields.next().is_some() {
+    // Two fields, or four: the daemon identity on its own, or the daemon
+    // identity plus the OWNER that started it. Any other shape was not
+    // written by `record_daemon_pid`, so nothing about it can be assumed.
+    match (fields.next(), fields.next()) {
+        (None, None) => Some((pid, start_ticks)),
+        (Some(owner_pid), Some(owner_ticks)) => {
+            let owner_pid = owner_pid.parse::<u32>().ok()?;
+            if owner_pid <= 1 {
+                return None;
+            }
+            // The owner's start time is validated here — a record whose owner
+            // field is not a number was not written by `record_daemon_pid` —
+            // but the identity this function returns is the DAEMON's. The
+            // owner is read separately by `read_daemon_owner`.
+            owner_ticks.parse::<u64>().ok()?;
+            if fields.next().is_some() {
+                return None;
+            }
+            Some((pid, start_ticks))
+        }
+        _ => None,
+    }
+}
+
+/// The process that STARTED the daemon recorded at `path`, if the record
+/// names one.
+///
+/// The owner is read from the daemon's own record, never from the leases: the
+/// lease order says who arrived first, which is not the same question as who
+/// started the daemon. A record written before the owner was recorded (or by
+/// a build that did not record one) yields `None`, which the stop decision
+/// reads as "nobody owns this daemon" — the safe reading, because it makes
+/// the decision fall back to the live-consumer rule instead of to a guess.
+pub(crate) fn read_daemon_owner(path: &Path) -> Option<zoder_core::DaemonOwner> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut fields = raw.split_whitespace();
+    // Skip the daemon identity.
+    fields.next()?;
+    fields.next()?;
+    let owner_pid = fields.next()?.parse::<u32>().ok()?;
+    if owner_pid <= 1 {
         return None;
     }
-    Some((pid, start_ticks))
+    let owner_ticks = fields.next()?.parse::<u64>().ok()?;
+    Some(zoder_core::DaemonOwner {
+        pid: owner_pid,
+        start_ticks: owner_ticks,
+    })
 }
 
 /// Run `f` while holding an exclusive lock on the daemon record, across every
@@ -8210,7 +8397,8 @@ mod stale_socket_cleanup_tests {
     //! The cleanup is delegated to [`remove_stale_socket`] and
     //! so the policy can be unit-tested without spawning a real daemon.
 
-    use super::remove_stale_socket;
+    use zoder_core::StaleSocketOutcome;
+    use zoder_core::{cleanup_stale_socket_if_dead, remove_stale_socket, socket_identity};
 
     /// A stale socket file (no daemon listening) must be removable
     /// by the cleanup helper. This is the happy-path test for the
@@ -8224,13 +8412,129 @@ mod stale_socket_cleanup_tests {
         std::fs::write(&socket, b"stale socket inode").expect("write stale socket");
         assert!(socket.exists(), "precondition: the stale socket exists");
 
-        remove_stale_socket(&socket);
+        let identity = socket_identity(&socket);
+        assert!(remove_stale_socket(&socket, identity));
 
         assert!(
             !socket.exists(),
             "after remove_stale_socket, the stale socket file MUST be gone; \
              ensure_engine_daemon's spawn would otherwise race EADDRINUSE on the next bind"
         );
+    }
+
+    /// A socket that was REPLACED between the probe and the removal must NOT
+    /// be unlinked.
+    ///
+    /// This is the race the inode guard exists for: the probe looked at one
+    /// directory entry, and by the time the cleanup acts, a daemon has bound
+    /// the path and the entry is a DIFFERENT one. Unlinking it would sever
+    /// every future `connect(2)` from a live daemon — the socket stays bound
+    /// in the kernel, but nothing can reach it any more.
+    #[test]
+    fn remove_stale_socket_leaves_a_replaced_socket_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, b"the entry the probe saw").expect("write");
+        let seen = socket_identity(&socket).expect("the entry has an identity");
+
+        // A daemon binds the path in between: the entry is REPLACED.
+        std::fs::remove_file(&socket).expect("remove the old entry");
+        std::fs::write(&socket, b"a different entry").expect("write the replacement");
+        let now = socket_identity(&socket).expect("the replacement has an identity");
+        assert_ne!(
+            seen, now,
+            "precondition: the directory entry was replaced by another one"
+        );
+
+        assert!(
+            !remove_stale_socket(&socket, Some(seen)),
+            "the entry that replaced the probed one must not be unlinked"
+        );
+        assert!(
+            socket.exists(),
+            "the replacement entry must survive the cleanup"
+        );
+    }
+
+    /// The PRODUCTION entry point removes a genuinely stale socket: the path
+    /// is there and nothing listens on it.
+    ///
+    /// The test drives [`cleanup_stale_socket_if_dead`] — the function the
+    /// product calls — so the probe, the identity capture, the lock and the
+    /// removal are all exercised together. A test of `remove_stale_socket`
+    /// alone would keep passing if the production path stopped using the
+    /// guard.
+    #[tokio::test]
+    async fn the_production_cleanup_removes_a_stale_socket_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        // A socket path that leads to nothing: the shape a crashed run
+        // leaves behind, with no listener to confuse the probe.
+        std::os::unix::fs::symlink(dir.path().join("gone.sock"), &socket).expect("symlink");
+
+        let outcome = cleanup_stale_socket_if_dead(&socket).await;
+        assert_eq!(
+            outcome,
+            StaleSocketOutcome::Removed,
+            "a socket path with nothing behind it must be cleaned up"
+        );
+        assert!(
+            std::fs::symlink_metadata(&socket).is_err(),
+            "the stale entry must be gone"
+        );
+    }
+
+    /// A daemon that is bound but does not answer the handshake keeps its
+    /// socket: the probe cannot prove it is dead, so nothing is unlinked.
+    #[tokio::test]
+    async fn the_production_cleanup_leaves_an_unresponsive_daemon_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        // The listener is never accepted on and never answers, so the probe
+        // runs into its budget and reports "possibly alive". The handle is
+        // leaked on purpose: dropping it would unlink the socket.
+        std::mem::forget(listener);
+
+        let outcome = cleanup_stale_socket_if_dead(&socket).await;
+        assert!(
+            matches!(outcome, StaleSocketOutcome::PossiblyAlive { .. }),
+            "an unresponsive daemon must be reported as possibly alive: {outcome:?}"
+        );
+        assert!(
+            socket.exists(),
+            "an unresponsive daemon's socket must survive the cleanup"
+        );
+    }
+
+    /// When the daemon lock cannot be taken, the cleanup stands down and
+    /// removes NOTHING.
+    ///
+    /// The lock is what keeps a cleanup and a client that is registering
+    /// itself from interleaving, so a cleanup that cannot take it has no
+    /// business deciding anything. A stale socket left behind costs one
+    /// respawn; a live daemon's socket removed costs the daemon.
+    #[tokio::test]
+    async fn the_production_cleanup_stands_down_when_the_lock_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::os::unix::fs::symlink(dir.path().join("gone.sock"), &socket).expect("symlink");
+
+        // Somebody else holds the daemon lock for the whole cleanup.
+        let held = zoder_core::DaemonLock::exclusive(&socket).expect("take the daemon lock");
+
+        let outcome = cleanup_stale_socket_if_dead(&socket).await;
+        assert_eq!(
+            outcome,
+            StaleSocketOutcome::NotRemoved,
+            "a cleanup that cannot take the lock must not remove anything"
+        );
+        assert!(
+            std::fs::symlink_metadata(&socket).is_ok(),
+            "the entry must survive a cleanup that could not take the lock"
+        );
+
+        drop(held);
     }
 
     /// Calling `remove_stale_socket` on a path that does NOT exist
@@ -8245,7 +8549,8 @@ mod stale_socket_cleanup_tests {
         assert!(!socket.exists(), "precondition: socket does not exist");
 
         // Must not panic / error.
-        remove_stale_socket(&socket);
+        let identity = socket_identity(&socket);
+        assert!(!remove_stale_socket(&socket, identity));
 
         assert!(!socket.exists());
     }
@@ -8262,7 +8567,8 @@ mod stale_socket_cleanup_tests {
         std::fs::write(&socket, b"not a socket, just a file").expect("write");
         assert!(socket.exists());
 
-        remove_stale_socket(&socket);
+        let identity = socket_identity(&socket);
+        assert!(remove_stale_socket(&socket, identity));
 
         assert!(
             !socket.exists(),
@@ -8511,7 +8817,7 @@ mod daemon_cwd_tests {
         let path = dir.path().join("daemon.pid");
         let a: (u32, u64) = (101, 202);
         let b: (u32, u64) = (303, 404);
-        super::write_daemon_record(&path, a).expect("first record");
+        super::write_daemon_record(&path, a, None).expect("first record");
         assert_eq!(super::read_daemon_record(&path), Some(a));
 
         // Hammer the replacement while a reader spins: every observation must
@@ -8540,7 +8846,8 @@ mod daemon_cwd_tests {
             })
         };
         for i in 0..200u64 {
-            super::write_daemon_record(&path, if i % 2 == 0 { b } else { a }).expect("rewrite");
+            super::write_daemon_record(&path, if i % 2 == 0 { b } else { a }, None)
+                .expect("rewrite");
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().expect("reader thread");
