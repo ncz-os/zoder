@@ -3866,6 +3866,19 @@ impl Config {
         &mut self,
         registry: &EngineModelRegistry,
     ) -> anyhow::Result<()> {
+        // A provider whose endpoint is still the host-free unset sentinel
+        // holds no engine profile, whatever the registry says. The profile
+        // carries its own endpoint, so keeping the mapping would let a later
+        // routing step pin a provider that names no host and can never be
+        // dialed. This pass runs BEFORE the empty-registry early return
+        // below, so an unset provider drops its mapping even when no engine
+        // profile is loaded at all.
+        for provider in &mut self.providers {
+            if !provider.endpoint_is_configured() {
+                provider.engine_provider_ref = None;
+            }
+        }
+
         if registry.models.is_empty() {
             return Ok(());
         }
@@ -3879,11 +3892,7 @@ impl Config {
                 // The operator has not pointed this provider at an endpoint
                 // yet, so it must not claim an engine profile: the engine
                 // would route the call to an endpoint zoder never agreed to.
-                // An EXPLICIT mapping is cleared as well — an endpoint that
-                // names no host has no route to pin, so keeping the mapping
-                // would let a later routing step pin a provider that can
-                // never be dialed.
-                provider.engine_provider_ref = None;
+                // The explicit mapping was already cleared by the pass above.
                 continue;
             }
             let explicit_ref = provider.engine_provider_ref.as_deref();
@@ -6215,6 +6224,45 @@ model_provider = "minimax"
             cfg.providers[0].engine_provider_ref.as_deref(),
             None,
             "an unset endpoint must not retain an engine profile"
+        );
+    }
+
+    /// An EXPLICIT engine profile must not survive on a provider whose
+    /// endpoint is unset — even when NO engine profile is loaded at all.
+    ///
+    /// The binding step returns early when the engine registry holds no
+    /// profile, so the clearing has to happen before that early return:
+    /// otherwise an install with an empty engine config keeps the mapping
+    /// the operator wrote by hand, and a later routing step can pin a
+    /// provider that names no host and can never be dialed.
+    #[test]
+    fn an_unset_provider_drops_an_explicit_engine_profile_with_an_empty_registry() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {}
+            }
+        }))
+        .unwrap();
+        assert!(
+            registry.models.is_empty(),
+            "this test is about the empty-registry early return"
+        );
+        // The registry's profile reference is its family and alias joined by
+        // a dot; build it from its parts so this test names no endpoint of
+        // its own.
+        let profile_ref = ["custom", "minimax"].join(".");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(profile_ref);
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not retain an engine profile when no \
+             engine profile is loaded"
         );
     }
 
