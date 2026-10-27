@@ -99,6 +99,28 @@ pub fn parse_corpus_date(raw: &str) -> Option<chrono::NaiveDate> {
         .map(|dt| dt.date_naive())
 }
 
+/// The corpus's own data date, by ONE rule everywhere.
+///
+/// Precedence: the writer's full timestamp (`generated_at`) wins, then the
+/// `generated` build date, then the `arena_date` fallback. `generated`
+/// outranks `arena_date` because a freshly rebuilt corpus can sit on an older
+/// arena snapshot, and it is the FILE's age the operator needs to know.
+///
+/// Returns `None` when none of the three parses: a date we cannot read is
+/// "age unknown", never "fresh".
+pub fn corpus_data_date(
+    generated: &str,
+    arena_date: &str,
+    generated_at: Option<&str>,
+) -> Option<chrono::NaiveDate> {
+    if let Some(at) = generated_at.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(d) = parse_corpus_date(at) {
+            return Some(d);
+        }
+    }
+    parse_corpus_date(generated).or_else(|| parse_corpus_date(arena_date))
+}
+
 /// [`DEFAULT_STALE_DAYS`] unless `$ZODER_CORPUS_STALE_DAYS` says otherwise.
 ///
 /// A value that does not parse falls back to the default: silently disabling
@@ -730,6 +752,17 @@ enum OverlayRead {
 pub struct Corpus {
     #[serde(default)]
     pub source: String,
+    /// Top-level `"managed": true` in the corpus file: the file is managed by
+    /// its installer and must not be re-pulled or overwritten by zoder. It is
+    /// the same marker the pricing catalog carries, and the file-source
+    /// switch reads it from EITHER file, so a corpus that drops the marker on
+    /// save would silently unprotect the managed file it was protecting.
+    /// Carried through load and save: a refresh re-saves the corpus it
+    /// loaded, so the marker survives it. Omitted from the serialized form
+    /// when false, so a corpus written before the field existed stays
+    /// byte-identical to one written now.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
     /// The date this corpus was BUILT (`YYYY-MM-DD`), as the builder writes it.
     /// Optional: a corpus produced before the field existed simply has it
     /// empty, and `skip_serializing_if` keeps such a corpus byte-identical to
@@ -754,6 +787,11 @@ pub struct Corpus {
     /// was deployed keeps resolving those names after the overlay file is gone.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub aliases: BTreeMap<String, String>,
+    /// Full RFC3339 generation timestamp (with `Z`) when the writer had one.
+    /// Read-only metadata: `None` round-trips as absent so files without it
+    /// stay byte-identical. Wins over `arena_date` in `data_date`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
 }
 
 /// Wire shape for [`Corpus`] deserialization. Separated from `Corpus` so
@@ -766,6 +804,8 @@ struct CorpusWire {
     #[serde(default)]
     source: String,
     #[serde(default)]
+    managed: bool,
+    #[serde(default)]
     generated: String,
     #[serde(default)]
     arena_date: String,
@@ -773,20 +813,69 @@ struct CorpusWire {
     count: usize,
     #[serde(default)]
     models: Vec<ModelEntry>,
+    #[serde(default)]
+    generated_at: Option<String>,
 }
 
 impl From<CorpusWire> for Corpus {
     fn from(wire: CorpusWire) -> Self {
         let mut corpus = Corpus {
             source: wire.source,
+            managed: wire.managed,
             generated: wire.generated,
             arena_date: wire.arena_date,
             count: wire.count,
             models: wire.models,
             aliases: BTreeMap::new(),
+            generated_at: wire.generated_at,
         };
         corpus.rebuild_aliases_from_models();
         corpus
+    }
+}
+
+/// `skip_serializing_if` helper: a false `managed` marker is omitted from
+/// the serialized corpus, so a corpus written before the field existed stays
+/// byte-identical to one written now.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The corpus file's provenance metadata, WITHOUT the model rows.
+///
+/// The corpus file is large (the bundled one is ~1.6 MiB) and a command that
+/// only needs to know WHEN the installed data was built must not pay for a
+/// full parse. Every field the age warning needs is a top-level scalar, so
+/// the model rows are simply skipped while the file is scanned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusMetadata {
+    /// The provenance label the writer recorded (`public: ...`, an installer
+    /// name, ...). Empty when the file carries none.
+    #[serde(default)]
+    pub source: String,
+    /// Whether the file was installed by an installer that owns it.
+    #[serde(default)]
+    pub managed: bool,
+    /// The date the corpus was BUILT (`YYYY-MM-DD`), when the writer set it.
+    #[serde(default)]
+    pub generated: String,
+    /// The date of the underlying arena snapshot, the age fallback.
+    #[serde(default)]
+    pub arena_date: String,
+    /// The writer's full RFC3339 generation timestamp, when it had one.
+    #[serde(default)]
+    pub generated_at: Option<String>,
+}
+
+impl CorpusMetadata {
+    /// The corpus's own data date, by the same rule as
+    /// [`Corpus::data_date`].
+    pub fn data_date(&self) -> Option<chrono::NaiveDate> {
+        corpus_data_date(
+            &self.generated,
+            &self.arena_date,
+            self.generated_at.as_deref(),
+        )
     }
 }
 
@@ -814,6 +903,18 @@ fn alias_overlay_path_from(env_override: Option<std::ffi::OsString>, home: &Path
 }
 
 impl Corpus {
+    /// The corpus file's provenance metadata, read WITHOUT materialising the
+    /// model rows.
+    ///
+    /// Returns `None` when the file is missing or unreadable: a caller that
+    /// only wants to warn about the data's age has nothing to say about a
+    /// file it could not read. The model rows are skipped rather than
+    /// parsed, so this costs a scan of the file, not a corpus.
+    pub fn load_metadata(path: &Path) -> Option<CorpusMetadata> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<CorpusMetadata>(&raw).ok()
+    }
+
     /// Maximum trusted model-corpus size. Larger files are rejected before the
     /// body is read so a misconfigured `corpus_path` pointing at a multi-GB JSON
     /// can't OOM `Engine::load()`. The actual bundled corpus is ~1.6 MiB
@@ -1061,11 +1162,24 @@ impl Corpus {
 
         let mut corpus = Corpus {
             source: str_field("source"),
+            // The installer-managed marker is read here so a corpus that
+            // carries it keeps it through the load/save round trip a forced
+            // refresh performs. A non-boolean or absent marker is simply
+            // "not managed" -- the same reading `file_is_managed` applies to
+            // the raw file.
+            managed: root
+                .get("managed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             generated: str_field("generated"),
             arena_date: str_field("arena_date"),
             count: models.len(),
             models,
             aliases: BTreeMap::new(),
+            generated_at: root
+                .get("generated_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         };
         // Includes the legitimately-empty `{"models":[]}` path: rebuilding an
         // empty set is a no-op, but every Corpus that leaves this parser has
@@ -1195,14 +1309,13 @@ impl Corpus {
     /// fresh, but it also must not trip a staleness warning, and a negative
     /// number does neither.
     pub fn age_days(&self, today: chrono::NaiveDate) -> Option<i64> {
-        let built =
-            parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))?;
+        let built = self.data_date()?;
         Some((today - built).num_days())
     }
 
     /// The date [`Self::age_days`] measured from, for the warning text.
     pub fn age_date(&self) -> Option<chrono::NaiveDate> {
-        parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))
+        self.data_date()
     }
 
     /// A one-line warning when this corpus is older than `max_days`, or `None`
@@ -1672,6 +1785,23 @@ impl Corpus {
     /// the dir with a half-written file a later reader could pick up. Mirrors the
     /// `write_atomic` pattern in `crates/model-health/src/lib.rs` (kept
     /// self-contained here — no cross-crate dependency).
+    /// The corpus's own data date, by the same rules as
+    /// [`crate::pricing::data_date`]: the writer's full timestamp
+    /// (`generated_at`, RFC3339 with `Z`) when present, then the top-level
+    /// `generated` build date, then the `arena_date` the corpus has always
+    /// carried. Never the file's modification time.
+    ///
+    /// The three dates are read in ONE place ([`corpus_data_date`]) so the
+    /// age arithmetic ([`Self::age_days`]) and this accessor can never
+    /// disagree about which date the corpus is measured from.
+    pub fn data_date(&self) -> Option<chrono::NaiveDate> {
+        corpus_data_date(
+            &self.generated,
+            &self.arena_date,
+            self.generated_at.as_deref(),
+        )
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -1684,6 +1814,17 @@ impl Corpus {
         if let Err(e) = std::fs::write(&tmp, &data) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
+        }
+        // Pin the corpus file's mode: `fs::write` inherits the process
+        // umask, so a lax umask (0002, as on many fleet hosts) would leave
+        // the corpus group-writable for whoever else is in the group. If the
+        // mode cannot be made safe the temp is removed and the rename never
+        // happens, so a corpus nobody may safely replace is never installed.
+        if let Err(e) = crate::pricing::harden_catalog_mode(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(
+                e.context("the corpus could not be made safe to write; refusing to install it")
+            );
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -2033,6 +2174,37 @@ mod corpus_io_tests {
         }
         // Belt-and-suspenders: the legacy deterministic temp path never exists.
         assert!(!path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The corpus file's mode is pinned by the save: `fs::write` inherits the
+    // process umask, so a lax umask (0002, as on many fleet hosts) would
+    // leave the corpus group-writable for everyone else in the group.
+    #[test]
+    fn saved_corpus_is_not_group_or_world_writable() {
+        let _env = AliasEnvGuard::none();
+        let dir = tmpdir();
+        let path = dir.join("corpus.json");
+        let c = Corpus {
+            source: "test".into(),
+            models: vec![ModelEntry {
+                id: "vendor/m".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "a saved corpus must never be group- or world-writable"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3261,5 +3433,224 @@ mod staleness_tests {
     fn rfc3339_timestamps_are_accepted() {
         let c = corpus("2026-10-18T04:05:06Z", "");
         assert_eq!(Some(8), c.age_days(day("2026-10-26")));
+    }
+}
+
+#[cfg(test)]
+mod corpus_source_metadata_tests {
+    use super::*;
+
+    /// A corpus file that predates the `generated_at` field must load and
+    /// re-save WITHOUT the loader inventing the new top-level key. (Full
+    /// byte-equality is not asserted: the loader normalizes model rows,
+    /// which is pre-existing behavior — the regression this test pins is
+    /// the new field.)
+    #[test]
+    fn corpus_file_without_new_fields_round_trips_without_new_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        let original = br#"{
+    "source": "public: test",
+    "arena_date": "2026-10-13",
+    "count": 1,
+    "models": [
+        { "id": "prov-a/model-1", "kind": "chat", "free": true }
+    ]
+}"#;
+        std::fs::write(&path, original).unwrap();
+        // load_without_overlay so the ambient overlay cannot perturb the rows.
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert!(c.generated_at.is_none());
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap())
+        );
+        c.save(&path).unwrap();
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&resaved).unwrap();
+        assert!(
+            root.get("generated_at").is_none(),
+            "save must not invent a generated_at key the corpus never had: {resaved}"
+        );
+        assert_eq!(
+            root.get("arena_date").and_then(|v| v.as_str()),
+            Some("2026-10-13"),
+            "existing keys must survive"
+        );
+        assert_eq!(
+            root.get("count").and_then(|v| v.as_u64()),
+            Some(1),
+            "existing keys must survive"
+        );
+    }
+
+    #[test]
+    fn corpus_generated_at_wins_over_arena_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"arena_date": "2026-01-01", "generated_at": "2026-10-14T05:00:00Z", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+        assert!(!crate::pricing::file_is_managed(&path));
+        // managed marker in the corpus file:
+        std::fs::write(
+            &path,
+            r#"{"managed": true, "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        assert!(crate::pricing::file_is_managed(&path));
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(c.data_date(), None);
+    }
+
+    /// The corpus's data date must prefer the `generated` build date over the
+    /// `arena_date` fallback: a freshly rebuilt corpus can sit on an older
+    /// arena snapshot, and it is the FILE's age the operator needs to know.
+    /// The old accessor passed `arena_date` to the shared date rule and
+    /// dropped `generated` entirely.
+    #[test]
+    fn corpus_data_date_prefers_generated_over_arena_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"generated": "2026-10-14", "arena_date": "2026-01-01", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap()),
+            "the generated build date must win over the arena snapshot date"
+        );
+        // The age arithmetic must agree with the accessor: one date notion.
+        assert_eq!(
+            c.age_date(),
+            c.data_date(),
+            "the age must be measured from the same date the accessor reports"
+        );
+        assert_eq!(
+            c.age_days(chrono::NaiveDate::from_ymd_opt(2026, 10, 26).unwrap()),
+            Some(12)
+        );
+    }
+
+    /// `generated_at` (the writer's full timestamp) wins over both.
+    #[test]
+    fn corpus_data_date_prefers_generated_at_over_generated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"generated": "2026-01-01", "arena_date": "2025-12-01", "generated_at": "2026-10-14T05:00:00Z", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    /// The metadata reader returns the corpus file's provenance WITHOUT
+    /// materialising the model rows, and resolves the same date the corpus
+    /// itself resolves.
+    #[test]
+    fn corpus_metadata_reads_the_dates_without_the_model_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"source": "public: test", "managed": true, "generated": "2026-10-14", "arena_date": "2026-01-01", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let meta = Corpus::load_metadata(&path).expect("metadata must be readable");
+        assert_eq!(meta.source, "public: test");
+        assert!(meta.managed);
+        assert_eq!(meta.generated, "2026-10-14");
+        assert_eq!(
+            meta.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+        // A missing file has no metadata to report.
+        assert!(Corpus::load_metadata(&dir.path().join("absent.json")).is_none());
+        // A file that is not a corpus at all has no metadata either.
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"not json").unwrap();
+        assert!(Corpus::load_metadata(&junk).is_none());
+    }
+}
+
+#[cfg(test)]
+mod corpus_managed_marker_tests {
+    use super::*;
+
+    /// A corpus that carries the installer's `"managed": true` marker must
+    /// keep it across the load/save round trip a forced refresh performs.
+    /// The file-source switch reads the marker off the raw file, so a save
+    /// that dropped it would silently unprotect the very file the marker was
+    /// protecting: the next refresh would overwrite the installed corpus.
+    #[test]
+    fn managed_marker_survives_a_load_save_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"managed": true, "source": "an internal corpus", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        assert!(crate::pricing::file_is_managed(&path));
+
+        let loaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(
+            loaded.managed,
+            "the loader must carry the managed marker into the corpus"
+        );
+
+        loaded.save(&path).unwrap();
+
+        assert!(
+            crate::pricing::file_is_managed(&path),
+            "the managed marker must survive the save: {}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        let reloaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(
+            reloaded.managed,
+            "the marker must survive a load/save/load round trip"
+        );
+    }
+
+    /// The converse: a corpus that was never managed must not acquire the
+    /// marker by being saved. `skip_serializing_if` keeps the serialized
+    /// form byte-identical to what an older build wrote.
+    #[test]
+    fn unmanaged_corpus_gains_no_managed_key_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"source": "public: test", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+
+        let loaded = Corpus::load_without_overlay(&path).unwrap();
+        assert!(!loaded.managed);
+        loaded.save(&path).unwrap();
+
+        let resaved = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&resaved).unwrap();
+        assert!(
+            root.get("managed").is_none(),
+            "an unmanaged corpus must not gain a managed key: {resaved}"
+        );
+        assert!(!crate::pricing::file_is_managed(&path));
     }
 }
