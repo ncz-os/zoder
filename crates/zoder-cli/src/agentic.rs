@@ -6025,8 +6025,8 @@ async fn dispatch_confirmer(
 ) -> crate::review_confirm::ConfirmerAttempt {
     let started = std::time::Instant::now();
     let system = "You are a second-opinion confirmer for a code review finding.";
-    let instruction = crate::review_confirm::CONFIRMER_INSTRUCTION;
-    let user = format!("{context}\n\n{instruction}\nfinding-id: {finding_id}");
+    let instruction = crate::review_confirm::confirmer_instruction(finding_id);
+    let user = format!("{context}\n\n{instruction}");
     let result = dispatch_reviewer_for_model(
         cli,
         model,
@@ -21078,18 +21078,19 @@ model_provider = "custom.reviewer"
 }
 
 // ---------------------------------------------------------------------------
-// Confirm-on-reject: the confirmer runs at the CONFIRM configuration's
-// reasoning effort.
+// Confirm-on-reject: what the confirmer dispatch sends on the wire.
 //
 // The confirmation dispatch used to take the effort the reviewer took, so
 // the configured `[review.confirm].reasoning_effort` was never applied and
-// a confirmation could cost what a whole review costs. These tests drive
-// the confirmer dispatch against a wiremock provider and read the effort
-// off the wire.
+// a confirmation could cost what a whole review costs. It also carried a
+// literal `{FINDING_ID}` placeholder, while the reply is only read when
+// its `finding_id` matches the finding it answers. These tests drive the
+// confirmer dispatch against a wiremock provider and read the request off
+// the wire.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod confirm_reasoning_effort_tests {
+mod confirm_dispatch_tests {
     use super::*;
     use crate::test_env::EnvGuard;
     use clap::Parser;
@@ -21097,6 +21098,8 @@ mod confirm_reasoning_effort_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const MODEL: &str = "rv-model";
+    /// The finding the confirmer is asked about.
+    const FINDING_ID: &str = "f-123";
 
     /// An engine profile that pins `reasoning_effort = "none"`, and a zoder
     /// model entry that pins `"high"`. Between them they cover every
@@ -21190,7 +21193,7 @@ model_provider = "custom.reviewer"
             &cli,
             Some(&eng),
             MODEL,
-            "finding-id",
+            FINDING_ID,
             "the code under review",
             confirm_effort,
         )
@@ -21220,6 +21223,42 @@ model_provider = "custom.reviewer"
             body.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("low"),
             "the confirmer must run at the configured effort: {body}"
+        );
+    }
+
+    /// The confirmer is told WHICH finding it is answering about.
+    ///
+    /// The instruction used to carry a literal `{FINDING_ID}` placeholder,
+    /// and a reply is only read when its `finding_id` matches the finding
+    /// it answers: a model that copied the placeholder back had answered
+    /// about nothing at all, and the finding stayed blocking forever.
+    #[tokio::test]
+    async fn the_confirmer_is_told_which_finding_it_answers() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let body = confirmer_request_body(&server, dir.path(), &cfg_path, "low").await;
+        let user = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            })
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .expect("the confirmer sent a user message");
+        assert!(
+            user.contains(FINDING_ID),
+            "the prompt must name the finding: {user}"
+        );
+        assert!(
+            !user.contains("{FINDING_ID}"),
+            "the prompt must not carry an unsubstituted placeholder: {user}"
         );
     }
 

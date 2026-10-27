@@ -1543,12 +1543,20 @@ pub(crate) fn split_location(location: &str) -> Option<(String, Option<usize>)> 
 }
 
 /// The strict-JSON instruction appended to a confirmer prompt.
-pub(crate) const CONFIRMER_INSTRUCTION: &str = "You are a second-opinion confirmer. A reviewer raised the finding above. \
+///
+/// The finding id is SUBSTITUTED, not left as a placeholder: the reply is
+/// only read when its `finding_id` matches the finding it answers, and a
+/// model that copies the placeholder back answers about nothing at all.
+pub(crate) fn confirmer_instruction(finding_id: &str) -> String {
+    format!(
+        "You are a second-opinion confirmer. A reviewer raised the finding above. \
 Decide whether it is real. Answer with ONE JSON object only, no prose, of the form \
-{\"finding_id\": \"<the id above>\", \"disposition\": \"confirm\" | \"reject\" | \"insufficient\", \"quote\": \"<verbatim text copied from the context above>\", \"reason\": \"<one sentence>\"}. \
+{{\"finding_id\": \"{finding_id}\", \"disposition\": \"confirm\" | \"reject\" | \"insufficient\", \"quote\": \"<verbatim text copied from the context above>\", \"reason\": \"<one sentence>\"}}. \
 A confirm or reject MUST include a quote copied verbatim from the context; without one your answer counts as insufficient. \
 Use \"insufficient\" when the context does not let you decide. \\
-finding-id: {FINDING_ID}";
+finding-id: {finding_id}"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // I/O driver: perform the async confirmer calls the aggregator plans.
