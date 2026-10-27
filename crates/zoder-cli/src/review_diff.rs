@@ -254,6 +254,24 @@ fn sections(diff: &str) -> Vec<&str> {
     out
 }
 
+/// Repo-relative paths of every file the diff touches, in diff order.
+///
+/// Used by the confirmation layer's grounding check: a finding's quoted
+/// code must occur in the code under review, and the code under review is
+/// the changed files at their post-image.
+pub fn touched_paths(diff: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for section in sections(diff) {
+        let Some(path) = section_path(section) else {
+            continue;
+        };
+        if !out.iter().any(|p| p == &path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// Repo-relative path for one diff section, taken from the `+++`/`---` header
 /// (or `/dev/null` for pure adds/deletes). `None` when the section carries no
 /// path (e.g. a leading preamble).
