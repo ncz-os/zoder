@@ -9,11 +9,15 @@
 //! This module re-checks each blocking finding with a DIFFERENT model family
 //! before it may block:
 //!
-//! 1. **Pre-check, no model call.** A blocking finding must carry a verbatim
-//!    quote that is a substring of the text the reviewer was shown. An
-//!    unquoted (or mis-quoted) finding is downgraded to
-//!    `filtered_z3`-style unsupported — non-blocking, still reported — and
-//!    costs nothing (`quote_found = false`, zero calls).
+//! 1. **Pre-check, no model call.** A blocking finding is checked against
+//!    the code it claims to be about: the place it cites must exist at the
+//!    reviewed head, and the code it quotes must actually occur in the
+//!    reviewed text. A finding that is demonstrably NOT about the code —
+//!    its cited place does not exist, or EVERY code span it quotes occurs
+//!    nowhere — is downgraded to `filtered_z3`-style unsupported
+//!    (non-blocking, still reported) and costs nothing (zero calls). A
+//!    finding the check CANNOT disprove is never dropped: it reaches a
+//!    confirmer.
 //! 2. **Confirmer choice.** The chain comes from `[review.confirm].models`
 //!    (config roles, never hard-coded ids in code). A candidate is kept only
 //!    when its family differs from BOTH the reviewer's family and the
@@ -175,12 +179,20 @@ pub(crate) struct PendingFinding {
     pub id: String,
     pub severity: String,
     pub location: String,
-    /// The verbatim quote the reviewer supplied, if any.
+    /// The code the finding points at, when it quotes code that exists in
+    /// the reviewed text. This is the EVIDENCE, not the reviewer's prose:
+    /// a reviewer's prose is never a substring of the diff it was shown.
     pub quote: Option<String>,
     /// The claim text, normalised, for hashing and the confirmer prompt.
     pub claim: String,
-    /// Whether the reviewer's quote is a substring of the text it was shown.
+    /// Whether the finding's evidence quote was found in the reviewed text.
     pub quote_found: bool,
+    /// Whether the finding is anchored in the code under review at all.
+    /// Only a finding that is demonstrably not about the code may be
+    /// dropped before confirmation.
+    pub grounded: bool,
+    /// Why the finding is not anchored (empty when it is).
+    pub ungrounded_reason: String,
 }
 
 /// Everything a single finding's confirmation needs, resolved once.
@@ -361,7 +373,330 @@ pub(crate) fn finding_id(family: &str, path: &str, claim: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-check: the verbatim-quote requirement, with no model call.
+// Grounding: is the finding anchored in the code under review?
+// ---------------------------------------------------------------------------
+
+/// Collapse every whitespace run to a single space, so a span is matched
+/// against the reviewed text regardless of how it is indented there.
+fn normalise_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a byte is a "word" byte for the boundary rule: alphanumeric or
+/// underscore, the same set the offline evaluation's `\b` used.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `sentence` contains `marker` at WORD boundaries.
+///
+/// The offline evaluation matched its fix-proposal markers with
+/// `\b(should|instead|use |e\.g\.|...)\b`. A plain `contains` is not the
+/// same rule: it would read "prefix" as the marker "fix" and "shoulders" as
+/// the marker "should", and it would miss "change to" (the evaluation's
+/// `change (it )?to` also matched that). The difference decides whether a
+/// sentence's code spans are treated as evidence, so the boundary rule is
+/// reproduced exactly.
+fn contains_at_word_boundary(sentence: &str, marker: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    let marker = marker.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let needle = marker.as_bytes();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0usize;
+    while from <= bytes.len() {
+        let Some(rel) = lower[from..].find(&marker) else {
+            return false;
+        };
+        let at = from + rel;
+        let end = at + needle.len();
+        // The leading boundary: every marker starts with a word byte, so the
+        // byte before it must not be a word byte.
+        let lead_ok = at == 0 || !is_word_byte(bytes[at - 1]);
+        // The trailing boundary: when the marker ends with a word byte the
+        // next byte must not be a word byte; when it ends with a non-word
+        // byte (a space, a dot) the next byte must be a word byte. At the
+        // end of the text a boundary exists only after a word byte.
+        let tail_ok = if end >= bytes.len() {
+            is_word_byte(needle[needle.len() - 1])
+        } else if is_word_byte(needle[needle.len() - 1]) {
+            !is_word_byte(bytes[end])
+        } else {
+            is_word_byte(bytes[end])
+        };
+        if lead_ok && tail_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// A sentence that proposes a fix is not evidence of existing code: "this
+/// should use `foo`" describes what the code SHOULD be, not what it IS.
+///
+/// The markers are the evaluation's, matched at word boundaries.
+fn is_fix_proposal(sentence: &str) -> bool {
+    const FIX_MARKERS: [&str; 11] = [
+        "should",
+        "instead",
+        "use ",
+        "e.g.",
+        "replace",
+        "fix",
+        "consider",
+        "for example",
+        "change it to",
+        "change to",
+        "such as",
+    ];
+    FIX_MARKERS
+        .iter()
+        .any(|m| contains_at_word_boundary(sentence, m))
+}
+
+/// Split text into sentences: a `.`, `!` or `?` followed by whitespace (or
+/// the end of the text) ends a sentence.
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in chars.iter().enumerate() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let ends_here = match chars.get(idx + 1) {
+            None => true,
+            Some(next) => next.is_whitespace(),
+        };
+        if ends_here {
+            out.push(chars[start..=idx].iter().collect::<String>());
+            start = idx + 1;
+        }
+    }
+    if start < chars.len() {
+        out.push(chars[start..].iter().collect::<String>());
+    }
+    out
+}
+
+/// Whether a span looks like code rather than prose.
+fn looks_like_code(span: &str) -> bool {
+    if span.chars().any(|c| {
+        matches!(
+            c,
+            '(' | ')' | '[' | ']' | '=' | '.' | '_' | '/' | ':' | '"' | '\''
+        )
+    }) {
+        return true;
+    }
+    // A snake_case identifier.
+    let chars: Vec<char> = span.chars().collect();
+    chars
+        .windows(3)
+        .any(|w| w[0].is_ascii_lowercase() && w[1] == '_' && w[2].is_ascii_lowercase())
+}
+
+/// The code spans a finding presents as EXISTING code.
+///
+/// A backticked span of at least six characters that looks like code, taken
+/// only from the sentences that do NOT propose a fix. A reviewer writes
+/// "the loop `for x in xs` never breaks" (evidence) and "it should use
+/// `for x in xs`" (a proposal); only the first is evidence of what the code
+/// says.
+pub(crate) fn evidence_spans(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for sentence in split_sentences(text) {
+        if is_fix_proposal(&sentence) {
+            continue;
+        }
+        let parts: Vec<&str> = sentence.split('`').collect();
+        for span in parts.iter().skip(1).step_by(2) {
+            // The span is kept EXACTLY as it was written, whitespace and all:
+            // the length test and the code test both run on the raw span, and
+            // the whitespace-normalised form is only used for the search in
+            // the corpus. Trimming first would shorten a span past the
+            // length threshold and silently drop evidence.
+            if span.chars().count() < 6 || span.contains('\n') || !looks_like_code(span) {
+                continue;
+            }
+            out.push(span.to_string());
+        }
+    }
+    out
+}
+
+/// The path and the line a finding cites.
+///
+/// The path is everything before the FIRST colon and the line is the first
+/// `:<digits>` in the location, with an optional `line`/`lines` word in
+/// between (`main.rs:242`, `main.rs: line 242`, `main.rs:242-245` all name
+/// the same place). The rule is the one the recorded replay measured, and
+/// taking the path from the LAST colon instead would turn
+/// `main.rs: line 242` into a path that names no file at all - which would
+/// make the finding look like it cited a place that does not exist.
+pub(crate) fn cited_location(location: &str) -> Option<(String, Option<usize>)> {
+    let loc = location.trim();
+    if loc.is_empty() {
+        return None;
+    }
+    let path = loc.split(':').next().unwrap_or("").trim().to_string();
+    let bytes = loc.as_bytes();
+    let mut line = None;
+    for (idx, b) in bytes.iter().enumerate() {
+        if *b != b':' {
+            continue;
+        }
+        let mut rest = &loc[idx + 1..];
+        let trimmed = rest.trim_start();
+        let skipped = rest.len() - trimmed.len();
+        rest = trimmed;
+        // An optional `line` / `lines` word between the colon and the number.
+        let lower = rest.to_ascii_lowercase();
+        // The evaluation's rule is `line`/`lines` followed by optional
+        // whitespace and then the number, so the word may sit directly
+        // against the number ("line242") as well as before it
+        // ("line 242").
+        for word in ["lines", "line"] {
+            if lower.starts_with(word) {
+                rest = &rest[word.len()..];
+                rest = rest.trim_start();
+                break;
+            }
+        }
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let _ = skipped;
+            line = digits.parse::<usize>().ok();
+            break;
+        }
+    }
+    Some((path, line))
+}
+
+/// How a finding is anchored in the code under review.
+///
+/// The pre-check exists to stop a reviewer's noise from blocking a change,
+/// so it must only ever drop a finding that is DEMONSTRABLY not about the
+/// code. It can prove two things: that the cited place does not exist at
+/// the reviewed head, and that every code span the finding quotes occurs
+/// nowhere in the reviewed text. It can prove nothing else — a finding it
+/// cannot disprove must reach a confirmer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Grounding {
+    /// The cited path exists at the reviewed head and the cited line is in
+    /// range. `false` when the path does not exist. `true` when the finding
+    /// cites no path at all: there is no place to check, and an unchecked
+    /// place is not evidence of a wrong one.
+    pub location_ok: bool,
+    /// The code spans the finding quotes that DO occur in the reviewed text.
+    pub present: Vec<String>,
+    /// The code spans the finding quotes that occur NOWHERE in the reviewed
+    /// text — the spans it made up.
+    pub missing: Vec<String>,
+}
+
+impl Grounding {
+    /// The finding is anchored in the reviewed code.
+    ///
+    /// A finding is UNGROUNDED only when its cited place does not exist at
+    /// the reviewed head, or when every code span it quotes occurs nowhere
+    /// in the reviewed text. A finding that quotes no code at all is NOT
+    /// ungrounded: there is nothing to disprove, so it must reach a
+    /// confirmer.
+    pub(crate) fn grounded(&self) -> bool {
+        self.location_ok && (self.missing.is_empty() || !self.present.is_empty())
+    }
+
+    /// Why the finding is not anchored, or `None` when it is.
+    pub(crate) fn ungrounded_reason(&self) -> Option<String> {
+        if self.grounded() {
+            return None;
+        }
+        if !self.location_ok {
+            return Some("the cited location does not exist at the reviewed head".to_string());
+        }
+        Some("every code span the finding quotes is absent from the reviewed text".to_string())
+    }
+
+    /// The code span the finding points at: the first one that occurs in the
+    /// reviewed text, if any.
+    pub(crate) fn evidence_quote(&self) -> Option<&str> {
+        self.present.first().map(String::as_str)
+    }
+}
+
+/// Ground a finding against the reviewed head and the text the reviewer was
+/// shown.
+///
+/// `read` reads a file at the reviewed head; `corpus` is the text the
+/// reviewer was shown (its diff chunks plus the context header).
+///
+/// The rule was chosen from the measured replay, not from taste: over the
+/// 137 recorded findings (73 false, 62 real) this rule drops 15 of the 73
+/// false findings (20.5%) and loses 0 of the 62 real ones. The stricter
+/// variants were rejected on the same numbers: dropping a finding whose
+/// cited line is out of range but whose path exists loses no real finding
+/// but also blocks fewer false ones, and dropping on ANY missing span
+/// blocks 20 false findings while losing 5 real ones.
+pub(crate) fn ground_finding(
+    location: &str,
+    claim: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+    touched: &[String],
+) -> Grounding {
+    let mut grounding = Grounding::default();
+    let cited = cited_location(location);
+    // The cited place. A finding that cites no path has no place to check:
+    // it is neither confirmed nor disproved, so it stays groundable.
+    match cited.as_ref() {
+        Some((path, _)) if !path.is_empty() => {
+            let src = read(path);
+            grounding.location_ok = match (&src, cited.as_ref().and_then(|(_, l)| *l)) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(text), Some(line)) => {
+                    let count = text.lines().count();
+                    line >= 1 && line <= count
+                }
+            };
+        }
+        _ => grounding.location_ok = true,
+    }
+    // The corpus the evidence is searched in: the file the finding cites and
+    // every file the diff touches, at their post-image. The diff text alone
+    // is NOT the corpus: it shows the changed lines, while the code a finding
+    // quotes may sit anywhere in the touched files.
+    let mut corpus = String::new();
+    if let Some((path, _)) = cited.as_ref() {
+        if !path.is_empty() {
+            if let Some(text) = read(path) {
+                corpus.push_str(&normalise_ws(&text));
+                corpus.push('\n');
+            }
+        }
+    }
+    for path in touched {
+        if let Some(text) = read(path) {
+            corpus.push_str(&normalise_ws(&text));
+            corpus.push('\n');
+        }
+    }
+    for span in evidence_spans(claim) {
+        let needle = normalise_ws(&span);
+        if corpus.contains(&needle) {
+            grounding.present.push(span);
+        } else {
+            grounding.missing.push(span);
+        }
+    }
+    grounding
+}
+
+// ---------------------------------------------------------------------------
+// Pre-check: the grounding requirement, with no model call.
 // ---------------------------------------------------------------------------
 
 /// Whether `quote` appears verbatim in `shown`. Whitespace at the edges is
@@ -378,28 +713,37 @@ pub(crate) fn quote_in(quote: &str, shown: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Precheck {
     pub finding_id: String,
+    /// Whether the finding's evidence quote was found in the reviewed text.
     pub quote_found: bool,
-    /// `true` when the finding is dropped from blocking (unquoted), i.e. the
-    /// Z3-style unsupported downgrade. NOT a confirmer result.
+    /// `true` when the finding is dropped from blocking (ungrounded), i.e.
+    /// the Z3-style unsupported downgrade. NOT a confirmer result.
     pub dropped: bool,
+    /// Why the finding was dropped (empty when it was not).
+    pub reason: String,
 }
 
-/// Pre-check every finding that would otherwise block against the text the
-/// reviewer was shown.
+/// Pre-check every finding that would otherwise block against the code it
+/// claims to be about.
 ///
-/// A finding whose quote is absent or is not a substring is dropped from
-/// blocking and recorded as `filtered_z3`; **no model call is ever made for
-/// it** (it is absent from the returned pending set). A finding with a valid
-/// quote is returned as still pending confirmation.
+/// A finding that is demonstrably NOT about the code — its cited place does
+/// not exist at the reviewed head, or every code span it quotes occurs
+/// nowhere in the reviewed text — is dropped from blocking and recorded as
+/// `filtered_z3`; **no model call is ever made for it** (it is absent from
+/// the returned pending set). Every other finding is returned as still
+/// pending confirmation.
+///
+/// The dropped direction is the risky one: dropping a finding stops it from
+/// blocking, so the rule must never drop a finding it cannot disprove.
 pub(crate) fn precheck(findings: &[PendingFinding]) -> (Vec<Precheck>, Vec<PendingFinding>) {
     let mut checks = Vec::with_capacity(findings.len());
     let mut pending = Vec::with_capacity(findings.len());
     for finding in findings {
-        let dropped = !finding.quote_found;
+        let dropped = !finding.grounded;
         checks.push(Precheck {
             finding_id: finding.id.clone(),
             quote_found: finding.quote_found,
             dropped,
+            reason: finding.ungrounded_reason.clone(),
         });
         if !dropped {
             pending.push(finding.clone());
@@ -1106,17 +1450,7 @@ fn defines_or_imports(line: &str, symbol: &str) -> bool {
 
 /// Split a `path:line` location into the repo-relative path and the line.
 pub(crate) fn split_location(location: &str) -> Option<(String, Option<usize>)> {
-    let trimmed = location.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rsplit_once(':') {
-        Some((path, tail)) => match tail.trim().split('-').next().and_then(|n| n.parse().ok()) {
-            Some(line) if !path.trim().is_empty() => Some((path.trim().to_string(), Some(line))),
-            _ => Some((trimmed.to_string(), None)),
-        },
-        None => Some((trimmed.to_string(), None)),
-    }
+    cited_location(location)
 }
 
 /// The strict-JSON instruction appended to a confirmer prompt.
@@ -1242,16 +1576,56 @@ mod tests {
 
     const CTX: &str = "fn f() { let x = 1; }";
 
-    fn finding(sev: &str, claim: &str, quote: Option<&str>, shown: &str) -> PendingFinding {
-        let quote = quote.map(str::to_string);
-        let quote_found = quote_in(quote.as_deref().unwrap_or(""), shown);
+    /// The file the reviewed code lives in, and its body. The body holds the
+    /// one code span the tests quote, so a quoted span that occurs here is
+    /// PRESENT and any other quoted span is absent.
+    const SRC: &str = "crates/zoder-cli/src/main.rs";
+    const SRC_BODY: &str = "fn f() { let x = 1; }\n";
+
+    /// The reader production uses: it reads a file at the reviewed head.
+    fn read_src(path: &str) -> Option<String> {
+        if path == SRC {
+            Some(SRC_BODY.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Build a `PendingFinding` the way production does: the claim carries
+    /// the code the finding is about, the grounding check decides whether
+    /// the finding is anchored in the code under review, and the recorded
+    /// quote is the code span that actually occurs there.
+    ///
+    /// The old helper put the reviewer's PROSE in `quote` and asked
+    /// `quote_in` whether that prose was a substring of the diff. A
+    /// reviewer's prose essentially never is, so the helper produced
+    /// `quote_found = false` for nearly every finding — which is exactly
+    /// how the production pre-check came to drop every blocking finding.
+    /// The helper now mirrors production: the claim carries the code span,
+    /// and the span is what the grounding check looks for.
+    fn finding(sev: &str, claim: &str, quote: Option<&str>, _shown: &str) -> PendingFinding {
+        let claim = match quote {
+            Some(q) => format!("{claim} `{q}`"),
+            None => claim.to_string(),
+        };
+        let location = format!("{SRC}:1");
+        let grounding = ground_finding(
+            &location,
+            &claim,
+            &read_src,
+            std::slice::from_ref(&SRC.to_string()),
+        );
+        let quote = grounding.evidence_quote().map(str::to_string);
+        let quote_found = quote.is_some();
         PendingFinding {
-            id: finding_id("fam", "src/a.rs", claim),
+            id: finding_id("fam", &location, &claim),
             severity: sev.to_string(),
-            location: "src/a.rs:1".to_string(),
+            location,
             quote,
-            claim: claim.to_string(),
+            claim,
             quote_found,
+            grounded: grounding.grounded(),
+            ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
         }
     }
 
@@ -1306,18 +1680,100 @@ mod tests {
         ConfirmLimits::default()
     }
 
-    // ---- pre-check: unquoted finding drops with ZERO model calls ---------
+    // ---- pre-check: an UNGROUNDED finding drops with ZERO model calls ---
 
+    /// A finding that quotes NO code is NOT dropped.
+    ///
+    /// The pre-check exists to drop a finding that is demonstrably not about
+    /// the code. A finding that quotes no code has nothing to disprove, so
+    /// dropping it would drop a real finding on no evidence: the check would
+    /// be a filter that removes whatever it cannot read.
     #[test]
-    fn precheck_drops_unquoted_finding_without_a_model_call() {
-        let quoted = finding("high", "x is unused", Some("let x"), CTX);
-        let unquoted = finding("critical", "y is wrong", Some("not in the diff"), CTX);
-        let (checks, pending) = precheck(&[quoted.clone(), unquoted.clone()]);
+    fn a_finding_without_code_spans_is_not_dropped() {
+        let f = finding("high", "the loop never breaks", None, CTX);
+        assert!(f.grounded, "a finding without code spans is not disproved");
+        let (checks, pending) = precheck(&[f]);
+        assert!(!checks[0].dropped);
+        assert!(checks[0].reason.is_empty());
+        assert_eq!(pending.len(), 1, "it must reach a confirmer");
+    }
+
+    /// A finding whose cited place does not exist at the reviewed head IS
+    /// dropped, and the reason says so.
+    #[test]
+    fn a_finding_citing_a_place_that_does_not_exist_is_dropped() {
+        let mut f = finding("high", "x is unused", Some("let x = 1"), CTX);
+        // A file that is not in the reviewed tree at all.
+        f.location = "crates/zoder-cli/src/does_not_exist.rs:1".to_string();
+        let grounding = ground_finding(
+            &f.location,
+            &f.claim,
+            &read_src,
+            std::slice::from_ref(&SRC.to_string()),
+        );
+        assert!(!grounding.location_ok);
+        f.grounded = grounding.grounded();
+        f.ungrounded_reason = grounding.ungrounded_reason().unwrap_or_default();
+        let (checks, pending) = precheck(&[f]);
+        assert!(checks[0].dropped);
+        assert!(
+            checks[0].reason.contains("location"),
+            "the reason must name the location: {}",
+            checks[0].reason
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// A finding whose EVERY quoted span occurs nowhere in the reviewed code
+    /// is dropped: it quotes code that does not exist.
+    #[test]
+    fn a_finding_whose_every_span_is_absent_is_dropped() {
+        let f = finding("critical", "y is wrong", Some("not_in_the_code"), CTX);
+        assert!(!f.grounded);
+        let (checks, pending) = precheck(&[f]);
+        assert!(checks[0].dropped);
+        assert!(
+            checks[0].reason.contains("absent"),
+            "the reason must name the missing spans: {}",
+            checks[0].reason
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// A finding with ONE present span survives even when another span is
+    /// absent: one real code reference is enough to keep it in play.
+    #[test]
+    fn a_finding_with_one_present_span_is_kept() {
+        let f = finding("high", "the value is wrong", Some("let x = 1"), CTX);
+        let mut f = f;
+        f.claim = format!("{} and `not_in_the_code`", f.claim);
+        let grounding = ground_finding(
+            &f.location,
+            &f.claim,
+            &read_src,
+            std::slice::from_ref(&SRC.to_string()),
+        );
+        assert_eq!(grounding.present.len(), 1);
+        assert_eq!(grounding.missing.len(), 1);
+        assert!(grounding.grounded(), "one present span keeps the finding");
+        f.grounded = grounding.grounded();
+        let (checks, pending) = precheck(&[f]);
+        assert!(!checks[0].dropped);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// The dropped finding costs NO model call, and the kept one costs
+    /// exactly one.
+    #[test]
+    fn a_dropped_finding_costs_no_model_call() {
+        let quoted = finding("high", "x is unused", Some("let x = 1"), CTX);
+        let ungrounded = finding("critical", "y is wrong", Some("not_in_the_code"), CTX);
+        let (checks, pending) = precheck(&[quoted.clone(), ungrounded.clone()]);
         assert!(checks[0].quote_found);
         assert!(!checks[0].dropped);
         assert!(!checks[1].quote_found);
-        assert!(checks[1].dropped, "an unquoted finding must drop");
-        // Only the quoted finding may reach a confirmer.
+        assert!(checks[1].dropped, "an ungrounded finding must drop");
+        // Only the grounded finding may reach a confirmer.
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, quoted.id);
 
@@ -1331,22 +1787,173 @@ mod tests {
         });
         assert_eq!(calls, 1, "zero calls may be made for the dropped finding");
         assert!(review.effective_blocking);
-        let _ = unquoted;
+        let _ = ungrounded;
     }
 
+    // ---- grounding: the rules the pre-check is built on -----------------
+
+    /// A code span is a backticked span of at least six characters that
+    /// looks like code.
     #[test]
-    fn precheck_missing_quote_also_drops() {
-        let f = finding("high", "no quote at all", None, CTX);
-        let (checks, pending) = precheck(&[f]);
-        assert!(checks[0].dropped);
-        assert!(pending.is_empty());
+    fn evidence_spans_takes_backticked_code_only() {
+        let spans = evidence_spans(
+            "The call `let x = 1` happens and `obj.method()` runs. The word `important` is prose.",
+        );
+        assert_eq!(
+            spans,
+            vec!["let x = 1".to_string(), "obj.method()".to_string()],
+            "only code spans are evidence: {spans:?}"
+        );
+    }
+
+    /// A span shorter than six characters is not evidence, however much it
+    /// looks like code.
+    #[test]
+    fn evidence_spans_ignores_short_spans() {
+        assert!(evidence_spans("The flag `x` is set.").is_empty());
+        assert!(evidence_spans("The call `f()` runs.").is_empty());
+    }
+
+    /// A sentence that proposes a fix describes what the code SHOULD be,
+    /// not what it IS, so it is not evidence.
+    #[test]
+    fn evidence_spans_ignores_a_sentence_that_proposes_a_fix() {
+        let spans = evidence_spans("It should use `obj.method()` instead of the current code.");
+        assert!(
+            spans.is_empty(),
+            "a proposal is not evidence of existing code: {spans:?}"
+        );
+    }
+
+    /// The fix-proposal markers are matched at WORD boundaries: a plain
+    /// containment would read "prefix" as the marker "fix" and "shoulders"
+    /// as the marker "should".
+    #[test]
+    fn fix_markers_are_matched_at_word_boundaries() {
+        assert!(contains_at_word_boundary("it should break", "should"));
+        assert!(!contains_at_word_boundary(
+            "it shoulders the load",
+            "should"
+        ));
+        assert!(!contains_at_word_boundary("the prefix is wrong", "fix"));
+        assert!(contains_at_word_boundary("change to the loop", "change to"));
+    }
+
+    /// A finding that cites a file that is not in the reviewed tree is not
+    /// anchored in the code.
+    #[test]
+    fn ground_finding_marks_a_missing_cited_path() {
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() {}\n".to_string());
+        let g = ground_finding("src/missing.rs:3", "nothing here", &read, &[]);
+        assert!(!g.location_ok);
+        assert!(!g.grounded());
+        assert!(
+            g.ungrounded_reason()
+                .unwrap_or_default()
+                .contains("location"),
+            "the reason must name the location"
+        );
+    }
+
+    /// A finding that cites a line past the end of the file is not anchored
+    /// in the code either.
+    #[test]
+    fn ground_finding_marks_an_out_of_range_line() {
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() {}\n".to_string());
+        let g = ground_finding("src/a.rs:99", "nothing here", &read, &[]);
+        assert!(
+            !g.location_ok,
+            "a line past the end of the file is not a place"
+        );
+        assert!(!g.grounded());
+    }
+
+    /// The corpus is the cited file PLUS every file the change touches: a
+    /// finding often quotes code that lives in a file it did not cite.
+    #[test]
+    fn ground_finding_finds_a_span_in_a_touched_file() {
+        let read = |path: &str| match path {
+            "src/a.rs" => Some("fn a() {}\n".to_string()),
+            "src/b.rs" => Some("fn b() { let y = 2; }\n".to_string()),
+            _ => None,
+        };
+        let g = ground_finding(
+            "src/a.rs:1",
+            "the `let y = 2` is wrong",
+            &read,
+            &["src/b.rs".to_string()],
+        );
+        assert_eq!(g.present, vec!["let y = 2".to_string()]);
+        assert!(g.missing.is_empty());
+        assert!(g.grounded());
+    }
+
+    /// A span that occurs nowhere in the reviewed code is reported as
+    /// missing, and a finding whose every span is missing is not anchored.
+    #[test]
+    fn ground_finding_reports_a_span_that_is_nowhere() {
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() {}\n".to_string());
+        let g = ground_finding("src/a.rs:1", "the `let y = 2` is wrong", &read, &[]);
+        assert!(g.present.is_empty());
+        assert_eq!(g.missing, vec!["let y = 2".to_string()]);
+        assert!(!g.grounded());
+        assert!(
+            g.ungrounded_reason().unwrap_or_default().contains("absent"),
+            "the reason must name the missing spans"
+        );
+    }
+
+    /// The cited place is the path before the FIRST colon and the first
+    /// number after it, with an optional `line`/`lines` word in between.
+    ///
+    /// Taking the path from the LAST colon instead would turn `main.rs: line
+    /// 242` into a path that names no file at all, which would make the
+    /// finding look like it cited a place that does not exist.
+    #[test]
+    fn cited_location_reads_the_path_before_the_first_colon() {
+        assert_eq!(
+            cited_location("crates/zoder-cli/src/main.rs:242"),
+            Some(("crates/zoder-cli/src/main.rs".to_string(), Some(242)))
+        );
+        assert_eq!(
+            cited_location("main.rs: line 242"),
+            Some(("main.rs".to_string(), Some(242)))
+        );
+        assert_eq!(
+            cited_location("main.rs:lines 242"),
+            Some(("main.rs".to_string(), Some(242)))
+        );
+        assert_eq!(
+            cited_location("main.rs:242-245"),
+            Some(("main.rs".to_string(), Some(242)))
+        );
+        assert_eq!(
+            cited_location("main.rs"),
+            Some(("main.rs".to_string(), None))
+        );
+        assert_eq!(cited_location("   "), None);
+    }
+
+    /// The cited window reads the file the location NAMES. A location
+    /// written as `main.rs: line 1` names the file `main.rs`.
+    #[test]
+    fn the_cited_window_reads_the_file_the_location_names() {
+        let mut f = finding("high", "x", Some("let x = 1"), CTX);
+        f.location = "main.rs: line 1".to_string();
+        let file = "fn f() { let x = 1; }\n";
+        let read = move |path: &str| (path == "main.rs").then(|| file.to_string());
+        let window = cited_window(&f, &read, 20).expect("the cited file must be found");
+        assert!(
+            window.contains("let x = 1"),
+            "the window must show the cited file: {window}"
+        );
     }
 
     // ---- aggregation branches -------------------------------------------
 
     #[test]
     fn confirm_keeps_blocking() {
-        let j = job(finding("high", "c", Some("let x"), CTX), &["c1", "c2"]);
+        let j = job(finding("high", "c", Some("let x = 1"), CTX), &["c1", "c2"]);
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Confirm)
         });
@@ -1357,7 +1964,7 @@ mod tests {
 
     #[test]
     fn one_high_reject_demotes() {
-        let j = job(finding("high", "h", Some("let x"), CTX), &["c1"]);
+        let j = job(finding("high", "h", Some("let x = 1"), CTX), &["c1"]);
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Reject)
         });
@@ -1370,7 +1977,7 @@ mod tests {
 
     #[test]
     fn one_critical_reject_does_not_demote() {
-        let j = job(finding("critical", "cr", Some("let x"), CTX), &["c1"]);
+        let j = job(finding("critical", "cr", Some("let x = 1"), CTX), &["c1"]);
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Reject)
         });
@@ -1383,7 +1990,7 @@ mod tests {
     #[test]
     fn two_independent_critical_rejects_demote() {
         let j = job(
-            finding("critical", "cr2", Some("let x"), CTX),
+            finding("critical", "cr2", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
         let review = aggregate(&[j], &limits(), &mut |m, _| {
@@ -1404,7 +2011,7 @@ mod tests {
     fn second_critical_reject_from_same_family_does_not_count() {
         // Two rejects, but the same family: not independent, so no demotion.
         let j = job(
-            finding("critical", "cr3", Some("let x"), CTX),
+            finding("critical", "cr3", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
         let review = aggregate(&[j], &limits(), &mut |m, _| {
@@ -1423,7 +2030,7 @@ mod tests {
             ConfirmerOutcome::Empty,
             ConfirmerOutcome::Unparsed,
         ] {
-            let j = job(finding("high", "f", Some("let x"), CTX), &["c1"]);
+            let j = job(finding("high", "f", Some("let x = 1"), CTX), &["c1"]);
             let review = aggregate(&[j], &limits(), &mut |m, _| failed(m, "other", outcome));
             assert!(
                 review.effective_blocking,
@@ -1444,7 +2051,7 @@ mod tests {
 
     #[test]
     fn insufficient_verdict_keeps_blocking() {
-        let j = job(finding("high", "i", Some("let x"), CTX), &["c1"]);
+        let j = job(finding("high", "i", Some("let x = 1"), CTX), &["c1"]);
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Insufficient)
         });
@@ -1456,8 +2063,11 @@ mod tests {
     fn unconfirmed_findings_never_yield_non_request_changes() {
         // A mix: one confirmed, one failed. The review must still block.
         let jobs = vec![
-            job(finding("high", "a", Some("let x"), CTX), &["c1"]),
-            job(finding("critical", "b", Some("let x"), CTX), &["c1", "c2"]),
+            job(finding("high", "a", Some("let x = 1"), CTX), &["c1"]),
+            job(
+                finding("critical", "b", Some("let x = 1"), CTX),
+                &["c1", "c2"],
+            ),
         ];
         let review = aggregate(&jobs, &limits(), &mut |m, _| {
             if m == "c1" {
@@ -1478,7 +2088,7 @@ mod tests {
         let jobs: Vec<ConfirmationJob> = (0..9)
             .map(|i| {
                 let claim = format!("claim number {i}");
-                job(finding("high", &claim, Some("let x"), CTX), &["c1"])
+                job(finding("high", &claim, Some("let x = 1"), CTX), &["c1"])
             })
             .collect();
         let mut calls = 0usize;
@@ -1498,9 +2108,9 @@ mod tests {
         // Two findings: one has a confirmer (rejects -> demoted), one has an
         // empty chain (never reached a confirmer). The recall denominator must
         // be 1, not 2, so recall == 1.0 rather than 0.5.
-        let demoted_job = job(finding("high", "reached", Some("let x"), CTX), &["c1"]);
+        let demoted_job = job(finding("high", "reached", Some("let x = 1"), CTX), &["c1"]);
         let unreached_job = ConfirmationJob {
-            plan: plan(finding("high", "unreached", Some("let x"), CTX), &[]),
+            plan: plan(finding("high", "unreached", Some("let x = 1"), CTX), &[]),
             confirmers: Vec::new(),
         };
         let review = aggregate(&[demoted_job, unreached_job], &limits(), &mut |m, _| {
@@ -1524,7 +2134,7 @@ mod tests {
         let jobs: Vec<ConfirmationJob> = (0..9)
             .map(|i| {
                 job(
-                    finding("high", &format!("budget claim {i}"), Some("let x"), CTX),
+                    finding("high", &format!("budget claim {i}"), Some("let x = 1"), CTX),
                     &["c1"],
                 )
             })
@@ -1574,7 +2184,7 @@ mod tests {
         // The same confirmer repeated in the chain must be called once.
         let j = ConfirmationJob {
             plan: plan(
-                finding("critical", "dup", Some("let x"), CTX),
+                finding("critical", "dup", Some("let x = 1"), CTX),
                 &["c1", "c1", "c1"],
             ),
             confirmers: vec!["c1".into(), "c1".into(), "c1".into()],
@@ -1661,7 +2271,7 @@ mod tests {
 
     #[test]
     fn record_shape_v1_round_trips() {
-        let j = job(finding("high", "rt", Some("let x"), CTX), &["c1"]);
+        let j = job(finding("high", "rt", Some("let x = 1"), CTX), &["c1"]);
         let review = aggregate(&[j], &limits(), &mut |m, _| {
             attempt(m, "other", ParsedDisposition::Reject)
         });
@@ -1675,8 +2285,8 @@ mod tests {
         let f = &parsed.findings[0];
         assert_eq!(f.id, review.decisions[0].finding_id);
         assert_eq!(f.severity, "high");
-        assert_eq!(f.location, "src/a.rs:1");
-        assert_eq!(f.quote.as_deref(), Some("let x"));
+        assert_eq!(f.location, format!("{SRC}:1"));
+        assert_eq!(f.quote.as_deref(), Some("let x = 1"));
         assert!(f.quote_found);
         assert_eq!(f.disposition, Disposition::Rejected);
         // reviewers[0] is the reviewer; the confirmer follows.
@@ -1702,7 +2312,7 @@ mod tests {
     #[test]
     fn record_includes_all_required_finding_fields() {
         let j = job(
-            finding("critical", "fields", Some("let x"), CTX),
+            finding("critical", "fields", Some("let x = 1"), CTX),
             &["c1", "c2"],
         );
         let review = aggregate(&[j], &limits(), &mut |m, _| {
@@ -1742,7 +2352,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let read = move |_: &str| Some(file.clone());
-        let f = finding("high", "something about foo", Some("let x"), CTX);
+        let f = finding("high", "something about foo", Some("let x = 1"), CTX);
         let ctx = build_context(&f, "diff body", &read, 20);
         // The hunk and the windowed file are present, but bounded.
         assert!(ctx.contains("diff body"));
@@ -1798,7 +2408,7 @@ mod tests {
         // No confirmer could be resolved (empty chain). The finding is not_run
         // but MUST still block, and the review must still request changes.
         let j = ConfirmationJob {
-            plan: plan(finding("critical", "no chain", Some("let x"), CTX), &[]),
+            plan: plan(finding("critical", "no chain", Some("let x = 1"), CTX), &[]),
             confirmers: Vec::new(),
         };
         let mut calls = 0usize;

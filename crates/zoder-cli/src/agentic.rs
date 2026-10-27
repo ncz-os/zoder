@@ -5669,14 +5669,6 @@ unbound, or missing imports:\n{context}"
     });
     let results = futures_util::future::join_all(futs).await;
 
-    // The exact text each reviewer was shown: its chunk plan's user prompts.
-    // The confirm pre-check compares a finding's quote against this.
-    let shown_for_reviews: Vec<String> = models
-        .iter()
-        .zip(&slot_plan_idx)
-        .map(|(_, &i)| plans[i].users.join("\n\n"))
-        .collect();
-
     // Outcome accounting:
     //   * `ok_models`  - the reviewer slots whose completions succeeded
     //                    (`ReviewerSlot::Ok`); only these cast a verdict vote.
@@ -5727,7 +5719,7 @@ unbound, or missing imports:\n{context}"
     let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
     if let Some(e) = eng.as_ref() {
         let author_families: Vec<String> = Vec::new();
-        for (slot_idx, slot) in reviews.iter_mut().enumerate() {
+        for slot in reviews.iter_mut() {
             let ReviewerSlot::Ok { model, review } = slot else {
                 continue;
             };
@@ -5741,14 +5733,12 @@ unbound, or missing imports:\n{context}"
             {
                 continue;
             }
-            let shown = shown_for_reviews.get(slot_idx).cloned().unwrap_or_default();
             let reviewer_model = model.clone();
             if let Some((section, verdict)) = confirm_review(
                 cli,
                 Some(e),
                 review,
                 &reviewer_model,
-                &shown,
                 &diff,
                 &read_post_image,
                 &author_families,
@@ -5866,18 +5856,28 @@ struct ReviewAggregate<'a> {
 /// Build the `PendingFinding` list for confirmation from a reviewer's output.
 ///
 /// Only findings are converted here; the caller decides whether the verdict
-/// triggers confirmation. The reviewer's `Finding` has no dedicated quote
-/// field, so the verbatim quote is its `body` — the reviewer's own text.
-/// `quote_found` is computed against `shown`, the exact text the reviewer was
-/// shown (its diff chunks plus the context header). A finding whose body is
-/// empty, or is not a substring of `shown`, sets `quote_found = false` and is
-/// dropped by the pre-check without a model call.
+/// triggers confirmation.
+///
+/// The reviewer's `Finding` has no dedicated quote field: its `body` is the
+/// reviewer's own PROSE, and prose is never a substring of the diff the
+/// reviewer was shown. Treating that prose as a quote made every blocking
+/// finding look unsupported, which dropped every one of them and turned a
+/// `request_changes` into a `comment` — the review stopped blocking
+/// entirely, which is a fail-open, not a filter.
+///
+/// So the evidence is grounded instead: the finding's code spans are
+/// extracted from the claim, and the finding is checked against the code at
+/// the reviewed head — the cited place must exist, and the code the finding
+/// quotes must actually occur in the reviewed text. A finding that is
+/// demonstrably not about the code is dropped; every other finding reaches
+/// a confirmer.
 fn pending_findings_for_confirm(
     review: &ReviewOutput,
     reviewer_family: &str,
-    shown: &str,
+    touched: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<crate::review_confirm::PendingFinding> {
-    use crate::review_confirm::{finding_id, quote_in, PendingFinding};
+    use crate::review_confirm::{finding_id, PendingFinding};
     review
         .findings
         .iter()
@@ -5888,13 +5888,9 @@ fn pending_findings_for_confirm(
                 format!("{} {}", f.title, f.body)
             };
             let location = f.location.clone().unwrap_or_default();
-            let body = f.body.trim();
-            let quote = if body.is_empty() {
-                None
-            } else {
-                Some(body.to_string())
-            };
-            let quote_found = quote.as_deref().is_some_and(|q| quote_in(q, shown));
+            let grounding = crate::review_confirm::ground_finding(&location, &claim, read, touched);
+            let quote = grounding.evidence_quote().map(str::to_string);
+            let quote_found = quote.is_some();
             PendingFinding {
                 id: finding_id(reviewer_family, &location, &claim),
                 severity: f.severity.clone(),
@@ -5902,6 +5898,8 @@ fn pending_findings_for_confirm(
                 quote,
                 claim,
                 quote_found,
+                grounded: grounding.grounded(),
+                ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
             }
         })
         .collect()
@@ -5934,7 +5932,6 @@ async fn confirm_review(
     eng: Option<&Engine>,
     review: &ReviewOutput,
     reviewer_model: &str,
-    shown: &str,
     hunk: &str,
     read: &dyn Fn(&str) -> Option<String>,
     author_families: &[String],
@@ -5955,7 +5952,11 @@ async fn confirm_review(
     let family_of_owned = |m: &str| -> Option<String> { eng.map(|e| e.cfg.model_family(m)) };
     let family_of: &dyn Fn(&str) -> Option<String> = &family_of_owned;
 
-    let all = pending_findings_for_confirm(review, &reviewer_family, shown);
+    // The files the diff touches at their post-image: the code a finding
+    // quotes has to occur in one of them (or in the file it cites) for the
+    // finding to be about the change at all.
+    let touched = crate::review_diff::touched_paths(hunk);
+    let all = pending_findings_for_confirm(review, &reviewer_family, &touched, read);
     if all.is_empty() {
         return None;
     }
@@ -6020,7 +6021,11 @@ async fn confirm_review(
         return Some((payload, verdict));
     }
 
-    // Pre-check the blocking set: unquoted findings drop with no model call.
+    // Pre-check the blocking set: findings that are demonstrably NOT about
+    // the code drop with no model call. The reason says WHY the finding was
+    // dropped — the place it cited, or the spans it quoted — so the record
+    // is auditable and a reviewer can tell a proven-ungrounded finding from
+    // a merely unconfirmed one.
     let (checks, pending) = precheck(&blocking);
     for preroll in &checks {
         if preroll.dropped {
@@ -6033,7 +6038,11 @@ async fn confirm_review(
                     quote_found: f.quote_found,
                     disposition: Disposition::FilteredZ3,
                     blocking: false,
-                    reason: "quote is not a verbatim substring of the reviewed text".to_string(),
+                    reason: if preroll.reason.is_empty() {
+                        "the finding is not grounded in the code under review".to_string()
+                    } else {
+                        preroll.reason.clone()
+                    },
                     attempts: Vec::new(),
                 });
             }
