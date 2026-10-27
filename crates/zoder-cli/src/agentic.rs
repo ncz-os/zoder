@@ -5277,6 +5277,7 @@ pub(crate) async fn cmd_review(
                 receipts: &[],
                 exclusions: None,
                 chunking: None,
+                confirm: &[],
             },
         );
         anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
@@ -5303,6 +5304,7 @@ pub(crate) async fn cmd_review(
                 receipts: &[],
                 exclusions: None,
                 chunking: None,
+                confirm: &[],
             },
         );
         return Ok(());
@@ -5612,6 +5614,7 @@ unbound, or missing imports:\n{context}"
                 receipts: &[],
                 exclusions: Some(&prepared.excluded),
                 chunking: None,
+                confirm: &[],
             },
         );
         anyhow::bail!(
@@ -5666,6 +5669,14 @@ unbound, or missing imports:\n{context}"
     });
     let results = futures_util::future::join_all(futs).await;
 
+    // The exact text each reviewer was shown: its chunk plan's user prompts.
+    // The confirm pre-check compares a finding's quote against this.
+    let shown_for_reviews: Vec<String> = models
+        .iter()
+        .zip(&slot_plan_idx)
+        .map(|(_, &i)| plans[i].users.join("\n\n"))
+        .collect();
+
     // Outcome accounting:
     //   * `ok_models`  - the reviewer slots whose completions succeeded
     //                    (`ReviewerSlot::Ok`); only these cast a verdict vote.
@@ -5709,6 +5720,49 @@ unbound, or missing imports:\n{context}"
             }
         }
     }
+    // Confirm-on-reject: re-check every high/critical blocking finding with a
+    // different model family before it may block. Only a `request_changes`
+    // verdict is confirmed; an approve stays advisory. A confirmer failure
+    // keeps the finding blocking — it is never a rejection.
+    let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
+    if let Some(e) = eng.as_ref() {
+        let author_families: Vec<String> = Vec::new();
+        for (slot_idx, slot) in reviews.iter_mut().enumerate() {
+            let ReviewerSlot::Ok { model, review } = slot else {
+                continue;
+            };
+            if !verdict_triggers_confirmation(&review.verdict) {
+                continue;
+            }
+            if !review
+                .findings
+                .iter()
+                .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
+            {
+                continue;
+            }
+            let shown = shown_for_reviews.get(slot_idx).cloned().unwrap_or_default();
+            let reviewer_model = model.clone();
+            if let Some((section, verdict)) = confirm_review(
+                cli,
+                Some(e),
+                review,
+                &reviewer_model,
+                &shown,
+                &diff,
+                &read_post_image,
+                &author_families,
+            )
+            .await
+            {
+                confirm_sections.push(section);
+                // The confirmed verdict supersedes the reviewer's own: a review
+                // whose findings all demoted is no longer request_changes.
+                review.verdict = verdict;
+            }
+        }
+    }
+
     let requested = models.len();
     let failed_count = requested.saturating_sub(ok_models);
     let aggregate = ReviewAggregate {
@@ -5720,6 +5774,7 @@ unbound, or missing imports:\n{context}"
         receipts: &receipts,
         exclusions: Some(&prepared.excluded),
         chunking: Some(head_plan.chunking.clone()),
+        confirm: &confirm_sections,
     };
 
     let agg = emit_reviews(cli, &aggregate);
@@ -5798,6 +5853,330 @@ struct ReviewAggregate<'a> {
     /// The route-specific decision and byte accounting used to choose one or
     /// multiple chunks.
     chunking: Option<serde_json::Value>,
+    /// The confirm-on-reject section (record shape v1) for each confirmed
+    /// reviewer, when confirmation ran. Absent (empty) for an approve or a
+    /// review with no blocking finding.
+    confirm: &'a [serde_json::Value],
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: bridge between the review output and the confirm layer.
+// ---------------------------------------------------------------------------
+
+/// Build the `PendingFinding` list for confirmation from a reviewer's output.
+///
+/// Only findings are converted here; the caller decides whether the verdict
+/// triggers confirmation. The reviewer's `Finding` has no dedicated quote
+/// field, so the verbatim quote is its `body` — the reviewer's own text.
+/// `quote_found` is computed against `shown`, the exact text the reviewer was
+/// shown (its diff chunks plus the context header). A finding whose body is
+/// empty, or is not a substring of `shown`, sets `quote_found = false` and is
+/// dropped by the pre-check without a model call.
+fn pending_findings_for_confirm(
+    review: &ReviewOutput,
+    reviewer_family: &str,
+    shown: &str,
+) -> Vec<crate::review_confirm::PendingFinding> {
+    use crate::review_confirm::{finding_id, quote_in, PendingFinding};
+    review
+        .findings
+        .iter()
+        .map(|f| {
+            let claim = if f.body.trim().is_empty() {
+                f.title.clone()
+            } else {
+                format!("{} {}", f.title, f.body)
+            };
+            let location = f.location.clone().unwrap_or_default();
+            let body = f.body.trim();
+            let quote = if body.is_empty() {
+                None
+            } else {
+                Some(body.to_string())
+            };
+            let quote_found = quote.as_deref().is_some_and(|q| quote_in(q, shown));
+            PendingFinding {
+                id: finding_id(reviewer_family, &location, &claim),
+                severity: f.severity.clone(),
+                location,
+                quote,
+                claim,
+                quote_found,
+            }
+        })
+        .collect()
+}
+
+/// The verdict class that triggers confirmation. Anything else (an `approve`,
+/// or a `comment`) never reaches a confirmer.
+fn verdict_triggers_confirmation(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "request_changes" | "reject" | "block"
+    )
+}
+
+/// Confirm-on-reject for a single reviewer's output.
+///
+/// Returns the confirm section (record shape v1) and the verdict the review
+/// should carry. When the verdict does NOT trigger confirmation (an
+/// `approve`) or no finding is a `high`/`critical` candidate, the output is
+/// returned unchanged except for a `not_run`-only record.
+///
+/// The confirmer is dispatched through the same reviewer call path as a
+/// reviewer (`dispatch_reviewer_for_model`), so every configured gate applies:
+/// the provider peak-window gate, the provider quota gate, the health breaker,
+/// and the remote client rules for a model served off-box. The confirmer runs
+/// at the configured (default `low`) reasoning effort.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_review(
+    cli: &crate::Cli,
+    eng: Option<&Engine>,
+    review: &ReviewOutput,
+    reviewer_model: &str,
+    shown: &str,
+    hunk: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+    author_families: &[String],
+) -> Option<(serde_json::Value, String)> {
+    use crate::review_confirm::{
+        build_context, precheck, run, select_confirmers, ConfirmLimits, ConfirmationJob,
+        Disposition, FindingDecision, FindingPlan,
+    };
+
+    let cfg = eng
+        .map(|e| e.cfg.review.confirm.clone())
+        .unwrap_or_default();
+    let limits = ConfirmLimits::from_config(&cfg);
+    let reviewer_family = eng
+        .map(|e| e.cfg.model_family(reviewer_model))
+        .unwrap_or_default();
+
+    let family_of_owned = |m: &str| -> Option<String> { eng.map(|e| e.cfg.model_family(m)) };
+    let family_of: &dyn Fn(&str) -> Option<String> = &family_of_owned;
+
+    let all = pending_findings_for_confirm(review, &reviewer_family, shown);
+    if all.is_empty() {
+        return None;
+    }
+
+    // Confirm only on a blocking verdict; an approve stays advisory.
+    let confirm_this = verdict_triggers_confirmation(&review.verdict);
+
+    let (blocking, non_blocking): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|f| crate::review_confirm::is_blocking_severity(&f.severity));
+
+    let mut decisions: Vec<FindingDecision> = Vec::new();
+
+    // Non-blocking severities are recorded, never confirmed.
+    for f in &non_blocking {
+        decisions.push(FindingDecision {
+            finding_id: f.id.clone(),
+            severity: f.severity.clone(),
+            location: f.location.clone(),
+            quote: f.quote.clone(),
+            quote_found: f.quote_found,
+            disposition: Disposition::NotRun,
+            blocking: false,
+            reason: "medium/low findings never reach confirmation".to_string(),
+            attempts: Vec::new(),
+        });
+    }
+
+    if !confirm_this {
+        // An approve (or comment): no confirmation runs. Blocking findings, if
+        // any, are recorded not_run and non-blocking because the verdict never
+        // blocked in the first place.
+        for f in &blocking {
+            decisions.push(FindingDecision {
+                finding_id: f.id.clone(),
+                severity: f.severity.clone(),
+                location: f.location.clone(),
+                quote: f.quote.clone(),
+                quote_found: f.quote_found,
+                disposition: Disposition::NotRun,
+                blocking: false,
+                reason: "verdict is not request_changes; confirmation never runs".to_string(),
+                attempts: Vec::new(),
+            });
+        }
+        let merged = crate::review_confirm::ConfirmedReview {
+            decisions,
+            demoted: Vec::new(),
+            effective_blocking: false,
+            reviewer_family_recall: None,
+        };
+        let verdict = "approve".to_string();
+        let payload = crate::review_confirm::record(
+            &merged,
+            reviewer_model,
+            &reviewer_family,
+            &verdict,
+            0,
+            0,
+            0,
+        );
+        return Some((payload, verdict));
+    }
+
+    // Pre-check the blocking set: unquoted findings drop with no model call.
+    let (checks, pending) = precheck(&blocking);
+    for preroll in &checks {
+        if preroll.dropped {
+            if let Some(f) = blocking.iter().find(|f| f.id == preroll.finding_id) {
+                decisions.push(FindingDecision {
+                    finding_id: f.id.clone(),
+                    severity: f.severity.clone(),
+                    location: f.location.clone(),
+                    quote: f.quote.clone(),
+                    quote_found: f.quote_found,
+                    disposition: Disposition::FilteredZ3,
+                    blocking: false,
+                    reason: "quote is not a verbatim substring of the reviewed text".to_string(),
+                    attempts: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let mut jobs: Vec<ConfirmationJob> = Vec::new();
+    for f in pending {
+        let chain = select_confirmers(
+            &cfg.models,
+            &reviewer_family,
+            author_families,
+            &[],
+            family_of,
+            true,
+        );
+        let context = build_context(&f, hunk, read, limits.max_context_lines);
+        jobs.push(ConfirmationJob {
+            plan: FindingPlan {
+                finding: f,
+                reviewer_model: reviewer_model.to_string(),
+                reviewer_family: reviewer_family.clone(),
+                confirmer_chain: chain.clone(),
+                context,
+            },
+            confirmers: chain,
+        });
+    }
+
+    // Dispatch each planned confirmer call through the reviewer path.
+    let confirmed = run(&jobs, &limits, |model, plan| {
+        let cli_ref = cli;
+        let eng_ref = eng;
+        let context = plan.context.clone();
+        let finding_id = plan.finding.id.clone();
+        async move {
+            let started = std::time::Instant::now();
+            let system = "You are a second-opinion confirmer for a code review finding.";
+            let instruction = crate::review_confirm::CONFIRMER_INSTRUCTION;
+            let user = format!("{context}\n\n{instruction}\nfinding-id: {finding_id}");
+            let result = dispatch_reviewer_for_model(
+                cli_ref,
+                &model,
+                &model,
+                system,
+                &user,
+                REVIEW_MIN_MAX_TOKENS,
+                None,
+            )
+            .await;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            match result {
+                Ok(c) => {
+                    let family = eng_ref
+                        .map(|e| e.cfg.model_family(&c.model))
+                        .unwrap_or_default();
+                    match crate::review_confirm::parse_confirmer_output(
+                        &c.content,
+                        &finding_id,
+                        &context,
+                    ) {
+                        Some(verdict) if !c.content.trim().is_empty() => {
+                            crate::review_confirm::ConfirmerAttempt {
+                                model: c.model,
+                                family,
+                                outcome: crate::review_confirm::ConfirmerOutcome::Ok,
+                                latency_ms,
+                                tokens_in: 0,
+                                tokens_out: 0,
+                                verdict: Some(verdict),
+                            }
+                        }
+                        Some(_) => crate::review_confirm::ConfirmerAttempt {
+                            model: c.model,
+                            family,
+                            outcome: crate::review_confirm::ConfirmerOutcome::Empty,
+                            latency_ms,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            verdict: None,
+                        },
+                        None => crate::review_confirm::ConfirmerAttempt {
+                            model: c.model,
+                            family,
+                            outcome: crate::review_confirm::ConfirmerOutcome::Unparsed,
+                            latency_ms,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            verdict: None,
+                        },
+                    }
+                }
+                Err(e) => {
+                    let outcome = classify_confirmer_error(&e);
+                    let family = eng_ref
+                        .map(|e| e.cfg.model_family(&model))
+                        .unwrap_or_default();
+                    crate::review_confirm::ConfirmerAttempt {
+                        model,
+                        family,
+                        outcome,
+                        latency_ms,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        verdict: None,
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    decisions.extend(confirmed.decisions.iter().cloned());
+    let merged = crate::review_confirm::ConfirmedReview {
+        decisions,
+        demoted: confirmed.demoted,
+        effective_blocking: confirmed.effective_blocking,
+        reviewer_family_recall: confirmed.reviewer_family_recall,
+    };
+    let verdict = merged.effective_verdict().to_string();
+    let payload =
+        crate::review_confirm::record(&merged, reviewer_model, &reviewer_family, &verdict, 0, 0, 0);
+    Some((payload, verdict))
+}
+
+/// Classify a confirmer dispatch error into the record's closed outcome set.
+fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::ConfirmerOutcome {
+    use crate::review_confirm::ConfirmerOutcome;
+    match e {
+        ReviewerError::FallbackWorthy { status, .. } => match status {
+            Some(429) => ConfirmerOutcome::TooManyRequests,
+            Some(503) => ConfirmerOutcome::Unavailable,
+            _ => ConfirmerOutcome::Empty,
+        },
+        ReviewerError::Skipped { .. } => ConfirmerOutcome::Unavailable,
+        ReviewerError::Fatal { message } => {
+            if message.contains("timed out") || message.contains("timeout") {
+                ConfirmerOutcome::Timeout
+            } else {
+                ConfirmerOutcome::Empty
+            }
+        }
+    }
 }
 
 /// Compute the aggregate verdict + per-reviewer view out of a list of
@@ -5942,6 +6321,11 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     }
     if let Some(chunking) = &aggregate.chunking {
         payload["chunking"] = chunking.clone();
+    }
+    // Confirm-on-reject (record shape v1). Additive and absent when no
+    // confirmation ran, so an old consumer reads an unchanged payload.
+    if !aggregate.confirm.is_empty() {
+        payload["confirm"] = json!(aggregate.confirm);
     }
 
     if let Some(dir) = active_job_dir() {

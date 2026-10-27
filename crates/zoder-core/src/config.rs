@@ -2825,6 +2825,149 @@ pub struct ReviewConfig {
     /// repository; zoder ships no fleet paths.
     #[serde(default, skip_serializing_if = "ReviewEscalateConfig::is_empty")]
     pub escalate: ReviewEscalateConfig,
+    /// `[review.confirm]` block: confirm-on-reject. A reviewer's `high` /
+    /// `critical` findings are re-checked by a DIFFERENT model family before
+    /// they may block. Absent, the built-in default chain and limits apply
+    /// (see [`ReviewConfirmConfig`]); a deployment overrides the chain and
+    /// per-severity limits here, so roles change without a code edit.
+    #[serde(default, skip_serializing_if = "ReviewConfirmConfig::is_empty")]
+    pub confirm: ReviewConfirmConfig,
+}
+
+/// `[review.confirm]` block — confirm-on-reject for blocking review findings.
+///
+/// A single reviewer family produces mostly-false blocking findings, so its
+/// `request_changes` is noise and its `approve` is not evidence. Every
+/// `high` / `critical` finding on a `request_changes` verdict is therefore
+/// re-checked by a model from a family that differs from BOTH the reviewer's
+/// and the author's before it may block.
+///
+/// **`insufficient` and `confirmer_failed` NEVER demote a finding.** Only an
+/// explicit, quoted `reject` from an independent family demotes: one reject
+/// for a `high`, two independent rejects for a `critical`. A confirmer that
+/// times out, is rate-limited (`429` / `503`), returns empty output, or
+/// cannot be parsed keeps the finding blocking and flags it unconfirmed — a
+/// failed confirmer is never a rejection. This rule lives in the code AND in
+/// `docs/REVIEW-CONFIRM.md` and the record-shape schema, so a reader of the
+/// JSON alone cannot mistake a failed confirmer for a demotion.
+///
+/// Every field is optional with the documented default; the block is absent
+/// from stock configs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfirmConfig {
+    /// The confirmer chain, in dispatch order. Each entry is a model id (as
+    /// configured/served) or a role name; the built-in default is
+    /// `deepseek-flash` (lead), `MiniMax-M3.1-Flash` (parallel second
+    /// opinion), then `nemotron-3-ultra` and `mimo-flash` as tiebreakers. A
+    /// candidate whose family equals the reviewer's or any author family is
+    /// skipped, so a family never confirms its own finding.
+    #[serde(default = "default_confirm_models")]
+    pub models: Vec<String>,
+    /// Maximum confirmation CALLS per review (across all findings). Default 8.
+    /// A finding with no call left is recorded `not_run` and keeps blocking.
+    #[serde(default = "default_confirm_max_per_review")]
+    pub max_per_review: usize,
+    /// Per-call wall-clock timeout in seconds. Default 60.
+    #[serde(default = "default_confirm_timeout_s")]
+    pub timeout_s: u64,
+    /// Reasoning effort for a confirmer call. Default `low`.
+    #[serde(default = "default_confirm_reasoning_effort")]
+    pub reasoning_effort: String,
+    /// Maximum lines of cited-file / definition-site context handed to a
+    /// confirmer. Default 200.
+    #[serde(default = "default_confirm_max_context_lines")]
+    pub max_context_lines: usize,
+    /// Independent rejects required to demote a `critical` finding. Default 2
+    /// and clamped to a minimum of 2 in code: one critical reject never
+    /// demotes.
+    #[serde(default = "default_confirm_critical_rejects")]
+    pub critical_rejects: usize,
+    /// Independent rejects required to demote a `high` finding. Default 1 and
+    /// clamped to a minimum of 1 in code.
+    #[serde(default = "default_confirm_high_rejects")]
+    pub high_rejects: usize,
+}
+
+fn default_confirm_models() -> Vec<String> {
+    [
+        "deepseek-flash",
+        "MiniMax-M3.1-Flash",
+        "nemotron-3-ultra",
+        "mimo-flash",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_confirm_max_per_review() -> usize {
+    8
+}
+
+fn default_confirm_timeout_s() -> u64 {
+    60
+}
+
+fn default_confirm_reasoning_effort() -> String {
+    "low".to_string()
+}
+
+fn default_confirm_max_context_lines() -> usize {
+    200
+}
+
+fn default_confirm_critical_rejects() -> usize {
+    2
+}
+
+fn default_confirm_high_rejects() -> usize {
+    1
+}
+
+impl Default for ReviewConfirmConfig {
+    fn default() -> Self {
+        Self {
+            models: default_confirm_models(),
+            max_per_review: default_confirm_max_per_review(),
+            timeout_s: default_confirm_timeout_s(),
+            reasoning_effort: default_confirm_reasoning_effort(),
+            max_context_lines: default_confirm_max_context_lines(),
+            critical_rejects: default_confirm_critical_rejects(),
+            high_rejects: default_confirm_high_rejects(),
+        }
+    }
+}
+
+impl ReviewConfirmConfig {
+    /// `true` when the block carries only defaults, so `[review.confirm]` is
+    /// omitted from a serialized config that did not set it.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The confirmation budget for a review: at least one call, since a
+    /// review with zero confirmations could never confirm anything and every
+    /// blocking finding would silently stay blocking (the safe direction, but
+    /// a config of `0` is far more likely a mistake than an intent).
+    pub fn confirmations_per_review(&self) -> usize {
+        self.max_per_review.max(1)
+    }
+
+    /// The independent rejects `severity` needs. Clamped to the spec floor:
+    /// a `critical` always needs 2, a `high` always needs 1, whatever the
+    /// config says.
+    pub fn rejects_required(&self, severity: &str) -> usize {
+        match severity.trim().to_ascii_lowercase().as_str() {
+            "critical" => self.critical_rejects.max(2),
+            _ => self.high_rejects.max(1),
+        }
+    }
+
+    /// The bounded line window for confirmer context.
+    pub fn context_lines(&self) -> usize {
+        self.max_context_lines.max(1)
+    }
 }
 
 /// `[review.escalate]` block. Currently a path list; an empty/absent block is
@@ -2878,6 +3021,7 @@ impl ReviewConfig {
             && self.exclude.is_empty()
             && self.route_defaults.is_empty()
             && self.escalate.is_empty()
+            && self.confirm.is_empty()
     }
 }
 
@@ -8993,5 +9137,69 @@ model = "bare-model"
         let s = bare.request_settings_for("bare-model", None, None, None);
         assert!(s.reasoning_effort.is_none());
         assert!(s.chat_template_kwargs.is_none());
+    }
+
+    #[test]
+    fn review_confirm_defaults_match_the_documented_chain() {
+        let c = ReviewConfirmConfig::default();
+        assert_eq!(
+            c.models,
+            vec![
+                "deepseek-flash".to_string(),
+                "MiniMax-M3.1-Flash".to_string(),
+                "nemotron-3-ultra".to_string(),
+                "mimo-flash".to_string(),
+            ]
+        );
+        assert_eq!(c.confirmations_per_review(), 8);
+        assert_eq!(c.timeout_s, 60);
+        assert_eq!(c.reasoning_effort, "low");
+        // A critical always needs two independent rejects; a high needs one.
+        assert_eq!(c.rejects_required("critical"), 2);
+        assert_eq!(c.rejects_required("high"), 1);
+        assert_eq!(c.rejects_required("medium"), 1);
+    }
+
+    #[test]
+    fn review_confirm_floors_are_clamped() {
+        let c = ReviewConfirmConfig {
+            critical_rejects: 1,
+            high_rejects: 0,
+            max_per_review: 0,
+            timeout_s: 0,
+            max_context_lines: 0,
+            ..ReviewConfirmConfig::default()
+        };
+        // A config of 1 still needs 2 for a critical; 0 still needs 1 for high.
+        assert_eq!(c.rejects_required("critical"), 2);
+        assert_eq!(c.rejects_required("high"), 1);
+        assert_eq!(c.confirmations_per_review(), 1);
+        assert_eq!(c.context_lines(), 1);
+    }
+
+    #[test]
+    fn review_confirm_block_is_absent_by_default_and_parses_when_set() {
+        // An absent `[review.confirm]` must leave the default in force and the
+        // block skipped when serialized.
+        let value = serde_json::json!({});
+        let review: ReviewConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(review.confirm, ReviewConfirmConfig::default());
+        let round = serde_json::to_value(&review).unwrap();
+        assert!(
+            round.get("confirm").is_none(),
+            "default block must be skipped"
+        );
+
+        // An explicit override parses and is preserved.
+        let value = serde_json::json!({
+            "confirm": { "models": ["a", "b"], "max_per_review": 3, "timeout_s": 90 }
+        });
+        let review: ReviewConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            review.confirm.models,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(review.confirm.max_per_review, 3);
+        assert_eq!(review.confirm.timeout_s, 90);
     }
 }
