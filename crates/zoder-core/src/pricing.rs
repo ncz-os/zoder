@@ -1937,6 +1937,20 @@ mod staleness_tests {
 mod pricing_source_metadata_tests {
     use super::*;
 
+    /// Write a catalog file with a mode the loader accepts. The loader
+    /// refuses a group- or world-writable catalog, and `fs::write` inherits
+    /// the process umask, so on a host with a lax umask (0002, as on many
+    /// hosts and CI runners) the file would land at 0664 and be rejected as
+    /// empty.
+    fn write_catalog(path: &std::path::Path, body: &[u8]) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn data_date_parses_plain_date() {
         assert_eq!(
@@ -1996,7 +2010,7 @@ mod pricing_source_metadata_tests {
         }
     }
 }"#;
-        std::fs::write(&path, original).unwrap();
+        write_catalog(&path, original);
         let cat = PricingCatalog::load(&path);
         assert_eq!(cat.generated, "2026-10-13");
         // The top-level `source` the file carries must survive the load.
@@ -2038,7 +2052,7 @@ mod pricing_source_metadata_tests {
         }
     }
 }"#;
-        std::fs::write(&path, original).unwrap();
+        write_catalog(&path, original);
         let cat = PricingCatalog::load(&path);
         assert!(cat.source.is_none());
         cat.save(&path).unwrap();
@@ -2077,7 +2091,7 @@ mod pricing_source_metadata_tests {
     "source": "an internal price database",
     "models": {}
 }"#;
-        std::fs::write(&path, original).unwrap();
+        write_catalog(&path, original);
         let cat = PricingCatalog::load(&path);
         assert!(cat.managed);
         assert_eq!(cat.source.as_deref(), Some("an internal price database"));
