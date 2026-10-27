@@ -99,6 +99,28 @@ pub fn parse_corpus_date(raw: &str) -> Option<chrono::NaiveDate> {
         .map(|dt| dt.date_naive())
 }
 
+/// The corpus's own data date, by ONE rule everywhere.
+///
+/// Precedence: the writer's full timestamp (`generated_at`) wins, then the
+/// `generated` build date, then the `arena_date` fallback. `generated`
+/// outranks `arena_date` because a freshly rebuilt corpus can sit on an older
+/// arena snapshot, and it is the FILE's age the operator needs to know.
+///
+/// Returns `None` when none of the three parses: a date we cannot read is
+/// "age unknown", never "fresh".
+pub fn corpus_data_date(
+    generated: &str,
+    arena_date: &str,
+    generated_at: Option<&str>,
+) -> Option<chrono::NaiveDate> {
+    if let Some(at) = generated_at.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(d) = parse_corpus_date(at) {
+            return Some(d);
+        }
+    }
+    parse_corpus_date(generated).or_else(|| parse_corpus_date(arena_date))
+}
+
 /// [`DEFAULT_STALE_DAYS`] unless `$ZODER_CORPUS_STALE_DAYS` says otherwise.
 ///
 /// A value that does not parse falls back to the default: silently disabling
@@ -819,6 +841,44 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The corpus file's provenance metadata, WITHOUT the model rows.
+///
+/// The corpus file is large (the bundled one is ~1.6 MiB) and a command that
+/// only needs to know WHEN the installed data was built must not pay for a
+/// full parse. Every field the age warning needs is a top-level scalar, so
+/// the model rows are simply skipped while the file is scanned.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusMetadata {
+    /// The provenance label the writer recorded (`public: ...`, an installer
+    /// name, ...). Empty when the file carries none.
+    #[serde(default)]
+    pub source: String,
+    /// Whether the file was installed by an installer that owns it.
+    #[serde(default)]
+    pub managed: bool,
+    /// The date the corpus was BUILT (`YYYY-MM-DD`), when the writer set it.
+    #[serde(default)]
+    pub generated: String,
+    /// The date of the underlying arena snapshot, the age fallback.
+    #[serde(default)]
+    pub arena_date: String,
+    /// The writer's full RFC3339 generation timestamp, when it had one.
+    #[serde(default)]
+    pub generated_at: Option<String>,
+}
+
+impl CorpusMetadata {
+    /// The corpus's own data date, by the same rule as
+    /// [`Corpus::data_date`].
+    pub fn data_date(&self) -> Option<chrono::NaiveDate> {
+        corpus_data_date(
+            &self.generated,
+            &self.arena_date,
+            self.generated_at.as_deref(),
+        )
+    }
+}
+
 impl Default for Corpus {
     fn default() -> Self {
         // Route the empty/default path through the same constructor so it has
@@ -843,6 +903,18 @@ fn alias_overlay_path_from(env_override: Option<std::ffi::OsString>, home: &Path
 }
 
 impl Corpus {
+    /// The corpus file's provenance metadata, read WITHOUT materialising the
+    /// model rows.
+    ///
+    /// Returns `None` when the file is missing or unreadable: a caller that
+    /// only wants to warn about the data's age has nothing to say about a
+    /// file it could not read. The model rows are skipped rather than
+    /// parsed, so this costs a scan of the file, not a corpus.
+    pub fn load_metadata(path: &Path) -> Option<CorpusMetadata> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<CorpusMetadata>(&raw).ok()
+    }
+
     /// Maximum trusted model-corpus size. Larger files are rejected before the
     /// body is read so a misconfigured `corpus_path` pointing at a multi-GB JSON
     /// can't OOM `Engine::load()`. The actual bundled corpus is ~1.6 MiB
@@ -1237,14 +1309,13 @@ impl Corpus {
     /// fresh, but it also must not trip a staleness warning, and a negative
     /// number does neither.
     pub fn age_days(&self, today: chrono::NaiveDate) -> Option<i64> {
-        let built =
-            parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))?;
+        let built = self.data_date()?;
         Some((today - built).num_days())
     }
 
     /// The date [`Self::age_days`] measured from, for the warning text.
     pub fn age_date(&self) -> Option<chrono::NaiveDate> {
-        parse_corpus_date(&self.generated).or_else(|| parse_corpus_date(&self.arena_date))
+        self.data_date()
     }
 
     /// A one-line warning when this corpus is older than `max_days`, or `None`
@@ -1715,12 +1786,20 @@ impl Corpus {
     /// `write_atomic` pattern in `crates/model-health/src/lib.rs` (kept
     /// self-contained here — no cross-crate dependency).
     /// The corpus's own data date, by the same rules as
-    /// [`crate::pricing::data_date`]: the top-level `generated` field (or the
-    /// `arena_date` the corpus has always carried) for the date, and
-    /// `generated_at` (RFC3339 with `Z`) when present. Never the file's
-    /// modification time.
+    /// [`crate::pricing::data_date`]: the writer's full timestamp
+    /// (`generated_at`, RFC3339 with `Z`) when present, then the top-level
+    /// `generated` build date, then the `arena_date` the corpus has always
+    /// carried. Never the file's modification time.
+    ///
+    /// The three dates are read in ONE place ([`corpus_data_date`]) so the
+    /// age arithmetic ([`Self::age_days`]) and this accessor can never
+    /// disagree about which date the corpus is measured from.
     pub fn data_date(&self) -> Option<chrono::NaiveDate> {
-        crate::pricing::data_date(&self.arena_date, self.generated_at.as_deref().unwrap_or(""))
+        corpus_data_date(
+            &self.generated,
+            &self.arena_date,
+            self.generated_at.as_deref(),
+        )
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -3429,6 +3508,83 @@ mod corpus_source_metadata_tests {
         assert!(crate::pricing::file_is_managed(&path));
         let c = Corpus::load_without_overlay(&path).unwrap();
         assert_eq!(c.data_date(), None);
+    }
+
+    /// The corpus's data date must prefer the `generated` build date over the
+    /// `arena_date` fallback: a freshly rebuilt corpus can sit on an older
+    /// arena snapshot, and it is the FILE's age the operator needs to know.
+    /// The old accessor passed `arena_date` to the shared date rule and
+    /// dropped `generated` entirely.
+    #[test]
+    fn corpus_data_date_prefers_generated_over_arena_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"generated": "2026-10-14", "arena_date": "2026-01-01", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap()),
+            "the generated build date must win over the arena snapshot date"
+        );
+        // The age arithmetic must agree with the accessor: one date notion.
+        assert_eq!(
+            c.age_date(),
+            c.data_date(),
+            "the age must be measured from the same date the accessor reports"
+        );
+        assert_eq!(
+            c.age_days(chrono::NaiveDate::from_ymd_opt(2026, 10, 26).unwrap()),
+            Some(12)
+        );
+    }
+
+    /// `generated_at` (the writer's full timestamp) wins over both.
+    #[test]
+    fn corpus_data_date_prefers_generated_at_over_generated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"generated": "2026-01-01", "arena_date": "2025-12-01", "generated_at": "2026-10-14T05:00:00Z", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let c = Corpus::load_without_overlay(&path).unwrap();
+        assert_eq!(
+            c.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+    }
+
+    /// The metadata reader returns the corpus file's provenance WITHOUT
+    /// materialising the model rows, and resolves the same date the corpus
+    /// itself resolves.
+    #[test]
+    fn corpus_metadata_reads_the_dates_without_the_model_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model_corpus.json");
+        std::fs::write(
+            &path,
+            r#"{"source": "public: test", "managed": true, "generated": "2026-10-14", "arena_date": "2026-01-01", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        let meta = Corpus::load_metadata(&path).expect("metadata must be readable");
+        assert_eq!(meta.source, "public: test");
+        assert!(meta.managed);
+        assert_eq!(meta.generated, "2026-10-14");
+        assert_eq!(
+            meta.data_date(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+        );
+        // A missing file has no metadata to report.
+        assert!(Corpus::load_metadata(&dir.path().join("absent.json")).is_none());
+        // A file that is not a corpus at all has no metadata either.
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"not json").unwrap();
+        assert!(Corpus::load_metadata(&junk).is_none());
     }
 }
 
