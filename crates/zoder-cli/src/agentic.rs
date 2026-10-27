@@ -5718,39 +5718,7 @@ unbound, or missing imports:\n{context}"
     // keeps the finding blocking — it is never a rejection.
     let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
     if let Some(e) = eng.as_ref() {
-        let author_families: Vec<String> = Vec::new();
-        for slot in reviews.iter_mut() {
-            let ReviewerSlot::Ok { model, review } = slot else {
-                continue;
-            };
-            if !verdict_triggers_confirmation(&review.verdict) {
-                continue;
-            }
-            if !review
-                .findings
-                .iter()
-                .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
-            {
-                continue;
-            }
-            let reviewer_model = model.clone();
-            if let Some((section, verdict)) = confirm_review(
-                cli,
-                Some(e),
-                review,
-                &reviewer_model,
-                &diff,
-                &read_post_image,
-                &author_families,
-            )
-            .await
-            {
-                confirm_sections.push(section);
-                // The confirmed verdict supersedes the reviewer's own: a review
-                // whose findings all demoted is no longer request_changes.
-                review.verdict = verdict;
-            }
-        }
+        confirm_sections = confirm_reviews(cli, e, &mut reviews, &diff, &read_post_image).await;
     }
 
     let requested = models.len();
@@ -5914,6 +5882,120 @@ fn verdict_triggers_confirmation(verdict: &str) -> bool {
     )
 }
 
+/// The models that authored the code under review.
+///
+/// Two explicit sources, and nothing else:
+///
+/// 1. `[review.confirm].author_models` -- the operator's declaration.
+/// 2. the PINNED primary author model: the `-m` override, the selected
+///    agent's `model` pin, or `Config::primary_model`.
+///
+/// The auto-routed fallback is deliberately NOT a source: routing picks a
+/// model by capability and health, which says nothing about who wrote the
+/// code under review. A standalone review of somebody else's commit
+/// therefore has no author model unless the operator declares one, and
+/// then the confirmer is excluded from the reviewer's family only. That
+/// is recorded, so a reader of the record sees which families were
+/// excluded.
+pub(crate) fn review_author_models(cli: &crate::Cli, eng: &Engine) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    let mut push = |model: String| {
+        if !model.trim().is_empty()
+            && !models
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&model))
+        {
+            models.push(model);
+        }
+    };
+    for declared in &eng.cfg.review.confirm.author_models {
+        push(declared.clone());
+    }
+    let pinned = cli
+        .model
+        .clone()
+        .or_else(|| crate::configured_model_for_agent(eng, cli.agent.as_deref()))
+        .or_else(|| eng.cfg.primary_model.clone());
+    if let Some(model) = pinned {
+        push(model);
+    }
+    models
+}
+
+/// The FAMILIES of the author models.
+///
+/// A model whose family cannot be resolved contributes nothing: an
+/// unknown family is not a family, and treating it as one would exclude a
+/// confirmer whose own family is equally unknown.
+pub(crate) fn review_author_families(cli: &crate::Cli, eng: &Engine) -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    for model in review_author_models(cli, eng) {
+        let family = eng.cfg.model_family(&model);
+        let family = family.trim();
+        if family.is_empty() || family.eq_ignore_ascii_case("unknown") {
+            continue;
+        }
+        if !families
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(family))
+        {
+            families.push(family.to_string());
+        }
+    }
+    families
+}
+
+/// Run confirm-on-reject over the reviews a panel produced.
+///
+/// The author families are DERIVED HERE, from the engine and the CLI, and
+/// are not handed in by the caller. A caller that forgets them is exactly
+/// the bug this function removes: the production path used to pass an
+/// empty list, so a confirmer from the author's own family could confirm
+/// the author's finding.
+async fn confirm_reviews(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviews: &mut [ReviewerSlot],
+    diff: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Vec<serde_json::Value> {
+    let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
+    let author_families = review_author_families(cli, eng);
+    for slot in reviews.iter_mut() {
+        let ReviewerSlot::Ok { model, review } = slot else {
+            continue;
+        };
+        if !verdict_triggers_confirmation(&review.verdict) {
+            continue;
+        }
+        if !review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
+        {
+            continue;
+        }
+        let reviewer_model = model.clone();
+        if let Some((section, verdict)) = confirm_review(
+            cli,
+            Some(eng),
+            review,
+            &reviewer_model,
+            diff,
+            read,
+            &author_families,
+        )
+        .await
+        {
+            confirm_sections.push(section);
+            // The confirmed verdict supersedes the reviewer's own: a review
+            // whose findings all demoted is no longer request_changes.
+            review.verdict = verdict;
+        }
+    }
+    confirm_sections
+}
+
 /// Confirm-on-reject for a single reviewer's output.
 ///
 /// Returns the confirm section (record shape v1) and the verdict the review
@@ -6018,6 +6100,7 @@ async fn confirm_review(
             0,
             0,
             &cfg.recall_eval_ref,
+            author_families,
         );
         return Some((payload, verdict));
     }
@@ -6172,6 +6255,7 @@ async fn confirm_review(
         0,
         0,
         &cfg.recall_eval_ref,
+        author_families,
     );
     Some((payload, verdict))
 }
@@ -20768,6 +20852,199 @@ model_provider = "custom.reviewer"
             body.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("high"),
             "the zoder model entry must still win in the reviewer: {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: the author's family is excluded from the confirmer chain.
+//
+// The production review caller used to hand the confirmer chain an EMPTY
+// author-family list, so a confirmer from the family that wrote the code
+// under review could confirm that code's own finding. The exclusion is
+// derived INSIDE the review path, so this test drives the review path
+// itself: a mock provider records which models were actually dispatched.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod confirm_author_family_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The reviewer: family `google`.
+    const REVIEWER: &str = "rv-model";
+    /// The family that authored the code under review: family `deepseek`.
+    const AUTHOR: &str = "conf-deepseek";
+    /// The only confirmer that may be dispatched: family `minimax`.
+    const OTHER: &str = "conf-minimax";
+
+    const DIFF: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-fn a() { }
++fn a() { let x = 1; }
+";
+
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    /// A home whose config declares the author model and pins the family of
+    /// every model, so the exclusion has something to exclude.
+    fn write_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["rv-model", "conf-deepseek", "conf-minimax"],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "model_families": {
+                "rv-model": "google",
+                "conf-deepseek": "deepseek",
+                "conf-minimax": "minimax",
+            },
+            "review": {
+                "confirm": {
+                    "models": ["conf-deepseek", "conf-minimax"],
+                    "author_models": ["conf-deepseek"],
+                    "max_per_review": 4,
+                    "timeout_s": 20,
+                }
+            },
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": "rv-model", "free": true, "routable": true},
+                {"id": "conf-deepseek", "free": true, "routable": true},
+                {"id": "conf-minimax", "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The models the provider was actually asked to run.
+    async fn dispatched_models(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .filter_map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            })
+            .collect()
+    }
+
+    /// The author family's confirmer is never dispatched.
+    ///
+    /// The chain lists the author's model FIRST, so a caller that passed an
+    /// empty author-family list would dispatch it. The exclusion is derived
+    /// inside the review path, so the test drives the review path.
+    #[tokio::test]
+    async fn the_author_family_is_never_dispatched_as_a_confirmer() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let reply = serde_json::json!({
+            "model": OTHER,
+            "choices": [{"message": {"content": "{\"finding_id\":\"other\",\"disposition\":\"reject\",\"quote\":\"let x = 1\",\"reason\":\"r\"}"}}],
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(reply))
+            .mount(&server)
+            .await;
+        write_home(dir.path(), &server.uri());
+        let _guard = EnvGuard::new(dir.path());
+        std::env::set_var("ZEROCLAW_SOCKET", dir.path().join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+
+        let cli = crate::Cli::try_parse_from(["zoder", "--quiet"]).expect("cli parses");
+        let eng = Engine::load().expect("the engine loads");
+        let mut reviews = vec![ReviewerSlot::Ok {
+            model: REVIEWER.to_string(),
+            review: ReviewOutput {
+                verdict: "request_changes".to_string(),
+                summary: "one blocking finding".to_string(),
+                findings: vec![Finding {
+                    severity: "high".to_string(),
+                    title: "the binding is wrong".to_string(),
+                    body: "the `let x = 1` binding is never used".to_string(),
+                    location: Some("src/a.rs:1".to_string()),
+                    disposition: None,
+                }],
+                ..Default::default()
+            },
+        }];
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() { let x = 1; }\n".to_string());
+        let sections = confirm_reviews(&cli, &eng, &mut reviews, DIFF, &read).await;
+
+        let models = dispatched_models(&server).await;
+        assert!(
+            !models.iter().any(|m| m == AUTHOR),
+            "the author's family must never be dispatched as a confirmer: {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m == OTHER),
+            "the confirmer from another family must be dispatched: {models:?}"
+        );
+        assert_eq!(
+            sections.len(),
+            1,
+            "the review must produce one confirm section"
+        );
+        let families = sections[0]
+            .get("author_families")
+            .and_then(|v| v.as_array())
+            .expect("the record must carry the excluded author families");
+        assert_eq!(
+            families
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deepseek"],
+            "the record must name the excluded family: {sections:?}"
         );
     }
 }
