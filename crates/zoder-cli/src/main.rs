@@ -3386,6 +3386,15 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
     // Refresh the pricing feed in the background if stale, so the ephemeral
     // daemon zerocode is about to start loads current rates (zoder only).
     maybe_spawn_daily_refresh();
+    // The data-age warning for the installed files. In `file` mode the
+    // refresh above never spawns, so the TUI prints the warning itself; in
+    // auto mode it names data the daily refresh could not keep up with. It
+    // goes to stderr, before the exec, so the operator sees it even though
+    // the TUI takes over the terminal.
+    if let Ok(cfg) = Config::load() {
+        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        warn_installed_data_age(&cfg, &pricing);
+    }
     let bin = locate_sibling("zerocode").ok_or_else(|| {
         anyhow::anyhow!(
             "zerocode binary not found (looked next to zoder, then in trusted install \
@@ -12117,18 +12126,12 @@ async fn cmd_report(
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
     let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
-    // In `file` pricing-source mode `maybe_spawn_daily_refresh` skipped the
-    // spawn; make sure the data-age warning still lands for a `report` that
-    // runs before the TUI (once per process).
-    if pricing_source_switch(&cfg).is_file() {
-        warn_data_age(
-            "pricing",
-            &Config::home().join("pricing.json"),
-            &pricing.generated,
-            pricing.generated_at.as_deref(),
-            pricing.source.as_deref().unwrap_or(""),
-        );
-    }
+    // The data-age warning for the installed files. In `file` pricing-source
+    // mode `maybe_spawn_daily_refresh` skipped the spawn, so this line is
+    // the only signal the operator gets that the installed data has gone
+    // stale; in auto mode it still names a catalog the daily refresh could
+    // not keep up with. One line per installed file (once per process).
+    warn_installed_data_age(&cfg, &pricing);
     let (since, until, gran, label) = report_window(period, days);
 
     // `--vendor <name>` scopes the report to entries whose `provider` id was
@@ -14495,8 +14498,24 @@ fn warn_data_age(
     generated_at: Option<&str>,
     source: &str,
 ) {
+    warn_data_age_at(
+        which,
+        path,
+        zoder_core::pricing::data_date(generated, generated_at.unwrap_or("")),
+        source,
+    );
+}
+
+/// The age warning for one installed data file whose data date is already
+/// resolved.
+///
+/// The split exists so a file whose date is read by its OWN rule (the corpus
+/// prefers `generated` over `arena_date`, and honours `generated_at` above
+/// both) can be warned about without the warning code second-guessing that
+/// rule: the caller passes the date it already computed.
+fn warn_data_age_at(which: &str, path: &Path, date: Option<chrono::NaiveDate>, source: &str) {
     let path_display = path.display().to_string();
-    let Some(date) = zoder_core::pricing::data_date(generated, generated_at.unwrap_or("")) else {
+    let Some(date) = date else {
         let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
         if state.warned.insert(which.to_string()) {
             let days = stale_threshold_days();
@@ -14531,6 +14550,59 @@ fn warn_data_age(
     eprintln!(
         "zoder: warning: installed {which} data is {age} days old (generated {date}, source {src}); {hint}"
     );
+}
+
+/// One installed data file the operator should hear the age of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledDataFile {
+    /// Which file this is, in the warning text (`pricing`, `corpus`).
+    which: &'static str,
+    path: PathBuf,
+    /// The file's own data date, resolved by the rule that file uses.
+    date: Option<chrono::NaiveDate>,
+    /// The provenance label the writer recorded, for the warning text.
+    source: String,
+}
+
+/// Collect the installed data files a command should age-warn about, in
+/// warning order: the pricing catalog, then the model corpus.
+///
+/// Both installed files are listed. In `file` pricing-source mode the daily
+/// auto-refresh never spawns, so this warning is the ONLY signal the
+/// operator gets about installed data that has gone stale — and the corpus is
+/// the file the router reads, so a stale corpus is at least as important as
+/// a stale price list.
+///
+/// The corpus contributes its date by its OWN rule (see
+/// [`zoder_core::corpus::Corpus::data_date`]); the pricing catalog by
+/// [`zoder_core::pricing::data_date`].
+fn installed_data_files(cfg: &Config, pricing: &PricingCatalog) -> Vec<InstalledDataFile> {
+    let mut files = vec![InstalledDataFile {
+        which: "pricing",
+        path: Config::home().join("pricing.json"),
+        date: zoder_core::pricing::data_date(
+            &pricing.generated,
+            pricing.generated_at.as_deref().unwrap_or(""),
+        ),
+        source: pricing.source.clone().unwrap_or_default(),
+    }];
+    let corpus_path = cfg.corpus_path.clone();
+    if let Some(meta) = Corpus::load_metadata(&corpus_path) {
+        files.push(InstalledDataFile {
+            which: "corpus",
+            path: corpus_path,
+            date: meta.data_date(),
+            source: meta.source,
+        });
+    }
+    files
+}
+
+/// Print the age warning for every installed data file, one line per file.
+fn warn_installed_data_age(cfg: &Config, pricing: &PricingCatalog) {
+    for file in installed_data_files(cfg, pricing) {
+        warn_data_age_at(file.which, &file.path, file.date, &file.source);
+    }
 }
 
 /// Process-lifetime set of files already age-warned about, so each file
@@ -14814,20 +14886,11 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
         }
         PricingCmd::Show { model } => {
             let cat = PricingCatalog::load(&path);
-            // Data-age warning for the installed catalog (file mode only; once
-            // per process, stderr only).
-            let switch = match Config::load() {
-                Ok(cfg) => pricing_source_switch(&cfg),
-                Err(_) => FileSwitch::None,
-            };
-            if switch.is_file() {
-                warn_data_age(
-                    "pricing",
-                    &path,
-                    &cat.generated,
-                    cat.generated_at.as_deref(),
-                    cat.source.as_deref().unwrap_or(""),
-                );
+            // Data-age warning for the installed files (once per process,
+            // stderr only): the pricing catalog AND the model corpus, one
+            // line per file.
+            if let Ok(cfg) = Config::load() {
+                warn_installed_data_age(&cfg, &cat);
             }
             match cat.lookup(model) {
                 Some(p) if json => println!("{}", serde_json::to_string_pretty(p)?),
@@ -21674,6 +21737,42 @@ mod pricing_source_file_tests {
             pricing_refresh_allowed(&FileSwitch::None, false),
             "auto mode must never refuse a refresh"
         );
+    }
+
+    /// The age warning must cover BOTH installed files: the pricing catalog
+    /// AND the model corpus. In `file` mode the daily auto-refresh never
+    /// spawns, so this warning is the only signal the operator gets about
+    /// stale installed data — and the corpus is the file the router reads.
+    #[test]
+    fn the_age_warning_covers_the_installed_corpus_as_well_as_the_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        write_pricing(
+            home.path(),
+            r#"{"managed": true, "generated": "2026-10-14", "models": {}}"#,
+        );
+        std::fs::write(
+            home.path().join("model_corpus.json"),
+            r#"{"source": "public: test", "generated": "2026-10-13", "arena_date": "2026-01-01", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            let pricing = PricingCatalog::load(&home.path().join("pricing.json"));
+            let files = installed_data_files(&cfg, &pricing);
+            let which = |name: &str| files.iter().find(|f| f.which == name).map(|f| f.clone());
+            let pricing_file = which("pricing").expect("the catalog must be warned about");
+            assert_eq!(
+                pricing_file.date,
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap())
+            );
+            let corpus_file = which("corpus").expect("the corpus must be warned about");
+            assert_eq!(
+                corpus_file.date,
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap()),
+                "the corpus date must be its own generated date, not the arena snapshot"
+            );
+            assert_eq!(corpus_file.source, "public: test");
+        });
     }
 
     /// A forced re-pull in file mode must keep the installed file's

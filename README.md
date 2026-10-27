@@ -1134,14 +1134,21 @@ RFC3339 timestamp; the first 10 characters are taken) and
 parse). Files without these fields load and save without them.
 
 **Age warning.** When the installed data is more than 7 days old *by its
-own date*, one line per file is printed on stderr (it never fails the
-command and never touches stdout) when `zoder report`, `zoder tui`, or
-`zoder pricing show` runs. In `file` mode the hint says the data was
-installed by its installer and should be updated there — it does not tell
-you to re-pull the public files. In auto mode it points at
-`zoder pricing refresh`. A file whose date cannot be parsed gets
-`age unknown` once. The threshold is `ZODER_CORPUS_STALE_DAYS` (integer
-days; an invalid value falls back to 7; `0` disables the warning).
+own date*, one line per installed file is printed on stderr (it never fails
+the command and never touches stdout) when `zoder report`, `zoder tui`, or
+`zoder pricing show` runs. Both installed files are covered: the pricing
+catalog (`~/.zoder/pricing.json`) and the model corpus
+(`~/.zoder/model_corpus.json`) — the corpus is the file the router reads, so
+a stale corpus matters at least as much as a stale price list. In `file`
+mode the hint says the data was installed by its installer and should be
+updated there — it does not tell you to re-pull the public files. In auto
+mode it points at `zoder pricing refresh`. A file whose date cannot be
+parsed gets `age unknown` once. The threshold is `ZODER_CORPUS_STALE_DAYS`
+(integer days; an invalid value falls back to 7; `0` disables the warning).
+
+Each file is measured by its own date rule: the pricing catalog by its
+`generated`/`generated_at` fields, the corpus by `generated_at`, then
+`generated`, then the `arena_date` fallback.
 
 
 ### Freshness gates
