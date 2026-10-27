@@ -6058,41 +6058,18 @@ async fn dispatch_confirmer(
     .await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
+        // A successful provider reply is recorded through the one shared
+        // decision: an empty body is `Empty` (answered, with nothing), a
+        // non-empty body that fails the contract is `Unparsed`, and a valid
+        // reply is `Ok`. Neither `Empty` nor `Unparsed` demotes — the
+        // finding keeps blocking, byte-identical to before.
         Ok(c) => {
             let family = eng
                 .map(|e| e.cfg.model_family(&c.model))
                 .unwrap_or_default();
-            match crate::review_confirm::parse_confirmer_output(&c.content, finding_id, context) {
-                Some(verdict) if !c.content.trim().is_empty() => {
-                    crate::review_confirm::ConfirmerAttempt {
-                        model: c.model,
-                        family,
-                        outcome: crate::review_confirm::ConfirmerOutcome::Ok,
-                        latency_ms,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        verdict: Some(verdict),
-                    }
-                }
-                Some(_) => crate::review_confirm::ConfirmerAttempt {
-                    model: c.model,
-                    family,
-                    outcome: crate::review_confirm::ConfirmerOutcome::Empty,
-                    latency_ms,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    verdict: None,
-                },
-                None => crate::review_confirm::ConfirmerAttempt {
-                    model: c.model,
-                    family,
-                    outcome: crate::review_confirm::ConfirmerOutcome::Unparsed,
-                    latency_ms,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    verdict: None,
-                },
-            }
+            crate::review_confirm::confirmer_attempt_from_reply(
+                c.model, family, latency_ms, &c.content, finding_id, context,
+            )
         }
         Err(e) => {
             let outcome = classify_confirmer_error(&e);
@@ -21509,6 +21486,151 @@ model_provider = "custom.reviewer"
                 .collect::<Vec<_>>(),
             vec!["deepseek"],
             "the record must name the excluded family: {sections:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: a successful reply with an empty body is recorded
+// `empty`, not `unparsed`.
+//
+// `parse_confirmer_output` returns `None` for an empty body, so a provider
+// that answered successfully with nothing used to fall into the `unparsed`
+// branch at the call site — the wrong recorded outcome. The blocking
+// behaviour is the same either way; the record is not.
+//
+// This test drives the PRODUCTION dispatch (`dispatch_confirmer`) against a
+// wiremock provider that answers HTTP 200 with an EMPTY BODY, and asserts
+// the recorded outcome. On the streaming wire a 200 whose stream carries no
+// content is a clean success with empty content (the terminal frame is
+// present, no answer bytes), which is the wire shape in which "the provider
+// answered successfully with an empty body" survives to the record as a
+// successful completion.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod confirm_empty_body_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "rv-model";
+    const FINDING_ID: &str = "f-empty";
+
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    fn write_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "stream": true,
+                "serves": [MODEL],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "review": {
+                "confirm": {
+                    "models": [MODEL],
+                    "timeout_s": 20,
+                }
+            },
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [{"id": MODEL, "free": true, "routable": true}],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The provider answers HTTP 200 with an EMPTY BODY (a clean
+    /// content-free stream: one terminal usage frame, no answer bytes),
+    /// and the production dispatch records the attempt.
+    async fn empty_body_attempt(
+        server: &MockServer,
+        home: &std::path::Path,
+        cfg_path: &std::path::Path,
+    ) -> crate::review_confirm::ConfirmerAttempt {
+        let body =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0,\"total_tokens\":5}}\n\n\
+             data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+        write_home(home, &server.uri());
+        let _guard = EnvGuard::new(home);
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+
+        // A 5s request budget: the streaming reader waits for its
+        // post-finish grace (bounded by this) before accepting the
+        // content-free stream as a successful answer.
+        let cli = crate::Cli::try_parse_from(["zoder", "--quiet", "--request-timeout", "5"])
+            .expect("cli parses");
+        let eng = Engine::load().expect("the engine loads");
+        dispatch_confirmer(
+            &cli,
+            Some(&eng),
+            MODEL,
+            FINDING_ID,
+            "the code under review",
+            "low",
+        )
+        .await
+    }
+
+    /// A confirmer that answered successfully with an empty body is
+    /// recorded `empty` — not `unparsed`.
+    #[tokio::test]
+    async fn a_successful_empty_body_is_recorded_empty_not_unparsed() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let attempt = empty_body_attempt(&server, dir.path(), &cfg_path).await;
+        let _ = dir;
+        assert_eq!(
+            attempt.outcome,
+            crate::review_confirm::ConfirmerOutcome::Empty,
+            "a 200 with an empty body is a successful EMPTY reply, not an unparsed one: {attempt:?}"
+        );
+        assert!(
+            attempt.verdict.is_none(),
+            "an empty reply carries no verdict: {attempt:?}"
         );
     }
 }
