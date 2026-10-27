@@ -511,13 +511,17 @@ pub(crate) fn parse_confirmer_output(
 /// (or role) to its family; `None` means the candidate cannot be resolved and
 /// is skipped. An empty result means no confirmer can run, and the finding
 /// keeps blocking (unconfirmed).
+///
+/// The family isolation is UNCONDITIONAL. There is deliberately no flag to
+/// relax it: a confirmer from the reviewer's family, or from an author's
+/// family, is never a valid second opinion, so the rule cannot be switched
+/// off by a caller.
 pub(crate) fn select_confirmers(
     chain: &[String],
     reviewer_family: &str,
     author_families: &[String],
     already_used: &[String],
     family_of: &dyn Fn(&str) -> Option<String>,
-    cross_family_only: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for candidate in chain {
@@ -529,11 +533,12 @@ pub(crate) fn select_confirmers(
         let Some(family) = family_of(candidate) else {
             continue;
         };
-        if cross_family_only
-            && (family.eq_ignore_ascii_case(reviewer_family)
-                || author_families
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case(&family)))
+        // Never the reviewer's own family (this is what stops `gpt-oss`
+        // confirming a `gpt-oss` finding), never an author family.
+        if family.eq_ignore_ascii_case(reviewer_family)
+            || author_families
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&family))
         {
             continue;
         }
@@ -589,7 +594,6 @@ pub(crate) fn aggregate(
                 &[],
                 &used,
                 &|_m| Some(String::new()),
-                false,
             );
             if remaining.is_empty() {
                 continue;
@@ -1612,7 +1616,7 @@ mod tests {
                 Some("other".to_string())
             }
         };
-        let selected = select_confirmers(&chain, "fam", &[], &[], &family_of, true);
+        let selected = select_confirmers(&chain, "fam", &[], &[], &family_of);
         assert_eq!(selected, vec!["otherfam".to_string()]);
     }
 
@@ -1621,7 +1625,7 @@ mod tests {
         let chain = vec!["a".to_string(), "b".to_string()];
         let used = vec!["a".to_string()];
         let family_of = |_: &str| Some("x".to_string());
-        let selected = select_confirmers(&chain, "rev", &[], &used, &family_of, true);
+        let selected = select_confirmers(&chain, "rev", &[], &used, &family_of);
         assert_eq!(selected, vec!["b".to_string()]);
     }
 
@@ -1748,6 +1752,79 @@ mod tests {
             windowed_lines < 60,
             "context must stay bounded: {windowed_lines}"
         );
+    }
+
+    #[test]
+    fn reviewer_family_is_never_a_confirmer() {
+        // The reviewer's own family can never confirm its finding — there is no
+        // flag that relaxes this.
+        let chain = vec!["rev-sibling".to_string(), "other".to_string()];
+        let family_of = |m: &str| {
+            if m == "rev-sibling" {
+                Some("revfam".to_string())
+            } else {
+                Some("otherfam".to_string())
+            }
+        };
+        let selected = select_confirmers(&chain, "revfam", &[], &[], &family_of);
+        assert_eq!(selected, vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn author_family_is_never_a_confirmer() {
+        // A confirmer from any author family is excluded, unconditionally.
+        let chain = vec![
+            "reviewer-ok".to_string(),
+            "author-sibling".to_string(),
+            "free".to_string(),
+        ];
+        let family_of = |m: &str| {
+            if m == "author-sibling" {
+                Some("authorfam".to_string())
+            } else {
+                Some(m.trim_end_matches("-ok").to_string())
+            }
+        };
+        let authors = vec!["authorfam".to_string()];
+        let selected = select_confirmers(&chain, "revfam", &authors, &[], &family_of);
+        assert_eq!(
+            selected,
+            vec!["reviewer-ok".to_string(), "free".to_string()]
+        );
+    }
+
+    #[test]
+    fn finding_with_no_confirmers_stays_blocking() {
+        // No confirmer could be resolved (empty chain). The finding is not_run
+        // but MUST still block, and the review must still request changes.
+        let j = ConfirmationJob {
+            plan: plan(finding("critical", "no chain", Some("let x"), CTX), &[]),
+            confirmers: Vec::new(),
+        };
+        let mut calls = 0usize;
+        let review = aggregate(&[j], &limits(), &mut |m, _| {
+            calls += 1;
+            attempt(m, "other", ParsedDisposition::Confirm)
+        });
+        assert_eq!(calls, 0, "no confirmer may be called for an empty chain");
+        assert_eq!(review.decisions[0].disposition, Disposition::NotRun);
+        assert!(review.decisions[0].blocking);
+        assert!(
+            review.effective_blocking,
+            "a finding with no available confirmer must stay blocking"
+        );
+        assert_eq!(review.effective_verdict(), "request_changes");
+    }
+
+    #[test]
+    fn already_used_confirmer_is_excluded_even_if_listed_again() {
+        // The used-set is honoured on every selection, so a caller that retries
+        // cannot re-call a confirmer that already ran for this finding.
+        let chain = vec!["a".to_string(), "b".to_string()];
+        let used = vec!["a".to_string()];
+        let family_of = |_: &str| Some("x".to_string());
+        let selected = select_confirmers(&chain, "rev", &[], &used, &family_of);
+        assert_eq!(selected, vec!["b".to_string()]);
     }
 
     #[test]
