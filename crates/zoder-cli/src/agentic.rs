@@ -18391,6 +18391,21 @@ mod reviewer_ledger_billing_tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Write a pricing catalog with a mode the loader accepts. The loader
+    /// refuses a group- or world-writable catalog, and `fs::write` inherits
+    /// the process umask, so on a host with a lax umask (0002, as on many
+    /// hosts and CI runners) the file would land at 0664 and be rejected as
+    /// an empty catalog -- which would make a test pass for the wrong
+    /// reason (a free route priced at $0 because it had no rate at all).
+    fn write_pricing_catalog(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     /// A config with ONE free route (`billing = "free"`, `paid = false`)
     /// and one metered route, both backed by the same wiremock server.
     fn write_two_provider_config(home: &Path, mock_uri: &str) {
@@ -18452,8 +18467,8 @@ mod reviewer_ledger_billing_tests {
         write_two_provider_config(home, &server.uri());
         // The runtime catalog prices the model: this is the condition that
         // used to bill the free route at list price.
-        std::fs::write(
-            home.join("pricing.json"),
+        write_pricing_catalog(
+            &home.join("pricing.json"),
             r#"{
                 "models": {
                     "free-model/reviewer": {
@@ -18462,8 +18477,7 @@ mod reviewer_ledger_billing_tests {
                     }
                 }
             }"#,
-        )
-        .unwrap();
+        );
         let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
         mount_openai_reply(
             &server,
@@ -18513,8 +18527,8 @@ mod reviewer_ledger_billing_tests {
         let server = MockServer::start().await;
         write_corpus(home, &["metered-model/reviewer"]);
         write_two_provider_config(home, &server.uri());
-        std::fs::write(
-            home.join("pricing.json"),
+        write_pricing_catalog(
+            &home.join("pricing.json"),
             r#"{
                 "models": {
                     "metered-model/reviewer": {
@@ -18524,8 +18538,7 @@ mod reviewer_ledger_billing_tests {
                     }
                 }
             }"#,
-        )
-        .unwrap();
+        );
         let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
         mount_openai_reply(
             &server,
@@ -18582,7 +18595,7 @@ mod reviewer_ledger_billing_tests {
         write_two_provider_config(home, &server.uri());
         // An EMPTY runtime catalog: the shipped list must not contain this
         // synthetic id either, so the lookup falls through to Unknown.
-        std::fs::write(home.join("pricing.json"), r#"{"models": {}}"#).unwrap();
+        write_pricing_catalog(&home.join("pricing.json"), r#"{"models": {}}"#);
         let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
         mount_openai_reply(
             &server,
@@ -18645,8 +18658,8 @@ mod reviewer_ledger_billing_tests {
         write_two_provider_config(home, &server.uri());
         // The model IS priced in the catalog, so a guessed token count would
         // have produced a real (wrong) charge.
-        std::fs::write(
-            home.join("pricing.json"),
+        write_pricing_catalog(
+            &home.join("pricing.json"),
             r#"{
                 "models": {
                     "metered-model/reviewer": {
@@ -18655,8 +18668,7 @@ mod reviewer_ledger_billing_tests {
                     }
                 }
             }"#,
-        )
-        .unwrap();
+        );
         let review = r#"{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}"#;
         mount_openai_reply(
             &server,

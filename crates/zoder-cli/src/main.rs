@@ -9420,7 +9420,35 @@ mod oneshot_ledger_billing_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Write a pricing catalog with a mode the loader accepts. The loader
+    /// refuses a group- or world-writable catalog, and `fs::write` inherits
+    /// the process umask, so on a host with a lax umask (0002, as on many
+    /// hosts and CI runners) the file would land at 0664 and be rejected as
+    /// an empty catalog.
+    fn write_pricing_catalog(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     fn write_one_provider_config(home: &Path, mock_uri: &str, billing: &str, paid: bool) {
+        write_provider_config(home, mock_uri, billing, paid, &["zz-unpriced/"]);
+    }
+
+    /// A provider config whose `serves` list declares the model prefixes it
+    /// backs. The router routes a model only when some provider claims it --
+    /// it never falls back to `default_provider` -- so a test that
+    /// dispatches a model needs a provider that serves it.
+    fn write_provider_config(
+        home: &Path,
+        mock_uri: &str,
+        billing: &str,
+        paid: bool,
+        serves: &[&str],
+    ) {
         let body = serde_json::json!({
             "providers": [
                 {
@@ -9430,7 +9458,7 @@ mod oneshot_ledger_billing_tests {
                     "auth": {"type": "none"},
                     "paid": paid,
                     "billing": billing,
-                    "serves": ["zz-unpriced/"],
+                    "serves": serves,
                 },
             ],
             "default_provider": "wiremock",
@@ -9548,8 +9576,8 @@ mod oneshot_ledger_billing_tests {
                     write_one_provider_config(home, &server.uri(), "free", false);
                     // The runtime catalog prices the model — the condition
                     // that used to bill the free route at list price.
-                    std::fs::write(
-                        home.join("pricing.json"),
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
                         r#"{
                         "models": {
                             "zz-unpriced/alpha-7": {
@@ -9558,8 +9586,7 @@ mod oneshot_ledger_billing_tests {
                             }
                         }
                     }"#,
-                    )
-                    .unwrap();
+                    );
                     mount_chat_completion(&server, true, 1_000_000, 500_000).await;
                     let cli = Cli::try_parse_from([
                         "zoder",
@@ -9621,7 +9648,7 @@ mod oneshot_ledger_billing_tests {
                     write_one_provider_config(home, &server.uri(), "metered", true);
                     // An EMPTY runtime catalog; the synthetic id is not in the
                     // shipped list, so the lookup falls through to Unknown.
-                    std::fs::write(home.join("pricing.json"), r#"{"models": {}}"#).unwrap();
+                    write_pricing_catalog(&home.join("pricing.json"), r#"{"models": {}}"#);
                     mount_chat_completion(&server, true, 100, 50).await;
                     let cli = Cli::try_parse_from([
                         "zoder",
@@ -9695,8 +9722,8 @@ mod oneshot_ledger_billing_tests {
                     write_one_provider_config(home, &server.uri(), "metered", true);
                     // The model IS priced: a guessed token count would have
                     // produced a real (wrong) charge.
-                    std::fs::write(
-                        home.join("pricing.json"),
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
                         r#"{
                             "models": {
                                 "zz-unpriced/alpha-7": {
@@ -9705,8 +9732,7 @@ mod oneshot_ledger_billing_tests {
                                 }
                             }
                         }"#,
-                    )
-                    .unwrap();
+                    );
                     mount_chat_completion(&server, false, 100, 50).await;
                     let cli = Cli::try_parse_from([
                         "zoder",
@@ -9855,12 +9881,11 @@ mod oneshot_ledger_billing_tests {
                         serde_json::to_string_pretty(&corpus).unwrap(),
                     )
                     .unwrap();
-                    write_one_provider_config(home, &server.uri(), "metered", true);
-                    std::fs::write(
-                        home.join("pricing.json"),
+                    write_provider_config(home, &server.uri(), "metered", true, &[MODEL]);
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
                         r#"{"models": {"some/other-model": {"input_usd_per_mtok": 9.0, "output_usd_per_mtok": 9.0}}}"#,
-                    )
-                    .unwrap();
+                    );
                     mount_chat_completion(&server, true, 31_620, 1_437).await;
                     let cli = Cli::try_parse_from([
                         "zoder",
@@ -9944,8 +9969,8 @@ mod oneshot_ledger_billing_tests {
                     )
                     .unwrap();
                     write_one_provider_config(home, &server.uri(), "free", false);
-                    std::fs::write(
-                        home.join("pricing.json"),
+                    write_pricing_catalog(
+                        &home.join("pricing.json"),
                         r#"{
                         "models": {
                             "zz-unpriced/alpha-7": {
@@ -9954,8 +9979,7 @@ mod oneshot_ledger_billing_tests {
                             }
                         }
                     }"#,
-                    )
-                    .unwrap();
+                    );
                     // A non-streaming reply whose header reports the provider
                     // billed the call despite the free posture.
                     let body = serde_json::json!({
