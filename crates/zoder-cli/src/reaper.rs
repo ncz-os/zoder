@@ -337,7 +337,7 @@ pub(crate) fn live_identity(pid: u32) -> Option<crate::DaemonIdentity> {
 /// there is no daemon there for anybody to be spared from — and the scan
 /// skips Z/X before selection anyway.
 #[cfg(target_os = "linux")]
-fn live_start_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn live_start_ticks(pid: u32) -> Option<u64> {
     let stat = read_stat(pid)?;
     if stat.state == "Z" || stat.state == "X" {
         return None;
@@ -346,7 +346,7 @@ fn live_start_ticks(pid: u32) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn live_start_ticks(_pid: u32) -> Option<u64> {
+pub(crate) fn live_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
 
@@ -1287,31 +1287,91 @@ pub(crate) async fn settle_unconfirmed_cancel(
     let daemon_pid = record.pid();
     settled.daemon_pid = daemon_pid;
     if let DaemonRecordState::Live(pid) = record {
-        // The identity is `(pid, start_ticks)`, and the START TIME is re-read
-        // immediately before every signal. Between the check above and the
-        // signal the daemon could exit and the kernel could hand its pid to an
-        // unrelated process; signalling on the bare pid would then kill a
-        // stranger. Re-reading the start time makes the window as small as the
-        // syscall allows, and a mismatch means the pid is no longer the daemon,
-        // so nothing is signalled.
-        let expected = live_start_ticks(pid);
-        if signal_if_same_process(pid, expected, libc_sigterm()) {
-            let deadline = Instant::now() + DAEMON_EXIT_GRACE;
-            while alive(pid) && Instant::now() < deadline {
-                tokio::time::sleep(POLL).await;
+        // A daemon that other live zoder processes are still using is NOT
+        // ours to stop, even when it is the recorded daemon for this socket:
+        // an unacknowledged cancel here is a problem with THIS session, and
+        // the remedy is to abandon the session (and reap the workspace
+        // processes, as below), not to kill the shared engine out from under
+        // every sibling loop on the host. The lease directory is the source
+        // of truth for "who is using it", each lease checked by liveness, so
+        // the decision is made from state, not from timing.
+        //
+        // WHO may stop it is a second, separate question, and the leases do
+        // not answer it: the lease order says who arrived first, which is not
+        // the same as who STARTED the daemon. The ownership record does
+        // answer it, and it is written by the spawner — the only process that
+        // can know. So the decision reads both: the leases say whether
+        // anybody else is using the daemon, the record says whether it is
+        // ours to stop at all.
+        //
+        // The whole decision AND the signal happen under the EXCLUSIVE
+        // daemon lock, and a client registers itself under the SAME lock
+        // (shared). That closes the window in which a sibling could take a
+        // lease between the census and the signal: a client that is
+        // registering itself is either already in the census we read, or it
+        // is still blocked on the lock and is therefore not yet talking to
+        // the daemon.
+        let lock = zoder_core::DaemonLock::exclusive(socket).ok();
+        let authority = match &lock {
+            Some(_) => {
+                let leases = zoder_core::read_daemon_leases(socket);
+                let owner = crate::read_daemon_owner(&crate::daemon_record_path_next_to(socket));
+                // The record is only a claim; `/proc` decides, exactly as it
+                // does for the daemon identity itself.
+                let owner_is_alive = owner
+                    .map(|o| live_start_ticks(o.pid) == Some(o.start_ticks))
+                    .unwrap_or(false);
+                zoder_core::daemon_stop_authority(
+                    &leases,
+                    std::process::id(),
+                    owner,
+                    owner_is_alive,
+                    zoder_core::DAEMON_LEASE_TTL,
+                )
             }
-            // Escalate only to the SAME process that ignored the SIGTERM.
-            if alive(pid) {
-                signal_if_same_process(pid, expected, libc_sigkill());
-            }
-            settled.daemon_stopped = !alive(pid);
-            // A daemon that is still alive after SIGKILL is still running the
-            // turn: the session is NOT settled and must stay pending.
-            daemon_still_running = !settled.daemon_stopped;
-        } else {
-            // The pid was recycled before the signal: nothing was sent, so
-            // nothing was stopped and nothing may be claimed.
+            // The lock could not be taken: the census cannot be trusted, so
+            // the daemon is left running. Every failure of this mechanism
+            // must leave a shared daemon alone.
+            None => zoder_core::DaemonStopAuthority::NotAuthorized,
+        };
+        if authority == zoder_core::DaemonStopAuthority::NotAuthorized {
+            // Not ours to stop: either another live client is using it, or
+            // we cannot prove that nobody is. The daemon is (by definition)
+            // still running.
             settled.daemon_stopped = false;
+            daemon_still_running = true;
+        } else {
+            // The identity is `(pid, start_ticks)`, and the START TIME is
+            // re-read immediately before every signal. Between the check
+            // above and the signal the daemon could exit and the kernel could
+            // hand its pid to an unrelated process; signalling on the bare
+            // pid would then kill a stranger. Re-reading the start time makes
+            // the window as small as the syscall allows, and a mismatch means
+            // the pid is no longer the daemon, so nothing is signalled.
+            let expected = live_start_ticks(pid);
+            let signalled = signal_if_same_process(pid, expected, libc_sigterm());
+            // The lock is released BEFORE the wait for the daemon to exit:
+            // a client must never be blocked behind our grace period, and by
+            // now the signal has already been sent.
+            drop(lock);
+            if signalled {
+                let deadline = Instant::now() + DAEMON_EXIT_GRACE;
+                while alive(pid) && Instant::now() < deadline {
+                    tokio::time::sleep(POLL).await;
+                }
+                // Escalate only to the SAME process that ignored the SIGTERM.
+                if alive(pid) {
+                    signal_if_same_process(pid, expected, libc_sigkill());
+                }
+                settled.daemon_stopped = !alive(pid);
+                // A daemon that is still alive after SIGKILL is still running
+                // the turn: the session is NOT settled and must stay pending.
+                daemon_still_running = !settled.daemon_stopped;
+            } else {
+                // The pid was recycled before the signal: nothing was sent,
+                // so nothing was stopped and nothing may be claimed.
+                settled.daemon_stopped = false;
+            }
         }
     }
     // The session is settled only when there is EVIDENCE that nothing of it
@@ -1362,6 +1422,20 @@ pub(crate) async fn settle_unconfirmed_cancel(
         UnconfirmedCancelOutcome::NeverAcknowledged(_) if settled.daemon_stopped => {
             "the daemon never acknowledged it and was stopped by pid, which ends any turn it \
              was still running"
+                .to_string()
+        }
+        UnconfirmedCancelOutcome::NeverAcknowledged(_)
+            if !settled.daemon_stopped && record.pid().is_some() =>
+        {
+            // The daemon is still running and was deliberately spared. Either
+            // another live zoder process is using it, or this session could
+            // not establish that it was the only one — and a daemon that
+            // somebody else may be using must not be torn down on the
+            // strength of a guess. This session is abandoned (and the
+            // workspace reaped) instead.
+            "the daemon never acknowledged it, but it is still running and this session could \
+             not establish that it was the only user of it, so it was left running and this \
+             session was abandoned"
                 .to_string()
         }
         UnconfirmedCancelOutcome::NeverAcknowledged(_) => match record {
@@ -1420,7 +1494,8 @@ pub(crate) fn daemon_pid_for_socket(socket: &Path) -> Option<u32> {
 /// the spawner writes and the reaper's daemon exemption already honours: "which
 /// process owns this socket" has one answer in this crate, not two.
 pub(crate) fn daemon_record_state(socket: &Path) -> DaemonRecordState {
-    let Some((pid, start_ticks)) = crate::read_daemon_record(&daemon_pid_file_next_to(socket))
+    let Some((pid, start_ticks)) =
+        crate::read_daemon_record(&crate::daemon_record_path_next_to(socket))
     else {
         return DaemonRecordState::Missing;
     };
@@ -1430,12 +1505,6 @@ pub(crate) fn daemon_record_state(socket: &Path) -> DaemonRecordState {
         return DaemonRecordState::RecycledPid(pid);
     }
     DaemonRecordState::Live(pid)
-}
-
-/// The daemon pid file that belongs to `socket`'s directory: the socket lives
-/// at `<data dir>/daemon.sock` and its record at `<data dir>/daemon.pid`.
-fn daemon_pid_file_next_to(socket: &Path) -> PathBuf {
-    socket.with_file_name("daemon.pid")
 }
 
 /// Session ids that were never cancelled AND are not already known to be
@@ -2345,7 +2414,7 @@ fn libc_sigkill() -> i32 {
 /// Returns `false` when the process is gone or was replaced — in both cases
 /// there is nothing of ours left to signal.
 #[cfg(target_os = "linux")]
-fn signal_if_same_process(pid: u32, expected: Option<u64>, sig: i32) -> bool {
+pub(crate) fn signal_if_same_process(pid: u32, expected: Option<u64>, sig: i32) -> bool {
     let Some(expected) = expected else {
         return false;
     };
@@ -2415,7 +2484,7 @@ fn signal(_pid: u32, _sig: i32) {}
 
 /// No `/proc`, so no start time to compare: nothing is ever signalled here.
 #[cfg(not(target_os = "linux"))]
-fn signal_if_same_process(_pid: u32, _expected: Option<u64>, _sig: i32) -> bool {
+pub(crate) fn signal_if_same_process(_pid: u32, _expected: Option<u64>, _sig: i32) -> bool {
     false
 }
 // ---------------------------------------------------------------------------
@@ -4110,6 +4179,18 @@ mod tests {
         .expect("write the daemon record");
     }
 
+    /// Register THIS process as a consumer of the daemon behind `socket`,
+    /// exactly as the production client does before it talks to the daemon.
+    ///
+    /// The stop decision reads the census of consumers, so a test that wants
+    /// the daemon to be stopped has to be a client: a process that never
+    /// registered cannot prove that nobody else is using the daemon, and
+    /// the decision fails closed for it.
+    fn acquire_lease_for(socket: &Path, daemon_pid: u32) {
+        zoder_core::acquire_daemon_lease(socket, std::process::id(), daemon_pid)
+            .expect("record this client's lease");
+    }
+
     /// The incident, in its most common shape: the daemon is slow (or the turn
     /// already finished) and never acknowledges the cancel.
     ///
@@ -4307,6 +4388,13 @@ mod tests {
     /// daemon pid the process is the last handle we hold: it is stopped by
     /// EXACT pid, and the report says so — the session cannot outlive the
     /// daemon that owns it.
+    ///
+    /// The client has to be a REGISTERED consumer of the daemon for the stop
+    /// to be authorised: the decision is made from the census of consumers
+    /// (is anybody else using this daemon?) and from the ownership record
+    /// (is it ours to stop?). A client that never registered cannot prove
+    /// that nobody else is using the daemon, so it fails closed — which is
+    /// what the companion test below pins.
     #[tokio::test]
     // The suite lock is held across an await on purpose: the reaper reads
     // the PROCESS-WIDE session list, so without it this test could pick up a
@@ -4336,6 +4424,9 @@ mod tests {
         let (server, _attempts) =
             spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
         record_daemon_for_socket(&socket, daemon_pid);
+        // This process is a real client of the daemon: it registered itself
+        // before it used it, and it is the only one.
+        acquire_lease_for(&socket, daemon_pid);
         note_session("settled-session-probe");
         wait_until(|| alive(daemon_pid), "the daemon fixture to be running");
 
@@ -4378,6 +4469,70 @@ mod tests {
             kill_exact(daemon_pid);
         }
         forget_session("settled-session-probe");
+        drop(server);
+    }
+
+    /// A client that never REGISTERED may not stop the daemon, even when it
+    /// is the only process on the host and the daemon will not answer.
+    ///
+    /// This is the fail-closed half of the decision, and it is the half that
+    /// the old "no lease means stop it by pid" rule got wrong: a client whose
+    /// lease write failed cannot prove that nobody else is using the daemon,
+    /// and a daemon that somebody else IS using must not be torn down.
+    #[tokio::test]
+    // The suite lock is held across an await on purpose: the reaper reads
+    // the PROCESS-WIDE session list, so without it this test could pick up a
+    // concurrent reaper test's session and fail that test at random.
+    // `#[tokio::test]` is a current-thread runtime and the guard never moves
+    // between threads, so the lock is sound here.
+    #[allow(clippy::await_holding_lock)]
+    // The stand-in daemon is a real process, killed by exact pid at the end
+    // of the test: the point of the test is that the REAPER leaves it alone.
+    #[allow(clippy::zombie_processes)]
+    async fn a_daemon_no_client_can_prove_is_alone_is_left_running() {
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+
+        let daemon = Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the daemon fixture");
+        let daemon_pid = daemon.id();
+        let (server, _attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        record_daemon_for_socket(&socket, daemon_pid);
+        // NO lease: this process never registered itself as a consumer.
+        note_session("unregistered-client-probe");
+        wait_until(|| alive(daemon_pid), "the daemon fixture to be running");
+
+        let outcome = retry_unconfirmed_cancel(&socket, "unregistered-client-probe").await;
+        let settled = settle_unconfirmed_cancel(
+            &socket,
+            "unregistered-client-probe",
+            outcome,
+            "first not confirmed",
+        )
+        .await;
+
+        assert_eq!(settled.daemon_pid, Some(daemon_pid));
+        assert!(
+            !settled.daemon_stopped,
+            "a client that never registered cannot prove the daemon is alone, so it must not stop it"
+        );
+        assert!(alive(daemon_pid), "the daemon must be left running");
+        assert!(
+            settled.reason.contains("left running"),
+            "the reason must say the daemon was left running: {}",
+            settled.reason
+        );
+
+        // Belt and braces on a failed assertion: never leave the fixture
+        // behind.
+        if alive(daemon_pid) {
+            kill_exact(daemon_pid);
+        }
+        forget_session("unregistered-client-probe");
         drop(server);
     }
 
