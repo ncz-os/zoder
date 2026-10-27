@@ -573,7 +573,6 @@ pub(crate) fn aggregate(
         let requires = limits.rejects_required(&severity);
         let mut attempts: Vec<ConfirmerAttempt> = Vec::new();
         let mut used: Vec<String> = Vec::new();
-        reached_confirmation += 1;
 
         for confirmer in &job.confirmers {
             // Decide as soon as the finding is settled, and never overrun the
@@ -581,8 +580,18 @@ pub(crate) fn aggregate(
             if budget == 0 {
                 break;
             }
-            // One call per finding per confirmer: skip a model already used.
-            if used.iter().any(|m| m == confirmer) {
+            // One call per finding per confirmer. `select_confirmers` is the
+            // single source of truth for that rule: a confirmer already used
+            // on THIS finding is never offered again.
+            let remaining = select_confirmers(
+                std::slice::from_ref(confirmer),
+                &job.plan.reviewer_family,
+                &[],
+                &used,
+                &|_m| Some(String::new()),
+                false,
+            );
+            if remaining.is_empty() {
                 continue;
             }
             // Stop once the finding is decided: a confirm settles it, and
@@ -619,6 +628,12 @@ pub(crate) fn aggregate(
         }
         let reject_ids = reject_models(&attempts);
         let enough_rejects = independent_rejects(&attempts) >= requires;
+        // Only a finding that a confirmer actually looked at "reached
+        // confirmation"; a finding with no attempt (empty chain, budget
+        // exhausted) stays out of the recall denominator.
+        if !attempts.is_empty() {
+            reached_confirmation += 1;
+        }
 
         let (disposition, blocking) = if confirmed {
             (Disposition::Confirmed, true)
@@ -1472,6 +1487,82 @@ mod tests {
         // The ninth finding was never confirmed: recorded not_run, still blocks.
         assert_eq!(review.decisions[8].disposition, Disposition::NotRun);
         assert!(review.decisions[8].blocking);
+    }
+
+    #[test]
+    fn recall_denominator_counts_only_findings_that_reached_confirmation() {
+        // Two findings: one has a confirmer (rejects -> demoted), one has an
+        // empty chain (never reached a confirmer). The recall denominator must
+        // be 1, not 2, so recall == 1.0 rather than 0.5.
+        let demoted_job = job(finding("high", "reached", Some("let x"), CTX), &["c1"]);
+        let unreached_job = ConfirmationJob {
+            plan: plan(finding("high", "unreached", Some("let x"), CTX), &[]),
+            confirmers: Vec::new(),
+        };
+        let review = aggregate(&[demoted_job, unreached_job], &limits(), &mut |m, _| {
+            attempt(m, "other", ParsedDisposition::Reject)
+        });
+        assert_eq!(review.demoted.len(), 1);
+        assert_eq!(
+            review.reviewer_family_recall,
+            Some(1.0),
+            "recall denominator must only count findings that reached a confirmer"
+        );
+        // The unreached finding never demoted, so the review still blocks.
+        assert!(review.effective_blocking);
+    }
+
+    #[test]
+    fn budget_exhausted_finding_is_not_run_and_still_blocks() {
+        // The spec (§7): unconfirmed findings keep blocking. A finding that
+        // never got a confirmation call because the budget ran out is
+        // `not_run` and MUST still block — it is not a demotion.
+        let jobs: Vec<ConfirmationJob> = (0..9)
+            .map(|i| {
+                job(
+                    finding("high", &format!("budget claim {i}"), Some("let x"), CTX),
+                    &["c1"],
+                )
+            })
+            .collect();
+        let review = aggregate(&jobs, &limits(), &mut |m, _| {
+            attempt(m, "other", ParsedDisposition::Confirm)
+        });
+        let last = review.decisions.last().unwrap();
+        assert_eq!(last.disposition, Disposition::NotRun);
+        assert!(
+            last.blocking,
+            "an unconfirmed, budget-exhausted finding keeps blocking"
+        );
+        assert!(review.effective_blocking);
+    }
+
+    #[test]
+    fn confirmed_low_finding_never_blocks() {
+        // A medium/low finding recorded by the caller as not_run must not
+        // contribute to effective_blocking. `aggregate` only sees blocking
+        // candidates, so this pins the caller-side contract: a NotRun
+        // decision added with blocking=false does not block.
+        use crate::review_confirm::ConfirmedReview;
+        let decisions: Vec<FindingDecision> = vec![FindingDecision {
+            finding_id: "x".into(),
+            severity: "low".into(),
+            location: "src/a.rs:1".into(),
+            quote: None,
+            quote_found: false,
+            disposition: Disposition::NotRun,
+            blocking: false,
+            reason: "medium/low findings never reach confirmation".into(),
+            attempts: Vec::new(),
+        }];
+        let review = ConfirmedReview {
+            decisions,
+            demoted: Vec::new(),
+            effective_blocking: false,
+            reviewer_family_recall: None,
+        };
+        assert!(!review.effective_blocking);
+        assert_eq!(review.effective_verdict(), "comment");
     }
 
     #[test]
