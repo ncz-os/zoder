@@ -182,6 +182,7 @@ pub fn build_probe_plan<'a>(
     for p in providers {
         if p.base_url
             .contains(crate::config::PLACEHOLDER_PROVIDER_HOST)
+            || !p.endpoint_is_configured()
         {
             continue;
         }

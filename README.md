@@ -44,15 +44,20 @@ export DEEPSEEK_API_KEY=...
 # 2. Create the starter config (skipped when a config already exists).
 zoder init --profile standalone
 
-# 3. First run. Hosted models are metered, so paid calls need --allow-paid.
+# 3. Fill in your provider endpoint(s) in $ZODER_HOME/config.standalone.toml.
+#    The template ships every provider with the host-free "unset" sentinel;
+#    replace each base_url with the OpenAI-compatible API base your provider
+#    publishes.
+
+# 4. First run. Hosted models are metered, so paid calls need --allow-paid.
 zoder exec --dry-run "summarize this repo"      # route preview; no model call
 zoder exec --allow-paid "summarize this repo"
 zoder review --allow-paid
 zoder loop --allow-paid --check "cargo test"
 ```
 
-The template includes an optional local OpenAI-compatible endpoint
-(llama.cpp `:8080` / Ollama `:11434`), commented out, plus a conservative
+The template includes an optional local OpenAI-compatible endpoint, commented
+out, plus a conservative
 `[budget]` backstop. With one provider key the reviewer first tries the other
 provider and then falls back to the provider you have, printing a warning; with
 two keys it uses a genuine cross-family reviewer. See

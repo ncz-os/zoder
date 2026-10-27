@@ -52,20 +52,19 @@ need to restate them. A standalone install gets the safer default.
 | Setting | Standalone | Fleet | Status |
 |---|---|---|---|
 | Context levers (`[context]`) | OFF; bigger caps, later compaction, more recent turns kept when enabled | ON with the tuned numbers | Wired: `Config::context_levers_for` inherits `[deployment] mode`, explicit `[context] profile` wins |
-| Terse agent I/O | Off (fuller output) | On (bounded output tokens) | Accessor hook: `ProfileDefaults::terse_io` |
-| Shared daemon assumption | Off | On | Accessor hook: `ProfileDefaults::shared_daemon` |
-| Fleet job workspaces / runner job id | Off (no runner-assigned id is published) | On | Wired where the loop records its checkpoint |
-| Fleet update pulling | Off | On | Accessor hook: `ProfileDefaults::fleet_pull_updates` |
+| Fleet job workspaces / runner job id | Off (no runner-assigned id is published) | On | Wired: `agentic.rs` checks `ProfileDefaults::fleet_job_workspaces` |
 | `session/cancel` settle budget | 1500 ms | 750 ms | Wired: `reaper::cancel_budget_for` |
 | Cost backstop default | $50/month suggested for a fresh template | Unset; the fleet's config repository owns fleet caps | Template value; `[budget]` is what the pre-call gate reads |
-| Provider reviewer concurrency | Unlimited (0) | Unlimited unless `ZODER_PROVIDER_CONCURRENCY` is set | Accessor hook; no provider ids are baked into the public tree |
-| Secondary reviewer pool | Off by default | Opt-in default | Accessor hook; `--reviewer-pool-routes` remains explicit on both |
+| Provider reviewer concurrency | Unlimited (0) | Unlimited unless `ZODER_PROVIDER_CONCURRENCY` is set | Wired: `agentic.rs` reads `ProfileDefaults::provider_concurrency_default` |
+| Secondary reviewer pool | Off | Off | Opt-in via `--reviewer-pool-routes` on both profiles; not profile-controlled |
 
-The in-flight fleet optimisations (context optimisation, cost accounting, terse
-I/O, daemon session-cancel) read their defaults from
-`Config::profile_defaults()` / `ProfileDefaults`, not from hardcoded fleet
+The wired fleet optimisations (context optimisation, runner job-id emission,
+the cancel settle budget, provider reviewer concurrency) read their defaults
+from `Config::profile_defaults()` / `ProfileDefaults`, not from hardcoded fleet
 numbers. That keeps the fleet's current behaviour and gives a single-host
-install the conservative side by default.
+install the conservative side by default. Accessor hooks for terse I/O, shared
+daemon assumption, and fleet update pulling exist in `ProfileDefaults` for
+future use but are not yet consulted by any production path.
 
 ## Context inheritance
 

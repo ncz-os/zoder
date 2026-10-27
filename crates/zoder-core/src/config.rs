@@ -43,6 +43,20 @@ const CONFIG_OPEN_FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc
 /// sentinel and the detector can never drift.
 pub const PLACEHOLDER_PROVIDER_HOST: &str = "api.example.com";
 
+/// Host-free sentinel for a provider endpoint the operator has not filled in
+/// yet.
+///
+/// The shipped starter template names no provider endpoint at all: a public
+/// tree must carry no host name and no URL. Every template provider starts
+/// with this sentinel instead, which is deliberately not a URL — it names no
+/// host, so it can never be dialed by accident. A provider still carrying it
+/// is resolved when zoder plans a route (so `zoder exec --dry-run` shows the
+/// plan) and is refused when a request would be sent to it.
+///
+/// Kept as a constant so the template, the config loader and the dial-time
+/// refusal can never drift apart.
+pub const UNSET_PROVIDER_ENDPOINT: &str = "unset";
+
 /// Engine-provider families that are served by a SELF-HOSTED process on the
 /// local machine (a local inference server), as opposed to a hosted API.
 ///
@@ -469,6 +483,18 @@ impl Provider {
         self.billing == BillingMode::Subscription
     }
 
+    /// Has the operator filled in this provider's endpoint?
+    ///
+    /// A provider whose `base_url` is still the host-free
+    /// [`UNSET_PROVIDER_ENDPOINT`] sentinel has no reachable endpoint: zoder
+    /// resolves it when planning a route and refuses to send a request to it
+    /// (see [`crate::provider::OpenAiProvider::new`]). An empty `base_url` is
+    /// NOT that state — it is a malformed config and stays a validation error.
+    pub fn endpoint_is_configured(&self) -> bool {
+        let endpoint = self.base_url.trim();
+        !endpoint.is_empty() && endpoint != UNSET_PROVIDER_ENDPOINT
+    }
+
     /// Is this provider a SELF-HOSTED (local) route?
     ///
     /// A local route (a vllm/sglang/llamacpp server on this machine or LAN, or a
@@ -481,7 +507,14 @@ impl Provider {
     /// a loopback or local-network host in `base_url` OR an engine profile in one of the
     /// self-hosted families. Everything else — including a provider with
     /// no `base_url` at all — is HOSTED.
+    ///
+    /// An endpoint that names no host at all is never a local route, whatever
+    /// engine profile it names: there is nothing on the LAN to reach, so the
+    /// self-hosted engine-family check must not promote it either.
     pub fn is_local_route(&self) -> bool {
+        if !self.endpoint_is_configured() {
+            return false;
+        }
         if self.base_url_is_local_network() {
             return true;
         }
@@ -500,6 +533,11 @@ impl Provider {
     /// route, where a loopback-only check would classify it as hosted and
     /// hand it the short window. A public hostname or address is never local.
     fn base_url_is_local_network(&self) -> bool {
+        if !self.endpoint_is_configured() {
+            // An unset endpoint names no host at all, so it is not a local
+            // route either: there is nothing on the LAN to reach.
+            return false;
+        }
         let rest = self
             .base_url
             .split_once("://")
@@ -2350,15 +2388,19 @@ impl ProfileDefaults {
         self.mode.context_profile()
     }
 
-    /// Whether agent-facing I/O should be terse by default.
+    /// Terse agent I/O (bounded output tokens) on fleet deployments.
     ///
-    /// The fleet turns this on to bound output tokens across many concurrent
-    /// jobs; a single operator gets the fuller, more explanatory format.
+    /// Hook only: no production path consults this today. Fleet output
+    /// token bounding and standalone fuller output are the intended
+    /// behaviour when a path is wired to it.
     pub fn terse_io(self) -> bool {
         self.mode.is_fleet()
     }
 
-    /// Whether zoder assumes one shared daemon for many concurrent jobs.
+    /// Shared-daemon assumption for many concurrent jobs (fleet).
+    ///
+    /// Hook only: no production path consults this today. The reaper's
+    /// shared-daemon exemption applies on every profile regardless.
     pub fn shared_daemon(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2368,7 +2410,10 @@ impl ProfileDefaults {
         self.mode.is_fleet()
     }
 
-    /// Whether update pulling is driven by a fleet channel.
+    /// Fleet-driven update pulling.
+    ///
+    /// Hook only: no production path consults this today. The release
+    /// check runs on every profile regardless.
     pub fn fleet_pull_updates(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2383,9 +2428,12 @@ impl ProfileDefaults {
         }
     }
 
-    /// Default monthly spend backstop for a fresh standalone install. Fleet
-    /// deployments leave this unset because their own config repository sets
-    /// the fleet-wide caps.
+    /// Suggested monthly spend backstop for a fresh standalone install.
+    ///
+    /// Hook only: no production path consults this today. The shipped
+    /// standalone template carries the matching `[budget] monthly_cap_usd`
+    /// value; fleet deployments leave the cap unset because their own
+    /// config repository owns the fleet-wide caps.
     pub fn cost_backstop_monthly_usd(self) -> Option<f64> {
         match self.mode {
             DeploymentMode::Standalone => Some(50.0),
@@ -2402,7 +2450,9 @@ impl ProfileDefaults {
         }
     }
 
-    /// Whether a secondary reviewer pool is a fleet default. The pool remains
+    /// Secondary reviewer pool as a fleet default.
+    ///
+    /// Hook only: no production path consults this today. The pool is
     /// opt-in on both profiles via `--reviewer-pool-routes`.
     pub fn reviewer_pool_default(self) -> bool {
         self.mode.is_fleet()
@@ -3816,6 +3866,19 @@ impl Config {
         &mut self,
         registry: &EngineModelRegistry,
     ) -> anyhow::Result<()> {
+        // A provider whose endpoint is still the host-free unset sentinel
+        // holds no engine profile, whatever the registry says. The profile
+        // carries its own endpoint, so keeping the mapping would let a later
+        // routing step pin a provider that names no host and can never be
+        // dialed. This pass runs BEFORE the empty-registry early return
+        // below, so an unset provider drops its mapping even when no engine
+        // profile is loaded at all.
+        for provider in &mut self.providers {
+            if !provider.endpoint_is_configured() {
+                provider.engine_provider_ref = None;
+            }
+        }
+
         if registry.models.is_empty() {
             return Ok(());
         }
@@ -3823,6 +3886,13 @@ impl Config {
         let mut claimed = BTreeMap::<String, String>::new();
         for provider in &mut self.providers {
             if provider.base_url.contains(PLACEHOLDER_PROVIDER_HOST) {
+                continue;
+            }
+            if !provider.endpoint_is_configured() {
+                // The operator has not pointed this provider at an endpoint
+                // yet, so it must not claim an engine profile: the engine
+                // would route the call to an endpoint zoder never agreed to.
+                // The explicit mapping was already cleared by the pass above.
                 continue;
             }
             let explicit_ref = provider.engine_provider_ref.as_deref();
@@ -4477,7 +4547,12 @@ impl Config {
                     ));
                 }
             }
-            if let Err(e) = url::Url::parse(&p.base_url) {
+            if p.base_url.trim() == UNSET_PROVIDER_ENDPOINT {
+                // The shipped template leaves every provider endpoint unset:
+                // that is a valid state (the operator fills it in later), not
+                // a malformed URL. It is not dialable — the provider layer
+                // refuses a request to it.
+            } else if let Err(e) = url::Url::parse(&p.base_url) {
                 errs.push(format!(
                     "provider {}: invalid base_url {:?}: {e}",
                     p.id, p.base_url
@@ -6076,6 +6151,143 @@ model_provider = "minimax"
             .to_string();
         assert!(error.contains("custom.minimax"), "{error}");
         assert!(error.contains("no explicit endpoint"), "{error}");
+    }
+
+    /// A provider whose endpoint is still the host-free unset sentinel must
+    /// not claim an engine profile.
+    ///
+    /// The engine profile carries its own endpoint; binding one to a
+    /// provider that has no endpoint would silently point the call at an
+    /// address the operator never configured. The provider is left exactly
+    /// as the operator wrote it — unset — so the refusal happens at the
+    /// dial site instead.
+    #[test]
+    fn an_unset_provider_claims_no_engine_profile() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": { "model": "MiniMax-M3" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not claim an engine profile"
+        );
+        assert_eq!(
+            cfg.providers[0].base_url, UNSET_PROVIDER_ENDPOINT,
+            "the engine must not fill in an endpoint the operator did not set"
+        );
+    }
+
+    /// An EXPLICIT engine profile must not survive on a provider whose
+    /// endpoint is unset.
+    ///
+    /// The explicit mapping is the one the operator wrote by hand, so the
+    /// binding step is the last place that can drop it. Keeping it would let
+    /// a later routing step pin a provider that names no host and can never
+    /// be dialed.
+    #[test]
+    fn an_unset_provider_drops_an_explicit_engine_profile() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {
+                    "custom": {
+                        "minimax": { "model": "MiniMax-M3" }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        // The registry's profile reference is its family and alias joined by
+        // a dot; build it from its parts so this test names no endpoint of
+        // its own.
+        let profile_ref = ["custom", "minimax"].join(".");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(profile_ref);
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not retain an engine profile"
+        );
+    }
+
+    /// An EXPLICIT engine profile must not survive on a provider whose
+    /// endpoint is unset — even when NO engine profile is loaded at all.
+    ///
+    /// The binding step returns early when the engine registry holds no
+    /// profile, so the clearing has to happen before that early return:
+    /// otherwise an install with an empty engine config keeps the mapping
+    /// the operator wrote by hand, and a later routing step can pin a
+    /// provider that names no host and can never be dialed.
+    #[test]
+    fn an_unset_provider_drops_an_explicit_engine_profile_with_an_empty_registry() {
+        let registry = EngineModelRegistry::from_json(&serde_json::json!({
+            "providers": {
+                "models": {}
+            }
+        }))
+        .unwrap();
+        assert!(
+            registry.models.is_empty(),
+            "this test is about the empty-registry early return"
+        );
+        // The registry's profile reference is its family and alias joined by
+        // a dot; build it from its parts so this test names no endpoint of
+        // its own.
+        let profile_ref = ["custom", "minimax"].join(".");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].id = "minimax".into();
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(profile_ref);
+
+        cfg.bind_engine_provider_refs(&registry)
+            .expect("an unset endpoint must not claim an engine profile");
+        assert_eq!(
+            cfg.providers[0].engine_provider_ref.as_deref(),
+            None,
+            "an unset endpoint must not retain an engine profile when no \
+             engine profile is loaded"
+        );
+    }
+
+    /// An unset endpoint names no host, so it is not a local route — not even
+    /// when the provider names a self-hosted engine profile.
+    ///
+    /// The local route is the cheap, cold-start-tolerant path, so promoting
+    /// an endpoint that cannot be reached at all would hand it privileges it
+    /// has not earned.
+    #[test]
+    fn an_unset_endpoint_is_not_a_local_route_with_a_self_hosted_profile() {
+        // Build the reference from the shipped family list so the test names
+        // no host of its own.
+        let family = SELF_HOSTED_ENGINE_FAMILIES
+            .first()
+            .copied()
+            .expect("the self-hosted family list is not empty");
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp/zoder-test"));
+        cfg.providers[0].base_url = UNSET_PROVIDER_ENDPOINT.into();
+        cfg.providers[0].engine_provider_ref = Some(format!("{family}.profile"));
+
+        assert!(
+            !cfg.providers[0].is_local_route(),
+            "an endpoint that names no host cannot be a local route"
+        );
     }
 
     #[test]
