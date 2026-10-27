@@ -1127,6 +1127,12 @@ In `file` mode:
   but refuses to save the reconciled corpus (and the alias-overlay rows
   persisted with it) without `--force`.
 
+The `file` protection does not depend on your config loading: the env var
+and the `"managed": true` marker are honoured even when the config cannot
+be read, and `[pricing] source = "file"` is honoured even when the rest of
+the config fails validation. A broken config is exactly when an overwrite
+is least likely to be noticed, so it must never switch the protection off.
+
 Both files may also carry optional provenance metadata: a top-level
 `"source"` (a string label), `"generated"` (a `YYYY-MM-DD` date or an
 RFC3339 timestamp; the first 10 characters are taken) and
