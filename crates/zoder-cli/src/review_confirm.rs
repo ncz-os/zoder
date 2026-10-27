@@ -2116,6 +2116,217 @@ mod tests {
         );
     }
 
+    // ---- the recorded grounding replay -----------------------------------
+
+    /// The recorded grounding replay: 137 findings, scrubbed of every name
+    /// the public tree may not carry.
+    ///
+    /// Each row is one recorded finding with the facts the grounding rule
+    /// turns on: whether the cited path existed at the reviewed head
+    /// (`path_present`), how many lines it had (`file_lines`), how many of
+    /// the code spans the finding quoted were present in the reviewed text
+    /// (`n_present`), how many were absent (`n_missing`), and the location
+    /// verdict the recorded run produced (`loc_ok`).
+    ///
+    /// The cited path itself is not in the fixture -- the review it came
+    /// from lives in a private repository -- but the row keeps the shape of
+    /// the location (`cite`), so the production location parser still has to
+    /// read it.
+    const GROUNDING_REPLAY: &str = include_str!("../tests/data/grounding-replay-20261026.jsonl");
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ReplayRow {
+        kind: String,
+        id: String,
+        class: String,
+        cite: String,
+        path_present: bool,
+        file_lines: Option<usize>,
+        n_present: usize,
+        n_missing: usize,
+        loc_ok: bool,
+    }
+
+    /// The cited path of a replay row. Every row gets its own file, so one
+    /// row's cited place can never answer another row's question.
+    fn replay_cited_path(idx: usize) -> String {
+        format!("src/replay/row_{idx:03}.rs")
+    }
+
+    /// The file the diff touched: the corpus every span is searched in.
+    const REPLAY_TOUCHED: &str = "src/replay/touched.rs";
+
+    /// The spans the recorded run found in the reviewed text.
+    fn replay_present_spans(idx: usize, row: &ReplayRow) -> Vec<String> {
+        (0..row.n_present)
+            .map(|j| format!("replay_p_{idx}_{j}"))
+            .collect()
+    }
+
+    /// The spans the recorded run did not find anywhere.
+    fn replay_missing_spans(idx: usize, row: &ReplayRow) -> Vec<String> {
+        (0..row.n_missing)
+            .map(|j| format!("replay_m_{idx}_{j}"))
+            .collect()
+    }
+
+    /// The claim the replay row makes: the spans it quotes, and nothing
+    /// else. The wording proposes no fix, so every quoted span counts as
+    /// evidence.
+    fn replay_claim(idx: usize, row: &ReplayRow) -> String {
+        let mut spans = replay_present_spans(idx, row);
+        spans.extend(replay_missing_spans(idx, row));
+        let quoted: Vec<String> = spans.iter().map(|s| format!("`{s}`")).collect();
+        format!("the reviewed code holds {}", quoted.join(" "))
+    }
+
+    /// The recorded replay reproduces.
+    ///
+    /// Over the 137 recorded findings the grounding rule drops 15 of the 73
+    /// false findings and NONE of the 62 real ones. The rule is driven
+    /// through the production path -- the location parser, the span
+    /// extractor, the grounding check and the pre-check -- so this test
+    /// fails when any of them stops answering the recorded question.
+    #[test]
+    fn the_recorded_replay_drops_15_false_findings_and_no_real_one() {
+        use std::collections::HashMap;
+
+        let rows: Vec<ReplayRow> = GROUNDING_REPLAY
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("every replay row is a JSON object"))
+            .collect();
+        assert_eq!(rows.len(), 137, "the recorded replay holds 137 findings");
+
+        // The reviewed head the replay is driven against. The touched file
+        // holds every span the recorded run found, and each row's own file
+        // holds the spans of that row.
+        let mut head: HashMap<String, String> = HashMap::new();
+        let mut touched = String::new();
+        for (idx, row) in rows.iter().enumerate() {
+            for span in replay_present_spans(idx, row) {
+                touched.push_str(&span);
+                touched.push('\n');
+            }
+        }
+        head.insert(REPLAY_TOUCHED.to_string(), touched);
+        for (idx, row) in rows.iter().enumerate() {
+            if !row.path_present {
+                continue;
+            }
+            let lines = row.file_lines.unwrap_or(1).max(1);
+            let mut text = replay_present_spans(idx, row).join(" ");
+            text.push('\n');
+            for _ in 1..lines {
+                text.push_str("replay filler line\n");
+            }
+            head.insert(replay_cited_path(idx), text);
+        }
+        let read = |path: &str| head.get(path).cloned();
+
+        let mut findings: Vec<PendingFinding> = Vec::with_capacity(rows.len());
+        let mut expected_dropped: Vec<bool> = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.iter().enumerate() {
+            let location = format!("{}{}", replay_cited_path(idx), row.cite);
+            let claim = replay_claim(idx, row);
+            let grounding = ground_finding(&location, &claim, &read, &[REPLAY_TOUCHED.to_string()]);
+            assert_eq!(
+                grounding.location_ok, row.loc_ok,
+                "row {} ({} {}): the cited place",
+                row.id, row.class, row.cite
+            );
+            assert_eq!(
+                grounding.present.len(),
+                row.n_present,
+                "row {} ({} {}): the spans the reviewed text holds",
+                row.id,
+                row.class,
+                row.cite
+            );
+            assert_eq!(
+                grounding.missing.len(),
+                row.n_missing,
+                "row {} ({} {}): the spans the reviewed text does not hold",
+                row.id,
+                row.class,
+                row.cite
+            );
+            let quote = grounding.evidence_quote().map(str::to_string);
+            let quote_found = quote.is_some();
+            findings.push(PendingFinding {
+                id: finding_id("fam", &location, &claim),
+                severity: "high".to_string(),
+                location,
+                quote,
+                claim,
+                quote_found,
+                grounded: grounding.grounded(),
+                ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
+            });
+            expected_dropped.push(!row.loc_ok || (row.n_missing > 0 && row.n_present == 0));
+        }
+
+        let (checks, pending) = precheck(&findings);
+        assert_eq!(checks.len(), rows.len());
+        let mut false_total = 0usize;
+        let mut false_dropped = 0usize;
+        let mut real_total = 0usize;
+        let mut real_dropped = 0usize;
+        for ((row, check), expected) in rows.iter().zip(checks.iter()).zip(expected_dropped.iter())
+        {
+            assert_eq!(
+                check.dropped, *expected,
+                "row {} ({} {}): the pre-check verdict",
+                row.id, row.class, row.cite
+            );
+            if check.dropped {
+                assert!(
+                    !check.reason.is_empty(),
+                    "a dropped finding must say why: {} {}",
+                    row.id,
+                    row.cite
+                );
+            } else {
+                assert!(
+                    check.reason.is_empty(),
+                    "a kept finding must not carry a reason: {} {}",
+                    row.id,
+                    row.cite
+                );
+            }
+            match row.kind.as_str() {
+                "false" => {
+                    false_total += 1;
+                    if check.dropped {
+                        false_dropped += 1;
+                    }
+                }
+                "real" => {
+                    real_total += 1;
+                    if check.dropped {
+                        real_dropped += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            false_total, 73,
+            "the recorded replay holds 73 false findings"
+        );
+        assert_eq!(
+            false_dropped, 15,
+            "the grounding rule stops 15 of the 73 false findings"
+        );
+        assert_eq!(real_total, 62, "the recorded replay holds 62 real findings");
+        assert_eq!(real_dropped, 0, "the grounding rule loses no real finding");
+        assert_eq!(
+            pending.len(),
+            rows.len() - false_dropped,
+            "a dropped finding never reaches a confirmer"
+        );
+    }
+
     // ---- aggregation branches -------------------------------------------
 
     #[test]
