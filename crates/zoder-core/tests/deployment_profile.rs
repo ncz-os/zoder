@@ -68,8 +68,16 @@ fn an_explicit_context_profile_still_wins_over_the_deployment() {
     assert_eq!(cfg.context_levers_for("deepseek-flash"), None);
 }
 
+/// Verify the accessor API contract for `ProfileDefaults`.
+///
+/// The wired settings (context_profile, fleet_job_workspaces,
+/// daemon_cancel_budget_ms, provider_concurrency_default) are exercised by
+/// production-path tests elsewhere. The hooks (terse_io, shared_daemon,
+/// fleet_pull_updates, cost_backstop_monthly_usd, reviewer_pool_default)
+/// are accessor-only today; this test pins their return values so a future
+/// wiring commit can rely on the contract without breaking silently.
 #[test]
-fn profile_defaults_keep_fleet_behaviour_and_relax_standalone() {
+fn profile_defaults_accessor_contract() {
     let fleet = ProfileDefaults::for_mode(DeploymentMode::Fleet);
     let standalone = ProfileDefaults::for_mode(DeploymentMode::Standalone);
 
@@ -103,6 +111,9 @@ fn profile_defaults_keep_fleet_behaviour_and_relax_standalone() {
 
     assert_eq!(fleet.provider_concurrency_default(), 0);
     assert_eq!(standalone.provider_concurrency_default(), 0);
+
+    assert!(fleet.reviewer_pool_default());
+    assert!(!standalone.reviewer_pool_default());
 }
 
 #[test]
@@ -149,7 +160,11 @@ fn the_standalone_template_is_a_valid_single_host_overlay() {
 
     let budget: Budget = overlay.budget.expect("budget backstop");
     assert_eq!(budget.max_cost_per_call_usd, Some(1.0));
-    assert_eq!(budget.monthly_cap_usd, Some(50.0));
+    // The template's cap must stay in lockstep with the accessor that
+    // documents the standalone default (cost_backstop_monthly_usd).
+    let standalone_default =
+        ProfileDefaults::for_mode(DeploymentMode::Standalone).cost_backstop_monthly_usd();
+    assert_eq!(budget.monthly_cap_usd, standalone_default);
 }
 
 #[test]
