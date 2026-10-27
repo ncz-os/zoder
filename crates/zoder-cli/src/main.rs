@@ -21703,6 +21703,45 @@ mod pricing_source_file_tests {
         });
     }
 
+    /// A managed corpus must keep protecting itself across a forced refresh.
+    /// The refresh loads the installed corpus and saves it back; if the save
+    /// dropped the `"managed": true` marker, the file-source switch would
+    /// fall back to "auto" on the next run and zoder would overwrite the
+    /// corpus its installer had marked as managed.
+    ///
+    /// The test drives the production loader and the production saver, so it
+    /// fails if either one stops carrying the marker.
+    #[test]
+    fn corpus_refresh_keeps_the_managed_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let corpus_path = home.path().join("model_corpus.json");
+        std::fs::write(
+            &corpus_path,
+            r#"{"managed": true, "source": "an internal corpus", "models": [{"id": "prov-a/model-1"}]}"#,
+        )
+        .unwrap();
+        with_env_home(home.path(), &[], || {
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(
+                pricing_source_switch(&cfg),
+                FileSwitch::Managed,
+                "the managed corpus must switch the pricing source to file mode"
+            );
+
+            // What a forced corpus refresh does: load the installed corpus,
+            // then save it back.
+            let loaded = zoder_core::Corpus::load_without_overlay(&corpus_path).unwrap();
+            loaded.save(&corpus_path).unwrap();
+
+            let cfg = Config::load_unvalidated().unwrap();
+            assert_eq!(
+                pricing_source_switch(&cfg),
+                FileSwitch::Managed,
+                "the managed marker must survive the corpus save"
+            );
+        });
+    }
+
     #[test]
     fn stale_days_threshold_invalid_falls_back_to_seven() {
         let home = tempfile::tempdir().unwrap();
