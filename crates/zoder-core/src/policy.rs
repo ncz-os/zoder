@@ -23,7 +23,6 @@ fn host_of(api_base: &str) -> Option<String> {
 
 /// True when `host` equals a free host exactly or is a subdomain of one.
 fn host_is_free(host: &str, free_hosts: &[String]) -> bool {
-    let host = host.trim().to_ascii_lowercase();
     free_hosts.iter().any(|h| {
         let h = h.trim().to_ascii_lowercase();
         !h.is_empty() && (host == h || host.ends_with(&format!(".{h}")))
