@@ -953,7 +953,7 @@ impl PricingCatalog {
         // other write bits so a saved catalog is loadable again.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             if let Ok(meta) = std::fs::metadata(&tmp) {
                 let mode = meta.mode() & 0o7777 & !0o022;
                 let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
