@@ -1348,6 +1348,7 @@ pub(crate) fn build_context(
     hunk: &str,
     read: &dyn Fn(&str) -> Option<String>,
     max_lines: usize,
+    site_paths: &[String],
 ) -> String {
     let max_lines = max_lines.max(1);
     let mut out = String::new();
@@ -1371,7 +1372,7 @@ pub(crate) fn build_context(
         out.push_str("\nCited file at the reviewed head (windowed around the cited line):\n");
         out.push_str(&window);
     }
-    if let Some(defs) = definition_sites(plan, read, max_lines) {
+    if let Some(defs) = definition_sites(plan, read, max_lines, site_paths) {
         out.push_str("\nDefinition sites of identifiers the finding names:\n");
         out.push_str(&defs);
     }
@@ -1403,26 +1404,93 @@ fn cited_window(
 
 /// Definition site of every identifier the claim names, reusing the Z3 name
 /// extraction ([`crate::review_filter::claimed_symbols`]).
+///
+/// EVERY identifier the claim names is looked up — not the first eight.
+/// A cap silently hid the definitions of the identifiers past it, and a
+/// confirmer that cannot see a definition cannot tell a real finding from a
+/// misread one.
+///
+/// The lookup runs over the RELEVANT definition sites: the file the finding
+/// cites first, then the other files the change touches, because a symbol
+/// named in a finding is often defined in a file the finding did not cite.
+///
+/// The bounds are explicit and separate:
+///
+/// * a PER-SITE bound — at most `max_lines` lines of each site are
+///   searched, so one huge file cannot eat the whole budget;
+/// * a TOTAL bound — at most `max_lines` definition lines are emitted
+///   across all sites.
+///
+/// An identifier that is not found in any searched site is reported as
+/// unresolved: the confirmer has to know that the context is missing a
+/// definition rather than believe there is none.
 fn definition_sites(
     plan: &PendingFinding,
     read: &dyn Fn(&str) -> Option<String>,
     max_lines: usize,
+    site_paths: &[String],
 ) -> Option<String> {
-    let (path, _) = split_location(&plan.location)?;
-    let text = read(&path)?;
     let symbols = crate::review_filter::claimed_symbols(&plan.claim, &plan.claim);
     if symbols.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = text.lines().collect();
+    let per_site_lines = max_lines.max(1);
+    let total_lines = max_lines.max(1);
+    // The sites to search: the cited file first, then the touched files.
+    let mut sites: Vec<String> = Vec::new();
+    if let Some((path, _)) = split_location(&plan.location) {
+        if !path.is_empty() {
+            sites.push(path);
+        }
+    }
+    for path in site_paths {
+        if !sites.iter().any(|p| p == path) {
+            sites.push(path.clone());
+        }
+    }
+    if sites.is_empty() {
+        return None;
+    }
     let mut out = String::new();
-    for symbol in symbols.iter().take(8) {
-        for (idx, line) in lines.iter().enumerate().take(max_lines) {
-            if defines_or_imports(line, symbol) {
-                out.push_str(&format!("- {}:{}: {}\n", path, idx + 1, line.trim()));
+    let mut emitted = 0usize;
+    let mut unresolved: Vec<&str> = Vec::new();
+    for symbol in &symbols {
+        if emitted >= total_lines {
+            // The budget is spent: the rest is reported as unresolved so the
+            // confirmer is never left thinking a symbol has no definition.
+            unresolved.push(symbol);
+            continue;
+        }
+        let mut found = false;
+        for site in &sites {
+            let Some(text) = read(site) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let mut hit = None;
+            for (idx, line) in lines.iter().enumerate().take(per_site_lines) {
+                if defines_or_imports(line, symbol) {
+                    hit = Some((idx + 1, line.trim().to_string()));
+                    break;
+                }
+            }
+            if let Some((line_no, line_text)) = hit {
+                out.push_str(&format!("- {symbol} at {site}:{line_no}: {line_text}\n"));
+                emitted += 1;
+                found = true;
                 break;
             }
         }
+        if !found {
+            unresolved.push(symbol);
+        }
+    }
+    if !unresolved.is_empty() {
+        out.push_str(&format!(
+            "- unresolved identifiers (no definition found in the {} searched site(s)): {}\n",
+            sites.len(),
+            unresolved.join(", ")
+        ));
     }
     if out.is_empty() {
         None
@@ -2343,6 +2411,156 @@ mod tests {
         assert_eq!(value["verdict_basis"], "reviewer_plus_confirmer");
     }
 
+    // ---- definition sites -----------------------------------------------
+
+    /// EVERY identifier the claim names is looked up, not the first eight.
+    ///
+    /// A cap silently hid the definitions of the identifiers past it, and a
+    /// confirmer that cannot see a definition cannot tell a real finding
+    /// from a misread one.
+    #[test]
+    fn definition_sites_covers_every_identifier_the_claim_names() {
+        let mut src = String::new();
+        for i in 0..12 {
+            src.push_str(&format!("fn symbol_number_{i}() {{}}\n"));
+        }
+        let read = move |_: &str| Some(src.clone());
+        let claim = "the symbols `symbol_number_0` `symbol_number_1` `symbol_number_2` `symbol_number_3` `symbol_number_4` `symbol_number_5` `symbol_number_6` `symbol_number_7` `symbol_number_8` `symbol_number_9` `symbol_number_10` `symbol_number_11` are not defined";
+        let f = PendingFinding {
+            id: "id".to_string(),
+            severity: "high".to_string(),
+            location: format!("{SRC}:1"),
+            quote: None,
+            claim: claim.to_string(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let defs =
+            definition_sites(&f, &read, 50, &[]).expect("the definition sites must be found");
+        for i in 0..12 {
+            assert!(
+                defs.contains(&format!("symbol_number_{i}")),
+                "symbol_number_{i} must be looked up: {defs}"
+            );
+        }
+    }
+
+    /// The lookup runs over the cited file FIRST and then over the other
+    /// files the change touches: a symbol the finding names is often
+    /// defined in a file the finding did not cite.
+    #[test]
+    fn definition_sites_search_the_touched_files() {
+        let read = |path: &str| match path {
+            "src/cited.rs" => Some("fn unrelated() {}\n".to_string()),
+            "src/touched.rs" => Some("fn elsewhere_defined() {}\n".to_string()),
+            _ => None,
+        };
+        let f = PendingFinding {
+            id: "id".to_string(),
+            severity: "high".to_string(),
+            location: "src/cited.rs:1".to_string(),
+            quote: None,
+            claim: "`elsewhere_defined` is not defined".to_string(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let defs = definition_sites(&f, &read, 20, &["src/touched.rs".to_string()])
+            .expect("the definition site must be found");
+        assert!(
+            defs.contains("elsewhere_defined at src/touched.rs"),
+            "the touched file must be searched: {defs}"
+        );
+    }
+
+    /// An identifier that is not found in any searched site is REPORTED as
+    /// unresolved: the confirmer has to know that the context is missing a
+    /// definition rather than believe there is none.
+    #[test]
+    fn definition_sites_report_unresolved_identifiers() {
+        let read = |_: &str| Some("fn something_else() {}\n".to_string());
+        let f = PendingFinding {
+            id: "id".to_string(),
+            severity: "high".to_string(),
+            location: format!("{SRC}:1"),
+            quote: None,
+            claim: "`never_defined_anywhere` is not defined".to_string(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let defs = definition_sites(&f, &read, 20, &[]).expect("the report must exist");
+        assert!(
+            defs.contains("never_defined_anywhere"),
+            "the unresolved identifier must be named: {defs}"
+        );
+        assert!(
+            defs.contains("unresolved identifiers"),
+            "the report must say they are unresolved: {defs}"
+        );
+    }
+
+    /// The per-site bound keeps one huge file from eating the whole budget:
+    /// a definition that sits past the bound is not found in that site.
+    #[test]
+    fn definition_sites_are_bounded_per_site() {
+        let mut src = String::new();
+        for i in 0..3 {
+            src.push_str(&format!("fn filler_{i}() {{}}\n"));
+        }
+        src.push_str("fn buried_definition() {}\n");
+        let read = move |_: &str| Some(src.clone());
+        let f = PendingFinding {
+            id: "id".to_string(),
+            severity: "high".to_string(),
+            location: format!("{SRC}:1"),
+            quote: None,
+            claim: "`buried_definition` is not defined".to_string(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let defs = definition_sites(&f, &read, 3, &[]).expect("the report must exist");
+        assert!(
+            !defs.contains("buried_definition at"),
+            "a definition past the per-site bound is not reported: {defs}"
+        );
+    }
+
+    /// The TOTAL bound caps how many definition lines are emitted across
+    /// ALL the sites, so one site cannot starve the others.
+    #[test]
+    fn definition_sites_are_bounded_in_total() {
+        let read = |path: &str| match path {
+            "src/a.rs" => {
+                Some("fn total_a0() {}\nfn total_a1() {}\nfn total_a2() {}\n".to_string())
+            }
+            "src/b.rs" => {
+                Some("fn total_b0() {}\nfn total_b1() {}\nfn total_b2() {}\n".to_string())
+            }
+            _ => None,
+        };
+        let claim = "the symbols `total_a0` `total_a1` `total_a2` `total_b0` `total_b1` `total_b2` are not defined";
+        let f = PendingFinding {
+            id: "id".to_string(),
+            severity: "high".to_string(),
+            location: "src/a.rs:1".to_string(),
+            quote: None,
+            claim: claim.to_string(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let defs = definition_sites(&f, &read, 3, &["src/b.rs".to_string()])
+            .expect("the report must exist");
+        let emitted = defs.lines().filter(|l| l.contains(" at ")).count();
+        assert!(
+            emitted <= 3,
+            "the total bound must cap the emitted definitions: {emitted} in {defs}"
+        );
+    }
+
     // ---- context builder ------------------------------------------------
 
     #[test]
@@ -2353,7 +2571,7 @@ mod tests {
             .join("\n");
         let read = move |_: &str| Some(file.clone());
         let f = finding("high", "something about foo", Some("let x = 1"), CTX);
-        let ctx = build_context(&f, "diff body", &read, 20);
+        let ctx = build_context(&f, "diff body", &read, 20, &[]);
         // The hunk and the windowed file are present, but bounded.
         assert!(ctx.contains("diff body"));
         let windowed_lines = ctx.lines().count();
