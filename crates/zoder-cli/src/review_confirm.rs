@@ -756,63 +756,76 @@ pub(crate) fn precheck(findings: &[PendingFinding]) -> (Vec<Precheck>, Vec<Pendi
 // Confirmer output parsing.
 // ---------------------------------------------------------------------------
 
-/// Extract the outermost `{...}` object from a confirmer reply and parse it.
+/// Parse a confirmer reply as EXACTLY one JSON object.
+///
+/// The contract asks for strict JSON: one object, no prose. Extracting the
+/// outermost `{...}` out of a reply that wraps it in prose accepted answers
+/// the contract does not allow, so the whole trimmed reply has to parse as
+/// one object. A reply with prose around it, or with two objects, is not a
+/// reply at all: it is `unparsed`, which keeps the finding blocking.
 fn parse_object(raw: &str) -> Option<Value> {
     let trimmed = raw.trim();
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if end <= start {
+    if trimmed.is_empty() {
         return None;
     }
-    serde_json::from_str::<Value>(&trimmed[start..=end]).ok()
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    Some(value)
 }
 
-/// Parse a confirmer's raw output into its disposition, enforcing the "no
-/// quote means insufficient" rule.
+/// Parse a confirmer's raw output into its disposition, enforcing the strict
+/// JSON contract and the "no quote means insufficient" rule.
 ///
-/// Returns `None` when the reply is not structured JSON at all (the caller
-/// records `unparsed`). A structurally valid reply with an empty or unknown
-/// disposition, an empty quote, or a quote that is not in the context reads
-/// as [`ParsedDisposition::Insufficient`] — the safe default that keeps the
-/// finding blocking. A reply about a DIFFERENT `finding_id` is also
-/// insufficient: it can never demote the wrong claim.
+/// Returns `None` when the reply does not satisfy the contract (the caller
+/// records `unparsed` and the finding keeps blocking):
+///
+/// * the reply is not exactly one JSON object — prose around it, a JSON array
+///   and two objects in a row are all refused;
+/// * `finding_id` is absent or does not match the finding being confirmed
+///   — a reply about a DIFFERENT finding can never demote this one, and a
+///   reply that does not say which finding it is about is not a reply the
+///   contract allows;
+/// * one of the required fields (`disposition`, `quote`, `reason`) is
+///   absent.
+///
+/// A reply that satisfies the contract but carries an unknown disposition, an
+/// empty quote, or a quote that is not in the context reads as
+/// [`ParsedDisposition::Insufficient`] — the safe default that keeps the
+/// finding blocking.
 pub(crate) fn parse_confirmer_output(
     raw: &str,
     expected_id: &str,
     context: &str,
 ) -> Option<ConfirmerVerdict> {
     let value = parse_object(raw)?;
-    let finding_id = value
-        .get("finding_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let object_id_ok = finding_id.is_empty() || finding_id == expected_id;
-    let disposition_raw = value
-        .get("disposition")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    let quote = value
-        .get("quote")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
-        .map(str::to_string);
-    let reason = value
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    // The finding id must be present and must be THIS finding.
+    let finding_id = value.get("finding_id").and_then(Value::as_str)?.trim();
+    if finding_id.is_empty() || finding_id != expected_id {
+        return None;
+    }
+    // The required fields must all be there.
+    let disposition_field = value.get("disposition").and_then(Value::as_str)?;
+    let quote_field = value.get("quote").and_then(Value::as_str)?;
+    let reason_field = value.get("reason").and_then(Value::as_str)?;
+    let disposition_raw = disposition_field.trim().to_ascii_lowercase();
+    let quote = {
+        let q = quote_field.trim();
+        if q.is_empty() {
+            None
+        } else {
+            Some(q.to_string())
+        }
+    };
+    let reason = reason_field.trim().to_string();
 
     let disposition = match disposition_raw.as_str() {
         "confirm" | "reject" => match quote.as_deref() {
             // A confirm or reject must quote the context verbatim; without a
             // quote (or with a quote that is not in the context) the answer
             // is insufficient, and the finding keeps blocking.
-            Some(q) if object_id_ok && quote_in(q, context) => {
+            Some(q) if quote_in(q, context) => {
                 if disposition_raw == "confirm" {
                     ParsedDisposition::Confirm
                 } else {
@@ -826,11 +839,7 @@ pub(crate) fn parse_confirmer_output(
         _ => ParsedDisposition::Insufficient,
     };
     Some(ConfirmerVerdict {
-        finding_id: if finding_id.is_empty() {
-            expected_id.to_string()
-        } else {
-            finding_id.to_string()
-        },
+        finding_id: finding_id.to_string(),
         disposition,
         quote,
         reason,
@@ -2320,9 +2329,61 @@ mod tests {
 
     #[test]
     fn reject_without_quote_is_insufficient() {
-        let raw = r#"{"finding_id":"id","disposition":"reject","reason":"bad"}"#;
+        // The quote field is there but empty: the reply satisfies the shape
+        // and carries no evidence, so it is insufficient.
+        let raw = r#"{"finding_id":"id","disposition":"reject","quote":"","reason":"bad"}"#;
         let v = parse_confirmer_output(raw, "id", CTX).unwrap();
         assert_eq!(v.disposition, ParsedDisposition::Insufficient);
+    }
+
+    /// The contract asks for strict JSON: one object, no prose. A reply
+    /// wrapped in prose is not a reply the contract allows, so it is
+    /// `unparsed` \u2014 and the finding keeps blocking.
+    #[test]
+    fn a_prose_wrapped_reply_is_rejected() {
+        let raw = "Sure, here is my answer:\n{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}\nHope that helps.";
+        assert!(
+            parse_confirmer_output(raw, "id", CTX).is_none(),
+            "a prose-wrapped reply must not be read as a verdict"
+        );
+    }
+
+    /// Two objects in a row are not one object either.
+    #[test]
+    fn two_objects_in_a_row_are_rejected() {
+        let raw = r#"{"finding_id":"id","disposition":"reject","quote":"let x","reason":"r"}{"finding_id":"id","disposition":"confirm","quote":"let x","reason":"r"}"#;
+        assert!(parse_confirmer_output(raw, "id", CTX).is_none());
+    }
+
+    /// A JSON array is not an object.
+    #[test]
+    fn a_json_array_is_rejected() {
+        let raw = r#"[{"finding_id":"id","disposition":"reject","quote":"let x","reason":"r"}]"#;
+        assert!(parse_confirmer_output(raw, "id", CTX).is_none());
+    }
+
+    /// A reply that does not say WHICH finding it is about is refused: the
+    /// contract requires the id, and a reply without it could be about
+    /// anything.
+    #[test]
+    fn a_reply_without_a_finding_id_is_rejected() {
+        let raw = r#"{"disposition":"reject","quote":"let x","reason":"r"}"#;
+        assert!(parse_confirmer_output(raw, "id", CTX).is_none());
+    }
+
+    /// A reply that leaves out one of the required fields is refused too.
+    #[test]
+    fn a_reply_without_a_required_field_is_rejected() {
+        for raw in [
+            r#"{"finding_id":"id","quote":"let x","reason":"r"}"#,
+            r#"{"finding_id":"id","disposition":"reject","reason":"r"}"#,
+            r#"{"finding_id":"id","disposition":"reject","quote":"let x"}"#,
+        ] {
+            assert!(
+                parse_confirmer_output(raw, "id", CTX).is_none(),
+                "a reply missing a required field must be unparsed: {raw}"
+            );
+        }
     }
 
     #[test]
@@ -2335,8 +2396,9 @@ mod tests {
     #[test]
     fn reply_about_a_different_finding_cannot_demote() {
         let raw = r#"{"finding_id":"other","disposition":"reject","quote":"let x","reason":"r"}"#;
-        let v = parse_confirmer_output(raw, "id", CTX).unwrap();
-        assert_eq!(v.disposition, ParsedDisposition::Insufficient);
+        // A reply about a different finding is refused outright: it can
+        // never demote this one, and it says nothing about this one.
+        assert!(parse_confirmer_output(raw, "id", CTX).is_none());
     }
 
     // ---- record shape v1 ------------------------------------------------
@@ -2580,6 +2642,101 @@ mod tests {
         assert!(
             emitted <= 3,
             "the total bound must cap the emitted definitions: {emitted} in {defs}"
+        );
+    }
+
+    // ---- the strict JSON contract, end to end ---------------------------
+
+    /// A reply that does not satisfy the contract never demotes a finding,
+    /// whatever it says.
+    ///
+    /// The contract asks for one JSON object with the finding id and the
+    /// three required fields. Anything else is `unparsed`, and an unparsed
+    /// reply keeps the finding blocking. A reply that satisfies the shape
+    /// but carries no usable quote is `insufficient`, which also keeps the
+    /// finding blocking.
+    #[test]
+    fn a_reply_that_breaks_the_contract_never_demotes() {
+        // (raw reply, expected outcome)
+        let cases: [(&str, ConfirmerOutcome); 6] = [
+            // prose around the object
+            (
+                "Sure, here is my answer:\n{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}",
+                ConfirmerOutcome::Unparsed,
+            ),
+            // two objects in a row
+            (
+                "{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}",
+                ConfirmerOutcome::Unparsed,
+            ),
+            // a JSON array is not an object
+            (
+                "[{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}]",
+                ConfirmerOutcome::Unparsed,
+            ),
+            // no finding id
+            (
+                "{\"disposition\":\"reject\",\"quote\":\"let x\",\"reason\":\"r\"}",
+                ConfirmerOutcome::Unparsed,
+            ),
+            // a required field is missing
+            (
+                "{\"finding_id\":\"id\",\"disposition\":\"reject\",\"reason\":\"r\"}",
+                ConfirmerOutcome::Unparsed,
+            ),
+            // the shape is right but the quote is empty
+            (
+                "{\"finding_id\":\"id\",\"disposition\":\"reject\",\"quote\":\"\",\"reason\":\"r\"}",
+                ConfirmerOutcome::Ok,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let verdict = parse_confirmer_output(raw, "id", CTX);
+            let outcome = match (verdict.clone(), raw.trim().is_empty()) {
+                (Some(_), true) => ConfirmerOutcome::Empty,
+                (Some(_), false) => ConfirmerOutcome::Ok,
+                (None, true) => ConfirmerOutcome::Empty,
+                (None, false) => ConfirmerOutcome::Unparsed,
+            };
+            assert_eq!(outcome, expected, "wrong outcome for {raw}: {verdict:?}");
+            if expected == ConfirmerOutcome::Unparsed {
+                assert!(
+                    verdict.is_none(),
+                    "a reply that breaks the contract is not a verdict: {raw}"
+                );
+            }
+            // Whatever the outcome, the finding must keep blocking: an
+            // unparsed or insufficient answer is never a demotion.
+            let attempt = ConfirmerAttempt {
+                model: "c1".to_string(),
+                family: "other".to_string(),
+                outcome,
+                latency_ms: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                verdict,
+            };
+            let j = job(finding("critical", "f", Some("let x = 1"), CTX), &["c1"]);
+            let review = aggregate(&[j], &limits(), &mut |_m, _| attempt.clone());
+            assert!(
+                review.effective_blocking,
+                "a reply that breaks the contract must keep the finding blocking: {raw}"
+            );
+            assert!(
+                review.demoted.is_empty(),
+                "a reply that breaks the contract must never demote: {raw}"
+            );
+        }
+    }
+
+    /// A reply about a DIFFERENT finding is refused outright: it can never
+    /// demote this one, and it says nothing about this one.
+    #[test]
+    fn a_reply_about_a_different_finding_is_refused() {
+        let raw = r#"{"finding_id":"other","disposition":"reject","quote":"let x","reason":"r"}"#;
+        assert!(
+            parse_confirmer_output(raw, "id", CTX).is_none(),
+            "a reply about another finding must not be read as a verdict here"
         );
     }
 
