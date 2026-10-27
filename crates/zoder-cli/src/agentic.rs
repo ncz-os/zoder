@@ -859,6 +859,7 @@ async fn complete_once_tracked(
             user,
             max_tokens,
             engine_config,
+            None,
         )
         .await
         {
@@ -2002,6 +2003,7 @@ fn routing_context_load_message(e: &anyhow::Error) -> String {
 /// (the provider serving a different model than requested) is detectable in
 /// the returned [`Completion`] (`requested_model != model`) and can never be
 /// silently folded into a "complete" review.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_reviewer_for_model(
     cli: &crate::Cli,
     requested: &str,
@@ -2010,6 +2012,7 @@ async fn dispatch_reviewer_for_model(
     user: &str,
     max_tokens: u32,
     engine_config: Option<&Path>,
+    reasoning_override: Option<&str>,
 ) -> Result<Completion, ReviewerError> {
     let started = std::time::Instant::now();
     let eng = match Engine::load_with_engine_config(engine_config) {
@@ -2109,6 +2112,14 @@ async fn dispatch_reviewer_for_model(
         cli.reasoning.as_deref(),
         model_cfg,
     );
+    // An explicit override wins over every resolved setting. It exists for
+    // the confirmer role, whose effort the operator declares for that role
+    // and not for the reviewer: a confirmation is a cheap second opinion on
+    // one finding, and running it at the reviewer's effort spends what a
+    // whole review costs.
+    let reasoning_effort = reasoning_override
+        .map(str::to_string)
+        .or(direct.reasoning_effort);
     let req = ChatRequest {
         model: model.to_string(),
         messages,
@@ -2116,7 +2127,7 @@ async fn dispatch_reviewer_for_model(
         temperature: model_cfg.and_then(|m| m.temperature).or(Some(0.1)),
         stream: false,
         show_reasoning: false,
-        reasoning_effort: direct.reasoning_effort,
+        reasoning_effort,
         top_p: model_cfg.and_then(|m| m.top_p),
         top_k: model_cfg.and_then(|m| m.top_k),
         presence_penalty: model_cfg.and_then(|m| m.presence_penalty),
@@ -5295,6 +5306,7 @@ pub(crate) async fn cmd_review(
                 receipts: &[],
                 exclusions: None,
                 chunking: None,
+                confirm: &[],
             },
         );
         anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
@@ -5321,6 +5333,7 @@ pub(crate) async fn cmd_review(
                 receipts: &[],
                 exclusions: None,
                 chunking: None,
+                confirm: &[],
             },
         );
         return Ok(());
@@ -5630,6 +5643,7 @@ unbound, or missing imports:\n{context}"
                 receipts: &[],
                 exclusions: Some(&prepared.excluded),
                 chunking: None,
+                confirm: &[],
             },
         );
         anyhow::bail!(
@@ -5727,6 +5741,15 @@ unbound, or missing imports:\n{context}"
             }
         }
     }
+    // Confirm-on-reject: re-check every high/critical blocking finding with a
+    // different model family before it may block. Only a `request_changes`
+    // verdict is confirmed; an approve stays advisory. A confirmer failure
+    // keeps the finding blocking — it is never a rejection.
+    let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
+    if let Some(e) = eng.as_ref() {
+        confirm_sections = confirm_reviews(cli, e, &mut reviews, &diff, &read_post_image).await;
+    }
+
     let requested = models.len();
     let failed_count = requested.saturating_sub(ok_models);
     let aggregate = ReviewAggregate {
@@ -5738,6 +5761,7 @@ unbound, or missing imports:\n{context}"
         receipts: &receipts,
         exclusions: Some(&prepared.excluded),
         chunking: Some(head_plan.chunking.clone()),
+        confirm: &confirm_sections,
     };
 
     let agg = emit_reviews(cli, &aggregate);
@@ -5816,6 +5840,489 @@ struct ReviewAggregate<'a> {
     /// The route-specific decision and byte accounting used to choose one or
     /// multiple chunks.
     chunking: Option<serde_json::Value>,
+    /// The confirm-on-reject section (record shape v1) for each confirmed
+    /// reviewer, when confirmation ran. Absent (empty) for an approve or a
+    /// review with no blocking finding.
+    confirm: &'a [serde_json::Value],
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: bridge between the review output and the confirm layer.
+// ---------------------------------------------------------------------------
+
+/// Build the `PendingFinding` list for confirmation from a reviewer's output.
+///
+/// Only findings are converted here; the caller decides whether the verdict
+/// triggers confirmation.
+///
+/// The reviewer's `Finding` has no dedicated quote field: its `body` is the
+/// reviewer's own PROSE, and prose is never a substring of the diff the
+/// reviewer was shown. Treating that prose as a quote made every blocking
+/// finding look unsupported, which dropped every one of them and turned a
+/// `request_changes` into a `comment` — the review stopped blocking
+/// entirely, which is a fail-open, not a filter.
+///
+/// So the evidence is grounded instead: the finding's code spans are
+/// extracted from the claim, and the finding is checked against the code at
+/// the reviewed head — the cited place must exist, and the code the finding
+/// quotes must actually occur in the reviewed text. A finding that is
+/// demonstrably not about the code is dropped; every other finding reaches
+/// a confirmer.
+fn pending_findings_for_confirm(
+    review: &ReviewOutput,
+    reviewer_family: &str,
+    touched: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Vec<crate::review_confirm::PendingFinding> {
+    use crate::review_confirm::{finding_id, PendingFinding};
+    review
+        .findings
+        .iter()
+        .map(|f| {
+            let claim = if f.body.trim().is_empty() {
+                f.title.clone()
+            } else {
+                format!("{} {}", f.title, f.body)
+            };
+            let location = f.location.clone().unwrap_or_default();
+            let grounding = crate::review_confirm::ground_finding(&location, &claim, read, touched);
+            let quote = grounding.evidence_quote().map(str::to_string);
+            let quote_found = quote.is_some();
+            PendingFinding {
+                id: finding_id(reviewer_family, &location, &claim),
+                severity: f.severity.clone(),
+                location,
+                quote,
+                claim,
+                quote_found,
+                grounded: grounding.grounded(),
+                ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// The verdict class that triggers confirmation. Anything else (an `approve`,
+/// or a `comment`) never reaches a confirmer.
+fn verdict_triggers_confirmation(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "request_changes" | "reject" | "block"
+    )
+}
+
+/// The models that authored the code under review.
+///
+/// Two explicit sources, and nothing else:
+///
+/// 1. `[review.confirm].author_models` -- the operator's declaration.
+/// 2. the PINNED primary author model: the `-m` override, the selected
+///    agent's `model` pin, or `Config::primary_model`.
+///
+/// The auto-routed fallback is deliberately NOT a source: routing picks a
+/// model by capability and health, which says nothing about who wrote the
+/// code under review. A standalone review of somebody else's commit
+/// therefore has no author model unless the operator declares one, and
+/// then the confirmer is excluded from the reviewer's family only. That
+/// is recorded, so a reader of the record sees which families were
+/// excluded.
+pub(crate) fn review_author_models(cli: &crate::Cli, eng: &Engine) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    let mut push = |model: String| {
+        if !model.trim().is_empty()
+            && !models
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&model))
+        {
+            models.push(model);
+        }
+    };
+    for declared in &eng.cfg.review.confirm.author_models {
+        push(declared.clone());
+    }
+    let pinned = cli
+        .model
+        .clone()
+        .or_else(|| crate::configured_model_for_agent(eng, cli.agent.as_deref()))
+        .or_else(|| eng.cfg.primary_model.clone());
+    if let Some(model) = pinned {
+        push(model);
+    }
+    models
+}
+
+/// The FAMILIES of the author models.
+///
+/// A model whose family cannot be resolved contributes nothing: an
+/// unknown family is not a family, and treating it as one would exclude a
+/// confirmer whose own family is equally unknown.
+pub(crate) fn review_author_families(cli: &crate::Cli, eng: &Engine) -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    for model in review_author_models(cli, eng) {
+        let family = eng.cfg.model_family(&model);
+        let family = family.trim();
+        if family.is_empty() || family.eq_ignore_ascii_case("unknown") {
+            continue;
+        }
+        if !families
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(family))
+        {
+            families.push(family.to_string());
+        }
+    }
+    families
+}
+
+/// Run confirm-on-reject over the reviews a panel produced.
+///
+/// The author families are DERIVED HERE, from the engine and the CLI, and
+/// are not handed in by the caller. A caller that forgets them is exactly
+/// the bug this function removes: the production path used to pass an
+/// empty list, so a confirmer from the author's own family could confirm
+/// the author's finding.
+async fn confirm_reviews(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviews: &mut [ReviewerSlot],
+    diff: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Vec<serde_json::Value> {
+    let mut confirm_sections: Vec<serde_json::Value> = Vec::new();
+    let author_families = review_author_families(cli, eng);
+    for slot in reviews.iter_mut() {
+        let ReviewerSlot::Ok { model, review } = slot else {
+            continue;
+        };
+        if !verdict_triggers_confirmation(&review.verdict) {
+            continue;
+        }
+        if !review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
+        {
+            continue;
+        }
+        let reviewer_model = model.clone();
+        if let Some((section, verdict)) = confirm_review(
+            cli,
+            Some(eng),
+            review,
+            &reviewer_model,
+            diff,
+            read,
+            &author_families,
+        )
+        .await
+        {
+            confirm_sections.push(section);
+            // The confirmed verdict supersedes the reviewer's own: a review
+            // whose findings all demoted is no longer request_changes.
+            review.verdict = verdict;
+        }
+    }
+    confirm_sections
+}
+
+/// Dispatch one confirmer call and turn the reply into an attempt.
+///
+/// The confirmer runs at the CONFIRM configuration's reasoning effort
+/// (`[review.confirm].reasoning_effort`, default `low`), not at the
+/// reviewer's and not at the provider profile's. The explicit setting
+/// overrides the `--reasoning` flag and the engine profile as well: the
+/// operator declared the effort for the confirmer role, and a role's
+/// declared effort is not the reviewer's to change.
+async fn dispatch_confirmer(
+    cli: &crate::Cli,
+    eng: Option<&Engine>,
+    model: &str,
+    finding_id: &str,
+    context: &str,
+    reasoning_effort: &str,
+) -> crate::review_confirm::ConfirmerAttempt {
+    let started = std::time::Instant::now();
+    let system = "You are a second-opinion confirmer for a code review finding.";
+    let instruction = crate::review_confirm::confirmer_instruction(finding_id);
+    let user = format!("{context}\n\n{instruction}");
+    let result = dispatch_reviewer_for_model(
+        cli,
+        model,
+        model,
+        system,
+        &user,
+        REVIEW_MIN_MAX_TOKENS,
+        None,
+        Some(reasoning_effort),
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(c) => {
+            let family = eng
+                .map(|e| e.cfg.model_family(&c.model))
+                .unwrap_or_default();
+            match crate::review_confirm::parse_confirmer_output(&c.content, finding_id, context) {
+                Some(verdict) if !c.content.trim().is_empty() => {
+                    crate::review_confirm::ConfirmerAttempt {
+                        model: c.model,
+                        family,
+                        outcome: crate::review_confirm::ConfirmerOutcome::Ok,
+                        latency_ms,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                        verdict: Some(verdict),
+                    }
+                }
+                Some(_) => crate::review_confirm::ConfirmerAttempt {
+                    model: c.model,
+                    family,
+                    outcome: crate::review_confirm::ConfirmerOutcome::Empty,
+                    latency_ms,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    verdict: None,
+                },
+                None => crate::review_confirm::ConfirmerAttempt {
+                    model: c.model,
+                    family,
+                    outcome: crate::review_confirm::ConfirmerOutcome::Unparsed,
+                    latency_ms,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    verdict: None,
+                },
+            }
+        }
+        Err(e) => {
+            let outcome = classify_confirmer_error(&e);
+            let family = eng.map(|e| e.cfg.model_family(model)).unwrap_or_default();
+            crate::review_confirm::ConfirmerAttempt {
+                model: model.to_string(),
+                family,
+                outcome,
+                latency_ms,
+                tokens_in: 0,
+                tokens_out: 0,
+                verdict: None,
+            }
+        }
+    }
+}
+
+/// Confirm-on-reject for a single reviewer's output.
+///
+/// Returns the confirm section (record shape v1) and the verdict the review
+/// should carry. When the verdict does NOT trigger confirmation (an
+/// `approve`) or no finding is a `high`/`critical` candidate, the output is
+/// returned unchanged except for a `not_run`-only record.
+///
+/// The confirmer is dispatched through the same reviewer call path as a
+/// reviewer (`dispatch_reviewer_for_model`), so every configured gate applies:
+/// the provider peak-window gate, the provider quota gate, the health breaker,
+/// and the remote client rules for a model served off-box. The confirmer runs
+/// at the configured (default `low`) reasoning effort.
+#[allow(clippy::too_many_arguments)]
+async fn confirm_review(
+    cli: &crate::Cli,
+    eng: Option<&Engine>,
+    review: &ReviewOutput,
+    reviewer_model: &str,
+    hunk: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+    author_families: &[String],
+) -> Option<(serde_json::Value, String)> {
+    use crate::review_confirm::{
+        build_context, precheck, run, select_confirmers, ConfirmLimits, ConfirmationJob,
+        Disposition, FindingDecision, FindingPlan,
+    };
+
+    let cfg = eng
+        .map(|e| e.cfg.review.confirm.clone())
+        .unwrap_or_default();
+    let limits = ConfirmLimits::from_config(&cfg);
+    let reviewer_family = eng
+        .map(|e| e.cfg.model_family(reviewer_model))
+        .unwrap_or_default();
+
+    let family_of_owned = |m: &str| -> Option<String> { eng.map(|e| e.cfg.model_family(m)) };
+    let family_of: &dyn Fn(&str) -> Option<String> = &family_of_owned;
+
+    // The files the diff touches at their post-image: the code a finding
+    // quotes has to occur in one of them (or in the file it cites) for the
+    // finding to be about the change at all.
+    let touched = crate::review_diff::touched_paths(hunk);
+    let all = pending_findings_for_confirm(review, &reviewer_family, &touched, read);
+    if all.is_empty() {
+        return None;
+    }
+
+    // Confirm only on a blocking verdict; an approve stays advisory.
+    let confirm_this = verdict_triggers_confirmation(&review.verdict);
+
+    let (blocking, non_blocking): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|f| crate::review_confirm::is_blocking_severity(&f.severity));
+
+    let mut decisions: Vec<FindingDecision> = Vec::new();
+
+    // Non-blocking severities are recorded, never confirmed.
+    for f in &non_blocking {
+        decisions.push(FindingDecision {
+            finding_id: f.id.clone(),
+            severity: f.severity.clone(),
+            location: f.location.clone(),
+            quote: f.quote.clone(),
+            quote_found: f.quote_found,
+            disposition: Disposition::NotRun,
+            blocking: false,
+            reason: "medium/low findings never reach confirmation".to_string(),
+            attempts: Vec::new(),
+        });
+    }
+
+    if !confirm_this {
+        // An approve (or comment): no confirmation runs. Blocking findings, if
+        // any, are recorded not_run and non-blocking because the verdict never
+        // blocked in the first place.
+        for f in &blocking {
+            decisions.push(FindingDecision {
+                finding_id: f.id.clone(),
+                severity: f.severity.clone(),
+                location: f.location.clone(),
+                quote: f.quote.clone(),
+                quote_found: f.quote_found,
+                disposition: Disposition::NotRun,
+                blocking: false,
+                reason: "verdict is not request_changes; confirmation never runs".to_string(),
+                attempts: Vec::new(),
+            });
+        }
+        let merged = crate::review_confirm::ConfirmedReview {
+            decisions,
+            demoted: Vec::new(),
+            effective_blocking: false,
+            reviewer_family_recall: None,
+        };
+        let verdict = "approve".to_string();
+        let payload = crate::review_confirm::record(
+            &merged,
+            reviewer_model,
+            &reviewer_family,
+            &verdict,
+            0,
+            0,
+            0,
+            &cfg.recall_eval_ref,
+            author_families,
+        );
+        return Some((payload, verdict));
+    }
+
+    // Pre-check the blocking set: findings that are demonstrably NOT about
+    // the code drop with no model call. The reason says WHY the finding was
+    // dropped — the place it cited, or the spans it quoted — so the record
+    // is auditable and a reviewer can tell a proven-ungrounded finding from
+    // a merely unconfirmed one.
+    let (checks, pending) = precheck(&blocking);
+    for preroll in &checks {
+        if preroll.dropped {
+            if let Some(f) = blocking.iter().find(|f| f.id == preroll.finding_id) {
+                decisions.push(FindingDecision {
+                    finding_id: f.id.clone(),
+                    severity: f.severity.clone(),
+                    location: f.location.clone(),
+                    quote: f.quote.clone(),
+                    quote_found: f.quote_found,
+                    disposition: Disposition::FilteredZ3,
+                    blocking: false,
+                    reason: if preroll.reason.is_empty() {
+                        "the finding is not grounded in the code under review".to_string()
+                    } else {
+                        preroll.reason.clone()
+                    },
+                    attempts: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let mut jobs: Vec<ConfirmationJob> = Vec::new();
+    for f in pending {
+        let chain = select_confirmers(
+            &cfg.models,
+            &reviewer_family,
+            author_families,
+            &[],
+            family_of,
+        );
+        let context = build_context(&f, hunk, read, limits.max_context_lines, &touched);
+        jobs.push(ConfirmationJob {
+            plan: FindingPlan {
+                finding: f,
+                reviewer_model: reviewer_model.to_string(),
+                reviewer_family: reviewer_family.clone(),
+                confirmer_chain: chain.clone(),
+                context,
+            },
+            confirmers: chain,
+        });
+    }
+
+    // Dispatch each planned confirmer call through the reviewer path.
+    let confirmed =
+        run(&jobs, &limits, |model, plan| {
+            let cli_ref = cli;
+            let eng_ref = eng;
+            let context = plan.context.clone();
+            let finding_id = plan.finding.id.clone();
+            let effort = cfg.reasoning_effort.clone();
+            async move {
+                dispatch_confirmer(cli_ref, eng_ref, &model, &finding_id, &context, &effort).await
+            }
+        })
+        .await;
+
+    decisions.extend(confirmed.decisions.iter().cloned());
+    let merged = crate::review_confirm::ConfirmedReview {
+        decisions,
+        demoted: confirmed.demoted,
+        effective_blocking: confirmed.effective_blocking,
+        reviewer_family_recall: confirmed.reviewer_family_recall,
+    };
+    let verdict = merged.effective_verdict().to_string();
+    let payload = crate::review_confirm::record(
+        &merged,
+        reviewer_model,
+        &reviewer_family,
+        &verdict,
+        0,
+        0,
+        0,
+        &cfg.recall_eval_ref,
+        author_families,
+    );
+    Some((payload, verdict))
+}
+
+/// Classify a confirmer dispatch error into the record's closed outcome set.
+fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::ConfirmerOutcome {
+    use crate::review_confirm::ConfirmerOutcome;
+    match e {
+        ReviewerError::FallbackWorthy { status, .. } => match status {
+            Some(429) => ConfirmerOutcome::TooManyRequests,
+            Some(503) => ConfirmerOutcome::Unavailable,
+            _ => ConfirmerOutcome::Empty,
+        },
+        ReviewerError::Skipped { .. } => ConfirmerOutcome::Unavailable,
+        ReviewerError::Fatal { message } => {
+            if message.contains("timed out") || message.contains("timeout") {
+                ConfirmerOutcome::Timeout
+            } else {
+                ConfirmerOutcome::Empty
+            }
+        }
+    }
 }
 
 /// Compute the aggregate verdict + per-reviewer view out of a list of
@@ -5960,6 +6467,11 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     }
     if let Some(chunking) = &aggregate.chunking {
         payload["chunking"] = chunking.clone();
+    }
+    // Confirm-on-reject (record shape v1). Additive and absent when no
+    // confirmation ran, so an old consumer reads an unchanged payload.
+    if !aggregate.confirm.is_empty() {
+        payload["confirm"] = json!(aggregate.confirm);
     }
 
     if let Some(dir) = active_job_dir() {
@@ -20732,6 +21244,7 @@ model_provider = "custom.reviewer"
             "diff",
             4096,
             Some(engine_path),
+            None,
         )
         .await
     }
@@ -20803,6 +21316,403 @@ model_provider = "custom.reviewer"
             body.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("high"),
             "the zoder model entry must still win in the reviewer: {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: the author's family is excluded from the confirmer chain.
+//
+// The production review caller used to hand the confirmer chain an EMPTY
+// author-family list, so a confirmer from the family that wrote the code
+// under review could confirm that code's own finding. The exclusion is
+// derived INSIDE the review path, so this test drives the review path
+// itself: a mock provider records which models were actually dispatched.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod confirm_author_family_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The reviewer: family `google`.
+    const REVIEWER: &str = "rv-model";
+    /// The family that authored the code under review: family `deepseek`.
+    const AUTHOR: &str = "conf-deepseek";
+    /// The only confirmer that may be dispatched: family `minimax`.
+    const OTHER: &str = "conf-minimax";
+
+    const DIFF: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-fn a() { }
++fn a() { let x = 1; }
+";
+
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    /// A home whose config declares the author model and pins the family of
+    /// every model, so the exclusion has something to exclude.
+    fn write_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["rv-model", "conf-deepseek", "conf-minimax"],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "model_families": {
+                "rv-model": "google",
+                "conf-deepseek": "deepseek",
+                "conf-minimax": "minimax",
+            },
+            "review": {
+                "confirm": {
+                    "models": ["conf-deepseek", "conf-minimax"],
+                    "author_models": ["conf-deepseek"],
+                    "max_per_review": 4,
+                    "timeout_s": 20,
+                }
+            },
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": "rv-model", "free": true, "routable": true},
+                {"id": "conf-deepseek", "free": true, "routable": true},
+                {"id": "conf-minimax", "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The models the provider was actually asked to run.
+    async fn dispatched_models(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .filter_map(|r| {
+                serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            })
+            .collect()
+    }
+
+    /// The author family's confirmer is never dispatched.
+    ///
+    /// The chain lists the author's model FIRST, so a caller that passed an
+    /// empty author-family list would dispatch it. The exclusion is derived
+    /// inside the review path, so the test drives the review path.
+    #[tokio::test]
+    async fn the_author_family_is_never_dispatched_as_a_confirmer() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let reply = serde_json::json!({
+            "model": OTHER,
+            "choices": [{"message": {"content": "{\"finding_id\":\"other\",\"disposition\":\"reject\",\"quote\":\"let x = 1\",\"reason\":\"r\"}"}}],
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(reply))
+            .mount(&server)
+            .await;
+        write_home(dir.path(), &server.uri());
+        let _guard = EnvGuard::new(dir.path());
+        std::env::set_var("ZEROCLAW_SOCKET", dir.path().join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+
+        let cli = crate::Cli::try_parse_from(["zoder", "--quiet"]).expect("cli parses");
+        let eng = Engine::load().expect("the engine loads");
+        let mut reviews = vec![ReviewerSlot::Ok {
+            model: REVIEWER.to_string(),
+            review: ReviewOutput {
+                verdict: "request_changes".to_string(),
+                summary: "one blocking finding".to_string(),
+                findings: vec![Finding {
+                    severity: "high".to_string(),
+                    title: "the binding is wrong".to_string(),
+                    body: "the `let x = 1` binding is never used".to_string(),
+                    location: Some("src/a.rs:1".to_string()),
+                    disposition: None,
+                }],
+                ..Default::default()
+            },
+        }];
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() { let x = 1; }\n".to_string());
+        let sections = confirm_reviews(&cli, &eng, &mut reviews, DIFF, &read).await;
+
+        let models = dispatched_models(&server).await;
+        assert!(
+            !models.iter().any(|m| m == AUTHOR),
+            "the author's family must never be dispatched as a confirmer: {models:?}"
+        );
+        assert!(
+            models.iter().any(|m| m == OTHER),
+            "the confirmer from another family must be dispatched: {models:?}"
+        );
+        assert_eq!(
+            sections.len(),
+            1,
+            "the review must produce one confirm section"
+        );
+        let families = sections[0]
+            .get("author_families")
+            .and_then(|v| v.as_array())
+            .expect("the record must carry the excluded author families");
+        assert_eq!(
+            families
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deepseek"],
+            "the record must name the excluded family: {sections:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Confirm-on-reject: what the confirmer dispatch sends on the wire.
+//
+// The confirmation dispatch used to take the effort the reviewer took, so
+// the configured `[review.confirm].reasoning_effort` was never applied and
+// a confirmation could cost what a whole review costs. It also carried a
+// literal `{FINDING_ID}` placeholder, while the reply is only read when
+// its `finding_id` matches the finding it answers. These tests drive the
+// confirmer dispatch against a wiremock provider and read the request off
+// the wire.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod confirm_dispatch_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "rv-model";
+    /// The finding the confirmer is asked about.
+    const FINDING_ID: &str = "f-123";
+
+    /// An engine profile that pins `reasoning_effort = "none"`, and a zoder
+    /// model entry that pins `"high"`. Between them they cover every
+    /// resolved setting a confirmer could inherit.
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+provider_extra = {{ reasoning_effort = "none" }}
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    fn write_home(home: &std::path::Path, mock_uri: &str, confirm_effort: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [MODEL],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "models": {
+                "local.test": {"model": MODEL, "reasoning_effort": "high"},
+            },
+            "review": {
+                "confirm": {
+                    "models": [MODEL],
+                    "reasoning_effort": confirm_effort,
+                    "timeout_s": 20,
+                }
+            },
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [{"id": MODEL, "free": true, "routable": true}],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Run one confirmer call against the mock and return the request body.
+    async fn confirmer_request_body(
+        server: &MockServer,
+        home: &std::path::Path,
+        cfg_path: &std::path::Path,
+        confirm_effort: &str,
+    ) -> serde_json::Value {
+        let reply = serde_json::json!({
+            "model": MODEL,
+            "choices": [{"message": {"content": "{\"finding_id\":\"other\",\"disposition\":\"reject\",\"quote\":\"q\",\"reason\":\"r\"}"}}],
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(reply))
+            .mount(server)
+            .await;
+        write_home(home, &server.uri(), confirm_effort);
+        let _guard = EnvGuard::new(home);
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+
+        // The CLI also asks for "high": a role's declared effort is not the
+        // reviewer's to change.
+        let cli = crate::Cli::try_parse_from(["zoder", "--quiet", "--reasoning", "high"])
+            .expect("cli parses");
+        let eng = Engine::load().expect("the engine loads");
+        let _attempt = dispatch_confirmer(
+            &cli,
+            Some(&eng),
+            MODEL,
+            FINDING_ID,
+            "the code under review",
+            confirm_effort,
+        )
+        .await;
+        server
+            .received_requests()
+            .await
+            .expect("server is alive")
+            .into_iter()
+            .find(|r| r.method.as_str() == "POST")
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).expect("body is JSON"))
+            .expect("the confirmer sent a chat request")
+    }
+
+    /// A confirmation runs at the confirm configuration's reasoning effort,
+    /// not at the reviewer's, the model entry's, or the provider profile's.
+    #[tokio::test]
+    async fn a_confirmation_runs_at_the_configured_reasoning_effort() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let body = confirmer_request_body(&server, dir.path(), &cfg_path, "low").await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low"),
+            "the confirmer must run at the configured effort: {body}"
+        );
+    }
+
+    /// The confirmer is told WHICH finding it is answering about.
+    ///
+    /// The instruction used to carry a literal `{FINDING_ID}` placeholder,
+    /// and a reply is only read when its `finding_id` matches the finding
+    /// it answers: a model that copied the placeholder back had answered
+    /// about nothing at all, and the finding stayed blocking forever.
+    #[tokio::test]
+    async fn the_confirmer_is_told_which_finding_it_answers() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let body = confirmer_request_body(&server, dir.path(), &cfg_path, "low").await;
+        let user = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            })
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .expect("the confirmer sent a user message");
+        assert!(
+            user.contains(FINDING_ID),
+            "the prompt must name the finding: {user}"
+        );
+        assert!(
+            !user.contains("{FINDING_ID}"),
+            "the prompt must not carry an unsubstituted placeholder: {user}"
+        );
+    }
+
+    /// The effort is the CONFIGURED one, not a constant: an operator that
+    /// declares a different effort for the confirmer role gets it.
+    #[tokio::test]
+    async fn the_confirmer_effort_is_the_configured_one() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+        let body = confirmer_request_body(&server, dir.path(), &cfg_path, "minimal").await;
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("minimal"),
+            "the confirmer must run at the effort the operator declared: {body}"
         );
     }
 }

@@ -19,6 +19,7 @@ mod provider_health;
 mod provider_slots;
 mod reaper;
 mod review_baton;
+mod review_confirm;
 mod review_context;
 mod review_diff;
 mod review_filter;
