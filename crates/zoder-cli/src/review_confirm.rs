@@ -846,6 +846,58 @@ pub(crate) fn parse_confirmer_output(
     })
 }
 
+/// Turn a SUCCEEDING provider reply into the recorded attempt.
+///
+/// The provider answered (the HTTP call succeeded), so the only question is
+/// what the reply contained:
+///
+/// * a non-empty reply that satisfies the contract is `Ok`, carrying the
+///   parsed verdict;
+/// * a non-empty reply that does NOT satisfy the contract is `Unparsed`;
+/// * an EMPTY (or whitespace-only) body is `Empty` — the provider answered
+///   successfully, it just answered with nothing. That is not the same as
+///   `Unparsed`, which is the provider's reply that could not be read as a
+///   verdict.
+///
+/// This is the ONE place the recorded outcome of a successful reply is
+/// decided: the production dispatch ([`crate::agentic::dispatch_confirmer`])
+/// and the tests call this instead of re-deriving the distinction, so the
+/// two can never record the same reply differently.
+///
+/// The BLOCKING behaviour is unchanged on every branch: an `Empty` or
+/// `Unparsed` attempt never demotes a finding ([`aggregate`]).
+pub(crate) fn confirmer_attempt_from_reply(
+    model: String,
+    family: String,
+    latency_ms: u64,
+    content: &str,
+    finding_id: &str,
+    context: &str,
+) -> ConfirmerAttempt {
+    let empty = content.trim().is_empty();
+    let verdict = if empty {
+        None
+    } else {
+        parse_confirmer_output(content, finding_id, context)
+    };
+    let outcome = if empty {
+        ConfirmerOutcome::Empty
+    } else if verdict.is_some() {
+        ConfirmerOutcome::Ok
+    } else {
+        ConfirmerOutcome::Unparsed
+    };
+    ConfirmerAttempt {
+        model,
+        family,
+        outcome,
+        latency_ms,
+        tokens_in: 0,
+        tokens_out: 0,
+        verdict,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Confirmer selection: one call per finding per confirmer.
 // ---------------------------------------------------------------------------
@@ -2713,6 +2765,72 @@ mod tests {
         // A reply about a different finding is refused outright: it can
         // never demote this one, and it says nothing about this one.
         assert!(parse_confirmer_output(raw, "id", CTX).is_none());
+    }
+
+    // ---- the recorded outcome of a successful reply ----------------------
+    //
+    // The provider answered (the HTTP call succeeded); the only question is
+    // what the body contained. `Empty` and `Unparsed` are DIFFERENT: the
+    // first is a successful answer with no body, the second is a body that
+    // could not be read as a verdict. Neither demotes.
+
+    #[test]
+    fn a_successful_empty_body_is_recorded_empty_not_unparsed() {
+        for raw in ["", "   ", "\n\t"] {
+            let attempt = confirmer_attempt_from_reply(
+                "c1".to_string(),
+                "other".to_string(),
+                0,
+                raw,
+                "id",
+                CTX,
+            );
+            assert_eq!(
+                attempt.outcome,
+                ConfirmerOutcome::Empty,
+                "a successful empty body is `empty`, not `unparsed`: {raw:?}"
+            );
+            assert!(attempt.verdict.is_none());
+        }
+        let attempt =
+            confirmer_attempt_from_reply("c1".to_string(), "other".to_string(), 0, "", "id", CTX);
+        let review = aggregate(
+            &[job(finding("high", "h", Some("let x = 1"), CTX), &["c1"])],
+            &limits(),
+            &mut |_p| vec![attempt.clone()],
+        );
+        let decision = &review.decisions[0];
+        // The empty answer is a FAILURE, never a rejection: the finding
+        // keeps blocking and is recorded `confirmer_failed`.
+        assert_eq!(decision.disposition, Disposition::ConfirmerFailed);
+        assert!(
+            decision.blocking,
+            "an empty answer must keep the finding blocking"
+        );
+    }
+
+    #[test]
+    fn a_successful_nonempty_bad_reply_is_recorded_unparsed() {
+        let attempt = confirmer_attempt_from_reply(
+            "c1".to_string(),
+            "other".to_string(),
+            0,
+            "not json at all",
+            "id",
+            CTX,
+        );
+        assert_eq!(attempt.outcome, ConfirmerOutcome::Unparsed);
+        assert!(attempt.verdict.is_none());
+    }
+
+    #[test]
+    fn a_successful_valid_reply_is_recorded_ok_with_its_verdict() {
+        let raw = r#"{"finding_id":"id","disposition":"reject","quote":"let x","reason":"fine"}"#;
+        let attempt =
+            confirmer_attempt_from_reply("c1".to_string(), "other".to_string(), 0, raw, "id", CTX);
+        assert_eq!(attempt.outcome, ConfirmerOutcome::Ok);
+        let verdict = attempt.verdict.expect("a valid reply carries its verdict");
+        assert_eq!(verdict.disposition, ParsedDisposition::Reject);
     }
 
     // ---- record shape v1 ------------------------------------------------
