@@ -6048,7 +6048,6 @@ async fn confirm_review(
             author_families,
             &[],
             family_of,
-            true,
         );
         let context = build_context(&f, hunk, read, limits.max_context_lines);
         jobs.push(ConfirmationJob {
