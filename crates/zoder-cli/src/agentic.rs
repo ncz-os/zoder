@@ -21636,6 +21636,389 @@ model_provider = "custom.reviewer"
 }
 
 // ---------------------------------------------------------------------------
+// Confirm-on-reject: end-to-end dispatch → record integration.
+//
+// Runs the confirmation dispatch end to end and asserts the OUTCOMES
+// recorded in the dispatch record: which confirmer answered, with what
+// disposition, and how the finding was settled. Asserts on values that
+// would be wrong if the production dispatch were broken.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod confirm_e2e_record_tests {
+    use super::*;
+    use crate::test_env::EnvGuard;
+    use clap::Parser;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const REVIEWER: &str = "rv-model";
+    const CONFIRMER: &str = "conf-model";
+
+    const DIFF: &str = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-fn a() { }
++fn a() { let x = 1; }
+";
+
+    fn engine_toml(mock_uri: &str) -> String {
+        format!(
+            r#"
+[providers.models.custom.reviewer]
+model = "rv-model"
+kind = "openai-chat"
+uri = "{uri}/v1"
+
+[agents.reviewer]
+model_provider = "custom.reviewer"
+"#,
+            uri = mock_uri
+        )
+    }
+
+    fn write_home(home: &std::path::Path, mock_uri: &str) {
+        let body = serde_json::json!({
+            "providers": [{
+                "id": "local",
+                "base_url": format!("{mock_uri}/v1"),
+                "kind": "openai-chat",
+                "engine_provider_ref": "custom.reviewer",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": [REVIEWER, CONFIRMER],
+            }],
+            "default_provider": "local",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+            "model_families": {
+                REVIEWER: "google",
+                CONFIRMER: "minimax",
+            },
+            "review": {
+                "confirm": {
+                    "models": [CONFIRMER],
+                    "timeout_s": 20,
+                }
+            },
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        let corpus = serde_json::json!({
+            "source": "test",
+            "models": [
+                {"id": REVIEWER, "free": true, "routable": true},
+                {"id": CONFIRMER, "free": true, "routable": true},
+            ],
+        });
+        std::fs::write(
+            home.join("model_corpus.json"),
+            serde_json::to_string_pretty(&corpus).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Run the production `confirm_reviews` end to end: a reviewer with one
+    /// high finding, a mock confirmer that answers with the given reply body,
+    /// and returns the confirm record section.
+    async fn run_e2e(
+        server: &MockServer,
+        home: &std::path::Path,
+        cfg_path: &std::path::Path,
+        confirmer_reply: &str,
+    ) -> serde_json::Value {
+        // The confirmer answers with the given reply. The wiremock mock
+        // matches any POST, so both the reviewer (if it were dispatched)
+        // and the confirmer would hit the same reply. We only dispatch the
+        // confirmer (the reviewer's output is synthesized in `reviews`).
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(confirmer_reply))
+            .mount(server)
+            .await;
+        write_home(home, &server.uri());
+        let _guard = EnvGuard::new(home);
+        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+
+        let cli = crate::Cli::try_parse_from(["zoder", "--quiet"]).expect("cli parses");
+        let eng = Engine::load().expect("the engine loads");
+        let mut reviews = vec![ReviewerSlot::Ok {
+            model: REVIEWER.to_string(),
+            review: ReviewOutput {
+                verdict: "request_changes".to_string(),
+                summary: "one blocking finding".to_string(),
+                findings: vec![Finding {
+                    severity: "high".to_string(),
+                    title: "the binding is wrong".to_string(),
+                    body: "the `let x = 1` binding is never used".to_string(),
+                    location: Some("src/a.rs:1".to_string()),
+                    disposition: None,
+                }],
+                ..Default::default()
+            },
+        }];
+        let read = |path: &str| (path == "src/a.rs").then(|| "fn a() { let x = 1; }\n".to_string());
+        let sections = confirm_reviews(&cli, &eng, &mut reviews, DIFF, &read).await;
+        assert_eq!(
+            sections.len(),
+            1,
+            "one confirm section for one blocking review"
+        );
+        sections[0].clone()
+    }
+
+    /// The record names the CONFIRMER that answered, its disposition
+    /// (`confirm` → the finding keeps blocking), and the settlement.
+    #[tokio::test]
+    async fn the_record_names_the_confirmer_and_its_confirm_disposition() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+
+        // The confirmer CONFIRMS the finding with a verbatim quote.
+        let finding_id = crate::review_confirm::finding_id(
+            "google",
+            "src/a.rs:1",
+            "the binding is wrong the `let x = 1` binding is never used",
+        );
+        let reply = serde_json::json!({
+            "model": CONFIRMER,
+            "choices": [{"message": {"content": format!(
+                r#"{{"finding_id":"{finding_id}","disposition":"confirm","quote":"let x = 1","reason":"the binding is real"}}"#
+            )}}],
+        })
+        .to_string();
+        let record = run_e2e(&server, dir.path(), &cfg_path, &reply).await;
+        let _ = dir;
+
+        // The record names the confirmer that answered.
+        let reviewers = record
+            .get("reviewers")
+            .and_then(|r| r.as_array())
+            .expect("record has reviewers");
+        let confirmer_entry = reviewers
+            .iter()
+            .find(|r| r.get("role").and_then(|v| v.as_str()) == Some("confirmer"))
+            .expect("record has a confirmer entry");
+        assert_eq!(
+            confirmer_entry.get("model").and_then(|m| m.as_str()),
+            Some(CONFIRMER),
+            "the record must name the confirmer that answered: {record:?}"
+        );
+        assert_eq!(
+            confirmer_entry.get("outcome").and_then(|o| o.as_str()),
+            Some("ok"),
+            "a parsed confirm reply is recorded `ok`: {record:?}"
+        );
+
+        // The finding is CONFIRMED and still blocking.
+        let findings = record
+            .get("findings")
+            .and_then(|f| f.as_array())
+            .expect("record has findings");
+        assert_eq!(findings.len(), 1, "one finding in the record");
+        let finding = &findings[0];
+        assert_eq!(
+            finding.get("disposition").and_then(|d| d.as_str()),
+            Some("confirmed"),
+            "a confirm reply settles the finding as `confirmed`: {record:?}"
+        );
+        assert_eq!(
+            finding.get("blocking").and_then(|b| b.as_bool()),
+            Some(true),
+            "a confirmed finding keeps blocking: {record:?}"
+        );
+        assert_eq!(
+            record.get("effective_blocking").and_then(|b| b.as_bool()),
+            Some(true),
+            "a confirmed finding keeps the review blocking: {record:?}"
+        );
+        // Nothing was demoted.
+        let demoted = record
+            .get("demoted")
+            .and_then(|d| d.as_array())
+            .expect("record has demoted");
+        assert!(
+            demoted.is_empty(),
+            "a confirm reply demotes nothing: {record:?}"
+        );
+        assert_eq!(
+            record.get("verdict").and_then(|v| v.as_str()),
+            Some("request_changes"),
+            "a confirmed blocking finding keeps request_changes: {record:?}"
+        );
+    }
+
+    /// A `reject` from an independent family demotes a `high` finding:
+    /// the record shows the confirmer's `reject` disposition and the
+    /// finding settled as `rejected`, non-blocking.
+    #[tokio::test]
+    async fn the_record_names_the_confirmer_and_its_reject_disposition() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+
+        let finding_id = crate::review_confirm::finding_id(
+            "google",
+            "src/a.rs:1",
+            "the binding is wrong the `let x = 1` binding is never used",
+        );
+        let reply = serde_json::json!({
+            "model": CONFIRMER,
+            "choices": [{"message": {"content": format!(
+                r#"{{"finding_id":"{finding_id}","disposition":"reject","quote":"let x = 1","reason":"false positive"}}"#
+            )}}],
+        })
+        .to_string();
+        let record = run_e2e(&server, dir.path(), &cfg_path, &reply).await;
+        let _ = dir;
+
+        let reviewers = record
+            .get("reviewers")
+            .and_then(|r| r.as_array())
+            .expect("record has reviewers");
+        let confirmer_entry = reviewers
+            .iter()
+            .find(|r| r.get("role").and_then(|v| v.as_str()) == Some("confirmer"))
+            .expect("record has a confirmer entry");
+        assert_eq!(
+            confirmer_entry.get("model").and_then(|m| m.as_str()),
+            Some(CONFIRMER),
+            "the record must name the confirmer: {record:?}"
+        );
+        assert_eq!(
+            confirmer_entry.get("outcome").and_then(|o| o.as_str()),
+            Some("ok"),
+            "a parsed reject reply is recorded `ok`: {record:?}"
+        );
+
+        // The finding is REJECTED (demoted) and non-blocking.
+        let findings = record
+            .get("findings")
+            .and_then(|f| f.as_array())
+            .expect("record has findings");
+        assert_eq!(
+            findings[0].get("disposition").and_then(|d| d.as_str()),
+            Some("rejected"),
+            "a reject from an independent family settles a high as `rejected`: {record:?}"
+        );
+        assert_eq!(
+            findings[0].get("blocking").and_then(|b| b.as_bool()),
+            Some(false),
+            "a demoted finding no longer blocks: {record:?}"
+        );
+        // The demoted array names the confirmer that rejected.
+        let demoted = record
+            .get("demoted")
+            .and_then(|d| d.as_array())
+            .expect("record has demoted");
+        assert_eq!(demoted.len(), 1, "one demoted finding");
+        let confirmer_ids = demoted[0]
+            .get("confirmer_ids")
+            .and_then(|c| c.as_array())
+            .expect("demoted carries confirmer ids");
+        assert_eq!(confirmer_ids, &vec![serde_json::json!(CONFIRMER)]);
+        assert_eq!(
+            record.get("effective_blocking").and_then(|b| b.as_bool()),
+            Some(false),
+            "all findings demoted => review no longer blocks: {record:?}"
+        );
+        assert_eq!(
+            record.get("verdict").and_then(|v| v.as_str()),
+            Some("comment"),
+            "a fully-demoted review becomes `comment`, never request_changes: {record:?}"
+        );
+    }
+
+    /// A reply that breaks the contract (unparseable) is recorded
+    /// `unparsed`, and the finding keeps blocking — never demoted.
+    #[tokio::test]
+    async fn the_record_names_the_confirmer_and_an_unparseable_reply() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("engine-cfg");
+        std::fs::create_dir_all(&cfg_path).unwrap();
+        let engine_path = cfg_path.join("config.toml");
+        std::fs::write(&engine_path, engine_toml(&server.uri())).unwrap();
+
+        // A reply that is NOT valid confirmer JSON (prose, not a contract reply).
+        let reply = serde_json::json!({
+            "model": CONFIRMER,
+            "choices": [{"message": {"content": "I think this is fine, no problems at all."}}],
+        })
+        .to_string();
+        let record = run_e2e(&server, dir.path(), &cfg_path, &reply).await;
+        let _ = dir;
+
+        let reviewers = record
+            .get("reviewers")
+            .and_then(|r| r.as_array())
+            .expect("record has reviewers");
+        let confirmer_entry = reviewers
+            .iter()
+            .find(|r| r.get("role").and_then(|v| v.as_str()) == Some("confirmer"))
+            .expect("record has a confirmer entry");
+        assert_eq!(
+            confirmer_entry.get("model").and_then(|m| m.as_str()),
+            Some(CONFIRMER),
+            "the record must name the confirmer: {record:?}"
+        );
+        assert_eq!(
+            confirmer_entry.get("outcome").and_then(|o| o.as_str()),
+            Some("unparsed"),
+            "a reply that breaks the contract is recorded `unparsed`: {record:?}"
+        );
+
+        // The finding is NOT demoted: it keeps blocking (fail-closed).
+        let findings = record
+            .get("findings")
+            .and_then(|f| f.as_array())
+            .expect("record has findings");
+        assert_eq!(
+            findings[0].get("disposition").and_then(|d| d.as_str()),
+            Some("confirmer_failed"),
+            "an unparsed reply never demotes: recorded `confirmer_failed`: {record:?}"
+        );
+        assert_eq!(
+            findings[0].get("blocking").and_then(|b| b.as_bool()),
+            Some(true),
+            "an unparsed reply keeps the finding blocking: {record:?}"
+        );
+        let demoted = record
+            .get("demoted")
+            .and_then(|d| d.as_array())
+            .expect("record has demoted");
+        assert!(
+            demoted.is_empty(),
+            "an unparsed reply demotes nothing: {record:?}"
+        );
+        assert_eq!(
+            record.get("effective_blocking").and_then(|b| b.as_bool()),
+            Some(true),
+            "an unparsed reply keeps the review blocking: {record:?}"
+        );
+        assert_eq!(
+            record.get("verdict").and_then(|v| v.as_str()),
+            Some("request_changes"),
+            "an unparsed reply keeps request_changes: {record:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Confirm-on-reject: what the confirmer dispatch sends on the wire.
 //
 // The confirmation dispatch used to take the effort the reviewer took, so
