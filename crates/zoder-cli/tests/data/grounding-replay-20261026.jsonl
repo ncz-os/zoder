@@ -1,0 +1,137 @@
+{"kind":"false","id":"FC-LOOKS_LIKE_TAR","class":"undefined-symbol","cite":":line 70","path_present":true,"file_lines":2340,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":line 66","path_present":true,"file_lines":2340,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-RECEIPT","class":"missing-cli-option","cite":":2175-2185","path_present":true,"file_lines":2385,"n_present":2,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-RECEIPT","class":"missing-cli-option","cite":":2175-2185","path_present":false,"file_lines":null,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":219","path_present":true,"file_lines":314,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":219-260","path_present":true,"file_lines":314,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":219-260","path_present":true,"file_lines":314,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":217-224","path_present":true,"file_lines":1392,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":1-200","path_present":true,"file_lines":178,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-9","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":5-7","path_present":true,"file_lines":11,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"TOCTOU","class":"","cite":":4-7","path_present":true,"file_lines":9,"n_present":1,"n_missing":2,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":5-7","path_present":true,"file_lines":9,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":6-12","path_present":true,"file_lines":22,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":6","path_present":true,"file_lines":9,"n_present":2,"n_missing":1,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":10-12","path_present":true,"file_lines":22,"n_present":2,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":8-10","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":4-5","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNCHK","class":"","cite":":6-8","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-9","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":7-9","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":5-7","path_present":true,"file_lines":9,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":10-13","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNCHK","class":"","cite":":6-9","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":": line 1200","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":2,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"","class":"misread-logic","cite":":630-632","path_present":true,"file_lines":1775,"n_present":2,"n_missing":1,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":656-660","path_present":true,"file_lines":1775,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":": line 590-595","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"speculative","cite":": line 914-920","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":": line 215-226","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":": line 171-179","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":1-20","path_present":true,"file_lines":352,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":line 2198","path_present":true,"file_lines":2340,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":1889-1909","path_present":false,"file_lines":null,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-GZIP-IMPORT","class":"undefined-symbol","cite":":1585-1605","path_present":true,"file_lines":2566,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-GZIP-IMPORT","class":"undefined-symbol","cite":":1585-1600","path_present":true,"file_lines":2566,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-MEDIADIR","class":"unseen-code","cite":":219-315","path_present":true,"file_lines":314,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":30","path_present":true,"file_lines":85,"n_present":1,"n_missing":2,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":50","path_present":true,"file_lines":85,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":10","path_present":true,"file_lines":104,"n_present":2,"n_missing":2,"loc_ok":true}
+{"kind":"false","id":"FC-OVERLAY-TABLES","class":"misread-logic","cite":":1-200","path_present":true,"file_lines":178,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-10","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":5-7","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":6-16,19-23","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":5","path_present":true,"file_lines":11,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"TOCTOU","class":"","cite":":4","path_present":true,"file_lines":9,"n_present":1,"n_missing":1,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":3","path_present":true,"file_lines":9,"n_present":1,"n_missing":1,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":6","path_present":true,"file_lines":22,"n_present":2,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNCHK","class":"","cite":":6","path_present":true,"file_lines":22,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":19","path_present":true,"file_lines":22,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"syntax-claim","cite":":166","path_present":true,"file_lines":174,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":360","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-VARIANT-UNDEF","class":"undefined-symbol","cite":": lines 600-620 and 1100-1120","path_present":false,"file_lines":null,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-VARIANT-UNDEF","class":"undefined-symbol","cite":": lines 282-299","path_present":true,"file_lines":627,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":200","path_present":true,"file_lines":534,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-RECEIPT","class":"missing-cli-option","cite":":2175","path_present":false,"file_lines":null,"n_present":1,"n_missing":1,"loc_ok":false}
+{"kind":"false","id":"","class":"unseen-code","cite":":217-224","path_present":true,"file_lines":1392,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":222","path_present":true,"file_lines":1392,"n_present":2,"n_missing":1,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":70","path_present":true,"file_lines":104,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-8","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":10-12","path_present":true,"file_lines":22,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":8","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":9","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":12","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":20","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":7","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":9","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":15","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":22","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":1200","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"","class":"unseen-code","cite":":line 210","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":line 630","path_present":true,"file_lines":1775,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":": line 860 (approx)","path_present":true,"file_lines":1775,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"other","id":"","class":"debatable-heuristic","cite":":260","path_present":true,"file_lines":534,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":94","path_present":true,"file_lines":2340,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-UNITS-KEYERROR","class":"unseen-code","cite":":line 2198","path_present":true,"file_lines":2340,"n_present":0,"n_missing":1,"loc_ok":true}
+{"kind":"false","id":"FC-RECEIPT","class":"missing-cli-option","cite":":2175-2185","path_present":false,"file_lines":null,"n_present":1,"n_missing":1,"loc_ok":false}
+{"kind":"false","id":"FC-GZIP-IMPORT","class":"undefined-symbol","cite":":1585","path_present":true,"file_lines":2566,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":219","path_present":true,"file_lines":1392,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":229","path_present":true,"file_lines":314,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":20","path_present":true,"file_lines":85,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-HERE","class":"path-misread","cite":":90","path_present":true,"file_lines":104,"n_present":1,"n_missing":2,"loc_ok":true}
+{"kind":"false","id":"FC-OVERLAY-TABLES","class":"misread-logic","cite":":44","path_present":true,"file_lines":104,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":7","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":6","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":16","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":": line 360","path_present":true,"file_lines":793,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-ASSETS-SHA-KEY","class":"unseen-code","cite":": line 226-232","path_present":true,"file_lines":1775,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":": line 1120-1125","path_present":true,"file_lines":1775,"n_present":4,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":1483","path_present":true,"file_lines":17806,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":1484","path_present":true,"file_lines":17806,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":1486","path_present":true,"file_lines":17806,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-GZIP-IMPORT","class":"undefined-symbol","cite":":1585-1600","path_present":true,"file_lines":2566,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":217-223","path_present":true,"file_lines":1392,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":217-224","path_present":true,"file_lines":1392,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":49","path_present":true,"file_lines":85,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":49-53","path_present":true,"file_lines":85,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-9","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"TOCTOU","class":"","cite":":4-8","path_present":true,"file_lines":9,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":6-8","path_present":true,"file_lines":9,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"OFF1","class":"","cite":":6-12","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":16-20","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":6","path_present":true,"file_lines":11,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":6","path_present":true,"file_lines":22,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"TOCTOU","class":"","cite":":4","path_present":true,"file_lines":9,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":5","path_present":true,"file_lines":9,"n_present":1,"n_missing":1,"loc_ok":true}
+{"kind":"real","id":"FAILOPEN","class":"","cite":":6-8","path_present":true,"file_lines":10,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SQLI","class":"","cite":":5-7","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"SIGN","class":"","cite":":8-10","path_present":true,"file_lines":11,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UNDEF","class":"","cite":":5-7","path_present":true,"file_lines":9,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"real","id":"UAF","class":"","cite":":6-16","path_present":true,"file_lines":22,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":1,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1400","path_present":true,"file_lines":793,"n_present":3,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"FC-LOOKUP-WRAP","class":"pattern-inference","cite":":line 1200","path_present":true,"file_lines":793,"n_present":1,"n_missing":0,"loc_ok":false}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":line 174","path_present":true,"file_lines":1775,"n_present":2,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":line 210","path_present":true,"file_lines":1775,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"speculative","cite":":line 210","path_present":true,"file_lines":1387,"n_present":0,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":line 174","path_present":true,"file_lines":1775,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"unseen-code","cite":":line 210","path_present":true,"file_lines":1775,"n_present":3,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"undefined-symbol","cite":":line 530","path_present":true,"file_lines":1775,"n_present":2,"n_missing":0,"loc_ok":true}
+{"kind":"false","id":"","class":"misread-logic","cite":":line 630-635","path_present":true,"file_lines":1775,"n_present":1,"n_missing":0,"loc_ok":true}
+{"kind":"other","id":"","class":"valid-minor","cite":":line 260-280","path_present":true,"file_lines":534,"n_present":3,"n_missing":2,"loc_ok":true}
