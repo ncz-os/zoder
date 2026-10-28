@@ -38,6 +38,10 @@ Covered against the real socket:
     connection dies without a response), the script ends with exactly ONE
     open issue labelled `corpus-sync` - the create is not retried, so one
     POST /issues reaches the server;
+  * the create's single-shot decision is made at the CALL SITE, not by
+    introspecting the transport: a `**kwargs` transport that drops the
+    keyword, and a var-positional transport that cannot take one, both see
+    exactly ONE create POST and leave exactly one open issue;
   * the dry-run path still never reaches the transport, even when a real
     HTTP server is standing up and listening.
 
@@ -200,36 +204,30 @@ FRESH_OK = {
 # parts so no host name or IP literal appears in the source) and let the
 # REAL `alert.urllib_http` talk to it, so urllib genuinely raises
 # `HTTPError` for the 4xx/5xx responses.  That is the only way the retry
-# classification is really exercised.  The backoff clock is injected through
-# the transport's `sleep` keyword (the house seam), so the real backoff path
-# runs without blocking.
+# classification is really exercised.  The retry loop lives in the CLIENT
+# (`GitLabClient._send`), so the backoff clock is injected there
+# (`sleep=`, the house seam) and the real backoff path runs without
+# blocking.
 
 # The loopback address, built from parts so the diff carries no host or IP
 # literal.
 LOOPBACK = ".".join(["127", "0", "0", "1"])
 
 
-def _real_transport(sleep) -> Any:
-    """The real transport with an injected backoff clock (house seam).
+def _client(server, sleeps: list[float]) -> Any:
+    """A real client against `server`, with the backoff clock recorded.
 
-    `attempts` is a real parameter (defaulting to the transport's own
-    `alert.HTTP_ATTEMPTS`): the client passes `attempts=1` for the
-    issue-create call, and this signature lets it through so the create is
-    actually sent once, not three times.  This is what the production
-    `HttpFn` contract implies - the transport takes `(method, url, token,
-    body, attempts=...)`.
+    The transport is the production `alert.urllib_http` and the retry policy
+    is the production one; only the clock is injected, so the suite drives
+    the real backoff path without blocking.
     """
-
-    def http(
-        method: str,
-        url: str,
-        token: str,
-        body: dict[str, Any] | None = None,
-        attempts: int = alert.HTTP_ATTEMPTS,
-    ) -> Any:
-        return alert.urllib_http(method, url, token, body, attempts=attempts, sleep=sleep)
-
-    return http
+    return alert.GitLabClient(
+        base_url=_base_url(server),
+        project_id="42",
+        token="secret-token",
+        http=alert.urllib_http,
+        sleep=sleeps.append,
+    )
 
 
 def _base_url(server) -> str:
@@ -390,12 +388,7 @@ def test_real_transport_retries_a_transient_5xx_then_succeeds() -> None:
         )
     )
     try:
-        client = alert.GitLabClient(
-            base_url=_base_url(server),
-            project_id="42",
-            token="secret-token",
-            http=_real_transport(sleeps.append),
-        )
+        client = _client(server, sleeps)
         result = client.request("GET", "/issues")
     finally:
         server.shutdown()
@@ -415,12 +408,7 @@ def test_real_transport_does_not_retry_a_non_retryable_4xx() -> None:
     )
     sleeps: list[float] = []
     try:
-        client = alert.GitLabClient(
-            base_url=_base_url(server),
-            project_id="42",
-            token="secret-token",
-            http=_real_transport(sleeps.append),
-        )
+        client = _client(server, sleeps)
         raised = None
         try:
             client.request("GET", "/issues")
@@ -459,12 +447,7 @@ def test_real_transport_retries_a_429_then_succeeds() -> None:
         )
     )
     try:
-        client = alert.GitLabClient(
-            base_url=_base_url(server),
-            project_id="42",
-            token="secret-token",
-            http=_real_transport(sleeps.append),
-        )
+        client = _client(server, sleeps)
         result = client.request("GET", "/issues")
     finally:
         server.shutdown()
@@ -481,12 +464,7 @@ def test_real_transport_exhaustion_names_url_and_last_cause() -> None:
     )
     sleeps: list[float] = []
     try:
-        client = alert.GitLabClient(
-            base_url=_base_url(server),
-            project_id="42",
-            token="secret-token",
-            http=_real_transport(sleeps.append),
-        )
+        client = _client(server, sleeps)
         url = client.url("/issues")
         raised = None
         try:
@@ -516,7 +494,7 @@ def test_lost_issue_create_does_not_open_a_second_issue() -> None:
     reaches the server, and the issue the server stored is the only one.
     """
     sleeps: list[float] = []
-    server, handler = _start_server(LostCreateHandler)
+    server, handler = _start_server(LostCreateHandler, issues=[])
     try:
         env = base_env(
             **{
@@ -530,7 +508,8 @@ def test_lost_issue_create_does_not_open_a_second_issue() -> None:
             )
             code = alert.run(
                 env,
-                http=_real_transport(sleeps.append),
+                http=alert.urllib_http,
+                sleep=sleeps.append,
                 freshness_path=freshness,
             )
     finally:
@@ -562,6 +541,108 @@ def test_lost_issue_create_does_not_open_a_second_issue() -> None:
     assert sleeps == [], "no call may have needed a retry: " + repr(sleeps)
 
 
+def test_lost_create_is_not_retried_through_a_kwargs_transport() -> None:
+    """The create's non-idempotency is a CALL-SITE property, not a property
+    of the injected transport's signature.
+
+    A transport shaped `(method, url, token, body=None, **kwargs)` that
+    IGNORES the keywords it captures is the dangerous case.  A guard that
+    introspected the transport's signature in order to decide whether to
+    pass `attempts=1` judged this shape unable to take the keyword, called
+    it plainly, and any retry inside it could then resend the create after
+    the lost response and open a SECOND issue.  Nothing about the transport
+    may change the create's fate: exactly one POST /issues, one open issue.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(LostCreateHandler, issues=[])
+
+    def kwargs_transport(
+        method: str, url: str, token: str, body: dict[str, Any] | None = None, **kwargs: Any
+    ) -> Any:
+        # The worst shape: it captures the keyword and drops it.
+        return alert.urllib_http(method, url, token, body)
+
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=kwargs_transport,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    assert code == 1, code
+    create_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/issues")
+    ]
+    assert len(create_posts) == 1, (
+        "the create must be sent once whatever the transport's signature: "
+        + repr(handler.hits)
+    )
+    open_issues = [i for i in handler.issues if i.get("state") == "opened"]
+    assert len(open_issues) == 1, (
+        "THE INVARIANT IS BROKEN: " + repr(handler.issues)
+    )
+    assert sleeps == [], repr(sleeps)
+
+
+def test_a_var_positional_transport_is_never_sent_the_attempts_keyword() -> None:
+    """`def t(method, url, token, body=None, *args)` cannot take a keyword.
+
+    Calling it with `attempts=1` would raise TypeError and LOSE the alert.
+    The client calls every transport with exactly the four documented
+    positional arguments, so this shape works - and the create is still
+    sent exactly once.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(LostCreateHandler, issues=[])
+
+    def var_positional_transport(
+        method: str, url: str, token: str, body: dict[str, Any] | None = None, *args: Any
+    ) -> Any:
+        return alert.urllib_http(method, url, token, body)
+
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=var_positional_transport,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    # The create reached the server at all: no keyword was forced on the
+    # var-positional transport (which would have raised TypeError).
+    create_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/issues")
+    ]
+    assert len(create_posts) == 1, (
+        "a var-positional transport must be called positionally: "
+        + repr(handler.hits)
+    )
+    assert code == 1, code
+    open_issues = [i for i in handler.issues if i.get("state") == "opened"]
+    assert len(open_issues) == 1, (
+        "THE INVARIANT IS BROKEN: " + repr(handler.issues)
+    )
+    assert sleeps == [], repr(sleeps)
+
+
+
 def test_dry_run_never_reaches_a_real_http_server() -> None:
     """The dry-run path never reaches the transport, even with a REAL HTTP
     server listening: not one request may arrive at the socket."""
@@ -579,7 +660,10 @@ def test_dry_run_never_reaches_a_real_http_server() -> None:
     try:
         with contextlib.redirect_stdout(buffer):
             code = alert.run(
-                env, http=_real_transport(sleeps.append), dry_run=True
+                env,
+                http=alert.urllib_http,
+                sleep=sleeps.append,
+                dry_run=True,
             )
     finally:
         server.shutdown()
