@@ -1515,12 +1515,8 @@ fn shader_builtin_evidence(path: &str, symbol: &str) -> Option<(String, String)>
     }
     let name = symbol.trim();
     // A member chain (`iChannel0.xyz`, `gl_FragCoord.xy`) claims its head.
-    let head = name
-        .split(['.', '[', '('])
-        .next()
-        .unwrap_or(name)
-        .trim();
-    if head.is_empty() || !SHADER_BUILTINS.iter().any(|builtin| *builtin == head) {
+    let head = name.split(['.', '[', '(']).next().unwrap_or(name).trim();
+    if head.is_empty() || !SHADER_BUILTINS.contains(&head) {
         return None;
     }
     Some((
