@@ -125,6 +125,7 @@ corpus-tests:
     - python3 scripts/tests/pricing-conformance-tests.py
     - python3 scripts/tests/corpus-sync-alert-tests.py
     - python3 scripts/tests/rsc-util-tests.py
+    - python3 scripts/tests/single-shot-fetch-retry-tests.py
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
