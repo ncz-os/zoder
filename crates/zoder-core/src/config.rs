@@ -2214,8 +2214,10 @@ pub const DEFAULT_MODEL_FAMILIES: &[(&str, &str)] = &[
     ("gpt-oss*", "openai"),
     ("openai/*", "openai"),
     ("*gpt-*", "openai"),
-    ("*qwen*", "qwen"),
+    ("*claude*", "claude"),
+    ("*gemini*", "gemini"),
     ("*gemma*", "gemma"),
+    ("*qwen*", "qwen"),
     ("*minimax*", "minimax"),
     ("*deepseek*", "deepseek"),
     ("*nemotron*", "nemotron"),
@@ -2231,8 +2233,15 @@ pub const DEFAULT_MODEL_FAMILIES: &[(&str, &str)] = &[
 /// Precedence:
 ///   1. an exact key in `overrides` (case-insensitive);
 ///   2. the first matching `*`/`?` glob in `overrides`;
-///   3. the matching built-in public-vendor family;
-///   4. the vendor prefix before the first `/`;
+///   3. the matching built-in public-vendor family (matched against the
+///      WHOLE id, so `aihubmix/gemini-3-flash-preview` resolves `gemini`
+///      from the leaf, never the aggregator namespace);
+///   4. the routing prefix before the last `/` — except when the model
+///      identity (the leaf after the last `/`, or the identity after the
+///      first `.` in dotted ids) resolves to its own family, which wins: a
+///      namespace serves as a family only for ids whose identity resolves
+///      to nothing better, so one namespace that serves several vendors
+///      never becomes one family;
 ///   5. the model id itself (an unknown model is its OWN family, so two
 ///      different unknown ids never compare as cross-family).
 pub fn model_family(overrides: &BTreeMap<String, String>, model_id: &str) -> String {
@@ -2274,9 +2283,36 @@ pub fn model_family(overrides: &BTreeMap<String, String>, model_id: &str) -> Str
         }
     }
     // Vendor-prefix heuristic: `provider-a/model-x` belongs to `provider-a`.
-    if let Some((vendor, _)) = lower.split_once('/') {
-        if !vendor.is_empty() {
-            return vendor.to_string();
+    // The namespace is a ROUTING prefix, not a family: when the model
+    // identity (the leaf after the last `/`, or the identity after the first
+    // `.` in dotted ids) resolves to its own family, that family wins over
+    // the namespace. A namespace that serves several vendors (an aggregator
+    // or a hosted route) must never collapse them into one family.
+    if let Some((prefix, leaf)) = lower.rsplit_once('/') {
+        if !prefix.is_empty() {
+            let identity = leaf
+                .rsplit_once('.')
+                .map(|(_, after_dot)| after_dot.to_string())
+                .unwrap_or_else(|| leaf.to_string());
+            if identity != leaf {
+                return identity.to_string();
+            }
+        }
+        return prefix.to_string();
+    }
+    // Dotted id with no namespace (a served id whose first segment is the
+    // vendor, e.g. `amazon.nova-2-lite-v1:0`): the identity after the first
+    // `.` is the model family, not the whole id, so two versions of the same
+    // served family compare as the SAME family.
+    if let Some((_, identity)) = lower.split_once('.') {
+        if !identity.is_empty()
+            && !identity
+                .bytes()
+                .next()
+                .map(|b| b.is_ascii_digit())
+                .unwrap_or(false)
+        {
+            return identity.to_string();
         }
     }
     // Unresolved: the model is its own family.
@@ -9278,6 +9314,71 @@ auth = { type = "env", var = "GUARD_KEY" }
         assert_eq!(model_family(&families, "provider-a/model-x"), "shared");
         assert_eq!(model_family(&families, "provider-a/special"), "special");
         assert_eq!(model_family(&families, "vendor/legacy-model"), "legacy");
+    }
+
+    /// FALSE-NEGATIVE direction (corpus `corpus/model_corpus.json`): dotted
+    /// served ids of the SAME family must resolve to ONE family. The corpus
+    /// records each of these ids' `family` as the whole id — the record of
+    /// the misclassification this test pins.
+    #[test]
+    fn model_family_dotted_ids_of_one_family_resolve_to_one_family() {
+        let families = BTreeMap::new();
+        let haiku = model_family(&families, "anthropic.claude-3-5-haiku-20241022-v1:0");
+        let sonnet_35 = model_family(&families, "anthropic.claude-3-5-sonnet-20241022-v2:0");
+        let sonnet_37 = model_family(&families, "anthropic.claude-3-7-sonnet-20240620-v1:0");
+        assert_eq!(
+            haiku, "claude",
+            "dotted haiku id must resolve the claude family"
+        );
+        assert_eq!(
+            sonnet_35, "claude",
+            "dotted 3-5 sonnet id must resolve the claude family"
+        );
+        assert_eq!(
+            sonnet_37, "claude",
+            "dotted 3-7 sonnet id must resolve the claude family"
+        );
+        assert_eq!(
+            haiku, sonnet_35,
+            "two versions of one family must compare as ONE family"
+        );
+        assert_eq!(
+            haiku, sonnet_37,
+            "two versions of one family must compare as ONE family"
+        );
+    }
+
+    /// FALSE-POSITIVE direction (corpus `corpus/model_corpus.json`): one
+    /// routing namespace serving TWO vendors must NOT resolve to one family.
+    /// The corpus records both ids' `family` as `aihubmix` — the record of
+    /// the misclassification this test pins.
+    #[test]
+    fn model_family_one_namespace_two_vendors_is_not_one_family() {
+        let families = BTreeMap::new();
+        let claude = model_family(&families, "aihubmix/claude-haiku-4-5");
+        let gemini = model_family(&families, "aihubmix/gemini-3-flash-preview");
+        assert_eq!(
+            claude, "claude",
+            "the leaf must beat the aggregator namespace"
+        );
+        assert_eq!(
+            gemini, "gemini",
+            "the leaf must beat the aggregator namespace"
+        );
+        assert_ne!(
+            claude, gemini,
+            "two vendors behind one namespace must stay different families"
+        );
+        // A namespace that IS the vendor still stays a namespace when the
+        // leaf names the family (corpus ids `google/gemini-2.5-pro` and
+        // `gemini/gemini-2.5-flash`).
+        assert_eq!(model_family(&families, "google/gemini-2.5-pro"), "gemini");
+        assert_eq!(model_family(&families, "gemini/gemini-2.5-flash"), "gemini");
+        // Cross-vendor ids behind the same namespace compare as different.
+        assert_ne!(
+            model_family(&families, "aihubmix/claude-haiku-4-5"),
+            model_family(&families, "aihubmix/gemini-3-flash-preview")
+        );
     }
 
     #[test]
