@@ -21,8 +21,9 @@ _PUSH = re.compile(r'self\.__next_f\.push\(\[\d+,"((?:[^"\\]|\\.)*)"\]\)', re.S)
 ATTEMPTS = 3
 
 
-def fetch(url: str, timeout: int = 40, attempts: int = ATTEMPTS, sleep=time.sleep) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (zoder-ingest)"})
+def fetch(url: str, timeout: int = 40, attempts: int = ATTEMPTS, sleep=time.sleep,
+          user_agent: str = "Mozilla/5.0 (zoder-ingest)") -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     last = None
     for attempt in range(attempts):
         try:
