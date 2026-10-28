@@ -73,7 +73,8 @@ offline tests use is listed here:
         `corpus-sync`. On a healthy run every open alert (primary and
         duplicates alike) is noted and closed; on an alert run the primary
         is noted and the duplicates are folded into it.
-    def run(env, http=None, dry_run=False, freshness_path=FRESHNESS_PATH) -> int
+    def run(env, http=None, dry_run=False, freshness_path=FRESHNESS_PATH,
+            sleep=time.sleep) -> int
         The whole decision + action. Returns the process exit code:
           0 - the alert was delivered, or was not needed, or this was a dry
               run (a dry run sends nothing, so it never fails: it prints the
@@ -85,7 +86,8 @@ offline tests use is listed here:
         with a None would exit 0 and mask a real failure.
         `freshness_path` defaults to FRESHNESS_PATH; a missing report is not
         an error - the staleness facts are simply unknown.
-    def run_dry(env, http=None, freshness_path=FRESHNESS_PATH) -> int
+    def run_dry(env, http=None, freshness_path=FRESHNESS_PATH,
+                sleep=time.sleep) -> int
         The dry-run path: it never authenticates, never reaches the
         transport, prints the decision and the planned calls, and always
         exits 0.
@@ -94,7 +96,6 @@ offline tests use is listed here:
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import sys
@@ -251,17 +252,26 @@ HttpFn = Callable[..., Any]
 HTTP_ATTEMPTS = 3
 
 
-def _http_call_once(
+def urllib_http(
     method: str,
     url: str,
     token: str,
     body: dict[str, Any] | None = None,
 ) -> Any:
-    """One urllib round-trip against the GitLab API.
+    """Default HTTP transport: ONE plain urllib round-trip against the API.
+
+    Deliberately single-attempt.  The retry policy belongs to the call site
+    (`GitLabClient._send`), not to the transport: only that makes "this call
+    is not idempotent, so it must never be retried" a property of the CALL
+    and not of whatever callable happens to be injected as the transport.  A
+    transport that captures `**kwargs`, a bound method, a `functools.partial`
+    or a C builtin is always invoked with exactly the four documented
+    positional arguments, so nothing can retry behind the client's back.
 
     Raises `urllib.error.HTTPError` for any 4xx/5xx response and
     `urllib.error.URLError` / `OSError` for a dropped or timed-out
-    connection: the retry policy in `urllib_http` owns the classification.
+    connection: `_is_retryable` owns the classification, the client the
+    retry loop.
     """
     data = None
     headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
@@ -289,46 +299,6 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, OSError)
 
 
-def urllib_http(
-    method: str,
-    url: str,
-    token: str,
-    body: dict[str, Any] | None = None,
-    attempts: int = HTTP_ATTEMPTS,
-    sleep: Callable[[float], None] = time.sleep,
-) -> Any:
-    """Default HTTP transport: a plain urllib call against the GitLab API,
-    retried with backoff on transient failures.
-
-    `attempts` is the TOTAL number of tries (default 3) and `sleep` is the
-    backoff clock (house seam: `rsc_util.fetch(..., sleep=time.sleep)`),
-    injected so the test suite can drive the real backoff path without
-    blocking.  When the attempts run out, the error names the URL and the
-    LAST cause, so a CI log says which call failed and why.
-
-    NOTE: this is the shared transport for every API call, including the
-    issue-create POST.  The create POST must never be retried blindly - a
-    retry after a lost response opens a SECOND `corpus-sync` issue and breaks
-    `act()`'s invariant.  The create path therefore passes `attempts=1`
-    (see `GitLabClient.request`); everything else retries freely.
-    """
-    last: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            return _http_call_once(method, url, token, body)
-        except Exception as exc:
-            if not _is_retryable(exc):
-                raise
-            last = exc
-            if attempt + 1 < attempts:
-                sleep(2**attempt)
-    if last is None:  # pragma: no cover - defensive
-        raise RuntimeError(f"{method} {url} failed after {attempts} attempts")
-    raise RuntimeError(
-        f"{method} {url} failed after {attempts} attempts ({last})"
-    ) from last
-
-
 class GitLabClient:
     """A very small GitLab REST client that records every call it makes.
 
@@ -347,40 +317,19 @@ class GitLabClient:
         token: str,
         http: HttpFn | None = None,
         dry_run: bool = False,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.project_id = project_id
         self.token = token
         self.http = http or urllib_http
         self.dry_run = dry_run
+        # The backoff clock: injected by the tests so the real backoff path
+        # runs without blocking - the same house seam as
+        # `scripts/rsc_util.py::fetch(..., sleep=time.sleep)`.
+        self.sleep = sleep
         self.planned_calls: list[str] = []
         self.sent_calls: list[str] = []
-        # Whether the transport accepts the extra `attempts` keyword.  The
-        # real `urllib_http` does; an injected `HttpFn` fake (the test seam)
-        # takes exactly (method, url, token, body).  Decided once, up front:
-        # the issue-create call passes `attempts=1` only when the transport
-        # can take it, so the create is never blindly retried and an
-        # injected transport is never called with a keyword it rejects.
-        self._http_takes_attempts = self._transport_accepts_attempts(self.http)
-
-    @staticmethod
-    def _transport_accepts_attempts(http: HttpFn) -> bool:
-        """Whether `http` can take the `attempts=` keyword.
-
-        The real `urllib_http` can.  An injected `HttpFn` is judged by its
-        signature: an explicit `attempts` parameter or a `*args` capture both
-        work; anything else is called with the four documented positional
-        arguments only.  A fake that cannot be introspected at all is treated
-        as incompatible (the conservative choice: it simply does not get the
-        extra keyword).
-        """
-        try:
-            params = inspect.signature(http).parameters
-        except (TypeError, ValueError):  # pragma: no cover - builtins etc.
-            return False
-        if "attempts" in params:
-            return True
-        return any(p.kind is p.VAR_POSITIONAL for p in params.values())
 
     def url(self, path: str, params: dict[str, Any] | None = None) -> str:
         quoted = urllib.parse.quote(str(self.project_id), safe="")
@@ -421,23 +370,54 @@ class GitLabClient:
             # Planned, not sent: the transport is never reached.
             return None
         self.sent_calls.append(f"{method} {path}")
-        # The issue create is never retried (design (a)); every other call
-        # gets the transport's default retry policy.  The `attempts` keyword
-        # is only passed to transports that accept it - the real
-        # `urllib_http` does, an injected `HttpFn` seam may not.
-        if method == "POST" and path == "/issues" and self._http_takes_attempts:
-            try:
-                return self.http(method, url, self.token, body, attempts=1)
-            except DeliveryError:
-                raise
-            except Exception as exc:
-                raise DeliveryError(f"{method} {path} failed: {exc}") from exc
+        # The issue create is the one call in this script that is NOT
+        # idempotent: if the server creates the issue but the response is
+        # lost, a retry opens a SECOND `corpus-sync` issue and breaks
+        # `act()`'s invariant.  `attempts=1` is decided HERE, at the call
+        # site: `_send` then invokes the transport exactly once - whatever
+        # the transport's signature, keyword capture or internal behaviour.
+        # Every other call (the idempotent list / notes / close) retries.
+        attempts = 1 if (method == "POST" and path == "/issues") else HTTP_ATTEMPTS
         try:
-            return self.http(method, url, self.token, body)
+            return self._send(method, url, body, attempts)
         except DeliveryError:
             raise
         except Exception as exc:
             raise DeliveryError(f"{method} {path} failed: {exc}") from exc
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        body: dict[str, Any] | None,
+        attempts: int,
+    ) -> Any:
+        """Send one call, retrying transient failures at most `attempts` times.
+
+        The retry loop lives HERE, at the call site, and the transport is
+        always invoked with exactly the four documented positional arguments:
+        no keyword negotiation, no signature introspection.  So `attempts=1`
+        means "invoke the transport exactly once" for every possible callable
+        shape - a `**kwargs` wrapper that forwards the keyword to a retrying
+        transport, a `*args` capture, a bound method, a `functools.partial`, a
+        C builtin - which is what makes the issue create's non-idempotency a
+        property of the CALL and not of the transport.
+        """
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self.http(method, url, self.token, body)
+            except Exception as exc:
+                if not _is_retryable(exc):
+                    raise
+                last = exc
+                if attempt + 1 < attempts:
+                    self.sleep(2**attempt)
+        if last is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"{method} {url} failed after {attempts} attempts")
+        raise RuntimeError(
+            f"{method} {url} failed after {attempts} attempts ({last})"
+        ) from last
 
 
 def corpus_sync_status(client: GitLabClient, pipeline_id: str) -> str | None:
@@ -788,6 +768,7 @@ def run_dry(
     env: dict[str, str],
     http: HttpFn | None = None,
     freshness_path: str = FRESHNESS_PATH,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Print the decision and the planned API calls. Send nothing.
 
@@ -824,6 +805,7 @@ def run_dry(
         token=token or "dry-run",
         http=http,
         dry_run=True,
+        sleep=sleep,
     )
 
     state = gather_state(client, env, freshness_path)
@@ -845,6 +827,7 @@ def run(
     http: HttpFn | None = None,
     dry_run: bool = False,
     freshness_path: str = FRESHNESS_PATH,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """The whole decision + action. Returns the process exit code.
 
@@ -857,7 +840,9 @@ def run(
     if dry_run:
         # A dry run is a separate path on purpose: it must never reach the
         # transport, and it must never exit non-zero.
-        return run_dry(env, http=http, freshness_path=freshness_path)
+        return run_dry(
+            env, http=http, freshness_path=freshness_path, sleep=sleep
+        )
 
     token, token_var = token_from_env(env)
     if token is None:
@@ -880,6 +865,7 @@ def run(
         token=token,
         http=http,
         dry_run=False,
+        sleep=sleep,
     )
 
     try:
