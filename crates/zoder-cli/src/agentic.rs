@@ -7609,6 +7609,78 @@ loop stays unresolved (reviewer_unavailable)."
     }
 }
 
+/// Why an iteration ended unresolved because the REVIEW was unusable.
+///
+/// The three shapes are different failures and used to share one message. The
+/// generic "reviewer produced no actionable verdict after retry" is only true
+/// of the third: it was printed whenever `review_error` was empty, which is
+/// also the case when a reviewer DID answer - with a verdict that cites no
+/// location - so a fleet investigation went looking for a reviewer that had
+/// never been called. Naming the shape, and the model that answered, is the
+/// difference between a diagnosable stop and a silent null.
+fn loop_unresolved_review_message(
+    review_error: Option<&str>,
+    unlocated_no_evidence: bool,
+    verdict: &str,
+    reviewer_model: Option<&str>,
+) -> String {
+    if let Some(err) = review_error {
+        return format!(
+            "review incomplete ({err}); stopping unresolved — an unfinished review is not an approval"
+        );
+    }
+    let who = reviewer_model.unwrap_or("the reviewer");
+    if unlocated_no_evidence {
+        return format!(
+            "{who} returned `{verdict}` with no located evidence; a verdict that points at no \
+             location cannot resolve the loop, so this iteration stays unresolved"
+        );
+    }
+    format!("{who} produced no actionable verdict after retry; stopping unresolved")
+}
+
+#[cfg(test)]
+mod loop_unresolved_message_tests {
+    use super::loop_unresolved_review_message;
+
+    #[test]
+    fn an_incomplete_review_names_the_reason() {
+        let msg = loop_unresolved_review_message(
+            Some("review chunk 1/1: provider 503"),
+            false,
+            "reviewer_unavailable",
+            None,
+        );
+        assert!(msg.contains("review incomplete"), "{msg}");
+        assert!(msg.contains("provider 503"), "{msg}");
+        assert!(
+            msg.contains("an unfinished review is not an approval"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_verdict_without_a_location_names_the_model_and_the_shape() {
+        let msg = loop_unresolved_review_message(None, true, "approve", Some("gemma4-31b"));
+        assert!(msg.contains("gemma4-31b"), "{msg}");
+        assert!(msg.contains("no located evidence"), "{msg}");
+        assert!(msg.contains("`approve`"), "{msg}");
+        // A reviewer that answered must never be described as having produced
+        // nothing actionable: that wording sent an investigation after a
+        // reviewer that had in fact replied.
+        assert!(!msg.contains("no actionable verdict"), "{msg}");
+    }
+
+    #[test]
+    fn an_unknown_reviewer_still_says_the_reviewer() {
+        let msg = loop_unresolved_review_message(None, false, "comment", None);
+        assert!(
+            msg.contains("the reviewer produced no actionable verdict"),
+            "{msg}"
+        );
+    }
+}
+
 /// Bound (in characters) for the located-findings ledger handoff (D).
 const MAX_LEDGER_FINDINGS_CHARS: usize = 1500;
 
@@ -9258,16 +9330,15 @@ or comment.\n"
         // oversized diff) lands here too: it is never an approve.
         if review.verdict == REVIEWER_UNAVAILABLE_VERDICT || review_unlocated_no_evidence {
             if !cli.quiet {
-                match &review_error {
-                    Some(e) => eprintln!(
-                        "[loop] review incomplete ({e}); stopping unresolved — \
-                         an unfinished review is not an approval"
-                    ),
-                    None => eprintln!(
-                        "[loop] reviewer produced no actionable verdict after retry; \
-                         stopping unresolved"
-                    ),
-                }
+                eprintln!(
+                    "[loop] {}",
+                    loop_unresolved_review_message(
+                        review_error.as_deref(),
+                        review_unlocated_no_evidence,
+                        &review.verdict,
+                        reviewer_model.as_deref(),
+                    )
+                );
             }
             break;
         }
