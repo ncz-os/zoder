@@ -20,6 +20,10 @@ Usage:
 from __future__ import annotations
 import argparse, json, sys, urllib.request
 import yaml
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from rsc_util import fetch as _fetch  # noqa: E402
 
 DEFAULT_URL = (
     "https://raw.githubusercontent.com/Aider-AI/aider/main/"
@@ -27,10 +31,10 @@ DEFAULT_URL = (
 )
 
 
-def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (zoder-ingest)"})
-    with urllib.request.urlopen(req, timeout=40) as r:
-        return r.read().decode("utf-8", "replace")
+def fetch(url: str, **kwargs) -> str:
+    # Shared helper: 3 attempts, backoff, 4xx non-retryable — same semantics as
+    # the RSC fetcher (rsc_util.fetch). JSON/YAML parse stays in parse().
+    return _fetch(url, **kwargs)
 
 
 def _date_from_dirname(dirname: str | None) -> str | None:
