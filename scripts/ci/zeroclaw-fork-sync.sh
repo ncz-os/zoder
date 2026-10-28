@@ -63,16 +63,42 @@ AGE_H=$(( ( $(date +%s) - OLDEST ) / 3600 ))
 echo "fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH; oldest missing commit is ${AGE_H}h old"
 
 # Real merge, never force. The fork's overlay commits are preserved; upstream
-# lands on top. Conflict => loud failure, nothing pushed.
-if ! git -C "$SYNC_WORKDIR" \
-      -c user.name="ncz-os-sync-bot" \
-      -c user.email="sync@ncz-os.local" \
-      merge --no-edit "upstream/$UPSTREAM_BRANCH" \
-      -m "merge: daily sync master with upstream zeroclaw-labs master ($(date -u +%F))"; then
-  echo "::error::fork sync hit a merge conflict that needs human resolution:"
-  git -C "$SYNC_WORKDIR" diff --name-only --diff-filter=U || true
-  git -C "$SYNC_WORKDIR" merge --abort || true
-  exit 1
+# lands on top. A conflict in SOURCE is a loud failure, nothing pushed.
+#
+# A conflict confined to the fork's own CI configuration is NOT a source
+# conflict: nothing we build or ship reads the fork's .github/ or .gitlab-ci.yml
+# (the zoder nightly builds the engine itself). On 2026-10-16 a conflict in
+# .github/workflows/ci.yml stopped this job for TEN days -- it failed correctly,
+# an alert was filed, and nobody was there to hand-resolve a file that does not
+# affect the binary -- until the fork crossed the nightly's 36h grace window and
+# the nightly went red on 10-24 and 10-25. So conflicts whose every path matches
+# SYNC_CI_PATHS_RE are resolved to UPSTREAM's side (so later merges converge, not
+# drift) and the merge is committed; any other conflicting path still aborts.
+CI_PATHS_RE="${SYNC_CI_PATHS_RE:-^(\.github/|\.gitlab/|\.gitlab-ci\.yml$)}"
+SYNC_MSG="merge: daily sync master with upstream zeroclaw-labs master ($(date -u +%F))"
+SYNC_GIT=(git -C "$SYNC_WORKDIR" -c user.name="ncz-os-sync-bot" -c user.email="sync@ncz-os.local")
+if ! "${SYNC_GIT[@]}" merge --no-edit "upstream/$UPSTREAM_BRANCH" -m "$SYNC_MSG"; then
+  CONFLICTS="$(git -C "$SYNC_WORKDIR" diff --name-only --diff-filter=U || true)"
+  NON_CI="$(grep -v -E "$CI_PATHS_RE" <<<"$CONFLICTS" || true)"
+  if [ -n "$CONFLICTS" ] && [ -z "$NON_CI" ]; then
+    echo "::warning::merge conflict confined to CI config; taking upstream's side:"
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      echo "  $path"
+      if git -C "$SYNC_WORKDIR" cat-file -e "upstream/$UPSTREAM_BRANCH:$path" 2>/dev/null; then
+        git -C "$SYNC_WORKDIR" checkout --theirs -- "$path"
+        git -C "$SYNC_WORKDIR" add -- "$path"
+      else
+        git -C "$SYNC_WORKDIR" rm -q -- "$path"
+      fi
+    done <<<"$CONFLICTS"
+    "${SYNC_GIT[@]}" commit -q --no-edit
+  else
+    echo "::error::fork sync hit a merge conflict that needs human resolution:"
+    echo "$CONFLICTS"
+    git -C "$SYNC_WORKDIR" merge --abort || true
+    exit 1
+  fi
 fi
 
 # A clean text merge can still duplicate dependency keys; verify manifests

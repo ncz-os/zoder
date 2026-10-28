@@ -8,6 +8,8 @@
 #   * behind, clean merge    -> upstream landed, overlay preserved, exit 0
 #   * conflict               -> exit 1, fork NOT advanced, conflict listed
 #   * clean merge, bad import-> exit 1, fork NOT advanced
+#   * conflict only in CI config (.github/, .gitlab*) -> resolved to upstream, exit 0
+#   * CI-config + source conflict -> exit 1, fork NOT advanced
 #
 # Run: bash scripts/tests/zeroclaw-fork-sync-tests.sh
 set -euo pipefail
@@ -114,6 +116,53 @@ if run_sync "$c4" >/dev/null 2>&1; then
 else
   [ "$(head_of "$c4/fork.git")" = "$before" ] && pass "bad manifest left fork untouched" \
     || bad "bad manifest advanced the fork"
+fi
+
+# ---- case 5: conflict ONLY in CI config -> resolved to upstream, advanced --
+# (2026-10-16..25 outage: .github/workflows/ci.yml conflict stalled the sync)
+c5="$TMP/ciconflict"; seed_repos "$c5"
+"${GIT[@]}" clone -q "$c5/fork.git" "$c5/forkdev"
+mkdir -p "$c5/forkdev/.github/workflows"; printf 'name: fork-ci\n' > "$c5/forkdev/.github/workflows/ci.yml"
+"${GIT[@]}" -C "$c5/forkdev" add -A; "${GIT[@]}" -C "$c5/forkdev" commit -q -m "fork ci"
+"${GIT[@]}" -C "$c5/forkdev" push -q origin master
+OVERLAY5="$(head_of "$c5/forkdev")"
+"${GIT[@]}" clone -q "$c5/upstream.git" "$c5/updev"
+mkdir -p "$c5/updev/.github/workflows"; printf 'name: upstream-ci\n' > "$c5/updev/.github/workflows/ci.yml"
+printf 'upstream = 5\n' > "$c5/updev/new.txt"
+"${GIT[@]}" -C "$c5/updev" add -A; "${GIT[@]}" -C "$c5/updev" commit -q -m "upstream ci + code"
+"${GIT[@]}" -C "$c5/updev" push -q origin master
+UP5="$(head_of "$c5/updev")"
+if out="$(run_sync "$c5" 2>&1)"; then
+  git -C "$c5/fork.git" merge-base --is-ancestor "$UP5" master \
+    && pass "CI-config-only conflict advanced the fork to upstream" || bad "CI conflict did not reach upstream"
+  git -C "$c5/fork.git" merge-base --is-ancestor "$OVERLAY5" master \
+    && pass "CI-config-only conflict kept the overlay history" || bad "CI conflict lost overlay commit"
+  [ "$(git -C "$c5/fork.git" show master:.github/workflows/ci.yml)" = "name: upstream-ci" ] \
+    && pass "CI-config conflict resolved to upstream's side" || bad "CI file not upstream's version"
+  grep -q "confined to CI config" <<<"$out" && pass "CI-config resolution is logged" || bad "no log of resolution"
+else
+  bad "CI-config-only conflict should have been auto-resolved: $out"
+fi
+
+# ---- case 6: CI-config AND source conflict -> still fails, no push --------
+c6="$TMP/mixed"; seed_repos "$c6"
+"${GIT[@]}" clone -q "$c6/fork.git" "$c6/forkdev"
+mkdir -p "$c6/forkdev/.github/workflows"; printf 'name: fork-ci\n' > "$c6/forkdev/.github/workflows/ci.yml"
+printf 'line = fork\n' > "$c6/forkdev/shared.txt"
+"${GIT[@]}" -C "$c6/forkdev" add -A; "${GIT[@]}" -C "$c6/forkdev" commit -q -m "fork ci + source"
+"${GIT[@]}" -C "$c6/forkdev" push -q origin master
+before="$(head_of "$c6/fork.git")"
+"${GIT[@]}" clone -q "$c6/upstream.git" "$c6/updev"
+mkdir -p "$c6/updev/.github/workflows"; printf 'name: upstream-ci\n' > "$c6/updev/.github/workflows/ci.yml"
+printf 'line = upstream\n' > "$c6/updev/shared.txt"
+"${GIT[@]}" -C "$c6/updev" add -A; "${GIT[@]}" -C "$c6/updev" commit -q -m "upstream ci + source"
+"${GIT[@]}" -C "$c6/updev" push -q origin master
+if out="$(run_sync "$c6" 2>&1)"; then
+  bad "mixed CI+source conflict should have failed: $out"
+else
+  grep -q "shared.txt" <<<"$out" && pass "mixed conflict still lists the source file" || bad "mixed conflict output: $out"
+  [ "$(head_of "$c6/fork.git")" = "$before" ] && pass "mixed conflict left fork untouched" \
+    || bad "mixed conflict advanced the fork"
 fi
 
 if [ "$fail" -ne 0 ]; then
