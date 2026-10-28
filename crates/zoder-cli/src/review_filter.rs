@@ -1948,6 +1948,64 @@ pub(crate) mod tests {
         assert!(claimed_symbols("The file does not exist", "").is_empty());
     }
 
+    /// The drop rule is narrow and invertible. A finding whose text names
+    /// SEVERAL symbols is dropped only when every symbol the claim itself
+    /// makes about has definition or import evidence at the reviewed head.
+    /// A title that names one defined symbol AND one undefined symbol keeps
+    /// the finding: the evidence for the defined symbol must not cancel the
+    /// claim about the missing one. This test drives the drop rule directly
+    /// (`false_undefined_record` on the claim's text) and does not exercise
+    /// the review call sites in `agentic.rs`; it pins the rule's narrowness,
+    /// not the callers' dispatch of it. The aggregate check shows the
+    /// filtered record the rule produces for the disproved control case.
+    #[test]
+    fn a_defined_symbol_in_the_title_does_not_drop_the_claimed_missing_one() {
+        let source = "RETRY_LIMIT = 3\n";
+        let read = read_from(vec![("pkg/mod.py", source)]);
+        // RETRY_LIMIT is defined in the file; missing_helper is not. The
+        // claim is about missing_helper, so the finding must survive.
+        let title = "RETRY_LIMIT is defined but missing_helper is undefined";
+        let record = false_undefined_record(
+            title,
+            "The code calls missing_helper() but the module never defines it.",
+            "pkg/mod.py",
+            &read,
+        );
+        assert!(
+            record.is_none(),
+            "the defined RETRY_LIMIT must not disprove the claim about missing_helper: {record:?}"
+        );
+        // The same sentence reversed in emphasis: the claim names the missing
+        // symbol alone. Also kept.
+        let record = false_undefined_record(
+            title,
+            "missing_helper is undefined in this chunk.",
+            "pkg/mod.py",
+            &read,
+        );
+        assert!(
+            record.is_none(),
+            "still a claim about missing_helper: {record:?}"
+        );
+        // And the control: when the ONLY claimed symbol is the defined one,
+        // the finding IS dropped with its defining line as evidence.
+        let record = false_undefined_record(
+            "RETRY_LIMIT is undefined",
+            "The code uses RETRY_LIMIT but the constant is not defined in this chunk.",
+            "pkg/mod.py",
+            &read,
+        )
+        .expect("the sole claimed symbol is defined");
+        assert_eq!(record["symbol"], "RETRY_LIMIT");
+        assert!(
+            record["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("RETRY_LIMIT = 3"),
+            "{record}"
+        );
+    }
+
     fn read_from(files: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> Option<String> {
         move |path: &str| {
             files
