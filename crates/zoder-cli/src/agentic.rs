@@ -19602,6 +19602,20 @@ data: [DONE]\n\n";
             msg.contains("no provider serves") || msg.contains("provider"),
             "the pin failure must name the missing provider: {msg}"
         );
+        // THE REGRESSION POINT: the failure must come from the loop's
+        // PRE-ITERATION entry guard, which is the only place that wraps the
+        // diagnosis as "reviewer pin ...". Without that guard the loop still
+        // ends with an error, but only after it has begun iterating (and,
+        // in this harness, from the author phase) - the string below is what
+        // distinguishes "refused before any work" from "discovered later".
+        assert!(
+            msg.contains("reviewer pin"),
+            "the loop must refuse an undispatable pin at its ENTRY: {msg}"
+        );
+        assert!(
+            msg.contains("phantom-model/ghost"),
+            "the refusal must name the model the operator pinned: {msg}"
+        );
         // No reviewer was ever dispatched.
         assert!(server.received_requests().await.unwrap().is_empty());
     }
