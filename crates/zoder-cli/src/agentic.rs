@@ -7636,6 +7636,16 @@ fn loop_unresolved_review_message(
              location cannot resolve the loop, so this iteration stays unresolved"
         );
     }
+    // A review can come back `reviewer_unavailable` with no recorded error:
+    // the reviewer answered, its reply was not usable, and the reason was
+    // never captured. That is still an ANSWERED review, so the catch-all
+    // below would misdescribe it.
+    if verdict == REVIEWER_UNAVAILABLE_VERDICT {
+        return format!(
+            "{who} returned `{verdict}` and no reason was recorded; the review is unusable, so \
+             this iteration stays unresolved"
+        );
+    }
     format!("{who} produced no actionable verdict after retry; stopping unresolved")
 }
 
@@ -7668,6 +7678,15 @@ mod loop_unresolved_message_tests {
         // A reviewer that answered must never be described as having produced
         // nothing actionable: that wording sent an investigation after a
         // reviewer that had in fact replied.
+        assert!(!msg.contains("no actionable verdict"), "{msg}");
+    }
+
+    #[test]
+    fn an_unavailable_verdict_with_no_error_names_the_model() {
+        let msg = loop_unresolved_review_message(None, false, "reviewer_unavailable", Some("gemma4-31b"));
+        assert!(msg.contains("gemma4-31b"), "{msg}");
+        assert!(msg.contains("reviewer_unavailable"), "{msg}");
+        assert!(msg.contains("no reason was recorded"), "{msg}");
         assert!(!msg.contains("no actionable verdict"), "{msg}");
     }
 
