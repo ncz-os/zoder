@@ -40,16 +40,22 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from corpus_match import canon_key  # noqa: E402
+from rsc_util import fetch  # noqa: E402
 
 LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
 PER_TOK_TO_MTOK = 1_000_000.0
 
 
-def fetch_json(url, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "zoder-corpus-builder"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+def fetch_json(url, timeout=30, **kwargs):
+    """Fetch one JSON document, retrying transient failures like rsc_util.fetch.
+
+    The retry semantics (3 attempts, backoff, 4xx non-retryable) live in the
+    shared helper; only the JSON parse stays here. The corpus builder keeps its
+    own User-Agent so upstream sees the same client as before.
+    """
+    kwargs.setdefault("user_agent", "zoder-corpus-builder")
+    return json.loads(fetch(url, timeout=timeout, **kwargs))
 
 
 def split_id(model_id):
