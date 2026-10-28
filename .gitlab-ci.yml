@@ -300,78 +300,13 @@ engine-sync-tests:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\""
 
-# Continuous build of UPSTREAM zeroclaw master.
-#
-# Why this exists: as of 2026-09-26 nothing anywhere tracked upstream
-# zeroclaw. Measured that day - one builder checkout was 610 commits behind
-# zeroclaw-labs/zeroclaw master, another was at a different head again, and
-# the only zeroclaw automation on the fleet was zeroclaw-sync.timer, which
-# syncs CONFIG, not source. The fleet's pull-nightly.sh pulls prebuilt
-# binaries from a GitHub release, so upstream could break us for weeks
-# without anyone noticing.
-#
-# This job builds upstream master itself, so a breaking upstream change
-# surfaces here rather than on a developer's machine days later.
-#
-# Scheduled only. A full Rust workspace build is expensive on shared
-# runners, so it deliberately does NOT run on push or merge requests.
-upstream-zeroclaw:
-  stage: upstream
-  # Upstream tracks its OWN MSRV, not our fork's pinned 1.93.0. Pinning 1.93.0
-  # here made the job die with "failed to parse process output:
-  # .../toolchains/1.96.1-x86_64-unknown-linux-gnu" (cargo exit 101) once
-  # upstream moved to 1.96. A job that tracks someone else's master must use
-  # a current toolchain, not ours.
-  image: rust:latest
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
-    CARGO_TERM_COLOR: "always"
-    UPSTREAM_URL: "https://github.com/zeroclaw-labs/zeroclaw.git"
-    UPSTREAM_REF: "master"
-  cache:
-    key: "cargo-upstream-zeroclaw"
-    paths:
-      - .cargo/registry/
-      - upstream/target/
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq pkg-config libssl-dev git >/dev/null
-    - rustup component add rustfmt clippy
-    - cargo --version && rustc --version
-  script:
-    - rm -rf upstream/src && git clone --depth 50 --branch "$UPSTREAM_REF" "$UPSTREAM_URL" upstream/src
-    - cd upstream/src
-    - "echo upstream-HEAD: $(git log --oneline -1)"
-    - "echo upstream-date: $(git log -1 --format=%cI)"
-    # The documented zeroclaw CI gate set. ci-all deliberately excludes the
-    # native session backends (postgres/oracle/db2/mysql), whose client libs
-    # are not present here; zeroclaw-desktop is excluded the same way CI does.
-    - cargo fmt --all -- --check
-    - cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings
-    - cargo check --locked --features ci-all --all-targets
-    - cargo check --no-default-features
-    - cargo test --locked --workspace --exclude zeroclaw-desktop
-  after_script:
-    # Always report drift, even when the build failed, so the report is useful
-    # in exactly the case we care about.
-    - |
-      if [ -d upstream/src ]; then
-        cd upstream/src
-        echo "=== upstream master ==="
-        git log --oneline -5 || true
-      fi
-  artifacts:
-    when: always
-    expire_in: 2 weeks
-    paths:
-      - upstream/src/target/release/zeroclaw
-  rules:
-    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
-    - if: "$CI_PIPELINE_SOURCE == \"web\""
-  # Upstream breakage is INFORMATION, not a defect in this repo. This job
-  # exists to notice when zeroclaw-labs/zeroclaw master stops building; making
-  # it block turns someone else's commit into a red pipeline on our master
-  # (and a buildwatch alert). It reports; it does not gate.
-  allow_failure: true
+# (2026-10-28) The `upstream-zeroclaw` job that built raw upstream zeroclaw master
+# was retired: it only ever ran on schedule/web, never gated anything
+# (allow_failure), kept its binary as an unused 2-week artifact, and in the last 40
+# pipelines it was skipped every time and never executed. Upstream breakage now
+# surfaces where it matters: `zeroclaw-fork-sync` merges upstream into the fork
+# daily and the native nightly builds that merge. Restore it from git history
+# (commit before this one) if a raw-upstream canary is ever wanted again.
 
 # Engine-fork sync: keep gitlab.com/ncz-os/zeroclaw within the native nightly's
 # 36h sync grace window, on a RELIABLE scheduler we control.
