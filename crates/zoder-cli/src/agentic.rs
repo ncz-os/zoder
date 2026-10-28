@@ -15260,6 +15260,149 @@ mod reviewer_chain_dispatch_tests {
         Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
     }
 
+    /// Build a minimal `Cli` for a `run_loop_review_once` call. No `-m`, no
+    /// allowlists: the caller passes the reviewer model as the
+    /// `reviewer_override` argument, which is priority 1 in candidate
+    /// ordering, and the dispatch loop walks `plan.candidates` — so the
+    /// reviewer dispatch is pinned without the `--reviewer-pool-routes`
+    /// machinery (whose author-chain guard would otherwise demand a
+    /// resolved author route). The scenario layer sees the free corpus and
+    /// produces a deterministic reviewer chain from it.
+    fn review_cli() -> Cli {
+        Cli::try_parse_from(["zoder", "exec"]).expect("clap parse")
+    }
+
+    /// OpenAI-shaped chat completion wrapping a structured JSON review.
+    /// The review is the caller's, so mounts can vary the verdict and
+    /// findings without duplicating the wire shape.
+    fn openai_completion(review: serde_json::Value) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": review.to_string()},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+        })
+        .to_string()
+    }
+
+    /// Mount a reviewer reply whose single finding is a FALSE
+    /// "undefined" claim: the file the finding points at DEFINES the
+    /// symbol the title calls missing. The loop review must drop the
+    /// finding and record the disproving evidence in
+    /// `filtered_findings`. The location's line number intentionally
+    /// does not match the defining line: a filter that only looks at
+    /// the cited line would keep the finding, so the pass also proves
+    /// the whole-file scan is what does the work.
+    async fn mount_200_review_with_false_undefined_finding(server: &MockServer) {
+        let review = serde_json::json!({
+            "verdict": "request_changes",
+            "summary": "the constant is not defined in this chunk",
+            "findings": [{
+                "severity": "critical",
+                "title": "RETRY_LIMIT is undefined",
+                "body": "the constant is not defined in this chunk",
+                "location": "pkg/mod.py:4"
+            }],
+            "next_steps": []
+        });
+        let body = openai_completion(review);
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Production-path proof for the loop review's false-"undefined"
+    /// filter. This drives the real [`run_loop_review_once`] — the loop
+    /// reviewer's one-call entry — end to end: a wiremock server stands
+    /// in for the reviewer provider, its reply carries one false
+    /// finding, and the review's worktree root (a real tempdir) defines
+    /// the symbol the finding claims is missing. The filter call inside
+    /// `run_loop_review_once` (the `filter_false_undefined_findings`
+    /// over the working-tree reader) must drop the finding before it is
+    /// returned; with that call removed the returned `ReviewOutput`
+    /// still carries the finding and has no `filtered_findings`, so
+    /// this test fails. It reaches the loop path only — it does not
+    /// exercise `cmd_review`'s standalone call site.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_loop_review_once_drops_a_false_undefined_finding() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        // The reviewer dispatch is pinned through the call's
+        // `reviewer_override` argument (candidate priority 1); the corpus
+        // marks the reviewer free so the policy gate passes.
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        // The review's worktree root: a real tempdir whose file defines the
+        // symbol the finding claims is missing. `run_loop_review_once` reads
+        // the location's path relative to this root.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        // No route flags: the `Some("working-model/reviewer")` override
+        // argument below is what pins the reviewer dispatch.
+        let cli = review_cli();
+
+        let (review, _, _, chunks, _) = run_loop_review_once(
+            &cli,
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            root,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        assert_eq!(chunks, 1, "one chunk for a diff this small");
+        // The false finding must be GONE from the returned review.
+        assert!(
+            review.findings.is_empty(),
+            "the disproved finding must not survive the loop review: {review:?}"
+        );
+        // ...and PRESENT in `filtered_findings` with its symbol and the
+        // defining line that disproves it.
+        assert_eq!(
+            review.filtered_findings.len(),
+            1,
+            "the loop must keep the disproving evidence: {review:?}"
+        );
+        let record = &review.filtered_findings[0];
+        assert_eq!(record["symbol"], "RETRY_LIMIT");
+        assert!(
+            record["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("RETRY_LIMIT = 3"),
+            "{record}"
+        );
+        // The only finding was disproved, so a blocking verdict is
+        // downgraded to `comment`, never `approve`.
+        assert_eq!(review.verdict, "comment", "{review:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reviewer_pool_fails_over_only_to_verified_healthy_secondary() {
         let home_dir = tempfile::tempdir().unwrap();
