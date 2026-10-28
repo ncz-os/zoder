@@ -21,6 +21,19 @@ healthy scheduled run adds a final note and closes the issue itself.
 Only the GitLab REST API and the standard library are used - no third-party
 dependencies - so it runs in a plain `python:3.12` container.
 
+The delivery path has its own retry, because the script's one job is to be
+the last line of monitoring: a single transient blip from the GitLab API
+(5xx, 429, dropped connection, read timeout) must not decide the fate of the
+alert.  `urllib_http` therefore retries the same failure classes the house
+fetchers retry (`scripts/rsc_util.py::fetch`, `scripts/fetch-arena.py`'s
+`fetch_json`): 3 attempts total, `2**attempt` seconds of backoff between
+them; every other 4xx is answered and NOT retried.  The issue-create POST is
+the one call that is not idempotent - a blind retry after a lost response
+would open a second `corpus-sync` issue and break `act()`'s invariant - so
+the create is never retried (design (a)): a transient failure there raises
+`DeliveryError`, the CI job shows "ALERT NOT DELIVERED", and the next
+scheduled run opens the issue.
+
 Environment (all GitLab predefined variables plus one token):
 
   CI_API_V4_URL        e.g. https://gitlab.com/api/v4
@@ -81,9 +94,12 @@ offline tests use is listed here:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -225,13 +241,28 @@ def state_from_freshness(report: dict[str, Any]) -> SyncState:
 HttpFn = Callable[..., Any]
 
 
-def urllib_http(
+# The GitLab API answers transient 5xx / 429 and drops connections, and the
+# alert's own delivery path is the thing this script monitors: one blip must
+# not decide the fate of the alert.  Retry the same failure classes the house
+# fetchers retry (`scripts/rsc_util.py::fetch`, `scripts/fetch-arena.py`'s
+# `fetch_json`): 3 attempts total, `2**attempt` seconds of backoff between
+# them.  Every other 4xx is answered and NOT retried - the upstream said no,
+# retrying only burns time.
+HTTP_ATTEMPTS = 3
+
+
+def _http_call_once(
     method: str,
     url: str,
     token: str,
     body: dict[str, Any] | None = None,
 ) -> Any:
-    """Default HTTP transport: a plain urllib call against the GitLab API."""
+    """One urllib round-trip against the GitLab API.
+
+    Raises `urllib.error.HTTPError` for any 4xx/5xx response and
+    `urllib.error.URLError` / `OSError` for a dropped or timed-out
+    connection: the retry policy in `urllib_http` owns the classification.
+    """
     data = None
     headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
     if body is not None:
@@ -243,6 +274,59 @@ def urllib_http(
     if not raw.strip():
         return {}
     return json.loads(raw)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """House retry classification: 5xx, 429, and network-level failures.
+
+    Every other `HTTPError` is a decision by the upstream - retrying it only
+    burns time - so it is not retryable.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500 or exc.code == 429
+    # URLError is an OSError subclass, as are TimeoutError and the plain
+    # connection/timeout errors urllib raises.
+    return isinstance(exc, OSError)
+
+
+def urllib_http(
+    method: str,
+    url: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    attempts: int = HTTP_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Default HTTP transport: a plain urllib call against the GitLab API,
+    retried with backoff on transient failures.
+
+    `attempts` is the TOTAL number of tries (default 3) and `sleep` is the
+    backoff clock (house seam: `rsc_util.fetch(..., sleep=time.sleep)`),
+    injected so the test suite can drive the real backoff path without
+    blocking.  When the attempts run out, the error names the URL and the
+    LAST cause, so a CI log says which call failed and why.
+
+    NOTE: this is the shared transport for every API call, including the
+    issue-create POST.  The create POST must never be retried blindly - a
+    retry after a lost response opens a SECOND `corpus-sync` issue and breaks
+    `act()`'s invariant.  The create path therefore passes `attempts=1`
+    (see `GitLabClient.request`); everything else retries freely.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _http_call_once(method, url, token, body)
+        except Exception as exc:
+            if not _is_retryable(exc):
+                raise
+            last = exc
+            if attempt + 1 < attempts:
+                sleep(2**attempt)
+    if last is None:  # pragma: no cover - defensive
+        raise RuntimeError(f"{method} {url} failed after {attempts} attempts")
+    raise RuntimeError(
+        f"{method} {url} failed after {attempts} attempts ({last})"
+    ) from last
 
 
 class GitLabClient:
@@ -271,6 +355,32 @@ class GitLabClient:
         self.dry_run = dry_run
         self.planned_calls: list[str] = []
         self.sent_calls: list[str] = []
+        # Whether the transport accepts the extra `attempts` keyword.  The
+        # real `urllib_http` does; an injected `HttpFn` fake (the test seam)
+        # takes exactly (method, url, token, body).  Decided once, up front:
+        # the issue-create call passes `attempts=1` only when the transport
+        # can take it, so the create is never blindly retried and an
+        # injected transport is never called with a keyword it rejects.
+        self._http_takes_attempts = self._transport_accepts_attempts(self.http)
+
+    @staticmethod
+    def _transport_accepts_attempts(http: HttpFn) -> bool:
+        """Whether `http` can take the `attempts=` keyword.
+
+        The real `urllib_http` can.  An injected `HttpFn` is judged by its
+        signature: an explicit `attempts` parameter or a `*args` capture both
+        work; anything else is called with the four documented positional
+        arguments only.  A fake that cannot be introspected at all is treated
+        as incompatible (the conservative choice: it simply does not get the
+        extra keyword).
+        """
+        try:
+            params = inspect.signature(http).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtins etc.
+            return False
+        if "attempts" in params:
+            return True
+        return any(p.kind is p.VAR_POSITIONAL for p in params.values())
 
     def url(self, path: str, params: dict[str, Any] | None = None) -> str:
         quoted = urllib.parse.quote(str(self.project_id), safe="")
@@ -295,6 +405,15 @@ class GitLabClient:
         A dry run records the call in `planned_calls` and returns `None`
         WITHOUT touching the transport: `self.http` is only reachable from
         the `else` branch below.
+
+        The issue-create POST (`POST /issues`) is the one call in the script
+        that is NOT idempotent: if the server creates the issue but the
+        response is lost, a blind retry opens a SECOND `corpus-sync` issue
+        and breaks `act()`'s invariant.  So the create is sent with
+        `attempts=1` - it is never retried (design (a)): a transient failure
+        there raises `DeliveryError`, the CI job shows "ALERT NOT DELIVERED",
+        and the next scheduled run opens the issue.  Every other call (the
+        idempotent list / notes / close) retries freely.
         """
         url = self.url(path, params)
         self.planned_calls.append(f"{method} {path}")
@@ -302,6 +421,17 @@ class GitLabClient:
             # Planned, not sent: the transport is never reached.
             return None
         self.sent_calls.append(f"{method} {path}")
+        # The issue create is never retried (design (a)); every other call
+        # gets the transport's default retry policy.  The `attempts` keyword
+        # is only passed to transports that accept it - the real
+        # `urllib_http` does, an injected `HttpFn` seam may not.
+        if method == "POST" and path == "/issues" and self._http_takes_attempts:
+            try:
+                return self.http(method, url, self.token, body, attempts=1)
+            except DeliveryError:
+                raise
+            except Exception as exc:
+                raise DeliveryError(f"{method} {path} failed: {exc}") from exc
         try:
             return self.http(method, url, self.token, body)
         except DeliveryError:
