@@ -1392,6 +1392,149 @@ pub(crate) fn false_undefined_record_with_location(
     Some(record)
 }
 
+/// Whether `path` is a shader source, where the GLSL built-ins and the
+/// Shadertoy globals exist by definition rather than by a declaration in the
+/// file under review.
+fn is_shader_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".glsl", ".glslf", ".glslv", ".frag", ".vert", ".comp", ".shader",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// Names a shader gets for free. GLSL is case-sensitive, and the reviewer's
+/// claim quotes the identifier exactly, so compare exactly. The list is the
+/// fragment-shader surface a review actually meets: the Shadertoy uniforms,
+/// the GLSL built-in functions, the type constructors, and the fragment
+/// outputs.
+const SHADER_BUILTINS: &[&str] = &[
+    // Shadertoy-provided uniforms and entry points.
+    "iTime",
+    "iTimeDelta",
+    "iFrame",
+    "iFrameRate",
+    "iResolution",
+    "iMouse",
+    "iDate",
+    "iSampleRate",
+    "iChannel0",
+    "iChannel1",
+    "iChannel2",
+    "iChannel3",
+    "iChannelResolution",
+    "iChannelTime",
+    "mainImage",
+    "mainVR",
+    // GLSL built-in functions.
+    "fract",
+    "mix",
+    "clamp",
+    "smoothstep",
+    "step",
+    "length",
+    "normalize",
+    "dot",
+    "cross",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "pow",
+    "exp",
+    "exp2",
+    "log",
+    "log2",
+    "sqrt",
+    "inversesqrt",
+    "abs",
+    "sign",
+    "floor",
+    "ceil",
+    "round",
+    "trunc",
+    "mod",
+    "min",
+    "max",
+    "reflect",
+    "refract",
+    "texture",
+    "texture2D",
+    "textureLod",
+    "dFdx",
+    "dFdy",
+    "fwidth",
+    "distance",
+    "degrees",
+    "radians",
+    "transpose",
+    "inverse",
+    "determinant",
+    // Type constructors and built-in values.
+    "vec2",
+    "vec3",
+    "vec4",
+    "ivec2",
+    "ivec3",
+    "ivec4",
+    "uvec2",
+    "uvec3",
+    "uvec4",
+    "bvec2",
+    "bvec3",
+    "bvec4",
+    "mat2",
+    "mat3",
+    "mat4",
+    "mat2x2",
+    "mat3x3",
+    "mat4x4",
+    "float",
+    "int",
+    "uint",
+    "bool",
+    "sampler2D",
+    "samplerCube",
+    "gl_FragColor",
+    "gl_FragCoord",
+    "gl_FragData",
+    "gl_Position",
+    "gl_PointCoord",
+    "discard",
+];
+
+/// Evidence that `symbol` is a shader global or built-in. Returns `None` for
+/// a non-shader path and for any name that is not on the list, so a genuinely
+/// undefined identifier in a shader is still reported.
+fn shader_builtin_evidence(path: &str, symbol: &str) -> Option<(String, String)> {
+    if !is_shader_path(path) {
+        return None;
+    }
+    let name = symbol.trim();
+    // A member chain (`iChannel0.xyz`, `gl_FragCoord.xy`) claims its head.
+    let head = name
+        .split(['.', '[', '('])
+        .next()
+        .unwrap_or(name)
+        .trim();
+    if head.is_empty() || !SHADER_BUILTINS.iter().any(|builtin| *builtin == head) {
+        return None;
+    }
+    Some((
+        format!(
+            "`{head}` is a GLSL built-in / Shadertoy global, defined by the shader preamble the \
+             reviewer is not shown"
+        ),
+        format!(
+            "{path}: `{head}` needs no declaration in the reviewed hunk; the Shadertoy preamble \
+             and the GLSL built-ins provide it"
+        ),
+    ))
+}
+
 /// Evidence that `symbol` is bound: the definition/import line for a plain
 /// name, or, for a dotted module path, any import that binds it.
 fn name_evidence(
@@ -1401,6 +1544,11 @@ fn name_evidence(
     target_line: Option<usize>,
     read: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(String, String)> {
+    // A shader's globals and built-ins are defined by the preamble the
+    // reviewer is not shown, so they can never be "missing from this file".
+    if let Some(found) = shader_builtin_evidence(path, symbol) {
+        return Some(found);
+    }
     if let Some(found) = definition_evidence_at(path, source, symbol, target_line, read) {
         return Some(found);
     }
@@ -3126,6 +3274,89 @@ pub(crate) mod tests {
                 .as_array()
                 .is_some_and(|l| !l.is_empty()),
             "{record}"
+        );
+    }
+
+    /// A Shadertoy shader's globals are defined by the preamble the reviewer
+    /// never sees, so `iTime`/`iResolution` can never be "undefined" in it.
+    #[test]
+    fn a_shadertoy_global_is_never_undefined_in_a_shader() {
+        let source = "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n    vec2 uv = fragCoord.xy / iResolution.xy;\n    fragColor = vec4(uv, 0.5 + 0.5 * sin(iTime), 1.0);\n}\n";
+        let read = move |p: &str| (p == "shaders/plasma.glsl").then(|| source.to_string());
+        let record = false_undefined_record_with_location(
+            "Undefined variable `iTime`",
+            "iTime is used but never declared in this file.",
+            "shaders/plasma.glsl",
+            Some("shaders/plasma.glsl:3"),
+            None,
+            &read,
+        )
+        .expect("the Shadertoy preamble defines iTime");
+        assert!(
+            record["evidence"]
+                .as_str()
+                .is_some_and(|e| e.contains("Shadertoy")),
+            "{record}"
+        );
+    }
+
+    /// GLSL built-in functions too: `fract`, `mix` and friends need no
+    /// declaration in the file.
+    #[test]
+    fn a_glsl_builtin_function_is_never_undefined_in_a_shader() {
+        let source = "void mainImage(out vec4 c, in vec2 p) {\n    vec2 uv = fract(p / 100.0);\n    c = vec4(mix(vec3(0.0), vec3(1.0), uv.x), 1.0);\n}\n";
+        let read = move |q: &str| (q == "shaders/a.frag").then(|| source.to_string());
+        for symbol in ["fract", "mix"] {
+            let title = format!("Undefined function `{symbol}`");
+            let record = false_undefined_record_with_location(
+                &title,
+                "the shader calls it but never declares it.",
+                "shaders/a.frag",
+                Some("shaders/a.frag:2"),
+                None,
+                &read,
+            );
+            assert!(record.is_some(), "{symbol} must be treated as defined");
+        }
+    }
+
+    /// The allowance is scoped to shaders: the same claim about a name that
+    /// merely looks shader-ish must survive in a non-shader file.
+    #[test]
+    fn a_shadertoy_global_claim_outside_a_shader_is_kept() {
+        let source = "fn render(t: f32) -> f32 {\n    t + iTime\n}\n";
+        let read = move |p: &str| (p == "src/render.rs").then(|| source.to_string());
+        assert!(
+            false_undefined_record_with_location(
+                "Undefined variable `iTime`",
+                "iTime is used but never declared in this file.",
+                "src/render.rs",
+                Some("src/render.rs:1"),
+                None,
+                &read,
+            )
+            .is_none(),
+            "the shader allowance must not leak into a Rust file"
+        );
+    }
+
+    /// And a genuinely undefined name in a shader is still reported.
+    #[test]
+    fn an_undefined_name_in_a_shader_is_still_reported() {
+        let source =
+            "void mainImage(out vec4 c, in vec2 p) {\n    c = vec4(noiseField(p), 0.0);\n}\n";
+        let read = move |q: &str| (q == "shaders/b.glsl").then(|| source.to_string());
+        assert!(
+            false_undefined_record_with_location(
+                "Undefined function `noiseField`",
+                "noiseField is called but never declared in this file.",
+                "shaders/b.glsl",
+                Some("shaders/b.glsl:2"),
+                None,
+                &read,
+            )
+            .is_none(),
+            "a name the preamble does not provide must still be reported"
         );
     }
 
