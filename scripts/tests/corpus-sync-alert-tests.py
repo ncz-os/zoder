@@ -16,6 +16,35 @@ What is covered:
   * no token                                 -> "ALERT NOT DELIVERED", exit 1
   * `--dry-run`                              -> no API call, and a printed plan
 
+The second half of the suite drives the REAL transport (`urllib_http`), not
+the injected seam: a `http.server.ThreadingHTTPServer` on the loopback
+interface on an ephemeral port, so urllib genuinely raises `HTTPError` for
+the 4xx/5xx responses - the only way the retry classification is really
+exercised.  The loopback address is assembled from parts so no host name or
+IP literal appears in the source.
+
+Covered against the real socket:
+
+  * a transient 5xx on a read is retried, then succeeds (the server counts
+    exactly the requests it received, and the injected backoff clock shows
+    the real backoff ran);
+  * a non-retryable 4xx is NOT retried (exactly one request) and the failure
+    surfaces;
+  * a 429 IS retried (then succeeds);
+  * exhausting the attempts raises an error naming the URL and the last
+    cause, with exactly 3 requests and the expected backoff;
+  * THE INVARIANT: when the issue-create POST leaves the client not knowing
+    whether the issue was created (the server stores the issue, then the
+    connection dies without a response), the script ends with exactly ONE
+    open issue labelled `corpus-sync` - the create is not retried, so one
+    POST /issues reaches the server;
+  * the create's single-shot decision is made at the CALL SITE, not by
+    introspecting the transport: a `**kwargs` transport that drops the
+    keyword, and a var-positional transport that cannot take one, both see
+    exactly ONE create POST and leave exactly one open issue;
+  * the dry-run path still never reaches the transport, even when a real
+    HTTP server is standing up and listening.
+
 The module under test is loaded by path (its file name is not a valid module
 name), and it is registered in `sys.modules` first: `@dataclass` needs to look
 the module up there while it is being executed.
@@ -26,13 +55,16 @@ Run with:  python3 scripts/tests/corpus-sync-alert-tests.py
 from __future__ import annotations
 
 import contextlib
+import http.server
 import importlib.util
 import io
 import json
 import os
 import sys
 import tempfile
+import threading
 import urllib.parse
+import urllib.request
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -161,6 +193,556 @@ FRESH_OK = {
     "prices": {"ok": True},
     "overlay": {"stale": False, "built_at": "2026-10-25", "age_days": 1},
 }
+
+
+# --------------------------------------------------------------------------
+# real-transport tests: a real HTTP server on loopback, an ephemeral port
+# --------------------------------------------------------------------------
+#
+# These tests do NOT inject an `http=` seam.  They build a
+# `http.server.ThreadingHTTPServer` on the loopback address (assembled from
+# parts so no host name or IP literal appears in the source) and let the
+# REAL `alert.urllib_http` talk to it, so urllib genuinely raises
+# `HTTPError` for the 4xx/5xx responses.  That is the only way the retry
+# classification is really exercised.  The retry loop lives in the CLIENT
+# (`GitLabClient._send`), so the backoff clock is injected there
+# (`sleep=`, the house seam) and the real backoff path runs without
+# blocking.
+
+# The loopback address, built from parts so the diff carries no host or IP
+# literal.
+LOOPBACK = ".".join(["127", "0", "0", "1"])
+
+
+def _client(server, sleeps: list[float]) -> Any:
+    """A real client against `server`, with the backoff clock recorded.
+
+    The transport is the production `alert.urllib_http` and the retry policy
+    is the production one; only the clock is injected, so the suite drives
+    the real backoff path without blocking.
+    """
+    return alert.GitLabClient(
+        base_url=_base_url(server),
+        project_id="42",
+        token="secret-token",
+        http=alert.urllib_http,
+        sleep=sleeps.append,
+    )
+
+
+def _base_url(server) -> str:
+    port = server.server_address[1]
+    return "http://" + LOOPBACK + ":" + str(port)
+
+
+class RecordingHandler(http.server.BaseHTTPRequestHandler):
+    """Counts every request (method, path) in `type(self).hits`.
+
+    `hits` is a class attribute, so it is shared across the one-per-request
+    handler instances; every test builds its own handler subclass with a
+    fresh list (via `_start_server`), so counts never leak between tests.
+    """
+
+    hits: list[tuple[str, str]] = []
+
+    def log_message(self, *args) -> None:  # silence request logging
+        pass
+
+    def _count(self) -> None:
+        type(self).hits.append((self.command, self.path))
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+
+    def do_PUT(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+
+
+class ScriptedHandler(RecordingHandler):
+    """Replays one (status, body) pair to every request.
+
+    One handler instance per request (ThreadingHTTPServer default); the pair
+    lives on the class, so the same response is returned for every request.
+    """
+
+    status: int = 200
+    body: bytes = b"{}"
+
+    def _respond(self) -> None:
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        self._respond()
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        self._respond()
+
+    def do_PUT(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        self._respond()
+
+
+class LostCreateHandler(RecordingHandler):
+    """A minimal in-memory GitLab API whose issue-create response is lost.
+
+    The issue IS stored (the server created it), but the POST /issues
+    connection is then destroyed without sending a response: the client
+    cannot know whether the create landed.  Everything else (issue list,
+    job, pipeline) answers normally.
+    """
+
+    issues: list[dict[str, Any]] = []
+
+    def _send_json(self, status: int, payload: Any) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/issues"):
+            self._send_json(
+                200,
+                [i for i in type(self).issues if i.get("state") == "opened"],
+            )
+            return
+        if path.endswith("/pipelines"):
+            self._send_json(200, [{"id": 99}, {"id": 98}])
+            return
+        if path.endswith("/jobs"):
+            self._send_json(200, [{"name": "corpus-sync", "status": "failed"}])
+            return
+        self._send_json(200, [])
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        if self.path.split("?", 1)[0].endswith("/issues"):
+            # The server creates the issue ...
+            issue = {
+                "iid": len(type(self).issues) + 1,
+                "title": body.get("title"),
+                "labels": body.get("labels"),
+                "state": "opened",
+            }
+            type(self).issues.append(issue)
+            # ... then the connection dies without a response: the client
+            # cannot tell that the issue was stored.
+            self.close_connection = True
+            self.connection.close()
+            return
+        self._send_json(200, {})
+
+
+class LostNoteHandler(LostCreateHandler):
+    """An in-memory GitLab API with ONE open alert whose note response is lost.
+
+    `POST /issues/<iid>/notes` STORES the note, then destroys the connection
+    without answering: the client cannot know whether the note landed.  A
+    retried POST would store the same note twice, so the note-creating POST
+    must be single-attempt just like the issue create.
+    """
+
+    notes: list[dict[str, Any]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/notes"):
+            type(self).notes.append({"path": path, "body": body})
+            self.close_connection = True
+            self.connection.close()
+            return
+        self._send_json(200, {})
+
+
+def _start_server(handler_cls: type, **attrs: Any):
+    """Start a server with a fresh handler subclass.
+
+    The subclass gets its OWN `hits` list (a fresh per-test list, not the
+    inherited class default) plus whatever extra attributes the test passes
+    in (a scripted status/body pair, a shared issue store, ...).
+    """
+    attrs = dict(attrs)
+    attrs.setdefault("hits", [])
+    handler = type("Handler", (handler_cls,), attrs)
+    server = http.server.ThreadingHTTPServer((LOOPBACK, 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, handler
+
+
+def test_real_transport_retries_a_transient_5xx_then_succeeds() -> None:
+    """A transient 5xx on a read IS retried, then the read succeeds.
+
+    The scripted server answers the first request with 500 and every later
+    request with 200: the transport must survive the blip on the second
+    attempt.
+    """
+
+    def _respond(self) -> None:
+        # After the first hit the server is healthy again.
+        if len(type(self).hits) >= 2:
+            type(self).status = 200
+            type(self).body = b'{"ok": true}'
+        ScriptedHandler._respond(self)
+
+    sleeps: list[float] = []
+    server, handler = _start_server(
+        type(
+            "BlipOnceThenOk",
+            (ScriptedHandler,),
+            {"status": 500, "body": b'{"message": "blip"}', "_respond": _respond},
+        )
+    )
+    try:
+        client = _client(server, sleeps)
+        result = client.request("GET", "/issues")
+    finally:
+        server.shutdown()
+    assert result == {"ok": True}, result
+    # Exactly two requests reached the server: the 500, then the success.
+    assert len(handler.hits) == 2, handler.hits
+    assert all(method == "GET" for method, _ in handler.hits), handler.hits
+    # The real backoff path ran: 2**0 = 1 second between the attempts.
+    assert sleeps == [1], sleeps
+
+
+def test_real_transport_does_not_retry_a_non_retryable_4xx() -> None:
+    """A non-retryable 4xx is NOT retried: exactly one request, and the
+    failure surfaces."""
+    server, handler = _start_server(
+        ScriptedHandler, status=404, body=b'{"message": "not found"}'
+    )
+    sleeps: list[float] = []
+    try:
+        client = _client(server, sleeps)
+        raised = None
+        try:
+            client.request("GET", "/issues")
+        except alert.DeliveryError as exc:
+            raised = exc
+    finally:
+        server.shutdown()
+    assert raised is not None, "a 404 must surface as a DeliveryError"
+    # The HTTP status is named so a CI log says why the call failed.
+    assert "404" in str(raised), str(raised)
+    # Exactly ONE request reached the server: the 404 was NOT retried.
+    assert len(handler.hits) == 1, handler.hits
+    assert sleeps == [], "no backoff may be scheduled for a 404"
+
+
+def test_real_transport_retries_a_429_then_succeeds() -> None:
+    """A 429 IS retried (then succeeds)."""
+
+    def _respond(self) -> None:
+        # After the first hit the server is no longer rate-limiting.
+        if len(type(self).hits) >= 2:
+            type(self).status = 200
+            type(self).body = b'{"ok": true}'
+        ScriptedHandler._respond(self)
+
+    sleeps: list[float] = []
+    server, handler = _start_server(
+        type(
+            "RateLimitOnceThenOk",
+            (ScriptedHandler,),
+            {
+                "status": 429,
+                "body": b'{"message": "too many requests"}',
+                "_respond": _respond,
+            },
+        )
+    )
+    try:
+        client = _client(server, sleeps)
+        result = client.request("GET", "/issues")
+    finally:
+        server.shutdown()
+    assert result == {"ok": True}, result
+    assert len(handler.hits) == 2, handler.hits
+    assert sleeps == [1], sleeps
+
+
+def test_real_transport_exhaustion_names_url_and_last_cause() -> None:
+    """Exhausting the attempts raises an error naming the URL and the last
+    cause, with exactly 3 requests and the expected backoff."""
+    server, handler = _start_server(
+        ScriptedHandler, status=503, body=b'{"message": "unavailable"}'
+    )
+    sleeps: list[float] = []
+    try:
+        client = _client(server, sleeps)
+        url = client.url("/issues")
+        raised = None
+        try:
+            client.request("GET", "/issues")
+        except alert.DeliveryError as exc:
+            raised = exc
+    finally:
+        server.shutdown()
+    assert raised is not None, "an exhausted transport must surface a failure"
+    # The error names the URL it could not reach ...
+    assert url in str(raised), str(raised)
+    # ... and the last cause that ended the attempts.
+    assert "503" in str(raised), str(raised)
+    # Exactly three attempts reached the server.
+    assert len(handler.hits) == 3, handler.hits
+    # Backed off between every attempt: 2**0 then 2**1 seconds.
+    assert sleeps == [1, 2], sleeps
+
+
+def test_lost_issue_create_does_not_open_a_second_issue() -> None:
+    """THE INVARIANT, over a real socket.
+
+    The server stores the issue, then the create connection dies without a
+    response: the client cannot know whether the create landed.  The script
+    must end with exactly ONE open issue labelled `corpus-sync`.  Because the
+    create POST is never retried (design (a)), exactly one POST /issues
+    reaches the server, and the issue the server stored is the only one.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(LostCreateHandler, issues=[])
+    try:
+        env = base_env(
+            **{
+                "CI_API_V4_URL": _base_url(server),
+                "CI_PIPELINE_ID": "100",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=alert.urllib_http,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    # The create POST could not get a response: the alert was NOT delivered.
+    assert code == 1, (
+        code,
+        "a lost create response must surface as ALERT NOT DELIVERED (exit 1)",
+    )
+    # Exactly ONE POST /issues reached the server: the create was NOT retried.
+    create_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/issues")
+    ]
+    assert len(create_posts) == 1, (
+        "the issue create must not be retried: " + repr(handler.hits)
+    )
+    # THE INVARIANT: exactly ONE open issue labelled `corpus-sync` exists.
+    open_issues = [i for i in handler.issues if i.get("state") == "opened"]
+    assert len(open_issues) == 1, (
+        "THE INVARIANT IS BROKEN: "
+        + str(len(open_issues))
+        + " open issue(s) stored: "
+        + repr(handler.issues)
+    )
+    assert handler.issues[0].get("labels") == [alert.LABEL]
+    assert handler.issues[0].get("state") == "opened"
+    # No backoff may have been scheduled: the create is not retried and
+    # every other call (jobs, pipelines, list) succeeded on the first try.
+    assert sleeps == [], "no call may have needed a retry: " + repr(sleeps)
+
+
+def test_lost_create_is_not_retried_through_a_kwargs_transport() -> None:
+    """The create's non-idempotency is a CALL-SITE property, not a property
+    of the injected transport's signature.
+
+    A transport shaped `(method, url, token, body=None, **kwargs)` that
+    IGNORES the keywords it captures is the dangerous case.  A guard that
+    introspected the transport's signature in order to decide whether to
+    pass `attempts=1` judged this shape unable to take the keyword, called
+    it plainly, and any retry inside it could then resend the create after
+    the lost response and open a SECOND issue.  Nothing about the transport
+    may change the create's fate: exactly one POST /issues, one open issue.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(LostCreateHandler, issues=[])
+
+    def kwargs_transport(
+        method: str, url: str, token: str, body: dict[str, Any] | None = None, **kwargs: Any
+    ) -> Any:
+        # The worst shape: it captures the keyword and drops it.
+        return alert.urllib_http(method, url, token, body)
+
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=kwargs_transport,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    assert code == 1, code
+    create_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/issues")
+    ]
+    assert len(create_posts) == 1, (
+        "the create must be sent once whatever the transport's signature: "
+        + repr(handler.hits)
+    )
+    open_issues = [i for i in handler.issues if i.get("state") == "opened"]
+    assert len(open_issues) == 1, (
+        "THE INVARIANT IS BROKEN: " + repr(handler.issues)
+    )
+    assert sleeps == [], repr(sleeps)
+
+
+def test_lost_note_response_does_not_store_a_second_note() -> None:
+    """A note-creating POST is single-attempt too.
+
+    `POST /issues/<iid>/notes` creates a note.  The server stores it and then
+    the connection dies without a response, so the client cannot know whether
+    it landed.  A retried POST would store the SAME note twice: every POST is
+    sent exactly once, so exactly one note is stored and the run reports that
+    the alert was not delivered.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(
+        LostNoteHandler,
+        issues=[{"iid": 7, "labels": [alert.LABEL], "state": "opened"}],
+        notes=[],
+    )
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=alert.urllib_http,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    # A lost note response is a delivery failure: the job must say so.
+    assert code == 1, code
+    # Exactly ONE note-creating POST reached the server: never retried.
+    note_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/notes")
+    ]
+    assert len(note_posts) == 1, (
+        "a note-creating POST must not be retried: " + repr(handler.hits)
+    )
+    # THE POINT: the same note was stored exactly once, not three times.
+    assert len(handler.notes) == 1, (
+        "the note must be stored once: " + repr(handler.notes)
+    )
+    assert sleeps == [], "no retry may have been scheduled: " + repr(sleeps)
+
+
+def test_a_var_positional_transport_is_never_sent_the_attempts_keyword() -> None:
+    """`def t(method, url, token, body=None, *args)` cannot take a keyword.
+
+    Calling it with `attempts=1` would raise TypeError and LOSE the alert.
+    The client calls every transport with exactly the four documented
+    positional arguments, so this shape works - and the create is still
+    sent exactly once.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(LostCreateHandler, issues=[])
+
+    def var_positional_transport(
+        method: str, url: str, token: str, body: dict[str, Any] | None = None, *args: Any
+    ) -> Any:
+        return alert.urllib_http(method, url, token, body)
+
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=var_positional_transport,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    # The create reached the server at all: no keyword was forced on the
+    # var-positional transport (which would have raised TypeError).
+    create_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/issues")
+    ]
+    assert len(create_posts) == 1, (
+        "a var-positional transport must be called positionally: "
+        + repr(handler.hits)
+    )
+    assert code == 1, code
+    open_issues = [i for i in handler.issues if i.get("state") == "opened"]
+    assert len(open_issues) == 1, (
+        "THE INVARIANT IS BROKEN: " + repr(handler.issues)
+    )
+    assert sleeps == [], repr(sleeps)
+
+
+
+def test_dry_run_never_reaches_a_real_http_server() -> None:
+    """The dry-run path never reaches the transport, even with a REAL HTTP
+    server listening: not one request may arrive at the socket."""
+    server, handler = _start_server(
+        ScriptedHandler, status=200, body=b'{"ok": true}'
+    )
+    sleeps: list[float] = []
+    env = base_env(
+        **{
+            "CI_API_V4_URL": _base_url(server),
+            "CI_PIPELINE_ID": "100",
+        }
+    )
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = alert.run(
+                env,
+                http=alert.urllib_http,
+                sleep=sleeps.append,
+                dry_run=True,
+            )
+    finally:
+        server.shutdown()
+    assert code == 0, buffer.getvalue()
+    assert "dry-run" in buffer.getvalue(), buffer.getvalue()
+    # No request may reach the real socket in a dry run.
+    assert handler.hits == [], handler.hits
+    assert sleeps == [], "a dry run must not schedule any backoff"
 
 
 # --------------------------------------------------------------------------

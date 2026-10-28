@@ -21,6 +21,19 @@ healthy scheduled run adds a final note and closes the issue itself.
 Only the GitLab REST API and the standard library are used - no third-party
 dependencies - so it runs in a plain `python:3.12` container.
 
+The delivery path has its own retry, because the script's one job is to be
+the last line of monitoring: a single transient blip from the GitLab API
+(5xx, 429, dropped connection, read timeout) must not decide the fate of the
+alert.  `urllib_http` therefore retries the same failure classes the house
+fetchers retry (`scripts/rsc_util.py::fetch`, `scripts/fetch-arena.py`'s
+`fetch_json`): 3 attempts total, `2**attempt` seconds of backoff between
+them; every other 4xx is answered and NOT retried.  The issue-create POST is
+the one call that is not idempotent - a blind retry after a lost response
+would open a second `corpus-sync` issue and break `act()`'s invariant - so
+the create is never retried (design (a)): a transient failure there raises
+`DeliveryError`, the CI job shows "ALERT NOT DELIVERED", and the next
+scheduled run opens the issue.
+
 Environment (all GitLab predefined variables plus one token):
 
   CI_API_V4_URL        e.g. https://gitlab.com/api/v4
@@ -60,7 +73,8 @@ offline tests use is listed here:
         `corpus-sync`. On a healthy run every open alert (primary and
         duplicates alike) is noted and closed; on an alert run the primary
         is noted and the duplicates are folded into it.
-    def run(env, http=None, dry_run=False, freshness_path=FRESHNESS_PATH) -> int
+    def run(env, http=None, dry_run=False, freshness_path=FRESHNESS_PATH,
+            sleep=time.sleep) -> int
         The whole decision + action. Returns the process exit code:
           0 - the alert was delivered, or was not needed, or this was a dry
               run (a dry run sends nothing, so it never fails: it prints the
@@ -72,7 +86,8 @@ offline tests use is listed here:
         with a None would exit 0 and mask a real failure.
         `freshness_path` defaults to FRESHNESS_PATH; a missing report is not
         an error - the staleness facts are simply unknown.
-    def run_dry(env, http=None, freshness_path=FRESHNESS_PATH) -> int
+    def run_dry(env, http=None, freshness_path=FRESHNESS_PATH,
+                sleep=time.sleep) -> int
         The dry-run path: it never authenticates, never reaches the
         transport, prints the decision and the planned calls, and always
         exits 0.
@@ -84,6 +99,8 @@ import argparse
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -225,13 +242,37 @@ def state_from_freshness(report: dict[str, Any]) -> SyncState:
 HttpFn = Callable[..., Any]
 
 
+# The GitLab API answers transient 5xx / 429 and drops connections, and the
+# alert's own delivery path is the thing this script monitors: one blip must
+# not decide the fate of the alert.  Retry the same failure classes the house
+# fetchers retry (`scripts/rsc_util.py::fetch`, `scripts/fetch-arena.py`'s
+# `fetch_json`): 3 attempts total, `2**attempt` seconds of backoff between
+# them.  Every other 4xx is answered and NOT retried - the upstream said no,
+# retrying only burns time.
+HTTP_ATTEMPTS = 3
+
+
 def urllib_http(
     method: str,
     url: str,
     token: str,
     body: dict[str, Any] | None = None,
 ) -> Any:
-    """Default HTTP transport: a plain urllib call against the GitLab API."""
+    """Default HTTP transport: ONE plain urllib round-trip against the API.
+
+    Deliberately single-attempt.  The retry policy belongs to the call site
+    (`GitLabClient._send`), not to the transport: only that makes "this call
+    is not idempotent, so it must never be retried" a property of the CALL
+    and not of whatever callable happens to be injected as the transport.  A
+    transport that captures `**kwargs`, a bound method, a `functools.partial`
+    or a C builtin is always invoked with exactly the four documented
+    positional arguments, so nothing can retry behind the client's back.
+
+    Raises `urllib.error.HTTPError` for any 4xx/5xx response and
+    `urllib.error.URLError` / `OSError` for a dropped or timed-out
+    connection: `_is_retryable` owns the classification, the client the
+    retry loop.
+    """
     data = None
     headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
     if body is not None:
@@ -243,6 +284,19 @@ def urllib_http(
     if not raw.strip():
         return {}
     return json.loads(raw)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """House retry classification: 5xx, 429, and network-level failures.
+
+    Every other `HTTPError` is a decision by the upstream - retrying it only
+    burns time - so it is not retryable.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500 or exc.code == 429
+    # URLError is an OSError subclass, as are TimeoutError and the plain
+    # connection/timeout errors urllib raises.
+    return isinstance(exc, OSError)
 
 
 class GitLabClient:
@@ -263,12 +317,17 @@ class GitLabClient:
         token: str,
         http: HttpFn | None = None,
         dry_run: bool = False,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.project_id = project_id
         self.token = token
         self.http = http or urllib_http
         self.dry_run = dry_run
+        # The backoff clock: injected by the tests so the real backoff path
+        # runs without blocking - the same house seam as
+        # `scripts/rsc_util.py::fetch(..., sleep=time.sleep)`.
+        self.sleep = sleep
         self.planned_calls: list[str] = []
         self.sent_calls: list[str] = []
 
@@ -295,6 +354,16 @@ class GitLabClient:
         A dry run records the call in `planned_calls` and returns `None`
         WITHOUT touching the transport: `self.http` is only reachable from
         the `else` branch below.
+
+        Every POST in this script CREATES a resource, and a POST is therefore
+        sent with `attempts=1` - never retried (design (a)).  `POST /issues`
+        creates the issue: a blind retry after a lost response opens a SECOND
+        `corpus-sync` issue and breaks `act()`'s one-open-issue invariant.
+        `POST /issues/<iid>/notes` creates a note: a blind retry after a lost
+        response stores the SAME note twice.  A transient failure on either
+        raises `DeliveryError`, the CI job shows "ALERT NOT DELIVERED", and
+        the next scheduled run repeats the action.  GET and PUT (the
+        idempotent list / read / close) retry freely.
         """
         url = self.url(path, params)
         self.planned_calls.append(f"{method} {path}")
@@ -302,12 +371,56 @@ class GitLabClient:
             # Planned, not sent: the transport is never reached.
             return None
         self.sent_calls.append(f"{method} {path}")
+        # Every POST in this script CREATES a resource: the issue
+        # (`POST /issues`) and the notes (`POST /issues/<iid>/notes`).  A
+        # retry after a lost response duplicates it - a second open issue,
+        # or the same note stored twice - so a POST is sent EXACTLY ONCE.
+        # The decision is made HERE, at the call site, from the method, and
+        # not from the transport's signature: `_send` invokes the transport
+        # exactly `attempts` times with four positional arguments, so no
+        # callable shape can retry behind the client's back.  GET and PUT
+        # (the idempotent list / read / close) retry.
+        attempts = 1 if method == "POST" else HTTP_ATTEMPTS
         try:
-            return self.http(method, url, self.token, body)
+            return self._send(method, url, body, attempts)
         except DeliveryError:
             raise
         except Exception as exc:
             raise DeliveryError(f"{method} {path} failed: {exc}") from exc
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        body: dict[str, Any] | None,
+        attempts: int,
+    ) -> Any:
+        """Send one call, retrying transient failures at most `attempts` times.
+
+        The retry loop lives HERE, at the call site, and the transport is
+        always invoked with exactly the four documented positional arguments:
+        no keyword negotiation, no signature introspection.  So `attempts=1`
+        means "invoke the transport exactly once" for every possible callable
+        shape - a `**kwargs` wrapper that forwards the keyword to a retrying
+        transport, a `*args` capture, a bound method, a `functools.partial`, a
+        C builtin - which is what makes the issue create's non-idempotency a
+        property of the CALL and not of the transport.
+        """
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self.http(method, url, self.token, body)
+            except Exception as exc:
+                if not _is_retryable(exc):
+                    raise
+                last = exc
+                if attempt + 1 < attempts:
+                    self.sleep(2**attempt)
+        if last is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"{method} {url} failed after {attempts} attempts")
+        raise RuntimeError(
+            f"{method} {url} failed after {attempts} attempts ({last})"
+        ) from last
 
 
 def corpus_sync_status(client: GitLabClient, pipeline_id: str) -> str | None:
@@ -658,6 +771,7 @@ def run_dry(
     env: dict[str, str],
     http: HttpFn | None = None,
     freshness_path: str = FRESHNESS_PATH,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """Print the decision and the planned API calls. Send nothing.
 
@@ -694,6 +808,7 @@ def run_dry(
         token=token or "dry-run",
         http=http,
         dry_run=True,
+        sleep=sleep,
     )
 
     state = gather_state(client, env, freshness_path)
@@ -715,6 +830,7 @@ def run(
     http: HttpFn | None = None,
     dry_run: bool = False,
     freshness_path: str = FRESHNESS_PATH,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     """The whole decision + action. Returns the process exit code.
 
@@ -727,7 +843,9 @@ def run(
     if dry_run:
         # A dry run is a separate path on purpose: it must never reach the
         # transport, and it must never exit non-zero.
-        return run_dry(env, http=http, freshness_path=freshness_path)
+        return run_dry(
+            env, http=http, freshness_path=freshness_path, sleep=sleep
+        )
 
     token, token_var = token_from_env(env)
     if token is None:
@@ -750,6 +868,7 @@ def run(
         token=token,
         http=http,
         dry_run=False,
+        sleep=sleep,
     )
 
     try:
