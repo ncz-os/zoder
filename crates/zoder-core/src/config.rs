@@ -2283,22 +2283,17 @@ pub fn model_family(overrides: &BTreeMap<String, String>, model_id: &str) -> Str
         }
     }
     // Vendor-prefix heuristic: `provider-a/model-x` belongs to `provider-a`.
-    // The namespace is a ROUTING prefix, not a family: when the model
-    // identity (the leaf after the last `/`, or the identity after the first
-    // `.` in dotted ids) resolves to its own family, that family wins over
-    // the namespace. A namespace that serves several vendors (an aggregator
-    // or a hosted route) must never collapse them into one family.
-    if let Some((prefix, leaf)) = lower.rsplit_once('/') {
+    // The namespace is a ROUTING prefix, not a family, and it is consulted
+    // only AFTER the built-in public-vendor patterns above: a namespace that
+    // serves several vendors (an aggregator or a hosted route) therefore
+    // never collapses them into one family, because each vendor's leaf has
+    // already matched its own pattern. An unknown leaf keeps its namespace -
+    // no family is invented from a version suffix, so `aihubmix/agnes-2.5-flash`
+    // stays `aihubmix` rather than becoming `5-flash`.
+    if let Some((prefix, _leaf)) = lower.rsplit_once('/') {
         if !prefix.is_empty() {
-            let identity = leaf
-                .rsplit_once('.')
-                .map(|(_, after_dot)| after_dot.to_string())
-                .unwrap_or_else(|| leaf.to_string());
-            if identity != leaf {
-                return identity.to_string();
-            }
+            return prefix.to_string();
         }
-        return prefix.to_string();
     }
     // Dotted id with no namespace (a served id whose first segment is the
     // vendor, e.g. `amazon.nova-2-lite-v1:0`): the identity after the first
@@ -9378,6 +9373,31 @@ auth = { type = "env", var = "GUARD_KEY" }
         assert_ne!(
             model_family(&families, "aihubmix/claude-haiku-4-5"),
             model_family(&families, "aihubmix/gemini-3-flash-preview")
+        );
+    }
+
+    /// A namespaced id whose LEAF names no known vendor keeps its namespace.
+    /// A dot inside the leaf is a version separator, not a vendor: resolving
+    /// `aihubmix/agnes-2.5-flash` to `5-flash` would invent a family that no
+    /// model belongs to.
+    #[test]
+    fn model_family_namespace_is_kept_for_an_unknown_dotted_leaf() {
+        let families = BTreeMap::new();
+        assert_eq!(
+            model_family(&families, "aihubmix/agnes-2.5-flash"),
+            "aihubmix",
+            "an unknown dotted leaf must keep its namespace, not its version suffix"
+        );
+        assert_eq!(
+            model_family(&families, "aihubmix/coding-xiaomi-mimo-v2.5-pro"),
+            "aihubmix",
+            "an unknown dotted leaf must keep its namespace, not its version suffix"
+        );
+        // A known vendor behind the same namespace still wins, so the two
+        // behaviours coexist.
+        assert_eq!(
+            model_family(&families, "aihubmix/claude-haiku-4-5"),
+            "claude"
         );
     }
 
