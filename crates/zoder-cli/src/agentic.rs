@@ -7683,7 +7683,8 @@ mod loop_unresolved_message_tests {
 
     #[test]
     fn an_unavailable_verdict_with_no_error_names_the_model() {
-        let msg = loop_unresolved_review_message(None, false, "reviewer_unavailable", Some("gemma4-31b"));
+        let msg =
+            loop_unresolved_review_message(None, false, "reviewer_unavailable", Some("gemma4-31b"));
         assert!(msg.contains("gemma4-31b"), "{msg}");
         assert!(msg.contains("reviewer_unavailable"), "{msg}");
         assert!(msg.contains("no reason was recorded"), "{msg}");
