@@ -355,14 +355,15 @@ class GitLabClient:
         WITHOUT touching the transport: `self.http` is only reachable from
         the `else` branch below.
 
-        The issue-create POST (`POST /issues`) is the one call in the script
-        that is NOT idempotent: if the server creates the issue but the
-        response is lost, a blind retry opens a SECOND `corpus-sync` issue
-        and breaks `act()`'s invariant.  So the create is sent with
-        `attempts=1` - it is never retried (design (a)): a transient failure
-        there raises `DeliveryError`, the CI job shows "ALERT NOT DELIVERED",
-        and the next scheduled run opens the issue.  Every other call (the
-        idempotent list / notes / close) retries freely.
+        Every POST in this script CREATES a resource, and a POST is therefore
+        sent with `attempts=1` - never retried (design (a)).  `POST /issues`
+        creates the issue: a blind retry after a lost response opens a SECOND
+        `corpus-sync` issue and breaks `act()`'s one-open-issue invariant.
+        `POST /issues/<iid>/notes` creates a note: a blind retry after a lost
+        response stores the SAME note twice.  A transient failure on either
+        raises `DeliveryError`, the CI job shows "ALERT NOT DELIVERED", and
+        the next scheduled run repeats the action.  GET and PUT (the
+        idempotent list / read / close) retry freely.
         """
         url = self.url(path, params)
         self.planned_calls.append(f"{method} {path}")
@@ -370,14 +371,16 @@ class GitLabClient:
             # Planned, not sent: the transport is never reached.
             return None
         self.sent_calls.append(f"{method} {path}")
-        # The issue create is the one call in this script that is NOT
-        # idempotent: if the server creates the issue but the response is
-        # lost, a retry opens a SECOND `corpus-sync` issue and breaks
-        # `act()`'s invariant.  `attempts=1` is decided HERE, at the call
-        # site: `_send` then invokes the transport exactly once - whatever
-        # the transport's signature, keyword capture or internal behaviour.
-        # Every other call (the idempotent list / notes / close) retries.
-        attempts = 1 if (method == "POST" and path == "/issues") else HTTP_ATTEMPTS
+        # Every POST in this script CREATES a resource: the issue
+        # (`POST /issues`) and the notes (`POST /issues/<iid>/notes`).  A
+        # retry after a lost response duplicates it - a second open issue,
+        # or the same note stored twice - so a POST is sent EXACTLY ONCE.
+        # The decision is made HERE, at the call site, from the method, and
+        # not from the transport's signature: `_send` invokes the transport
+        # exactly `attempts` times with four positional arguments, so no
+        # callable shape can retry behind the client's back.  GET and PUT
+        # (the idempotent list / read / close) retry.
+        attempts = 1 if method == "POST" else HTTP_ATTEMPTS
         try:
             return self._send(method, url, body, attempts)
         except DeliveryError:
