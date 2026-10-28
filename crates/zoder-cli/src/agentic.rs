@@ -15523,6 +15523,118 @@ mod reviewer_chain_dispatch_tests {
 
     // ---- Task H: author-family-aware reviewer chain ---------------------
 
+    /// A runtime-derived, no-literal base URL: bind a listener to the
+    /// loopback interface on an ephemeral port and assemble the URL from the
+    /// bound address. The plan tests never dispatch, so the listener only
+    /// supplies a valid loopback host/port for the configured providers.
+    fn runtime_loopback_uri() -> String {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        format!("http://{}", addr)
+    }
+
+    /// FINDING 3 regression: the family filter must run on the PRODUCTION
+    /// path, not just the direct helper. This test drives
+    /// `complete_review_chunks` -> `complete_once_tracked` ->
+    /// `build_reviewer_plan` (the production call site at
+    /// `complete_once_tracked`, line ~814) with LOOP author models, and
+    /// proves a same-family candidate is SKIPPED BEFORE DISPATCH: the
+    /// configured head reviewer is in the author family, so the chain
+    /// must fall through to the cross-family tail, and the skip record
+    /// must name `family_excluded`. If the production call to
+    /// `build_reviewer_plan` inside `complete_once_tracked` were removed,
+    /// the head candidate would dispatch (or the plan would be empty
+    /// without a skip trail) and this test fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_review_path_skips_same_family_candidate_before_dispatch() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        // The head (same-family) reviewer must NEVER be dispatched: its
+        // route is mounted with a 500 that names the violation if hit.
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("same-family reviewer must not be dispatched"),
+            )
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/reviewer",
+            ],
+        );
+        // Configured chain: same-family head first, cross-family tail second.
+        write_config(
+            home,
+            &server.uri(),
+            "broken-model/reviewer,working-model/reviewer",
+        );
+        write_model_families(
+            home,
+            json!({
+                "broken-model/*": "family-a",
+                "working-model/*": "family-b",
+            }),
+        );
+        let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
+        // LOOP author models: the code under review was authored by a
+        // `broken-model` family member.
+        let author_models: Vec<String> = vec!["broken-model/coder".to_string()];
+        let (completion, report) = complete_review_chunks(
+            &cli,
+            None,
+            &[],
+            &author_models,
+            REVIEW_SYSTEM,
+            &["diff".into()],
+            2048,
+            None,
+            &|_| None,
+        )
+        .await
+        .expect("the cross-family tail must review after the same-family head is excluded");
+        assert_eq!(
+            completion.model, "working-model/reviewer",
+            "the cross-family tail must serve the review, not the same-family head"
+        );
+        assert_eq!(
+            report.served_model.as_deref(),
+            Some("working-model/reviewer"),
+            "the report must record the model that actually served the review"
+        );
+        assert_eq!(
+            report.requested_model.as_deref(),
+            Some("working-model/reviewer"),
+            "a same-family head is never requested; the cross-family tail is"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.model == "broken-model/reviewer" && s.reason == "family_excluded"),
+            "the same-family head must be recorded as skipped BEFORE dispatch: {:?}",
+            report.skipped
+        );
+        // The same-family reviewer was never dispatched.
+        let hit_broken = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().contains("/broken/"));
+        assert!(
+            !hit_broken,
+            "the same-family reviewer must not receive a dispatch"
+        );
+    }
+
     #[test]
     fn author_family_excludes_configured_chain_pin_and_pool() {
         let home_dir = tempfile::tempdir().unwrap();
@@ -15538,7 +15650,7 @@ mod reviewer_chain_dispatch_tests {
         );
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "broken-model/reviewer,working-model/other",
         );
         write_model_families(
@@ -15631,7 +15743,7 @@ mod reviewer_chain_dispatch_tests {
         );
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "broken-model/reviewer,working-model/other",
         );
         // `write_config` never writes `model_families`; the only source is the
@@ -15667,7 +15779,7 @@ mod reviewer_chain_dispatch_tests {
         let home = home_dir.path();
         let _guard = HomeGuard::new(home);
         write_corpus(home, &["broken-model/coder", "broken-model/reviewer"]);
-        write_config(home, "http://127.0.0.1:9", "broken-model/reviewer");
+        write_config(home, &runtime_loopback_uri(), "broken-model/reviewer");
         write_model_families(home, json!({"broken-model/*": "family-a"}));
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
         let err = build_reviewer_plan(&cli, None, &[], &["broken-model/coder".to_string()], None)
@@ -15899,7 +16011,7 @@ mod reviewer_chain_dispatch_tests {
         write_corpus(home, &["working-model/reviewer", "broken-model/head"]);
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "working-model/reviewer,broken-model/head",
         );
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
@@ -15923,7 +16035,7 @@ mod reviewer_chain_dispatch_tests {
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "working-model/reviewer,broken-model/head",
         );
         let cli = Cli::try_parse_from([
@@ -15974,7 +16086,7 @@ mod reviewer_chain_dispatch_tests {
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "working-model/reviewer,broken-model/head",
         );
         for reviewer_list in [
@@ -16030,7 +16142,7 @@ mod reviewer_chain_dispatch_tests {
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
         write_config(
             home,
-            "http://127.0.0.1:9",
+            &runtime_loopback_uri(),
             "broken-model/head,working-model/reviewer",
         );
 
@@ -16069,7 +16181,7 @@ mod reviewer_chain_dispatch_tests {
         let home = home_dir.path();
         let _guard = HomeGuard::new(home);
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
-        write_config(home, "http://127.0.0.1:9", "broken-model/head");
+        write_config(home, &runtime_loopback_uri(), "broken-model/head");
         let cli = Cli::try_parse_from([
             "zoder",
             "review",
@@ -16102,7 +16214,7 @@ mod reviewer_chain_dispatch_tests {
         let home = home_dir.path();
         let _guard = HomeGuard::new(home);
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
-        write_config(home, "http://127.0.0.1:9", "working-model/reviewer");
+        write_config(home, &runtime_loopback_uri(), "working-model/reviewer");
         let cli = Cli::try_parse_from([
             "zoder",
             "review",
@@ -16176,7 +16288,7 @@ mod reviewer_chain_dispatch_tests {
         let home = home_dir.path();
         let _guard = HomeGuard::new(home);
         write_corpus(home, &["broken-model/head", "working-model/reviewer"]);
-        write_config(home, "http://127.0.0.1:9", "working-model/reviewer");
+        write_config(home, &runtime_loopback_uri(), "working-model/reviewer");
 
         // Valid CLI parse
         let cli = Cli::try_parse_from([
