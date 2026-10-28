@@ -7759,6 +7759,80 @@ fn loop_review_base(explicit: Option<&str>, start_head: Option<&str>) -> Option<
         .or_else(|| start_head.map(str::to_string))
 }
 
+/// Validate a `--reviewer` pin for `zoder loop` BEFORE any iteration runs, so
+/// a pin that can never be dispatched fails loudly once instead of every
+/// review failing closed as `reviewer_unavailable` with a null
+/// `reviewer_model`.
+///
+/// Only the engine-loadable, route-independent half of the reviewer plan is
+/// checked here: a pin that no configured provider serves (a typo, an id
+/// absent from the registry) is refused with the same diagnosis
+/// [`dispatch_reviewer_for_model`] would give at dispatch time. The
+/// allowlist half (the pin outside `--reviewer-allowed-routes`) and the
+/// cross-family half are enforced per iteration by
+/// [`build_reviewer_plan`], which also sees the loop's resolved author
+/// families; with an allowlist present an invalid pin bails at the same plan
+/// point every iteration (named, explicit, never a silent null).
+fn validate_loop_reviewer_pin(cli: &crate::Cli, reviewer: Option<&str>) -> anyhow::Result<()> {
+    let Some(raw) = reviewer else {
+        return Ok(());
+    };
+    let Some(eng) = Engine::load().ok() else {
+        // An engine the loop cannot load already fails on the first author
+        // turn; do not invent a second failure surface here.
+        return Ok(());
+    };
+    // Build the plan with the pin as the sole override candidate. The plan
+    // enforces BOTH the allowlist (when present) and the provider-backing
+    // check, so a pin that is outside `--reviewer-allowed-routes` or that no
+    // configured provider serves fails here with a named, explicit error
+    // instead of surfacing later as `reviewer_unavailable` with a null
+    // `reviewer_model`.
+    let plan = build_reviewer_plan(cli, Some(raw), &[], &[], None)?;
+    let Some(head) = plan.candidates.first() else {
+        anyhow::bail!("no reviewer model resolved for --reviewer {raw}");
+    };
+    let routing = crate::RoutingContext::load(&eng.cfg)?;
+    if routing.real_provider_for_model(&eng.cfg, head).is_none() {
+        let msg = no_reviewer_provider_message(cli, &eng, &routing, head);
+        record_loop_reviewer_pin_failure(cli, &msg);
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
+/// Write the loop's `reviewer_unavailable` record (iter 0, null
+/// `reviewer_model`, the failure in `review_error`) for a `--reviewer` pin
+/// that cannot be dispatched, so the loop's structured output names the
+/// reason instead of leaving a silent null behind.
+fn record_loop_reviewer_pin_failure(cli: &crate::Cli, detail: &str) {
+    let iteration = json!({
+        "iter": 0,
+        "author_model": null,
+        "reviewer_model": null,
+        "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+        "review_error": detail,
+    });
+    let payload = json!({
+        "kind": "loop",
+        "resolved": false,
+        "final_verdict": REVIEWER_UNAVAILABLE_VERDICT,
+        "log": vec![iteration],
+    });
+    if let Some(dir) = active_job_dir() {
+        let _ = std::fs::write(
+            dir.join("result.json"),
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        );
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    }
+}
+
 /// The working-tree state a loop started from, captured BEFORE the first
 /// author turn.
 ///
@@ -8373,6 +8447,22 @@ async fn cmd_loop_run(
              cannot tell its own changes from pre-existing ones and branch-scope review \
              will refuse to run"
         ),
+    }
+    // A `--reviewer` pin that names a model no configured provider serves (a
+    // typo, or an id absent from the registry) can never be dispatched: every
+    // per-iteration review would fail closed as `reviewer_unavailable` with a
+    // null `reviewer_model`, burning iterations while the healthy reviewer is
+    // never called. `zoder review` fails fast with the same diagnosis; the
+    // loop must too. A pin with no allowlist flags and a backing provider is
+    // left to the per-iteration plan, which enforces `--reviewer-allowed-routes`
+    // and the cross-family rule with the operator's full flag set (and the
+    // loop's resolved author families).
+    if let Err(e) = validate_loop_reviewer_pin(cli, reviewer.as_deref()) {
+        let detail = format!("reviewer pin {e}");
+        if !cli.quiet {
+            eprintln!("[loop] {detail}");
+        }
+        return Err(anyhow::anyhow!("[zoder] {detail}"));
     }
     const STALL_LIMIT: usize = 3;
 
