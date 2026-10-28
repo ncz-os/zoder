@@ -19288,6 +19288,323 @@ data: [DONE]\n\n";
         assert!(v["log"][0].get("reviewer_verdicts").is_none());
         assert!(v["log"][0].get("findings").is_none());
     }
+    // ---- loop reviewer pin (Saver-20261012 loop F1, 2026-10-28) ----
+    //
+    // The loop's `--reviewer` pin must reach the reviewer plan exactly as the
+    // standalone review's does: the pinned model is the first candidate, it is
+    // dispatched, and the loop record names it. A pin that cannot be
+    // dispatched (no provider serves it, or it is outside
+    // `--reviewer-allowed-routes`) must fail LOUDLY with the reason — never
+    // as `reviewer_unavailable` with a null `reviewer_model` on a review
+    // that never happened.
+
+    /// The pinned reviewer model (the harness equivalent of the fleet's
+    /// `gemma4-31b`): served by the mock's `working-model/` route.
+    const PINNED_REVIEWER: &str = "working-model/reviewer";
+    /// The author model: a different namespace, so the cross-family rule can
+    /// never exclude the pinned reviewer.
+    const AUTHOR_MODEL: &str = "broken-model/coder";
+    /// A reviewer the mock does NOT serve: its provider route is mounted
+    /// with a 500 that names the violation if it is ever dispatched.
+    const UNLISTED_REVIEWER: &str = "broken-model/reviewer";
+
+    /// The pinned reviewer route (`working`), answering a clean approve with
+    /// no findings so a review can complete.
+    async fn mount_200_pinned_reviewer(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(openai_completion(serde_json::json!({
+                        "verdict": "approve",
+                        "summary": "loop pin ok",
+                        "findings": [],
+                        "next_steps": []
+                    }))),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// The unlisted reviewer route (`broken`): any dispatch to it is a test
+    /// failure in itself.
+    async fn mount_500_unlisted_reviewer(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("unlisted reviewer must never be dispatched"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Hermetic loop workspace: a fresh, CLEAN git repo with one commit.
+    /// The author's change is applied by the caller (or by the loop's own
+    /// author turn) AFTER the loop snapshots the start state, so it lands
+    /// inside the reviewed delta.
+    fn hermetic_loop_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Loop Test")
+                .env("GIT_AUTHOR_EMAIL", "loop@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Loop Test")
+                .env("GIT_COMMITTER_EMAIL", "loop@example.invalid")
+                .output()
+                .expect("git ran");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Loop Test"]);
+        git(&["config", "user.email", "loop@example.invalid"]);
+        std::fs::write(cwd.join("a.txt"), "alpha\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        (dir, cwd)
+    }
+
+    /// Apply the author's edit (what the loop reviews) to the working tree.
+    fn apply_author_edit(cwd: &Path) {
+        // The author's pending edit (what the loop reviews), applied to the
+        // working tree; the loop snapshots the start state at entry, so the
+        // edit lands inside the reviewed delta.
+        std::fs::write(cwd.join("a.txt"), "alpha\nbeta\n").unwrap();
+    }
+
+    /// Saver-20261012 loop F1: the fleet's exact pair — `--reviewer
+    /// <model>` plus `--reviewer-allowed-routes <provider>=<model>` — must
+    /// dispatch the PINNED reviewer and record it. Drives the REAL loop
+    /// entry (`cmd_loop_run`, the same `zoder loop` uses via `cmd_loop`):
+    /// the author turn leaves the pending edit, the loop reviews it through
+    /// `run_loop_review` -> `complete_review_chunks` -> `build_reviewer_plan`
+    /// with the loop's author families, and the iteration record must name
+    /// the pinned model. A healthy pin resolving to a null `reviewer_model`
+    /// and `reviewer_unavailable` is the defect this pins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_with_explicit_reviewer_pin_invokes_that_reviewer() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_pinned_reviewer(&server).await;
+        mount_500_unlisted_reviewer(&server).await;
+        write_corpus(home, &[AUTHOR_MODEL, UNLISTED_REVIEWER, PINNED_REVIEWER]);
+        write_config(home, &server.uri(), UNLISTED_REVIEWER);
+        let (_repo, cwd) = hermetic_loop_repo();
+        // The author's pending edit (what the loop reviews), applied to the
+        // working tree; the loop snapshots the start state at entry, so the
+        // edit lands inside the reviewed delta.
+        apply_author_edit(&cwd);
+
+        // The SAME pair as the recorded fault: an explicit pin plus a
+        // `--reviewer-allowed-routes` that names exactly that route.
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "loop",
+            "fix",
+            "the",
+            "pending",
+            "edit",
+            "--check",
+            "true",
+            "--max-iters",
+            "2",
+            "--scope",
+            "working-tree",
+            "--reviewer",
+            PINNED_REVIEWER,
+            "--reviewer-allowed-routes",
+            &format!("wiremock-working={PINNED_REVIEWER}"),
+        ])
+        .expect("clap parse");
+
+        // The loop entry validates the pin before any iteration (the
+        // pre-loop half of the fix). A healthy, listed pin must pass it.
+        validate_loop_reviewer_pin(&cli, Some(PINNED_REVIEWER))
+            .expect("a listed, backed pin must pass the loop entry check");
+
+        // Run the REAL loop entry. It must complete (a healthy pin on a
+        // passing author edit resolves), and it must have dispatched the
+        // pinned reviewer.
+        cmd_loop_run(
+            &cli,
+            &["fix the pending edit".to_string()],
+            None,
+            2,
+            Some("true".to_string()),
+            Some(PINNED_REVIEWER.to_string()),
+            None,
+            crate::ReviewScope::WorkingTree,
+            false,
+            900,
+            900,
+            false,
+            false,
+            &cwd,
+        )
+        .await
+        .expect("a healthy pin on a passing edit must let the loop resolve");
+
+        // The pinned reviewer must have been the one that served the
+        // review — its route received the request, naming the pin.
+        let requests = server.received_requests().await.unwrap();
+        let working: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().contains("/working/"))
+            .collect();
+        assert!(
+            !working.is_empty(),
+            "the pinned reviewer was never called (no request hit its route) —              the pin was lost between the CLI and the reviewer plan"
+        );
+        for req in &working {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["model"].as_str(),
+                Some(PINNED_REVIEWER),
+                "the dispatched request must name the pinned model"
+            );
+        }
+        let broken: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().contains("/broken/"))
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "the unlisted reviewer must never be dispatched"
+        );
+    }
+
+    /// A pin whose provider is NOT in `--reviewer-allowed-routes` must fail
+    /// with the existing "explicit reviewer route is outside" error — at the
+    /// loop entry, before any iteration — and never as a silent null model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_with_unlisted_reviewer_pin_fails_loudly_not_silent_null() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_500_unlisted_reviewer(&server).await;
+        mount_200_pinned_reviewer(&server).await;
+        write_corpus(home, &[AUTHOR_MODEL, UNLISTED_REVIEWER, PINNED_REVIEWER]);
+        write_config(home, &server.uri(), PINNED_REVIEWER);
+        let (_repo, _cwd) = hermetic_loop_repo();
+        apply_author_edit(&_cwd);
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "loop",
+            "fix",
+            "the",
+            "pending",
+            "edit",
+            "--reviewer",
+            UNLISTED_REVIEWER,
+            "--reviewer-allowed-routes",
+            &format!("wiremock-working={PINNED_REVIEWER}"),
+        ])
+        .expect("clap parse");
+        let err = cmd_loop_run(
+            &cli,
+            &["fix the pending edit".to_string()],
+            None,
+            2,
+            Some("true".to_string()),
+            Some(UNLISTED_REVIEWER.to_string()),
+            None,
+            crate::ReviewScope::Auto,
+            false,
+            900,
+            900,
+            false,
+            false,
+            &_cwd,
+        )
+        .await
+        .expect_err("an unlisted pin must stop the loop before any iteration");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("explicit reviewer route is outside --reviewer-allowed-routes"),
+            "the pin failure must name the allowlist violation: {msg}"
+        );
+        assert!(
+            msg.contains("wiremock-broken=broken-model/reviewer"),
+            "the pin failure must name the offending route: {msg}"
+        );
+        // The unlisted reviewer was never dispatched.
+        let requests = server.received_requests().await.unwrap();
+        let broken: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().contains("/broken/"))
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "the unlisted reviewer must never be dispatched"
+        );
+    }
+
+    /// A pin that NO configured provider serves (a typo / unbacked id) must
+    /// also fail loudly at the loop entry, with the missing-provider
+    /// diagnosis — the same one `zoder review` gives — never a silent null.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loop_with_unbacked_reviewer_pin_fails_loudly_at_entry() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_pinned_reviewer(&server).await;
+        write_corpus(home, &[AUTHOR_MODEL, PINNED_REVIEWER]);
+        write_config(home, &server.uri(), PINNED_REVIEWER);
+        let (_repo, _cwd) = hermetic_loop_repo();
+        apply_author_edit(&_cwd);
+
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "loop",
+            "fix",
+            "the",
+            "pending",
+            "edit",
+            "--reviewer",
+            "phantom-model/ghost",
+        ])
+        .expect("clap parse");
+        let err = cmd_loop_run(
+            &cli,
+            &["fix the pending edit".to_string()],
+            None,
+            2,
+            Some("true".to_string()),
+            Some("phantom-model/ghost".to_string()),
+            None,
+            crate::ReviewScope::Auto,
+            false,
+            900,
+            900,
+            false,
+            false,
+            &_cwd,
+        )
+        .await
+        .expect_err("an unbacked pin must stop the loop before any iteration");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no provider serves") || msg.contains("provider"),
+            "the pin failure must name the missing provider: {msg}"
+        );
+        // No reviewer was ever dispatched.
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
