@@ -348,6 +348,30 @@ class LostCreateHandler(RecordingHandler):
         self._send_json(200, {})
 
 
+class LostNoteHandler(LostCreateHandler):
+    """An in-memory GitLab API with ONE open alert whose note response is lost.
+
+    `POST /issues/<iid>/notes` STORES the note, then destroys the connection
+    without answering: the client cannot know whether the note landed.  A
+    retried POST would store the same note twice, so the note-creating POST
+    must be single-attempt just like the issue create.
+    """
+
+    notes: list[dict[str, Any]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        self._count()
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/notes"):
+            type(self).notes.append({"path": path, "body": body})
+            self.close_connection = True
+            self.connection.close()
+            return
+        self._send_json(200, {})
+
+
 def _start_server(handler_cls: type, **attrs: Any):
     """Start a server with a fresh handler subclass.
 
@@ -591,6 +615,53 @@ def test_lost_create_is_not_retried_through_a_kwargs_transport() -> None:
         "THE INVARIANT IS BROKEN: " + repr(handler.issues)
     )
     assert sleeps == [], repr(sleeps)
+
+
+def test_lost_note_response_does_not_store_a_second_note() -> None:
+    """A note-creating POST is single-attempt too.
+
+    `POST /issues/<iid>/notes` creates a note.  The server stores it and then
+    the connection dies without a response, so the client cannot know whether
+    it landed.  A retried POST would store the SAME note twice: every POST is
+    sent exactly once, so exactly one note is stored and the run reports that
+    the alert was not delivered.
+    """
+    sleeps: list[float] = []
+    server, handler = _start_server(
+        LostNoteHandler,
+        issues=[{"iid": 7, "labels": [alert.LABEL], "state": "opened"}],
+        notes=[],
+    )
+    try:
+        env = base_env(
+            **{"CI_API_V4_URL": _base_url(server), "CI_PIPELINE_ID": "100"}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            freshness = write_freshness(
+                tmp, {"sources": [{"name": "x", "ok": False, "reason": "boom"}]}
+            )
+            code = alert.run(
+                env,
+                http=alert.urllib_http,
+                sleep=sleeps.append,
+                freshness_path=freshness,
+            )
+    finally:
+        server.shutdown()
+    # A lost note response is a delivery failure: the job must say so.
+    assert code == 1, code
+    # Exactly ONE note-creating POST reached the server: never retried.
+    note_posts = [
+        (m, p) for (m, p) in handler.hits if m == "POST" and p.endswith("/notes")
+    ]
+    assert len(note_posts) == 1, (
+        "a note-creating POST must not be retried: " + repr(handler.hits)
+    )
+    # THE POINT: the same note was stored exactly once, not three times.
+    assert len(handler.notes) == 1, (
+        "the note must be stored once: " + repr(handler.notes)
+    )
+    assert sleeps == [], "no retry may have been scheduled: " + repr(sleeps)
 
 
 def test_a_var_positional_transport_is_never_sent_the_attempts_keyword() -> None:
