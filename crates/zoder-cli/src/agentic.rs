@@ -8410,6 +8410,18 @@ pub(crate) async fn cmd_loop(
 /// every exit path in one place instead of being threaded through the loop's
 /// `break`/`bail!`/timeout exits.
 #[allow(clippy::too_many_arguments)]
+/// The `ZODER_LOOP_RESULT` line is for orchestrators (Hive). It is emitted when
+/// the run has a Hive job id, or when `ZODER_LOOP_RESULT=1` asks for it;
+/// `ZODER_LOOP_RESULT=0` suppresses it even under Hive. Standalone runs print
+/// nothing extra.
+fn loop_result_line_enabled(job_id: Option<&str>, env: Option<&str>) -> bool {
+    match env.map(str::trim) {
+        Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        _ => job_id.is_some(),
+    }
+}
+
 /// Writes a `teardown` event with reason `crash` if the loop function exits
 /// without disarming (early `?`/bail/panic), so a dying loop still leaves a
 /// trail in MNEMOS. Disarmed on every normal teardown.
@@ -9815,11 +9827,18 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         json!({"teardown": teardown, "verdicts": iterations.iter()
             .map(|it| it.get("verdict").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>()})
     );
-    // --json keeps stdout a single JSON document; the line goes to stderr there.
-    if cli.json {
-        eprintln!("{result_line}");
-    } else {
-        println!("{result_line}");
+    // Only for Hive-configured runs (or explicit opt-in): a standalone zoder's
+    // output is unchanged. --json keeps stdout a single JSON document, so the
+    // line goes to stderr there.
+    if loop_result_line_enabled(
+        event_job_id.as_deref(),
+        std::env::var("ZODER_LOOP_RESULT").ok().as_deref(),
+    ) {
+        if cli.json {
+            eprintln!("{result_line}");
+        } else {
+            println!("{result_line}");
+        }
     }
 
     if let Some(dir) = active_job_dir() {
@@ -10921,6 +10940,15 @@ mod tests {
         )
         .expect("a JSON verdict object must parse");
         assert_eq!(parsed.verdict, "approve");
+    }
+
+    #[test]
+    fn loop_result_line_is_off_for_standalone_runs() {
+        assert!(!loop_result_line_enabled(None, None));
+        assert!(loop_result_line_enabled(Some("job-1"), None));
+        assert!(loop_result_line_enabled(None, Some("1")));
+        assert!(!loop_result_line_enabled(Some("job-1"), Some("0")));
+        assert!(!loop_result_line_enabled(None, Some("")));
     }
 
     #[test]
