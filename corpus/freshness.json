@@ -1,6 +1,35 @@
 {
+  "overlay": {
+    "age_days": 16,
+    "built_at": "2026-10-13T09:08:34Z",
+    "candidate_models_with_score": 197,
+    "models_with_score": 191,
+    "reason": "bench source(s) unavailable with no LKG: fetch-terminal-bench.py",
+    "stale": true
+  },
+  "overlay_age_days": 16,
+  "overlay_stale": true,
+  "prices": {
+    "catalog_models": 3461,
+    "generated": "2026-10-29",
+    "litellm": {
+      "models": 3024,
+      "ok": true,
+      "reason": ""
+    },
+    "ok": true,
+    "openrouter": {
+      "added": 437,
+      "ok": true,
+      "reason": ""
+    },
+    "previous_catalog_models": 3362
+  },
+  "schema": 2,
   "sources": [
     {
+      "kind": "bench",
+      "lkg": false,
       "name": "fetch-vals-swebench.py",
       "ok": true,
       "outputs": [
@@ -9,6 +38,8 @@
       "reason": ""
     },
     {
+      "kind": "bench",
+      "lkg": false,
       "name": "fetch-aider-polyglot.py",
       "ok": true,
       "outputs": [
@@ -17,6 +48,8 @@
       "reason": ""
     },
     {
+      "kind": "bench",
+      "lkg": false,
       "name": "fetch-arena.py",
       "ok": true,
       "outputs": [
@@ -26,6 +59,8 @@
       "reason": ""
     },
     {
+      "kind": "bench",
+      "lkg": false,
       "name": "fetch-scale.py",
       "ok": true,
       "outputs": [
@@ -34,13 +69,15 @@
       "reason": ""
     },
     {
+      "kind": "bench",
+      "lkg": false,
       "name": "fetch-terminal-bench.py",
       "ok": false,
       "outputs": [
         "terminal-bench.json"
       ],
-      "reason": "terminal-bench: no scored rows found \u2014 format changed?"
+      "reason": "terminal-bench: could not locate leaderboard rows (page format changed?)"
     }
   ],
-  "ts": "2026-10-13T09:08:34Z"
+  "ts": "2026-10-29T09:07:53Z"
 }
