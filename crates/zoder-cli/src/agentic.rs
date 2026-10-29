@@ -8410,6 +8410,26 @@ pub(crate) async fn cmd_loop(
 /// every exit path in one place instead of being threaded through the loop's
 /// `break`/`bail!`/timeout exits.
 #[allow(clippy::too_many_arguments)]
+/// Writes a `teardown` event with reason `crash` if the loop function exits
+/// without disarming (early `?`/bail/panic), so a dying loop still leaves a
+/// trail in MNEMOS. Disarmed on every normal teardown.
+struct LoopEventGuard {
+    job_id: Option<String>,
+    armed: bool,
+}
+
+impl Drop for LoopEventGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::mnemos::event_blocking(
+                self.job_id.as_deref(),
+                "teardown",
+                json!({"reason": "crash"}),
+            );
+        }
+    }
+}
+
 async fn cmd_loop_run(
     cli: &crate::Cli,
     task: &[String],
@@ -8440,6 +8460,15 @@ async fn cmd_loop_run(
     // Fleet job workspaces publish the job id their runner assigned. A
     // standalone run has no such runner, so it must not invent or forward one.
     let fleet_job_workspaces = engine_cfg.profile_defaults().fleet_job_workspaces();
+    let event_job_id: Option<String> = if fleet_job_workspaces {
+        std::env::var("HIVE_JOB_ID").ok()
+    } else {
+        None
+    };
+    let mut event_guard = LoopEventGuard {
+        job_id: event_job_id.clone(),
+        armed: true,
+    };
 
     // Task text: trailing args, else -i FILE, else stdin.
     let mut task_txt = task.join(" ");
@@ -8460,6 +8489,13 @@ async fn cmd_loop_run(
     }
 
     let max_iters = max_iters.max(1);
+    crate::mnemos::event(
+        event_job_id.as_deref(),
+        "loop_start",
+        json!({"brief_bytes": task_txt.len(), "max_iters": max_iters,
+               "reviewer": reviewer, "workspace": cwd.to_string_lossy()}),
+    )
+    .await;
     // The author's engine session for the NEXT iteration, together with the
     // agent alias that minted it. Zeroclaw binds a session to its agent, so
     // the id alone is not enough: a model fallback resolves to a different
@@ -8605,6 +8641,13 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         if !cli.quiet {
             eprintln!("\n[loop] iter {i}/{max_iters}: author…");
         }
+        crate::mnemos::event(
+            event_job_id.as_deref(),
+            "author_start",
+            json!({"iteration": i}),
+        )
+        .await;
+        let author_started = std::time::Instant::now();
         // The author turn is best-effort: a wall-clock timeout (or transient
         // engine error) must NOT discard the round. The engine applies edits to
         // disk as tool calls run, so partial work survives; we still validate,
@@ -8763,6 +8806,25 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 None
             }
         };
+        {
+            let (a_status, a_error) = match (&turn, &author_err) {
+                (Some(_), _) => ("ok", None),
+                (None, Some(m)) if m.contains("timed out") || m.contains("timeout") => {
+                    ("timeout", Some(m.chars().take(300).collect::<String>()))
+                }
+                (None, Some(m)) => ("error", Some(m.chars().take(300).collect::<String>())),
+                (None, None) => ("error", None),
+            };
+            crate::mnemos::event(
+                event_job_id.as_deref(),
+                "author_end",
+                json!({"iteration": i, "model": turn.as_ref().map(|t| t.model.clone()),
+                       "cost_usd": turn.as_ref().map(|t| t.cost_usd),
+                       "duration_s": author_started.elapsed().as_secs(),
+                       "status": a_status, "error": a_error}),
+            )
+            .await;
+        }
 
         // 2. Post-commit author reconciliation. The default engine is a
         //    long-lived zeroclaw daemon whose git identity is out of
@@ -9152,6 +9214,12 @@ diff is not a finished turn"
         // calibration only) follows the same honest rule.
         let green = check_passed == Some(true);
         let check_satisfied = check_passed != Some(false);
+        crate::mnemos::event(
+            event_job_id.as_deref(),
+            "check_end",
+            json!({"iteration": i, "passed": check_passed}),
+        )
+        .await;
 
         // B. A `request_changes` whose findings array is empty or carries no
         // `location` is an invalid review, not a real blocker. Re-ask ONCE
@@ -9222,6 +9290,16 @@ or comment.\n"
         }
         final_verdict = review.verdict.clone();
         let blocking = count_blocking(&review, green);
+        crate::mnemos::event(
+            event_job_id.as_deref(),
+            "review_response",
+            json!({"iteration": i, "reviewer_model": reviewer_model,
+                   "chunks": review_chunks, "bytes": review_diff.len(),
+                   "status": if review_error.is_some() || review.verdict == REVIEWER_UNAVAILABLE_VERDICT { "unavailable" } else { "ok" },
+                   "error": review_error.as_deref().map(|e| e.chars().take(300).collect::<String>()),
+                   "verdict": review.verdict, "blocking_findings": blocking}),
+        )
+        .await;
 
         let author_model = turn.as_ref().map(|t| t.model.clone());
         let tool_calls = turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0);
@@ -9711,6 +9789,38 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
             .and_then(|it| it.get("filtered_findings"))
             .cloned(),
     });
+
+    let teardown_reason = if resolved {
+        "approved"
+    } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
+        "reviewer_unavailable"
+    } else if iterations.is_empty() {
+        "author_failed"
+    } else {
+        "exhausted"
+    };
+    let teardown = json!({
+        "reason": teardown_reason, "resolved": resolved,
+        "iterations": iterations.len(), "max_iters": max_iters,
+        "final_verdict": final_verdict, "cost_usd": total_cost,
+        "duration_s": started.elapsed().as_secs(),
+        "last_good_head_sha": rev_parse_head(cwd),
+        "reviewer_model": iterations.last().and_then(|it| it.get("reviewer_model")).cloned(),
+    });
+    crate::mnemos::event(event_job_id.as_deref(), "teardown", teardown.clone()).await;
+    event_guard.armed = false;
+    // One parseable line for callers (Hive worker) instead of scraping the tail.
+    let result_line = format!(
+        "ZODER_LOOP_RESULT {}",
+        json!({"teardown": teardown, "verdicts": iterations.iter()
+            .map(|it| it.get("verdict").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>()})
+    );
+    // --json keeps stdout a single JSON document; the line goes to stderr there.
+    if cli.json {
+        eprintln!("{result_line}");
+    } else {
+        println!("{result_line}");
+    }
 
     if let Some(dir) = active_job_dir() {
         let _ = std::fs::write(
