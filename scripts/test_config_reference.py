@@ -36,22 +36,40 @@ def key_table() -> list[str]:
     return keys
 
 
-def leaf_token(key: str) -> str:
-    name = key.split(".")[-1].strip("[]*")
-    return name
+def key_is_covered(key: str, code: str, template: str) -> bool:
+    """A documented key must appear as a real TOML key or struct field.
+
+    Glob keys (``*``) require every fixed path segment to appear in the
+    parsing code (they match many concrete keys by design). A bare
+    ``[section]`` needs its literal header in a template or its name in
+    the code. A ``section.field`` key needs a ``field =`` assignment in a
+    template or a ``pub field:`` struct field in the code — never a bare
+    substring, so ``mode`` cannot match ``deployment_mode``.
+    """
+    if "*" in key:
+        fixed = [seg for seg in re.split(r"[^A-Za-z0-9_]+", key) if seg]
+        return bool(fixed) and all(seg in code for seg in fixed)
+    section_match = re.fullmatch(r"\[([^\].]+)\]", key)
+    if section_match:
+        section = section_match.group(1)
+        return f"[{section}]" in template or section in code
+    if "." in key:
+        _section, field = key.rsplit(".", 1)
+        field = field.strip("[]")
+        in_template = (
+            re.search(rf"(?m)^\s*{re.escape(field)}\s*=", template) is not None
+        )
+        in_code = re.search(rf"pub {re.escape(field)}\s*:", code) is not None
+        return in_template or in_code
+    return key in template or key in code
 
 
 def test_every_documented_key_exists_in_template_or_code():
     code = CONFIG_RS.read_text() + BUDGET_RS.read_text()
     template = TEMPLATE.read_text() + FLEET.read_text()
-    missing = []
-    for key in key_table():
-        leaf = leaf_token(key)
-        if leaf in ("model.*", "*"):
-            continue
-        if leaf not in template and leaf not in code:
-            missing.append(key)
-    assert key_table(), "key table must not be empty"
+    keys = key_table()
+    assert keys, "key table must not be empty"
+    missing = [key for key in keys if not key_is_covered(key, code, template)]
     assert not missing, "documented keys missing from template and code: " + ", ".join(
         missing
     )
