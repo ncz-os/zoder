@@ -8442,12 +8442,31 @@ mod stale_socket_cleanup_tests {
         let seen = socket_identity(&socket).expect("the entry has an identity");
 
         // A daemon binds the path in between: the entry is REPLACED.
-        std::fs::remove_file(&socket).expect("remove the old entry");
-        std::fs::write(&socket, b"a different entry").expect("write the replacement");
+        //
+        // The replacement is created while the ORIGINAL is still on disk, and
+        // is then renamed over the path. Removing the original first and
+        // writing a new file at the same path is NOT equivalent: the
+        // filesystem is free to hand the just-freed inode straight back to the
+        // new file, so (dev, ino) can be IDENTICAL for two different
+        // directory entries. The precondition below then fails on a
+        // filesystem that reuses inodes eagerly -- tmpfs, overlayfs, ext4
+        // with a small dir_index -- even though the production behaviour
+        // under test is perfectly correct. Holding both entries at once
+        // makes the two inodes provably distinct: a filesystem cannot give
+        // one inode to two live entries.
+        let replacement = dir.path().join("replacement.sock");
+        std::fs::write(&replacement, b"a different entry").expect("write the replacement");
+        std::fs::rename(&replacement, &socket).expect("rename the replacement over the socket");
+
         let now = socket_identity(&socket).expect("the replacement has an identity");
         assert_ne!(
             seen, now,
             "precondition: the directory entry was replaced by another one"
+        );
+        assert_eq!(
+            std::fs::read(&socket).expect("read the replacement"),
+            b"a different entry",
+            "precondition: the entry at the path really is the replacement"
         );
 
         assert!(
