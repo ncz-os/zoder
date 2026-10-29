@@ -1,0 +1,6 @@
+{
+  "description": "Existing LAN IPv4 address occurrences per non-Rust file. audit_nonrust_addresses.py --check fails when a file exceeds its count.",
+  "files": {
+    "scripts/ci/public-repo-guard.py": 2
+  }
+}
