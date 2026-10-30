@@ -1,29 +1,29 @@
 {
   "overlay": {
-    "age_days": 16,
-    "built_at": "2026-10-13T09:08:34Z",
+    "age_days": 0,
+    "built_at": "2026-10-30T09:07:22Z",
     "candidate_models_with_score": 197,
-    "models_with_score": 191,
-    "reason": "bench source(s) unavailable with no LKG: fetch-terminal-bench.py",
-    "stale": true
+    "models_with_score": 197,
+    "reason": "",
+    "stale": false
   },
-  "overlay_age_days": 16,
-  "overlay_stale": true,
+  "overlay_age_days": 0,
+  "overlay_stale": false,
   "prices": {
-    "catalog_models": 3461,
-    "generated": "2026-10-29",
+    "catalog_models": 3554,
+    "generated": "2026-10-30",
     "litellm": {
-      "models": 3024,
+      "models": 3118,
       "ok": true,
       "reason": ""
     },
     "ok": true,
     "openrouter": {
-      "added": 437,
+      "added": 436,
       "ok": true,
       "reason": ""
     },
-    "previous_catalog_models": 3362
+    "previous_catalog_models": 3461
   },
   "schema": 2,
   "sources": [
@@ -72,12 +72,12 @@
       "kind": "bench",
       "lkg": false,
       "name": "fetch-terminal-bench.py",
-      "ok": false,
+      "ok": true,
       "outputs": [
         "terminal-bench.json"
       ],
-      "reason": "terminal-bench: could not locate leaderboard rows (page format changed?)"
+      "reason": ""
     }
   ],
-  "ts": "2026-10-29T09:07:53Z"
+  "ts": "2026-10-30T09:07:22Z"
 }
