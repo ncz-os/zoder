@@ -31,6 +31,12 @@ bench/raw/
 # never belongs in the repo).
 /memory
 
+# Root-level `.scratch*` (e.g. `.scratch2.rs`, `.scratch_tail.diff`) — WIP
+# dumps relocated from /tmp, which is tmpfs. Never repo content. It must be
+# ignored BEFORE the review diff is collected: `git diff` does not apply
+# `--exclude`, so a tracked scratch file makes the diff unreadable.
+/.scratch*
+
 # Local scratch roots for the test harness. `/t` is where the test
 # suite writes its per-run session dirs when TMPDIR points inside the
 # workspace; `.tmpbuild/` holds the flake-evidence harness (stress
