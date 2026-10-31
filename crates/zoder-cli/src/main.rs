@@ -16083,12 +16083,17 @@ fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
 /// delimiter-bounded one is returned as written.
 fn catalog_models_for_declaration(cat: &PricingCatalog, id: &str) -> Vec<String> {
     let is_prefix_shaped = id.ends_with('/') || !id.contains('/');
+    // Routing matches `serves` with a plain `starts_with` (see
+    // `models_for_provider`), so this expansion must claim exactly what the
+    // router claims. A delimiter-bounded entry may also be a feed id in its
+    // own right; when it is, that row belongs in the catalog too -- excluding
+    // it left a model the host definitely routes unpriced.
     let mut targets: Vec<String> = if cat.models.contains_key(id) && !is_prefix_shaped {
         vec![id.to_string()]
     } else {
         cat.models
             .keys()
-            .filter(|k| k.starts_with(id) && k.as_str() != id)
+            .filter(|k| k.starts_with(id))
             .cloned()
             .collect()
     };
@@ -24056,6 +24061,61 @@ mod engine_cost_accounting_tests {
             !out.models.contains_key("deepseek/deepseek-r1"),
             "an unconfigured model must not be published"
         );
+    }
+
+    /// Review r5: a `serves` entry that IS itself a feed id must keep its row.
+    ///
+    /// Routing matches `serves` with a plain `starts_with`, so a declaration
+    /// claims the exact id AND every id under it. The expansion used to drop
+    /// the exact key (`k != id`), so a provider whose declared id the feed
+    /// lists ended up with NO row for a model the host definitely routes --
+    /// the engine then had nothing to price it with.
+    #[test]
+    fn a_serves_entry_that_is_itself_a_feed_id_keeps_its_row() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["llama"]
+            }"#,
+        );
+        let mut cat = PricingCatalog::default();
+        // An id the declaration names exactly, and one it only prefixes. Both
+        // are routable to this provider via `starts_with`, so both need a row.
+        for k in ["llama", "llama-3"] {
+            cat.models.insert(
+                k.to_string(),
+                ModelPrice {
+                    input_usd_per_mtok: 5.0,
+                    output_usd_per_mtok: 9.0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let out = engine_catalog(&cat, &cfg);
+
+        assert!(
+            out.models.contains_key("llama"),
+            "the declared id itself must keep its row: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            out.models.contains_key("llama-3"),
+            "ids under the declaration must be claimed too: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+        // The host is cost-neutral, so both are explicit $0 -- never the
+        // feed's cloud rate.
+        for id in ["llama", "llama-3"] {
+            assert!(
+                !out.models[id].is_priced(),
+                "{id} must be an explicit $0 on a free provider"
+            );
+        }
     }
 
     /// A `serves` entry is a PREFIX, not a model id (`mimax-`, `gpt-`,
