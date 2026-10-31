@@ -17,7 +17,9 @@
 //!    nowhere — is downgraded to `filtered_z3`-style unsupported
 //!    (non-blocking, still reported) and costs nothing (zero calls). A
 //!    finding the check CANNOT disprove is never dropped: it reaches a
-//!    confirmer.
+//!    confirmer. A cited path the review cannot READ (a deleted file, a
+//!    path that was never there, an IO error) is not disproved either: the
+//!    reader cannot tell "absent" from "unreadable", so the finding is kept.
 //! 2. **Confirmer choice.** The chain comes from `[review.confirm].models`
 //!    (config roles, never hard-coded ids in code). A candidate is kept only
 //!    when its family differs from BOTH the reviewer's family and the
@@ -336,6 +338,41 @@ impl ConfirmedReview {
     }
 }
 
+/// Whether a confirmed blocking finding raises `original` to
+/// `request_changes`.
+///
+/// The rule closes the second half of the gate: a reviewer that answers
+/// `comment` (or `approve`) while carrying a `high`/`critical` finding has
+/// said, in its own output, that something blocks. `strict_review` only
+/// forbids `approve` with such a finding, so a `comment` carrying one used to
+/// pass. Once confirmation has looked at that finding and it is not demoted
+/// (`confirmed`, `insufficient`, `confirmer_failed` or `not_run` — every
+/// blocking disposition), the verdict is raised to `request_changes`. The
+/// rule only ever RAISES: a `request_changes` stays one, and a `comment`
+/// whose blocking findings were all demoted by independent confirmers stays
+/// a `comment`.
+pub(crate) fn raised_by_confirmed_finding(confirmed: &ConfirmedReview, original: &str) -> bool {
+    if !is_blocking_verdict(original) {
+        return false;
+    }
+    confirmed.effective_blocking
+        && confirmed
+            .decisions
+            .iter()
+            .any(|d| d.blocking && is_blocking_severity(&d.severity))
+}
+
+/// The verdicts that do NOT block on their own and may be raised by a
+/// confirmed finding. An explicit blocking verdict is already blocking, and a
+/// verdict outside the closed set is left to the fail-closed ranking (an
+/// unknown verdict ranks as blocking).
+pub(crate) fn is_blocking_verdict(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "comment" | "approve"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Normalisation and the stable finding id.
 // ---------------------------------------------------------------------------
@@ -583,14 +620,24 @@ pub(crate) fn cited_location(location: &str) -> Option<(String, Option<usize>)> 
 /// code. It can prove two things: that the cited place does not exist at
 /// the reviewed head, and that every code span the finding quotes occurs
 /// nowhere in the reviewed text. It can prove nothing else — a finding it
-/// cannot disprove must reach a confirmer.
+/// cannot disprove must reach a confirmer. A cited path it could not READ
+/// proves nothing: the file may be deleted, or the read may have failed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Grounding {
     /// The cited path exists at the reviewed head and the cited line is in
-    /// range. `false` when the path does not exist. `true` when the finding
-    /// cites no path at all: there is no place to check, and an unchecked
-    /// place is not evidence of a wrong one.
+    /// range. `false` when a path was cited, read successfully, and the cited
+    /// line is not in range. `true` when the finding cites no path at all:
+    /// there is no place to check, and an unchecked place is not evidence of
+    /// a wrong one.
     pub location_ok: bool,
+    /// The cited path could not be read at the reviewed head: the file is
+    /// gone, it was never there, or the read failed with an IO error.
+    ///
+    /// `read(path) == None` does NOT prove the place does not exist. An
+    /// unreadable path is therefore UNGROUNDABLE, not disproved: it is kept
+    /// and reaches a confirmer. Treating it as a wrong location dropped the
+    /// finding, and a review whose only blocker was dropped exits 0.
+    pub location_unreadable: bool,
     /// The code spans the finding quotes that DO occur in the reviewed text.
     pub present: Vec<String>,
     /// The code spans the finding quotes that occur NOWHERE in the reviewed
@@ -605,9 +652,12 @@ impl Grounding {
     /// the reviewed head, or when every code span it quotes occurs nowhere
     /// in the reviewed text. A finding that quotes no code at all is NOT
     /// ungrounded: there is nothing to disprove, so it must reach a
-    /// confirmer.
+    /// confirmer. A cited path the review could not READ is not a place
+    /// known to be missing — see [`Grounding::location_unreadable`] — so it
+    /// never disproves the finding either.
     pub(crate) fn grounded(&self) -> bool {
-        self.location_ok && (self.missing.is_empty() || !self.present.is_empty())
+        (self.location_ok || self.location_unreadable)
+            && (self.missing.is_empty() || !self.present.is_empty())
     }
 
     /// Why the finding is not anchored, or `None` when it is.
@@ -615,7 +665,7 @@ impl Grounding {
         if self.grounded() {
             return None;
         }
-        if !self.location_ok {
+        if !self.location_ok && !self.location_unreadable {
             return Some("the cited location does not exist at the reviewed head".to_string());
         }
         Some("every code span the finding quotes is absent from the reviewed text".to_string())
@@ -641,6 +691,12 @@ impl Grounding {
 /// cited line is out of range but whose path exists loses no real finding
 /// but also blocks fewer false ones, and dropping on ANY missing span
 /// blocks 20 false findings while losing 5 real ones.
+///
+/// `read` returning `None` is NOT evidence: a path the review cannot read
+/// may be a deleted file, a path that was never there, or an IO error, and
+/// the reader cannot tell them apart. Such a finding is marked
+/// [`Grounding::location_unreadable`] and stays groundable, so it reaches a
+/// confirmer instead of being dropped without a model call.
 pub(crate) fn ground_finding(
     location: &str,
     claim: &str,
@@ -648,20 +704,25 @@ pub(crate) fn ground_finding(
     touched: &[String],
 ) -> Grounding {
     let mut grounding = Grounding::default();
+    let mut cited_unreadable = false;
     let cited = cited_location(location);
     // The cited place. A finding that cites no path has no place to check:
     // it is neither confirmed nor disproved, so it stays groundable.
     match cited.as_ref() {
         Some((path, _)) if !path.is_empty() => {
             let src = read(path);
-            grounding.location_ok = match (&src, cited.as_ref().and_then(|(_, l)| *l)) {
-                (None, _) => false,
-                (Some(_), None) => true,
+            match (&src, cited.as_ref().and_then(|(_, l)| *l)) {
+                // Unreadable: the place is not known to be missing.
+                (None, _) => {
+                    grounding.location_unreadable = true;
+                    cited_unreadable = true;
+                }
+                (Some(_), None) => grounding.location_ok = true,
                 (Some(text), Some(line)) => {
                     let count = text.lines().count();
-                    line >= 1 && line <= count
+                    grounding.location_ok = line >= 1 && line <= count;
                 }
-            };
+            }
         }
         _ => grounding.location_ok = true,
     }
@@ -669,9 +730,14 @@ pub(crate) fn ground_finding(
     // every file the diff touches, at their post-image. The diff text alone
     // is NOT the corpus: it shows the changed lines, while the code a finding
     // quotes may sit anywhere in the touched files.
+    //
+    // A cited path the review could NOT read is not searched, and its absence
+    // from the corpus is not held against the finding: the reader has no text
+    // to search, so "the span is missing" would only restate the read failure.
+    // The span is therefore neither present nor missing.
     let mut corpus = String::new();
     if let Some((path, _)) = cited.as_ref() {
-        if !path.is_empty() {
+        if !path.is_empty() && !cited_unreadable {
             if let Some(text) = read(path) {
                 corpus.push_str(&normalise_ws(&text));
                 corpus.push('\n');
@@ -688,7 +754,7 @@ pub(crate) fn ground_finding(
         let needle = normalise_ws(&span);
         if corpus.contains(&needle) {
             grounding.present.push(span);
-        } else {
+        } else if !(cited_unreadable && corpus.trim().is_empty()) {
             grounding.missing.push(span);
         }
     }
@@ -1914,13 +1980,19 @@ mod tests {
         assert_eq!(pending.len(), 1, "it must reach a confirmer");
     }
 
-    /// A finding whose cited place does not exist at the reviewed head IS
-    /// dropped, and the reason says so.
+    /// A finding whose cited place was READ and found wrong IS dropped, and
+    /// the reason says so.
+    ///
+    /// "Found wrong" is a place the review can check: the file is there and
+    /// the cited line is past its end. A path the review cannot read at all
+    /// is a different case and is KEPT (D4.1, see
+    /// `unreadable_cited_path_keeps_blocking_finding`): a read failure is not
+    /// evidence that the place does not exist.
     #[test]
-    fn a_finding_citing_a_place_that_does_not_exist_is_dropped() {
+    fn a_finding_citing_a_place_that_is_wrong_is_dropped() {
         let mut f = finding("high", "x is unused", Some("let x = 1"), CTX);
-        // A file that is not in the reviewed tree at all.
-        f.location = "crates/zoder-cli/src/does_not_exist.rs:1".to_string();
+        // A file that IS in the reviewed tree, cited past its last line.
+        f.location = format!("{SRC}:99");
         let grounding = ground_finding(
             &f.location,
             &f.claim,
@@ -1928,6 +2000,7 @@ mod tests {
             std::slice::from_ref(&SRC.to_string()),
         );
         assert!(!grounding.location_ok);
+        assert!(!grounding.location_unreadable, "the file was read");
         f.grounded = grounding.grounded();
         f.ungrounded_reason = grounding.ungrounded_reason().unwrap_or_default();
         let (checks, pending) = precheck(&[f]);
@@ -2009,6 +2082,97 @@ mod tests {
         let _ = ungrounded;
     }
 
+    // ---- D4.1: an unreadable cited path must not drop a blocker --------
+
+    /// A finding that cites a path the review cannot read — a path that never
+    /// existed, a file the change deleted, or a plain IO error — is NOT
+    /// disproved. `read(path) == None` says nothing about whether the cited
+    /// place exists at the reviewed head, so the finding must stay
+    /// UNGROUNDABLE (kept, reaches a confirmer) rather than be dropped as
+    /// `filtered_z3` with no model call.
+    ///
+    /// The regression it pins: the pre-check used to treat `None` as "the
+    /// cited location does not exist", drop every such finding, and turn a
+    /// `request_changes` into a `comment` — which exits 0.
+    #[test]
+    fn unreadable_cited_path_keeps_blocking_finding() {
+        // A path in the form reviewers actually emit, and a file the change
+        // deleted (it is in the diff, so it is a touched path, but it is gone
+        // at the reviewed head).
+        let never_there = "a/src/x.rs";
+        let deleted = "a/src/deleted.rs";
+        // The review touches both files. For the deleted one the reader has
+        // nothing at the head; for the other the finding cites a place the
+        // review cannot read at all.
+        let touched = vec![deleted.to_string()];
+
+        for (label, read, cited) in [
+            (
+                "cited path in a/ form, unreadable",
+                &(|_: &str| None) as &dyn Fn(&str) -> Option<String>,
+                never_there,
+            ),
+            (
+                "deleted file (in the diff, gone at the head)",
+                &(|p: &str| (p != deleted).then(|| "fn helper() {}\n".to_string()))
+                    as &dyn Fn(&str) -> Option<String>,
+                deleted,
+            ),
+            (
+                "IO error behind the reader",
+                &(|p: &str| {
+                    if p == "a/src/io.rs" {
+                        // The reader's own error path: it reports the same
+                        // `None` a missing file does, so neither is proof.
+                        None
+                    } else {
+                        None
+                    }
+                }) as &dyn Fn(&str) -> Option<String>,
+                "a/src/io.rs",
+            ),
+        ] {
+            let location = format!("{cited}:12");
+            let claim = "the `let guard = value.unwrap()` is dropped".to_string();
+            let grounding = ground_finding(&location, &claim, read, &touched);
+            assert!(
+                grounding.location_unreadable,
+                "{label}: the read failed, so the place is not known to be missing"
+            );
+            assert!(
+                !grounding.location_ok,
+                "{label}: an unreadable place is never reported as a wrong one"
+            );
+            assert!(
+                grounding.grounded(),
+                "{label}: an unreadable cited file cannot disprove the finding"
+            );
+            assert_eq!(grounding.ungrounded_reason(), None);
+            let f = PendingFinding {
+                id: finding_id("fam", &location, &claim),
+                severity: "critical".to_string(),
+                location: location.clone(),
+                quote: None,
+                claim: claim.clone(),
+                quote_found: false,
+                grounded: grounding.grounded(),
+                ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
+            };
+            let (checks, pending) = precheck(std::slice::from_ref(&f));
+            assert_eq!(checks.len(), 1);
+            assert!(
+                !checks[0].dropped,
+                "{label}: an unreadable cited path must NOT drop a blocking finding"
+            );
+            assert_eq!(
+                pending.len(),
+                1,
+                "{label}: the finding must still reach a confirmer"
+            );
+            assert_eq!(pending[0].id, f.id);
+        }
+    }
+
     // ---- grounding: the rules the pre-check is built on -----------------
 
     /// A code span is a backticked span of at least six characters that
@@ -2058,20 +2222,25 @@ mod tests {
         assert!(contains_at_word_boundary("change to the loop", "change to"));
     }
 
-    /// A finding that cites a file that is not in the reviewed tree is not
-    /// anchored in the code.
+    /// A finding that cites a file the review cannot read is neither anchored
+    /// nor disproved: the read failure says nothing about whether the place
+    /// exists (the file may be deleted, or the read may have failed), so the
+    /// finding stays groundable (D4.1).
+    ///
+    /// A place the review DID read and found wrong is a different case: the
+    /// cited line past the end of a real file disproves it
+    /// (`ground_finding_marks_an_out_of_range_line`).
     #[test]
-    fn ground_finding_marks_a_missing_cited_path() {
+    fn ground_finding_keeps_a_finding_whose_cited_path_is_unreadable() {
         let read = |path: &str| (path == "src/a.rs").then(|| "fn a() {}\n".to_string());
         let g = ground_finding("src/missing.rs:3", "nothing here", &read, &[]);
-        assert!(!g.location_ok);
-        assert!(!g.grounded());
+        assert!(!g.location_ok, "an unreadable place is not a checked place");
+        assert!(g.location_unreadable, "the read failed");
         assert!(
-            g.ungrounded_reason()
-                .unwrap_or_default()
-                .contains("location"),
-            "the reason must name the location"
+            g.grounded(),
+            "a read failure cannot disprove the finding: it is ungroundable, not wrong"
         );
+        assert_eq!(g.ungrounded_reason(), None);
     }
 
     /// A finding that cites a line past the end of the file is not anchored
@@ -2287,6 +2456,17 @@ mod tests {
                 "row {} ({} {}): the cited place",
                 row.id, row.class, row.cite
             );
+            // Whether the cited place could be READ is what separates
+            // disproving a finding from merely failing to check it. A row
+            // recorded as absent had no file at the reviewed head; the
+            // grounder reports that as unreadable, and the finding is KEPT.
+            // `path_present == true` with `loc_ok == false` is a file that
+            // exists with the cited line out of range, which IS proof.
+            assert_eq!(
+                grounding.location_unreadable, !row.path_present,
+                "row {} ({} {}): the cited file's readability",
+                row.id, row.class, row.cite
+            );
             assert_eq!(
                 grounding.present.len(),
                 row.n_present,
@@ -2315,13 +2495,24 @@ mod tests {
                 grounded: grounding.grounded(),
                 ungrounded_reason: grounding.ungrounded_reason().unwrap_or_default(),
             });
-            expected_dropped.push(!row.loc_ok || (row.n_missing > 0 && row.n_present == 0));
+            // D4.1: an unreadable cited path is UNGROUNDABLE, not disproved,
+            // so it is never a reason to drop a finding. Only a place that was
+            // READ and found wrong, or spans that were searched and found
+            // nowhere, can disprove one.
+            expected_dropped.push(
+                !grounding.location_unreadable
+                    && (!row.loc_ok || (row.n_missing > 0 && row.n_present == 0)),
+            );
         }
 
         let (checks, pending) = precheck(&findings);
         assert_eq!(checks.len(), rows.len());
         let mut false_total = 0usize;
         let mut false_dropped = 0usize;
+        // False findings whose cited place could not be READ: they used to be
+        // dropped as `filtered_z3` on the read failure alone. They are kept
+        // now (D4.1), so they are counted apart and must reach a confirmer.
+        let mut false_unreadable_kept = 0usize;
         let mut real_total = 0usize;
         let mut real_dropped = 0usize;
         for ((row, check), expected) in rows.iter().zip(checks.iter()).zip(expected_dropped.iter())
@@ -2351,6 +2542,8 @@ mod tests {
                     false_total += 1;
                     if check.dropped {
                         false_dropped += 1;
+                    } else if !row.path_present {
+                        false_unreadable_kept += 1;
                     }
                 }
                 "real" => {
@@ -2366,9 +2559,23 @@ mod tests {
             false_total, 73,
             "the recorded replay holds 73 false findings"
         );
+        // The recorded run dropped 15 of the 73 false findings. Five of those
+        // 15 rested on one thing only: `read(path)` returned `None`. A read
+        // failure does not prove the place is wrong (deleted file, wrong path,
+        // IO error), so those 5 are no longer dropped and now reach a
+        // confirmer; the 10 the rule can still DISPROVE stay dropped.
         assert_eq!(
-            false_dropped, 15,
-            "the grounding rule stops 15 of the 73 false findings"
+            false_dropped + false_unreadable_kept,
+            15,
+            "15 of the 73 false findings were ungrounded at the recorded run"
+        );
+        assert_eq!(
+            false_unreadable_kept, 5,
+            "5 of those 15 rested on a read failure alone and are now kept (D4.1)"
+        );
+        assert_eq!(
+            false_dropped, 10,
+            "the grounding rule still disproves 10 false findings"
         );
         assert_eq!(real_total, 62, "the recorded replay holds 62 real findings");
         assert_eq!(real_dropped, 0, "the grounding rule loses no real finding");
@@ -3493,5 +3700,16 @@ mod tests {
         );
         let models: Vec<&str> = decision.attempts.iter().map(|a| a.model.as_str()).collect();
         assert_eq!(models, vec!["c1", "c2"]);
+    }
+}
+#[cfg(test)]
+mod probe_dbg {
+    #[test]
+    fn probe() {
+        let touched = vec!["a/src/deleted.rs".to_string()];
+        let claim = "the `let guard = value.unwrap()` is dropped".to_string();
+        let read = &(|_: &str| None) as &dyn Fn(&str) -> Option<String>;
+        let g = super::ground_finding("a/src/x.rs:12", &claim, read, &touched);
+        println!("G={g:?} grounded={}", g.grounded());
     }
 }

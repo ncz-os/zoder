@@ -4,7 +4,9 @@
 use crate::config::{Auth, Provider, DEFAULT_ACCOUNT_ID};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
@@ -144,6 +146,163 @@ mod reliability_deadline_tests {
             .expect("a zero budget must be rejected")
             .to_string()
             .contains("greater than zero"));
+    }
+
+    /// D5.8: `OpenAiProvider::new` must not build a `reqwest::Client` per
+    /// dispatch. Two providers on the same base URL share one pooled client
+    /// (same `ClientKey`), so a second call reuses the keep-alive connection
+    /// instead of paying a fresh TCP + TLS handshake; a provider on a
+    /// different base URL gets a different one.
+    #[test]
+    fn providers_sharing_a_base_url_share_one_pooled_client() {
+        let (first, _) = fixture("http://127.0.0.1:1/v1", 1000, 50);
+        let (second, _) = fixture("http://127.0.0.1:1/v1", 1000, 50);
+        let (elsewhere, _) = fixture("http://127.0.0.1:2/v1", 1000, 50);
+        assert!(
+            first.client_key().same_as(second.client_key()),
+            "two dispatches to the same base URL must share one pooled client"
+        );
+        assert!(
+            !first.client_key().same_as(elsewhere.client_key()),
+            "different base URLs must not share a connection pool"
+        );
+        // A per-model retime returns a CLONE of the same handle, so it keeps
+        // using the shared pool (only the deadline moves).
+        let retimed = first.with_request_timeout_s(600).expect("positive");
+        assert!(retimed.client_key().same_as(first.client_key()));
+    }
+
+    #[tokio::test]
+    async fn second_dispatch_reuses_the_first_connection() {
+        // Count accepted TCP connections. With a per-dispatch client each call
+        // opens its own; with the process-wide pool the second reuses the
+        // keep-alive socket.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let mut buf = [0u8; 1024];
+                        let n = match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                      content-length: 2\r\n\r\n[]",
+                                )
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (first, _) = fixture(&uri, 5000, 5000);
+        let _ = first.list_models().await.expect("first /models");
+        let (second, _) = fixture(&uri, 5000, 5000);
+        let _ = second.list_models().await.expect("second /models");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call must reuse the first one's connection, not open another"
+        );
+    }
+
+    /// D5.8: the pool must hand out ONE client per base URL, not build a
+    /// second one under a concurrent first use. Drive many `OpenAiProvider::new`
+    /// calls from several runtime threads at a cold URL and assert they all
+    /// observe the same identity: the pool builds under its lock, so nothing
+    /// can slip past the emptiness check and construct a private client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_construction_shares_one_client_per_base_url() {
+        let uri = "http://127.0.0.1:9/v1"; // never dialed; only client identity
+        let started = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let started = started.clone();
+            tasks.push(tokio::spawn(async move {
+                started.wait().await;
+                fixture(uri, 1000, 50).0.client_key().clone()
+            }));
+        }
+        let mut keys = Vec::new();
+        for task in tasks {
+            keys.push(task.await.expect("constructor task"));
+        }
+        let first = keys.first().expect("at least one key").clone();
+        assert!(
+            keys.iter().all(|k| k.same_as(&first)),
+            "concurrent construction for one base URL must yield one client"
+        );
+    }
+
+    /// D5.8: the pool key is the TRIMMED base URL, so a config that spells the
+    /// same gateway with and without a trailing slash still shares one client
+    /// (and therefore one connection pool). Without the trim before keying,
+    /// `…/v1` and `…/v1/` would each build a client.
+    #[tokio::test]
+    async fn trailing_slash_spellings_share_the_pooled_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let mut buf = [0u8; 1024];
+                        let n = match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                      content-length: 2\r\n\r\n[]",
+                                )
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plain, _) = fixture(&uri, 5000, 5000);
+        let (slashed, _) = fixture(&format!("{uri}/"), 5000, 5000);
+        assert!(
+            plain.client_key().same_as(slashed.client_key()),
+            "base URLs differing only by a trailing slash must share one client"
+        );
+        let _ = plain.list_models().await.expect("first /models");
+        let _ = slashed.list_models().await.expect("second /models");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second dispatch must reuse the first one's connection"
+        );
     }
 
     #[tokio::test]
@@ -1355,6 +1514,64 @@ impl ResponsesResponse {
     }
 }
 
+/// Process-wide [`reqwest::Client`] pool, one entry per base URL.
+///
+/// A `reqwest::Client` owns its connection pool (keep-alive sockets, TLS
+/// sessions, DNS cache). Building one per dispatch threw all of that away, so
+/// every short call — a confirmer, a reviewer — paid a fresh TCP + TLS
+/// handshake. The pool is keyed by the trimmed `base_url`, so providers that
+/// point at the same gateway share connections while two providers on
+/// different hosts never do.
+fn shared_clients() -> &'static Mutex<HashMap<String, reqwest::Client>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stable identity of the client a provider with this `base_url` uses, so a
+/// test can prove two dispatches shared one client without exposing the
+/// `reqwest::Client` itself.
+#[derive(Debug, Clone, Default)]
+pub struct ClientKey(Option<u64>);
+
+impl ClientKey {
+    /// Whether both keys name the same pooled client. `false` when either
+    /// side has no client (a provider that failed to build).
+    pub fn same_as(&self, other: &Self) -> bool {
+        matches!((self.0, other.0), (Some(a), Some(b)) if a == b)
+    }
+}
+
+/// The shared client for `base_url`, building it once per process.
+///
+/// The build is done while holding the pool lock: `reqwest::Client::builder()`
+/// only assembles config (no IO), and holding the lock means two concurrent
+/// dispatches cannot each build, and then race to store, two clients.
+fn shared_client(base_url: &str) -> anyhow::Result<reqwest::Client> {
+    let mut pool = shared_clients()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(client) = pool.get(base_url) {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()?;
+    pool.insert(base_url.to_string(), client.clone());
+    Ok(client)
+}
+
+/// Identity of a pooled client: the address of an `Arc`-like clone target.
+/// `reqwest::Client` is a shallow handle, so we key the identity on the pool
+/// entry itself rather than on the clone we hand out.
+fn client_identity(base_url: &str) -> ClientKey {
+    static IDS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let ids = IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut ids = ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let next = ids.len() as u64 + 1;
+    ClientKey(Some(*ids.entry(base_url.to_string()).or_insert(next)))
+}
+
 /// A configured provider client. `Clone` is cheap and shares the underlying
 /// [`reqwest::Client`] connection pool, which is what makes a per-call
 /// request budget ([`Self::with_request_timeout_s`]) practical on routes that
@@ -1421,6 +1638,8 @@ pub struct OpenAiProvider {
     /// it because capture paths bail before reaching the store).
     account_id: String,
     client: reqwest::Client,
+    /// Identity of the pooled client in `client` (see [`ClientKey`]).
+    client_key: ClientKey,
     request_timeout: Duration,
     idle_timeout: Duration,
     /// Time-to-first-token budget for streamed calls: abort (retryable
@@ -1520,8 +1739,14 @@ impl OpenAiProvider {
         } else {
             None
         };
+        // One pooled client per base URL for the whole process: a fresh
+        // client per dispatch meant no connection, TLS session or DNS entry
+        // was ever reused.
+        let base_url = p.base_url.trim_end_matches('/').to_string();
+        let client = shared_client(&base_url)?;
+        let client_key = client_identity(&base_url);
         Ok(Self {
-            base_url: p.base_url.trim_end_matches('/').to_string(),
+            base_url,
             kind: p.kind.clone(),
             auth_header: p.auth.header_pair(),
             // Cloned so the Anthropic path can re-resolve the raw
@@ -1533,10 +1758,8 @@ impl OpenAiProvider {
             provider_id: p.id.clone(),
             plan_label,
             account_id,
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .pool_idle_timeout(Duration::from_secs(90))
-                .build()?,
+            client,
+            client_key,
             request_timeout: Duration::from_secs(
                 request_timeout_s
                     .or_else(request_timeout_s_from_env)
@@ -1618,6 +1841,13 @@ impl OpenAiProvider {
     /// Exposed for tests and for diagnostics that report the budget in use.
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    /// Identity of the process-wide pooled [`reqwest::Client`] this provider
+    /// uses. Two providers with the same `base_url` report the same key,
+    /// which is how a test proves a dispatch did not build its own client.
+    pub fn client_key(&self) -> &ClientKey {
+        &self.client_key
     }
 
     /// Read step for a stream loop: the idle budget once generation began;

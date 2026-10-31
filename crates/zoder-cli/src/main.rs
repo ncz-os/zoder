@@ -295,6 +295,50 @@ pub(crate) fn record_turn_entry(
         .with_context(|| format!("reconciling reserved {turn_kind} spend"))
 }
 
+/// [`reconcile_policy_checked_turn`] off the async task.
+///
+/// Both halves do small blocking IO: the ledger write (flock + write + fsync)
+/// and the health-store update (lock + read + fsync). The caller's ordering is
+/// preserved — the ledger is still written before the policy failure is
+/// persisted or returned — only the thread the fsync runs on changes. The
+/// updated health store is handed back, so the caller's copy still sees it.
+pub(crate) async fn reconcile_policy_checked_turn_async(
+    reservation: BillableReservation,
+    entry: &Entry,
+    turn_kind: &'static str,
+    health: HealthStore,
+    health_model: &str,
+    policy_failure: Option<String>,
+) -> (anyhow::Result<()>, HealthStore) {
+    let entry = entry.clone();
+    let health_model = health_model.to_string();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut health = health;
+        let result = reconcile_policy_checked_turn(
+            reservation,
+            &entry,
+            turn_kind,
+            &mut health,
+            &health_model,
+            policy_failure.as_deref(),
+        );
+        // The caller still needs the post-update store even when the turn
+        // reported a violation, so hand it back instead of dropping it.
+        (result, health)
+    })
+    .await;
+    match joined {
+        Ok((result, health)) => (result, health),
+        // A panicked/cancelled blocking task must not look like success.
+        Err(join) => (
+            Err(anyhow::anyhow!(
+                "policy check during {turn_kind}: ledger task failed: {join}"
+            )),
+            HealthStore::default(),
+        ),
+    }
+}
+
 /// Classify an observed paid outcome independently of the pre-dispatch route.
 /// A backend can silently change models or billing posture after that route was
 /// approved, so every dispatch site must apply this to the actual result.
@@ -1503,6 +1547,11 @@ enum Cmd {
         /// what the gate would actually do.
         #[arg(long)]
         plan_only: bool,
+        /// Per-step wall-clock limit in seconds. A step that runs longer
+        /// is killed and reported as a failure, so one wedged check cannot
+        /// hang an unattended gate. Default: 1800 (generous on purpose).
+        #[arg(long, value_name = "SECS")]
+        step_timeout: Option<u64>,
         /// Emit machine-readable JSON to stdout (the GateReport +
         /// tool-probe, serialized). Suppresses the pretty renderer.
         #[arg(long)]
@@ -2715,6 +2764,7 @@ async fn run() -> anyhow::Result<()> {
             strict,
             tools_only,
             plan_only,
+            step_timeout,
             json,
         }) => cmd_gate(
             root.as_deref(),
@@ -2722,6 +2772,7 @@ async fn run() -> anyhow::Result<()> {
             *strict,
             *tools_only,
             *plan_only,
+            *step_timeout,
             *json,
         ),
         Some(Cmd::Completions { shell }) => {
@@ -2754,27 +2805,51 @@ async fn run() -> anyhow::Result<()> {
 /// invocation wants clean machine output (`--json`) or it is the `update`
 /// command itself. Cached + opt-out via `ZODER_NO_UPDATE_CHECK=1`; any failure
 /// (offline, etc.) is silently ignored.
+///
+/// The check runs on a background thread and this task waits at most
+/// [`zoder_core::update::BACKGROUND_BUDGET`] for it
+/// ([`zoder_core::update::spawn_background`]), so a short command — every fleet
+/// subprocess included — never pays the update check's network latency. When
+/// the budget expires the hint is dropped for this run; the detached check
+/// still records its outcome, so a failed check is not retried for the whole
+/// retry interval.
 async fn maybe_notify_update(cli: &Cli) {
     if cli.json || matches!(cli.cmd, Some(Cmd::Update { .. })) {
         return;
     }
     let home = Config::home();
-    if let Some(st) =
-        zoder_core::update::check_cached(&home, std::time::Duration::from_secs(86_400)).await
-    {
-        if st.newer {
-            let p = Pal::new();
-            eprintln!(
-                "{}",
-                p.dim(&format!(
-                    "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
-                    st.current,
-                    st.latest,
-                    zoder_core::update::release_url()
-                ))
-            );
+    // The budget wait parks the calling thread, so the check runs on the
+    // blocking pool instead of stalling a runtime worker.
+    let checked = tokio::task::spawn_blocking(move || {
+        zoder_core::update::spawn_background(&home, std::time::Duration::from_secs(86_400))
+    })
+    .await;
+    // `spawn_background` itself returns `Option<UpdateStatus>`: `None` means
+    // "no hint for this run" (budget expired, fresh negative cache, disabled).
+    // Only the outer join can fail, and it fails when the blocking task
+    // panicked, which the update check must still never turn into a command
+    // failure. Debuggable, not silent: the reason goes to the log.
+    let st = match checked {
+        Ok(Some(st)) => st,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(%error, "background update check task failed; skipping the hint");
+            return;
         }
+    };
+    if !st.newer {
+        return;
     }
+    let p = Pal::new();
+    eprintln!(
+        "{}",
+        p.dim(&format!(
+            "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
+            st.current,
+            st.latest,
+            zoder_core::update::release_url()
+        ))
+    );
 }
 
 /// `zoder update [--check]`: report whether a newer release exists; without
@@ -3024,6 +3099,7 @@ fn cmd_gate(
     strict: bool,
     tools_only: bool,
     plan_only: bool,
+    step_timeout: Option<u64>,
     json: bool,
 ) -> anyhow::Result<()> {
     // Resolve the repo root. Default to the current directory; expand
@@ -3110,15 +3186,20 @@ fn cmd_gate(
     }
 
     // Run the plan against the real PATH and produce the final report.
-    let report = outcome.run(&mode);
+    // Steps run in `root_path` (so `--root DIR` checks DIR and not the
+    // caller's cwd) and are bounded by the per-step timeout.
+    let step_timeout = step_timeout
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| {
+            std::time::Duration::from_secs(zoder_core::gate_bundle::DEFAULT_GATE_STEP_TIMEOUT_SECS)
+        });
+    let report = outcome.run(&mode, &root_path, step_timeout);
 
-    // Delegate the exit-code decision to the pure helper so the same
-    // contract is unit-testable. The actual `std::process::exit`
-    // stays here so the binary keeps the documented exit-code surface.
-    let code = gate_exit_code(&mode, &report);
-    if code != 0 {
-        std::process::exit(code);
-    }
+    // The report is rendered on EVERY path, red included: a caller that
+    // asked for `--json` must always get the JSON document (it names the
+    // failing steps), and the human renderer is what a reviewer reads
+    // when the gate blocks. Exiting before rendering left a red gate
+    // with no stdout at all. The exit code is decided after the output.
     if json {
         let payload = serde_json::json!({
             "root": root_path.display().to_string(),
@@ -3140,6 +3221,7 @@ fn cmd_gate(
                 "compatibility": compat_payload(&report.compatibility),
                 "passed_required_names": report.passed_required_names(),
             },
+            "exit_code": gate_exit_code(&mode, &report),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -3161,6 +3243,7 @@ fn cmd_gate(
     // Map (mode, report) -> exit code. Pure function so the same
     // contract is unit-testable (see `gate_exit_code_*` tests); the
     // CLI binary only decides whether to call `std::process::exit`.
+    // This runs AFTER the report is printed (see above).
     //
     // Y-13: under Strict mode, exit 0 ONLY when
     // `is_authoritative_pass()` is true (i.e., the gate certifies "all
@@ -3268,8 +3351,15 @@ impl GateOutcome {
     /// Run the plan against the real PATH and produce the final report.
     /// The runner's `run_plan` + `GateReport::new` recomputes the
     /// status from results so the report stays self-consistent.
-    fn run(&self, mode: &GateMode) -> GateReport {
-        let env = PathEnv::new();
+    fn run(
+        &self,
+        mode: &GateMode,
+        root: &std::path::Path,
+        step_timeout: std::time::Duration,
+    ) -> GateReport {
+        let env = PathEnv::new()
+            .with_working_dir(root)
+            .with_step_timeout(step_timeout);
         let (results, _) = run_plan(&self.plan, *mode, &env);
         // Stamp the mode into the report so consumers (and the rest of
         // the CLI / merge-gate adapters) can distinguish a Strict
@@ -14418,7 +14508,7 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconcile_probe_success(
+async fn reconcile_probe_success(
     cli: &Cli,
     eng: &Engine,
     gate: &PolicyGate,
@@ -14426,8 +14516,8 @@ fn reconcile_probe_success(
     model_id: &str,
     result: ChatResult,
     reservation: BillableReservation,
-    health: &mut HealthStore,
-) -> anyhow::Result<()> {
+    health: HealthStore,
+) -> (anyhow::Result<()>, HealthStore) {
     let tokens_in = result.prompt_tokens.unwrap_or(0);
     let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
     let posture = eng
@@ -14493,14 +14583,17 @@ fn reconcile_probe_success(
         tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    reconcile_policy_checked_turn(
+    // D5.9: the ledger write (flock + fsync) and the health-store update run
+    // on a blocking thread; the caller gets the updated store back.
+    reconcile_policy_checked_turn_async(
         reservation,
         &entry,
         "health probe",
         health,
         model_id,
-        policy_failure.as_deref(),
+        policy_failure.clone(),
     )
+    .await
 }
 
 /// Pick the probe for `health --probe`.
@@ -14640,7 +14733,7 @@ async fn run_probe_default(
         match provider.stream_chat(&req, None).await {
             Ok(result) => {
                 let ms = t.elapsed().as_millis() as f64;
-                reconcile_probe_success(
+                let (reconciled, updated) = reconcile_probe_success(
                     cli,
                     eng,
                     &gate,
@@ -14648,8 +14741,11 @@ async fn run_probe_default(
                     id,
                     result,
                     reservation,
-                    health,
-                )?;
+                    std::mem::take(health),
+                )
+                .await;
+                *health = updated;
+                reconciled?;
                 health.record_success(id, ms);
                 if !quiet {
                     eprintln!("  ok   {id}  {ms:.0}ms");
@@ -14995,7 +15091,7 @@ async fn run_probe_all(
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
                     Ok(Ok(result)) => {
                         let ms = t.elapsed().as_millis() as f64;
-                        reconcile_probe_success(
+                        let (reconciled, updated) = reconcile_probe_success(
                             cli,
                             eng,
                             &gate,
@@ -15003,8 +15099,11 @@ async fn run_probe_all(
                             model_id,
                             result,
                             reservation,
-                            health,
-                        )?;
+                            std::mem::take(health),
+                        )
+                        .await;
+                        *health = updated;
+                        reconciled?;
                         health.record_classified_success(
                             model_id,
                             ms,
@@ -17248,6 +17347,12 @@ mod gate_tests {
     use zoder_core::gate::{Ecosystem, GateMode, GateStatus, GateStep, StepCategory, StepOutcome};
     use zoder_core::gate_bundle::default_bundle;
 
+    /// Steps in these tests are `true`/`echo`-class commands; give them
+    /// a timeout that can never bite.
+    fn test_gate_step_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
     #[test]
     fn empty_repo_yields_no_plan_and_inconclusive_status() {
         // A repo with NO marker files must produce an empty plan, no
@@ -17264,7 +17369,7 @@ mod gate_tests {
         assert!(outcome.plan.is_empty(), "no markers -> empty plan");
         assert!(outcome.signals.ecosystems.is_empty());
         assert!(outcome.probe.is_empty(), "no plan -> no probe");
-        let report = outcome.run(&GateMode::Strict);
+        let report = outcome.run(&GateMode::Strict, tmp.path(), test_gate_step_timeout());
         assert_eq!(
             report.status,
             GateStatus::Inconclusive,
@@ -17512,7 +17617,7 @@ mod gate_tests {
         let outcome = run_gate_for_root(tmp.path());
         assert_eq!(outcome.plan.len(), 0);
         assert_eq!(outcome.pre_run_compat.added_baseline.len(), 0);
-        let report = outcome.run(&GateMode::Strict);
+        let report = outcome.run(&GateMode::Strict, tmp.path(), test_gate_step_timeout());
         assert!(
             !report.is_passed(),
             "empty repo must NOT be is_passed() (Z-6), got status {:?}",

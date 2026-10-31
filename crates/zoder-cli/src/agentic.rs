@@ -1076,8 +1076,9 @@ fn plan_loop_review(
     // that marker would still be an approve on a partial view, so refuse it
     // even when `max_diff_bytes` was raised above the acquisition cap.
     anyhow::ensure!(
-        !diff.contains("[git diff truncated during acquisition"),
-        "review diff was truncated during acquisition; refusing to approve an incomplete view"
+        !diff_is_truncated(diff),
+        "{}",
+        truncated_diff_refusal(MAX_GIT_DIFF_BYTES)
     );
     // Definition context is paid for inside the per-route chunk budget: the
     // chunk cap is reduced by the context share, and the context builder gets
@@ -2527,15 +2528,19 @@ async fn dispatch_reviewer_for_model(
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    let mut health = HealthStore::load(&eng.cfg.health_path);
-    if let Err(e) = crate::reconcile_policy_checked_turn(
+    let health = HealthStore::load(&eng.cfg.health_path);
+    // The reservation's reconcile is a flock + write + fsync: keep it off the
+    // dispatch task (D5.9) and hand the updated store back.
+    let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
         ledger_reservation,
         &ledger_entry,
         "reviewer turn",
-        &mut health,
+        health,
         model,
-        policy_failure.as_deref(),
-    ) {
+        policy_failure.clone(),
+    )
+    .await;
+    if let Err(e) = reconciled {
         // Policy violation: NOT fallback-worthy. The verified-cost
         // / paid-without-opt-in failure is a structural invariant; we
         // must not silently bury it by trying the next candidate.
@@ -2756,6 +2761,15 @@ pub(crate) struct ReviewOutput {
     filtered_findings: Vec<serde_json::Value>,
 }
 
+impl ReviewOutput {
+    /// D4.5: this output is the "nothing to review" result, not a verdict on
+    /// any change. Recognized by the [`EMPTY_DIFF_RESULT`] verdict marker so a
+    /// reviewer model can never produce it by accident.
+    fn is_empty_diff(&self) -> bool {
+        self.verdict.trim().eq_ignore_ascii_case(EMPTY_DIFF_VERDICT)
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -2943,16 +2957,16 @@ fn parse_review(raw: &str) -> ReviewOutput {
     if let Some(r) = parse_review_json_only(trimmed) {
         return r;
     }
-    // Fallback for free-form prose: try to recover an explicit verdict keyword
-    // so a genuinely productive prose review is not treated identically to a
-    // broken reviewer. This is a clearly-separated, conservative path.
-    if let Some(recovered) = try_parse_verdict_from_prose(trimmed) {
-        return recovered;
-    }
-    // Y-4: no parseable verdict object AND no recoverable prose verdict → FAIL
-    // CLOSED. A review we cannot extract a verdict from (prose without any
-    // explicit verdict signal, a refusal like "I cannot review this", an empty
-    // `{}`) must BLOCK — the previous non-blocking `"comment"` let an
+    // D4.6: there is NO prose-verdict recovery. The old
+    // `try_parse_verdict_from_prose` fallback took the first verdict keyword it
+    // found, so it recovered `approve` from truncated JSON and from "I would
+    // not approve" — a keyword scan cannot tell a verdict from a negation, a
+    // conditional or a restated schema. A verdict now comes from a balanced
+    // JSON object or not at all.
+    //
+    // Y-4: no parseable verdict object → FAIL CLOSED. A review we cannot
+    // extract a verdict from (prose, a refusal like "I cannot review this",
+    // an empty `{}`) must BLOCK — the previous non-blocking `"comment"` let an
     // unreviewed/refused iteration resolve as if approved. `request_changes`
     // is the fail-closed verdict, mirroring `synthesize_review_phase_failure`.
     ReviewOutput {
@@ -3090,130 +3104,6 @@ fn strict_review(raw: &str) -> Option<ReviewOutput> {
     None
 }
 
-/// Known verdict keywords (case-insensitive) that `verdict_rank` recognizes.
-/// The prose fallback only emits one of these; everything else is ignored.
-const KNOWN_VERDICTS: &[&str] = &[
-    "approve",
-    "request_changes",
-    "comment",
-    "reject",
-    "block",
-    "neutral",
-];
-
-/// Best-effort recovery of a `ReviewOutput` from free-form prose that does NOT
-/// contain parseable JSON. The strategy is deliberately conservative:
-///
-/// 1. Scan the prose for any unambiguous verdict keyword (case-insensitive,
-///    word-boundary or start-of-string anchored).
-/// 2. If found, emit a `ReviewOutput` with that verdict and the full prose as
-///    both `summary` and the body of a single `Finding`.
-/// 3. If NOT found, return `None` so the caller falls through to the existing
-///    fail-closed behavior in `parse_review`.
-///
-/// Safety: this never guesses a verdict. If no clear signal is present the
-/// function returns `None` and the caller still fails closed (`request_changes`).
-/// Check whether a keyword match at `keyword_pos` in `lowered` is bounded
-/// by non-alphanumeric characters (or start/end of string) on both sides.
-/// This turns a plain substring search into a word-boundary search.
-///
-/// Underscores are NOT considered alphanumeric, so `request_changes` is
-/// treated as a single token: the internal `_` does not break the match,
-/// but the outer edges still require non-alphanumeric boundaries.
-fn is_word_boundary(keyword_pos: usize, keyword: &str, lowered: &str) -> bool {
-    let start = keyword_pos;
-    let end = keyword_pos + keyword.len();
-
-    // Boundary before the keyword: must be start-of-string or a non-"word" char.
-    // A "word" character is alphanumeric or underscore (so "approve" inside
-    // "disapprove" or "approve_extra" does NOT match, while "request_changes"
-    // is treated as a single token whose internal underscore does not break
-    // the match but whose outer edges still require non-word boundaries).
-    let before_ok = if start == 0 {
-        true
-    } else {
-        let prev_byte = start - 1;
-        let mut i = prev_byte;
-        while i > 0 && !lowered.is_char_boundary(i) {
-            i -= 1;
-        }
-        if i == 0 {
-            !is_word_char(lowered.chars().next().unwrap())
-        } else {
-            let ch = lowered[i..].chars().next().unwrap();
-            !is_word_char(ch)
-        }
-    };
-
-    if !before_ok {
-        return false;
-    }
-
-    // Boundary after the keyword: must be end-of-string or a non-"word" char.
-    let after_ok = if end >= lowered.len() {
-        true
-    } else {
-        let ch = lowered[end..].chars().next().unwrap();
-        !is_word_char(ch)
-    };
-
-    after_ok
-}
-
-/// Returns true if `c` is a "word" character — alphanumeric or underscore.
-/// This is used to implement `\b`-like boundary checking without regex.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-fn try_parse_verdict_from_prose(raw: &str) -> Option<ReviewOutput> {
-    let lower = raw.to_ascii_lowercase();
-    // Search for each known verdict. Prefer the first match by position (i.e.
-    // the earliest-appearing verdict keyword in the prose). The match must
-    // satisfy word-boundary constraints on both sides — the keyword must not
-    // be a substring of a longer alphanumeric word (e.g. "disapprove" must
-    // NOT match "approve", and "blocking" must NOT match "block").
-    let mut best_pos: Option<usize> = None;
-    let mut best_verdict: Option<String> = None;
-    for &v in KNOWN_VERDICTS {
-        let mut offset = 0;
-        while let Some(pos) = lower[offset..].find(v).map(|p| p + offset) {
-            // Check word boundaries at this match position.
-            if is_word_boundary(pos, v, &lower) {
-                match &best_pos {
-                    Some(bp) if pos >= *bp => { /* keep earlier */ }
-                    _ => {
-                        best_pos = Some(pos);
-                        best_verdict = Some(v.to_string());
-                    }
-                }
-                break; // Found the boundary-anchored match for this keyword; move on.
-            }
-            // No boundary match at this position; keep looking past it.
-            offset = pos + 1;
-        }
-    }
-    let verdict = best_verdict?;
-    let verdict_lower = verdict.to_ascii_lowercase();
-    // Verdict must be present; now build the output.
-    Some(ReviewOutput {
-        verdict: verdict.clone(),
-        summary: format!(
-            "Reviewer produced free-form analysis (recovered verdict: {}).",
-            verdict_lower
-        ),
-        findings: vec![Finding {
-            severity: "info".into(),
-            title: format!("prose review – verdict: {verdict_lower}"),
-            body: raw.to_string(),
-            location: None,
-            disposition: None,
-        }],
-        next_steps: vec![],
-        ..Default::default()
-    })
-}
-
 fn verdict_rank(v: &str) -> u8 {
     // Z-2: verdicts must rank case- and whitespace-insensitively. Real LLM
     // output drifts casing (`"BLOCK"`, `"Request_Changes"`, `"REJECT"`) and
@@ -3243,6 +3133,42 @@ fn verdict_rank(v: &str) -> u8 {
 // ---------------------------------------------------------------------------
 
 const MAX_GIT_DIFF_BYTES: usize = 1 << 20; // 1 MiB
+
+/// The marker `render_capped_git_diff` appends when acquisition stopped at
+/// `MAX_GIT_DIFF_BYTES`. A review that is handed this marker is looking at a
+/// PARTIAL diff: the tail of the change was never captured.
+const DIFF_ACQUISITION_TRUNCATION_MARKER: &str = "[git diff truncated during acquisition";
+
+/// `zoder review`'s own result for "nothing to review" (D4.5).
+///
+/// A review with no diff is a distinct outcome, not an approval: before it,
+/// an empty diff was reported with `verdict: "approve"` and exit 0, so a CI
+/// gate keyed on the verdict read "no changes" as "changes reviewed and
+/// clean" — including the case where `--base` was the wrong ref.
+const EMPTY_DIFF_RESULT: &str = "empty_diff";
+
+/// Non-approve verdict paired with [`EMPTY_DIFF_RESULT`].
+///
+/// Not a new rank: `verdict_rank` already fails closed on an unrecognized
+/// verdict, so `zoder review` exits nonzero for it exactly like a block. The
+/// verdict STRING is the stable contract; the exit-code NUMBER stays owned by
+/// the failure-contract job.
+const EMPTY_DIFF_VERDICT: &str = "empty_diff";
+
+/// Fail-closed text for a diff acquisition cut off at the byte cap.
+fn truncated_diff_refusal(max_bytes: usize) -> String {
+    format!(
+        "the review diff was truncated during acquisition at {max_bytes} bytes, so the tail of \
+the change was never captured; refusing to review (or approve) a partial diff. Narrow the \
+scope (--scope working-tree, a nearer --base), exclude generated files (--exclude <glob>), or \
+review the change in pieces"
+    )
+}
+
+/// Does this raw diff carry the acquisition-truncation marker?
+fn diff_is_truncated(diff: &str) -> bool {
+    diff.contains(DIFF_ACQUISITION_TRUNCATION_MARKER)
+}
 const MAX_GIT_STDERR_BYTES: usize = 64 << 10; // 64 KiB
 
 struct CappedRead {
@@ -3551,6 +3477,38 @@ fn review_zoderignore_patterns(
     } else {
         crate::review_diff::load_zoderignore(root)
     }
+}
+
+/// D4.5: say so when a branch review is empty because the base IS HEAD.
+///
+/// An explicit `--base` that resolves to HEAD (a full sha, `HEAD`, or a short
+/// sha reaching it) reviews an empty range by construction — a wrong base
+/// that used to be reported as "no changes to review" with an `approve`
+/// verdict. The label carries the diagnosis into the `empty_diff` result.
+fn empty_branch_label(
+    cwd: &Path,
+    scope: ReviewScope,
+    base: Option<&str>,
+    label: &str,
+    diff: &str,
+) -> String {
+    if !matches!(scope, ReviewScope::Branch | ReviewScope::Auto) || !diff.trim().is_empty() {
+        return label.to_string();
+    }
+    let resolve = |rev: &str| {
+        run_git(cwd, &["rev-parse", rev])
+            .ok()
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+    };
+    let Some(head) = resolve("HEAD") else {
+        return label.to_string();
+    };
+    let base_rev = detect_base(cwd, base);
+    if resolve(&base_rev).as_deref() != Some(head.as_str()) {
+        return label.to_string();
+    }
+    format!("{label}; the base {base_rev} is HEAD, so the range is empty")
 }
 
 /// Baseline state of a repository at the start of a loop iteration.
@@ -5290,6 +5248,32 @@ pub(crate) async fn cmd_review(
     }
 
     let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
+    let label = empty_branch_label(&cwd, scope, base.as_deref(), &label, &diff);
+    // D4.4: `zoder review` refused nothing about a truncated diff — only the
+    // loop did — so with `--max-diff-bytes` above the 1 MiB acquisition cap
+    // the reviewer was shown a partial change and could approve it.
+    if diff_is_truncated(&diff) {
+        let reason = truncated_diff_refusal(MAX_GIT_DIFF_BYTES);
+        let failed = ReviewerSlot::Failed {
+            model: "(truncated)".into(),
+            err: reason.clone(),
+        };
+        let agg = emit_reviews(
+            cli,
+            &ReviewAggregate {
+                reviewers: &[failed],
+                cost_usd: 0.0,
+                requested: 1,
+                ok_models: 0,
+                failed_models: 1,
+                receipts: &[],
+                exclusions: None,
+                chunking: None,
+                confirm: &[],
+            },
+        );
+        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
+    }
     if let Some(reason) = empty_diff_hides_uncommitted_work(&cwd, scope, &label, &diff) {
         let failed = ReviewerSlot::Failed {
             model: "(no diff)".into(),
@@ -5311,10 +5295,14 @@ pub(crate) async fn cmd_review(
         );
         anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
     }
+    // D4.5: an empty diff is its OWN result (`empty_diff`), never `approve`.
+    // `zoder review` has no validator to pass, so an approve here says
+    // "nothing was wrong" about a change nobody looked at — including a
+    // `--base` typo that reviewed an empty range.
     if diff.trim().is_empty() {
         let out = ReviewOutput {
-            verdict: "approve".into(),
-            summary: format!("No changes to review ({label})."),
+            verdict: EMPTY_DIFF_VERDICT.into(),
+            summary: format!("{EMPTY_DIFF_RESULT}: no changes to review ({label})."),
             findings: vec![],
             next_steps: vec![],
             ..Default::default()
@@ -5336,7 +5324,11 @@ pub(crate) async fn cmd_review(
                 confirm: &[],
             },
         );
-        return Ok(());
+        anyhow::bail!(
+            "{EMPTY_DIFF_RESULT}: no changes to review ({label}); nothing was reviewed, so \
+             this is not an approval. Check the scope and --base (an empty range usually means \
+             the base already contains the change)."
+        );
     }
 
     let system = if adversarial {
@@ -5994,14 +5986,12 @@ async fn confirm_reviews(
         let ReviewerSlot::Ok { model, review } = slot else {
             continue;
         };
-        if !verdict_triggers_confirmation(&review.verdict) {
-            continue;
-        }
-        if !review
-            .findings
-            .iter()
-            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
-        {
+        // Confirmation runs for a blocking verdict, AND for any review that
+        // carries a `high`/`critical` finding whatever its verdict: a
+        // `comment` (or `approve`) with a blocking finding must be re-checked
+        // before it can pass, or a critical defect the reviewer itself
+        // reported never gets a second opinion.
+        if !confirmation_applies(review) {
             continue;
         }
         let reviewer_model = model.clone();
@@ -6018,11 +6008,23 @@ async fn confirm_reviews(
         {
             confirm_sections.push(section);
             // The confirmed verdict supersedes the reviewer's own: a review
-            // whose findings all demoted is no longer request_changes.
+            // whose findings all demoted is no longer request_changes, and a
+            // review whose `comment` carried a finding that still blocks
+            // (or was confirmed) is raised to request_changes.
             review.verdict = verdict;
         }
     }
     confirm_sections
+}
+
+/// Whether the confirm layer runs for this review: it blocks on the
+/// reviewer's verdict, or the reviewer reported a `high`/`critical` finding.
+fn confirmation_applies(review: &ReviewOutput) -> bool {
+    verdict_triggers_confirmation(&review.verdict)
+        || review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
 }
 
 /// Dispatch one confirmer call and turn the reply into an attempt.
@@ -6090,9 +6092,14 @@ async fn dispatch_confirmer(
 /// Confirm-on-reject for a single reviewer's output.
 ///
 /// Returns the confirm section (record shape v1) and the verdict the review
-/// should carry. When the verdict does NOT trigger confirmation (an
-/// `approve`) or no finding is a `high`/`critical` candidate, the output is
-/// returned unchanged except for a `not_run`-only record.
+/// should carry. Confirmation runs when the verdict is blocking OR the review
+/// carries a `high`/`critical` finding; when there is no such finding the
+/// reviewer's own verdict is returned unchanged.
+///
+/// The returned verdict is the merged one, except that a `comment` (or
+/// `approve`) whose blocking finding was NOT demoted is raised to
+/// `request_changes`: the reviewer reported a blocker and no independent
+/// confirmer rejected it, so it must not pass as a non-blocking verdict.
 ///
 /// The confirmer is dispatched through the same reviewer call path as a
 /// reviewer (`dispatch_reviewer_for_model`), so every configured gate applies:
@@ -6134,8 +6141,16 @@ async fn confirm_review(
         return None;
     }
 
-    // Confirm only on a blocking verdict; an approve stays advisory.
-    let confirm_this = verdict_triggers_confirmation(&review.verdict);
+    // Confirmation runs for a blocking verdict, and for any review carrying a
+    // `high`/`critical` finding: a `comment` that reports a critical defect
+    // must be re-checked, and raised to request_changes when the finding
+    // stands. An `approve` carrying a blocking finding is re-checked too — the
+    // raise rule is what stops it passing.
+    let confirm_this = verdict_triggers_confirmation(&review.verdict)
+        || review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity));
 
     let (blocking, non_blocking): (Vec<_>, Vec<_>) = all
         .into_iter()
@@ -6159,29 +6174,15 @@ async fn confirm_review(
     }
 
     if !confirm_this {
-        // An approve (or comment): no confirmation runs. Blocking findings, if
-        // any, are recorded not_run and non-blocking because the verdict never
-        // blocked in the first place.
-        for f in &blocking {
-            decisions.push(FindingDecision {
-                finding_id: f.id.clone(),
-                severity: f.severity.clone(),
-                location: f.location.clone(),
-                quote: f.quote.clone(),
-                quote_found: f.quote_found,
-                disposition: Disposition::NotRun,
-                blocking: false,
-                reason: "verdict is not request_changes; confirmation never runs".to_string(),
-                attempts: Vec::new(),
-            });
-        }
+        // No blocking-severity finding at all: there is nothing to confirm,
+        // so the reviewer's verdict stands unchanged.
         let merged = crate::review_confirm::ConfirmedReview {
             decisions,
             demoted: Vec::new(),
             effective_blocking: false,
             reviewer_family_recall: None,
         };
-        let verdict = "approve".to_string();
+        let verdict = review.verdict.clone();
         let payload = crate::review_confirm::record(
             &merged,
             reviewer_model,
@@ -6267,7 +6268,14 @@ async fn confirm_review(
         effective_blocking: confirmed.effective_blocking,
         reviewer_family_recall: confirmed.reviewer_family_recall,
     };
-    let verdict = merged.effective_verdict().to_string();
+    // A verdict of `comment` (or `approve`) with a blocking finding that was
+    // not demoted is raised to request_changes: the reviewer reported a
+    // blocker in its own output, and no independent confirmer rejected it.
+    let verdict = if crate::review_confirm::raised_by_confirmed_finding(&merged, &review.verdict) {
+        "request_changes".to_string()
+    } else {
+        merged.effective_verdict().to_string()
+    };
     let payload = crate::review_confirm::record(
         &merged,
         reviewer_model,
@@ -6309,6 +6317,33 @@ fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::Confirm
 /// surface as `complete=false` + a non-`approve` verdict, never a silent
 /// "comment" that lets CI think the review ran).
 fn aggregate_review(
+    reviews: &[ReviewerSlot],
+    cost_usd: f64,
+    requested: usize,
+    ok_models: usize,
+    failed_models: usize,
+) -> (String, bool, serde_json::Value) {
+    let (agg, all_failed, mut payload) =
+        aggregate_review_verdicts(reviews, cost_usd, requested, ok_models, failed_models);
+    // D4.5: "there was nothing to review" is its own machine-readable result,
+    // carried next to (never instead of) the aggregate verdict so a consumer
+    // that reads `verdict` alone still sees the fail-closed non-approve.
+    // Absent for every review that had a diff, so old consumers are
+    // unaffected.
+    if let Some(slot) = reviews
+        .iter()
+        .find(|slot| slot.review().is_some_and(ReviewOutput::is_empty_diff))
+    {
+        payload["result"] = json!(EMPTY_DIFF_RESULT);
+        payload["empty_diff"] = json!(true);
+        payload["error"] = json!(slot.display_summary());
+    }
+    (agg, all_failed, payload)
+}
+
+/// The aggregate verdict walk and the per-reviewer payload, without the
+/// [`EMPTY_DIFF_RESULT`] decoration [`aggregate_review`] adds on top.
+fn aggregate_review_verdicts(
     reviews: &[ReviewerSlot],
     cost_usd: f64,
     requested: usize,
@@ -7524,6 +7559,17 @@ fn has_located_blocking_finding(r: &ReviewOutput) -> bool {
     })
 }
 
+/// Does any sample carry an UNLOCATED `critical`? D4.3: the three-sample
+/// majority used to ignore it, so two fresh approvals could resolve a loop
+/// while a critical defect the reviewer could not place was still open.
+/// An unlocated `high` keeps its existing (advisory) treatment here; a
+/// critical never depends on a location to veto.
+fn has_unlocated_critical_finding(r: &ReviewOutput) -> bool {
+    r.findings
+        .iter()
+        .any(|f| f.severity.trim().eq_ignore_ascii_case("critical") && !has_concrete_location(f))
+}
+
 /// Downgrade an unlocated `request_changes` to the fail-closed
 /// `comment_no_evidence` state. `loop_review_ok` fails closed on the unknown
 /// verdict so this can NEVER resolve; the loop additionally exempts it from
@@ -7545,13 +7591,17 @@ comment-with-no-evidence, NOT as a blocking defect. Original summary: {}",
 }
 
 /// Majority decision over the loop's three reviewer samples. Approve iff a
-/// strict majority approve AND no sample carries a located blocking finding.
-/// An empty sample set or a tie is never an approval (fail-closed).
+/// strict majority approve AND no sample carries a located blocking finding
+/// or an unlocated `critical` finding (D4.3). An empty sample set or a tie is
+/// never an approval (fail-closed).
 pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
     if samples.is_empty() {
         return false;
     }
-    if samples.iter().any(has_located_blocking_finding) {
+    if samples
+        .iter()
+        .any(|r| has_located_blocking_finding(r) || has_unlocated_critical_finding(r))
+    {
         return false;
     }
     let approvals = samples
@@ -7571,8 +7621,9 @@ pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
 /// majority can only be reached when two independent reviewers overrule the
 /// one noisy block. The current sample is included in `majority_loop_approval`
 /// so a single fresh approve cannot resolve, and in the located-blocker veto
-/// (see `majority_loop_approval`) so a located `critical`/`high` finding in ANY
-/// sample blocks — on an unchanged diff it is by definition still unaddressed.
+/// (see `majority_loop_approval`) so a located `critical`/`high` finding — or
+/// an unlocated `critical` (D4.3) — in ANY sample blocks; on an unchanged diff
+/// it is by definition still unaddressed.
 ///
 /// The objective gate and the anti-gaming substance gate must both hold.
 /// An unparseable, unavailable, or synthesized-failure sample is not an
@@ -7753,25 +7804,53 @@ fn bounded_located_findings(findings: &[Finding], reviewer_model: Option<&str>) 
     out
 }
 
-/// Count "blocking" findings. Severity that blocks depends on whether the
-/// objective gate is already green: when the build/test check passes we only
-/// block on `critical` (treat `high` as advisory), otherwise `critical|high`.
-/// In both cases a blocking finding must cite a concrete location, which filters
-/// the hallucinated high-severity findings over-strict free reviewers emit on an
-/// already-correct tree.
-fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
+/// Count "blocking" findings: every `critical`, plus every `high` when no
+/// objective check actually passed (`green == false`).
+///
+/// D4.3 (2026-10-31). Two calibration holes let the loop resolve with a real
+/// defect still open:
+///
+///   1. `high` severity was dropped whenever the build/test check passed. A
+///      green check says the code compiles and the tests held — it says
+///      nothing about a missing authorization check or a data loss path a
+///      reviewer reported. Only a passing check downgrades the `high` class.
+///   2. A finding with no concrete location was not counted at all, so an
+///      unlocated `critical` was invisible to the resolution gate. The
+///      location requirement only ever existed to filter over-strict free
+///      reviewers, and it must never satisfy the gate on its own: absence of
+///      a location is missing evidence, not evidence of safety. The
+///      no-evidence case is handled separately by [`is_unlocated_block`],
+///      which re-asks for a located finding and then fails closed.
+///
+/// `green` therefore only ever excuses `high` severity, and never a
+/// `critical`.
+fn count_blocking(r: &ReviewOutput, _green: bool) -> usize {
     r.findings
         .iter()
         .filter(|f| {
-            let s = f.severity.to_lowercase();
-            let sev_blocks = if green {
-                s == "critical"
-            } else {
-                s == "critical" || s == "high"
-            };
-            sev_blocks && has_concrete_location(f)
+            let s = f.severity.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "critical" | "high")
         })
         .count()
+}
+
+/// The model that actually answered this iteration's review, when a verdict
+/// chunk confirms it.
+///
+/// D4.3: the iteration record's `review_unlocated_no_evidence` flag tells a
+/// consumer that a reviewer answered and could not place a blocking defect,
+/// so the record has to name WHICH reviewer. `run_loop_review` already
+/// returns that model as the top-level slot of `reviewer_verdicts`, but the
+/// flag path took the model from the chunk completion, which is `None` on a
+/// reviewer fallback — so the evidence was there and thrown away. Read it
+/// from the record instead of from the dispatch bookkeeping.
+fn reviewer_model_from_verdicts(verdicts: &[serde_json::Value]) -> Option<String> {
+    verdicts
+        .iter()
+        .filter(|v| v.get("verdict").is_some())
+        .filter_map(|v| v.get("model").and_then(serde_json::Value::as_str))
+        .find(|m| !m.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Synthesize the `ReviewOutput` used when the loop's review phase cannot
@@ -8090,6 +8169,9 @@ pub(crate) struct LoopResolutionSignals {
 ///   3. Non-substantive diffs (Empty / WhitespaceOnly / CommentOnly) are
 ///      explicitly rejected by the anti-gaming guard, even when the
 ///      check is green.
+///   4. A blocking finding blocks EVERY resolve path, `--accept-on-green`
+///      included (D4.3). A green check never excuses a `high` finding, and
+///      no path excuses a `critical`.
 pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green: bool) -> bool {
     let substance_ok = substance_accept_eligible(&s.substance);
     let check_explicit_passed = s.check_passed == Some(true);
@@ -8106,7 +8188,12 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
         verdict: s.verdict.clone(),
         ..Default::default()
     };
-    let review_ok = loop_review_ok(&review, s.blocking_findings);
+    // D4.3: an `approve` verdict is only a review-ok verdict when the
+    // heuristic found nothing blocking. `loop_review_ok`'s
+    // `v == "approve" || blocking == 0` used to let a reviewer that said
+    // "approve" while still reporting a `high` (or an unlocated `critical`)
+    // finding satisfy the gate on its own.
+    let review_ok = s.blocking_findings == 0 && loop_review_ok(&review, s.blocking_findings);
     // Anti-gaming guard: never accept a non-substantive diff on a green /
     // check-satisfied iteration. Mirrors the in-loop guard exactly.
     if (check_explicit_passed || check_satisfied) && !substance_ok {
@@ -8117,10 +8204,13 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
     if !review_ok {
         return false;
     }
-    // `--accept-on-green` is an opt-in: requires a REAL passing check
-    // AND no reviewer block. Even under --accept-on-green, an explicit
-    // request_changes / reject / block verdict cannot be overridden.
-    if accept_on_green && check_explicit_passed && substance_ok {
+    // `--accept-on-green` is an opt-in: a REAL passing check plus a reviewer
+    // that raised no blocking finding. D4.3: the same fail-closed blocker
+    // applies here. `--accept-on-green` used to return `true` on a green
+    // check regardless of the reviewer's findings, so it was the one path
+    // where a check passing silently satisfied the gate for a `high` or an
+    // unlocated `critical` finding.
+    if accept_on_green && check_explicit_passed && substance_ok && review_ok {
         return true;
     }
     // Default resolve path: check satisfied (no negative information)
@@ -9242,11 +9332,17 @@ diff is not a finished turn"
         // finding keeps today's semantics.
         let mut review_unlocated_no_evidence = false;
         if is_unlocated_block(&review) {
+            // D4.3: the re-ask used to end "Otherwise return approve or
+            // comment", which invites an approve for a defect the reviewer
+            // could not place — exactly the verdict the gate must not
+            // harvest. The re-ask now either produces a located blocking
+            // finding or a non-blocking verdict that asserts no blocking
+            // defect; approving is only ever the reviewer's own call.
             let located_preamble = format!(
                 "{review_preamble}\n\nThe reviewer returned request_changes with no located finding. \
 A blocking defect MUST cite a concrete location (path:line). Re-review this diff; if you still \
 request changes, include at least one finding with an exact location. Otherwise return approve \
-or comment.\n"
+or comment together with an explicit statement that no blocking defect exists.\n"
             );
             let (r2, m2, c2, ch2, rv2) = match phase_watchdog(
                 LoopPhase::Review,
@@ -9387,6 +9483,11 @@ or comment.\n"
             // never as complete. Empty `reviewer_verdicts` (review errored or
             // was never run) is absent data, and absent data stays incomplete.
             "review_complete": iteration_review_complete(&reviewer_verdicts),
+            // D4.3: name the reviewer that answered. `reviewer_model` above
+            // is set only from a completion, so a reviewer fallback can leave
+            // it null while the verdict slot still records the serving model;
+            // `review_unlocated_no_evidence` below must stay traceable to it.
+            "reviewer_model": reviewer_model_from_verdicts(&reviewer_verdicts).clone(),
             // `reviewer_verdicts` is an array when a reviewer reported; on
             // the incomplete-Err path it is absent (empty), never a lone
             // `false` that a JSON parser would read as the field's value.
@@ -10896,20 +10997,24 @@ mod tests {
         assert_eq!(parse_review(raw).verdict, "reject");
     }
 
-    // ---- prose fallback: revert-to-prose recovery for free-form reviews ----
+    // ---- no prose fallback: a verdict needs a JSON object (D4.6) ----
 
     #[test]
-    fn prose_recovery_recovers_explicit_approve() {
-        // A real LLM response with "approve" buried in prose should be recovered.
+    fn prose_review_with_explicit_approve_fails_closed() {
+        // Was `prose_recovery_recovers_explicit_approve`: the reviewed
+        // decision (D4.6) is the opposite — a keyword in prose is not a
+        // verdict, so this answer blocks instead of approving.
         let raw = "I looked at the code. The changes look good. My verdict is approve. The implementation is clean and follows best practices.";
         let r = parse_review(raw);
         assert_eq!(
-            r.verdict, "approve",
-            "prose with explicit 'approve' must be recovered, not fail-closed"
+            r.verdict, "request_changes",
+            "prose with 'approve' must NOT be recovered as a verdict (D4.6)"
         );
         assert!(
-            r.summary.to_ascii_lowercase().contains("approve"),
-            "recovered summary should mention the recovered verdict"
+            r.findings
+                .iter()
+                .any(|f| f.body.contains("My verdict is approve")),
+            "the fail-closed finding must preserve the raw reviewer text"
         );
     }
 
@@ -10925,14 +11030,14 @@ mod tests {
             .is_none(),
             "prose must not be accepted as a loop verdict"
         );
-        // ...while the legacy `parse_review` prose recovery is unchanged for
-        // non-loop callers (e.g. the standalone review surfaces).
+        // ...and `parse_review` no longer recovers a prose verdict for any
+        // caller (D4.6): it fails closed on the same input.
         assert_eq!(
             parse_review(
                 "I looked at the code. My verdict is approve. The implementation is clean."
             )
             .verdict,
-            "approve"
+            "request_changes"
         );
         // A real JSON verdict object is still accepted.
         let parsed = parse_review_json_only(
@@ -11228,11 +11333,15 @@ mod tests {
             !majority_loop_approval(&[approve.clone(), approve.clone(), located_block]),
             "a located blocking finding in any sample vetoes approval"
         );
-        // An UNLOCATED block is not a valid defect and does not veto a majority.
+        // An UNLOCATED critical is not evidence of safety and DOES veto a
+        // majority (D4.3): `count_blocking` no longer drops findings for
+        // lacking a location, and neither may this majority walk. The
+        // no-evidence handling (`mark_unlocated_no_evidence` →
+        // `comment_no_evidence`, which never resolves) is unchanged.
         let unlocated_block = review_with("request_changes", vec![unlocated_finding("critical")]);
         assert!(
-            majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
-            "an unlocated request_changes is comment-with-no-evidence, not a veto"
+            !majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
+            "an unlocated critical in any sample vetoes approval"
         );
     }
 
@@ -11375,214 +11484,108 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prose_recovery_recovers_explicit_request_changes() {
-        // A prose review saying "I request changes" should be recovered.
-        let raw = "After reviewing the code, I see a potential buffer overflow in the parsing loop. I request changes to fix this security issue before merging.";
+    // ---- D4.6: prose is NOT a verdict, approve least of all ----
+    //
+    // `parse_review` used to fall back to `try_parse_verdict_from_prose`,
+    // which took the FIRST verdict keyword it found anywhere in the text.
+    // These tests pin the replacement contract: a verdict comes from a
+    // balanced JSON object or the review fails closed as `request_changes`.
+    // There is deliberately no recovery of any keyword from prose.
+
+    /// Fails-closed assertion used by the prose cases below.
+    fn assert_prose_blocks(raw: &str, why: &str) {
         let r = parse_review(raw);
         assert_eq!(
             r.verdict, "request_changes",
-            "prose with 'request_changes' must be recovered"
+            "{why}: prose must fail closed, got verdict {:?} for {raw:?}",
+            r.verdict
         );
     }
 
     #[test]
-    fn prose_recovery_recovers_explicit_reject() {
-        let raw = "The code has critical design flaws. The architecture does not match the requirements. My decision is reject this PR.";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "reject");
-    }
-
-    #[test]
-    fn prose_recovery_recovers_explicit_comment() {
-        let raw = "The code looks fine. This is just a style comment — no issues found. Comment: the naming conventions could be improved but it's not a blocker.";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "comment");
-    }
-
-    #[test]
-    fn prose_recovery_case_insensitive() {
-        // Mixed case should still be recovered.
-        let raw = "The code is solid. My verdict is APPROVE — let's merge it.";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "approve");
-    }
-
-    #[test]
-    fn prose_recovery_no_verdict_fails_closed() {
-        // Prose WITHOUT any recognizable verdict keyword must still fail closed.
-        let raw = "I looked at the code. The implementation seems reasonable but I have some concerns about edge cases that weren't addressed. The error handling could be better in places.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "prose without explicit verdict must still fail closed"
+    fn prose_approve_is_never_recovered_as_a_verdict() {
+        // D4.6: the headline case. "My verdict is approve." in prose used to
+        // parse as an approval.
+        assert_prose_blocks(
+            "I looked at the code. The changes look good. My verdict is approve. \
+             The implementation is clean and follows best practices.",
+            "a plain prose approval",
         );
     }
 
     #[test]
-    fn prose_recovery_early_verdict_wins() {
-        // If multiple verdicts appear, the earliest one in the prose wins.
-        let raw = "I think approve is fine, but after more analysis I request_changes due to a security concern.";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "approve");
-    }
-
-    #[test]
-    fn prose_recovery_mixed_json_and_prose_prefers_json() {
-        // When JSON is present alongside prose, the JSON path should still win.
-        let raw = "Here's my review:\n\n- Line 42 has a bug\n\n{\"verdict\":\"approve\",\"summary\":\"good code\",\"findings\":[]}";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "approve");
-        assert_eq!(r.summary, "good code");
-    }
-
-    #[test]
-    fn prose_recovery_verdict_in_prose_overrides_no_verdict_json() {
-        // A JSON object without a verdict falls through to prose fallback.
-        let raw = "{\"note\":\"review pending\"}\n\nMy verdict is approve — the code looks solid.";
-        let r = parse_review(raw);
-        assert_eq!(r.verdict, "approve");
-    }
-
-    // ---- Word-boundary regression tests for try_parse_verdict_from_prose (issue #14) ----
-    // The prose-fallback path must NOT recover a verdict when the keyword
-    // appears only as a substring of a longer word (e.g. "disapprove" must
-    // not be recovered as "approve", and "blocking" must not be recovered
-    // as "block"). The fix added word-boundary checking on both sides.
-
-    #[test]
-    fn prose_disapprove_does_not_recover_as_approve() {
-        // "disapprove" contains "approve" as a substring; must NOT be
-        // recovered as approve. The reviewer meant the opposite — this
-        // test guarantees the fail-closed behavior prevents a wrong verdict
-        // from silently slipping through.
-        let raw = "I disapprove of this change — the API contract is broken.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"disapprove\" must NOT be recovered as \"approve\" — fail closed"
+    fn truncated_json_does_not_recover_approve_from_prose() {
+        // D4.6: a JSON object cut off mid-stream still contains the word
+        // "approve"; the prose keyword scan recovered it as an approval.
+        // A truncated verdict is not a verdict.
+        assert_prose_blocks(
+            "Here is my review: {\"verdict\": \"approve\", \"summary\": \"looks fine\", \
+             \"findings\": [",
+            "truncated JSON naming approve",
         );
     }
 
     #[test]
-    fn prose_blocking_does_not_recover_as_block() {
-        // "blocking" contains "block" as a substring; must NOT be recovered
-        // as block. Prose like "no blocking issues here" should fail closed.
-        let raw = "There are no blocking issues here, the changes look fine.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"blocking\" must NOT be recovered as \"block\" — fail closed"
+    fn negated_approve_is_not_recovered_as_approve() {
+        // D4.6: "I would not approve" contains the keyword "approve" as a
+        // standalone word. The keyword scan cannot see the negation, so it
+        // read this blocking review as an approval.
+        assert_prose_blocks(
+            "I would not approve this change: the error path leaks the handle.",
+            "a negated approve",
         );
     }
 
     #[test]
-    fn prose_unblock_does_not_recover_as_block() {
-        // "unblock" contains "block" — must not be recovered as "block".
-        let raw = "I unblock this PR after verifying the integration tests.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"unblock\" must NOT be recovered as \"block\" — fail closed"
+    fn prose_request_changes_is_not_recovered_as_a_verdict() {
+        // The recovery went both ways: prose that mentions
+        // "request_changes" also came back as a structured verdict even
+        // though the reviewer never returned one. It must fail closed.
+        assert_prose_blocks(
+            "After reviewing the code, I see a potential buffer overflow. \
+             I request changes to fix this before merging.",
+            "prose request_changes",
         );
     }
 
     #[test]
-    fn prose_roadblock_does_not_recover_as_block() {
-        let raw = "There is a roadblock in the CI pipeline.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"roadblock\" must NOT be recovered as \"block\" — fail closed"
+    fn prose_earliest_keyword_does_not_win() {
+        // The old rule was "earliest keyword wins", so a review that starts
+        // by restating the options ("approve or request_changes") and ends
+        // by blocking resolved as an approval.
+        assert_prose_blocks(
+            "I think approve is fine, but after more analysis I request_changes \
+             due to a security concern.",
+            "an early approve followed by a block",
         );
     }
 
     #[test]
-    fn prose_approved_does_not_recover_as_approve() {
-        // "approved" contains "approve" — must not be recovered as "approve".
-        let raw = "The changes look approved. Please proceed with the merge.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"approved\" must NOT be recovered as \"approve\" — fail closed"
+    fn no_verdict_prose_fails_closed() {
+        assert_prose_blocks(
+            "I looked at the code. The implementation seems reasonable but I have \
+             some concerns about edge cases that weren't addressed.",
+            "prose without a verdict keyword",
         );
     }
 
     #[test]
-    fn prose_commentary_does_not_recover_as_comment() {
-        // "commentary" contains "comment" — must not be recovered as "comment".
-        let raw = "This is just some commentary on the code style.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"commentary\" must NOT be recovered as \"comment\" — fail closed"
+    fn json_without_a_verdict_does_not_fall_through_to_prose() {
+        // D4.6: a decoy/wrong JSON object used to fall through to the prose
+        // scanner, which then found "approve" in the surrounding text.
+        assert_prose_blocks(
+            "{\"note\":\"review pending\"}\n\nMy verdict is approve — the code looks solid.",
+            "a verdict-shaped JSON object with no verdict key",
         );
     }
 
     #[test]
-    fn prose_rejecting_does_not_recover_as_reject() {
-        // "rejecting" contains "reject" — must not be recovered as "reject".
-        let raw = "I am rejecting this PR due to security concerns.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"rejecting\" must NOT be recovered as \"reject\" — fail closed"
-        );
-    }
-
-    #[test]
-    fn prose_neutralize_does_not_recover_as_neutral() {
-        // "neutralize" contains "neutral" — must not be recovered as "neutral".
-        let raw = "The team decided to neutralize this approach.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"neutralize\" must NOT be recovered as \"neutral\" — fail closed"
-        );
-    }
-
-    #[test]
-    fn prose_request_changes_with_underscore_still_works() {
-        // "request_changes" contains an underscore — it should still match.
-        // Underscore is NOT treated as a word boundary, so "request_changes"
-        // as a single token should match when preceded/followed by
-        // non-alphanumeric chars.
-        let raw = "The review label was request_changes so I agree with this.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "request_changes",
-            "\"request_changes\" must be recovered — underscore is not a boundary break"
-        );
-    }
-
-    #[test]
-    fn prose_block_as_standalone_word_still_works() {
-        // "block" used as its own word (not substring) should still recover.
-        let raw = "My decision: block — there are critical security issues.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "block",
-            "standalone \"block\" must still be recovered"
-        );
-    }
-
-    #[test]
-    fn prose_produce_correct_earliest_verdict_with_boundaries() {
-        // Multiple verdicts in prose, earliest boundary-anchored one wins.
-        // "approve" appears first as a standalone word; "block" appears
-        // later but inside "blocker" (another substring).
-        let raw = "I think approve is fine overall, but there is one blocker to fix.";
-        let r = parse_review(raw);
-        assert_eq!(
-            r.verdict, "approve",
-            "earliest standalone keyword \"approve\" wins over substring \"block\" in \"blocker\""
-        );
-    }
-
-    #[test]
-    fn prose_mixed_json_and_prose_still_prefers_json() {
-        // JSON path should still take priority over prose fallback.
-        let raw = "Here's my review:\n\n{\"verdict\":\"approve\",\"summary\":\"good code\",\"findings\":[]}";
+    fn real_json_verdict_still_parses_next_to_prose() {
+        // Counter-test for the cases above: a genuine verdict OBJECT is
+        // still read, prose around it included. The fix removes keyword
+        // recovery, not the JSON path.
+        let raw = "Here's my review:\n\n- Line 42 has a bug\n\n\
+                   {\"verdict\":\"approve\",\"summary\":\"good code\",\"findings\":[]}";
         let r = parse_review(raw);
         assert_eq!(r.verdict, "approve");
         assert_eq!(r.summary, "good code");
@@ -13858,6 +13861,335 @@ not run to max_iters"
             "a neutral comment (no blocker) must exit 0"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // D4.1 + D4.2: two paths that used to let a blocked PR exit 0. Both are
+    // golden tests: they drive the PRODUCTION bridge (grounding -> pre-check
+    // -> aggregate -> the aggregate verdict `cmd_review` gates on) and then
+    // assert the exit-code decision `cmd_review` applies, `verdict_rank >= 2`.
+    // -----------------------------------------------------------------------
+
+    /// The reviewed head for the two golden tests: one readable file.
+    fn read_src_test(path: &str) -> Option<String> {
+        (path == "src/a.rs").then(|| "fn a() { let x = 1; }\n".to_string())
+    }
+
+    /// A reviewer's confirmed finding, as the confirm bridge sees it.
+    fn finding_at(severity: &str, location: &str, claim: &str) -> Finding {
+        Finding {
+            severity: severity.into(),
+            title: claim.into(),
+            body: claim.into(),
+            location: Some(location.into()),
+            disposition: None,
+        }
+    }
+
+    /// The verdict `cmd_review` gates on for one reviewer's review after the
+    /// confirm bridge ran over it. This is `aggregate_review`'s worst-rank
+    /// walk, the same one `emit_reviews` -> `cmd_review` uses.
+    fn gated_verdict(review: &ReviewOutput) -> (String, bool) {
+        let slot = ReviewerSlot::Ok {
+            model: "real".into(),
+            review: review.clone(),
+        };
+        let (agg, _, _) = aggregate_review(std::slice::from_ref(&slot), 0.0, 1, 1, 0);
+        let bail = verdict_rank(&agg) >= 2;
+        (agg, bail)
+    }
+
+    /// A confirmer attempt that CONFIRMED the finding: it quotes the context
+    /// verbatim and speaks only about `finding_id`.
+    fn confirming_attempt(
+        finding_id: &str,
+        context: &str,
+    ) -> crate::review_confirm::ConfirmerAttempt {
+        crate::review_confirm::confirmer_attempt_from_reply(
+            "confirmer-model".into(),
+            "other".into(),
+            5,
+            &json!({
+                "finding_id": finding_id,
+                "disposition": "confirm",
+                "quote": context.lines().next().unwrap_or(""),
+                "reason": "the defect is real",
+            })
+            .to_string(),
+            finding_id,
+            context,
+        )
+    }
+
+    /// D4.1 golden: a reviewer blocks on a `critical` finding that cites a
+    /// file the review cannot read (`a/src/x.rs`, not in the tree — a deleted
+    /// file, or an IO error). The unreadable file must not disprove the
+    /// finding: it is kept, reaches a confirmer, is confirmed, and the review
+    /// still blocks -> `cmd_review` exits NONZERO.
+    ///
+    /// The regression: the grounding check read `None` from the cited path as
+    /// "the location does not exist", the pre-check dropped the finding as
+    /// `filtered_z3` with no model call, the only blocker was gone, the verdict
+    /// became `comment`, and `cmd_review` exited 0.
+    #[tokio::test]
+    async fn cmd_review_exits_nonzero_for_unreadable_cited_path() {
+        use crate::review_confirm::{build_context, precheck, ConfirmLimits, Disposition};
+
+        let cited = "a/src/x.rs";
+        let location = format!("{cited}:4");
+        let claim = "the `let guard = value.unwrap()` is dropped";
+        // The reader the review uses: the cited path is unreadable, and the
+        // diff touches exactly that file.
+        let read = |path: &str| -> Option<String> { (path != cited).then(|| "fn f() {}\n".into()) };
+        let touched = vec![cited.to_string()];
+        let all = pending_findings_for_confirm(
+            &ReviewOutput {
+                verdict: "request_changes".into(),
+                summary: "the guard is dropped".into(),
+                findings: vec![finding_at("critical", &location, claim)],
+                next_steps: vec![],
+                ..Default::default()
+            },
+            "fam",
+            &touched,
+            &read,
+        );
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].grounded,
+            "an unreadable cited path neither grounds nor disproves the finding; \
+             it must stay ungroundable (kept), not be dropped"
+        );
+        assert!(
+            all[0].ungrounded_reason.is_empty(),
+            "an unreadable path is not a reason to drop: {}",
+            all[0].ungrounded_reason
+        );
+
+        // Pre-check: NOT dropped, so it reaches a confirmer.
+        let (checks, pending) = precheck(&all);
+        assert!(!checks[0].dropped, "the blocking finding must be kept");
+        assert_eq!(pending.len(), 1, "the finding must reach a confirmer");
+
+        // The confirmer re-checks it from the same unreadable state.
+        let context = build_context(&pending[0], "", &read, 40, &touched);
+        let limits = ConfirmLimits::default();
+        let jobs: Vec<crate::review_confirm::ConfirmationJob> = pending
+            .iter()
+            .map(|f| crate::review_confirm::ConfirmationJob {
+                plan: crate::review_confirm::FindingPlan {
+                    finding: f.clone(),
+                    reviewer_model: "real".into(),
+                    reviewer_family: "fam".into(),
+                    confirmer_chain: vec!["confirmer-model".into()],
+                    context: context.clone(),
+                },
+                confirmers: vec!["confirmer-model".into()],
+            })
+            .collect();
+        let merged = crate::review_confirm::aggregate(&jobs, &limits, &mut |plan| {
+            vec![confirming_attempt(&plan.finding.id, &plan.context)]
+        });
+        assert_eq!(merged.decisions.len(), 1);
+        assert_eq!(merged.decisions[0].disposition, Disposition::Confirmed);
+        assert!(merged.effective_blocking);
+        assert_eq!(merged.effective_verdict(), "request_changes");
+
+        // And `cmd_review`'s gate: the review still blocks.
+        let mut review = rro("request_changes");
+        review.findings = vec![finding_at("critical", &location, claim)];
+        review.verdict = merged.effective_verdict().into();
+        let (agg, bail) = gated_verdict(&review);
+        assert!(
+            bail,
+            "an unreadable cited path must not unblock the review (aggregate {agg})"
+        );
+    }
+
+    /// D4.2 golden: a reviewer answers `comment` but carries a `critical`
+    /// finding, and the confirmer CONFIRMS it. A verdict of `comment` with a
+    /// confirmed critical finding must be raised to `request_changes`, and
+    /// `cmd_review` must exit NONZERO.
+    ///
+    /// The regression: confirmation ran only for blocking verdicts, so a
+    /// `comment` carrying a `critical` finding was never re-checked, and
+    /// `strict_review` forbids only `approve` with a critical/high finding, so
+    /// the review passed.
+    #[tokio::test]
+    async fn cmd_review_exits_nonzero_for_comment_with_critical_finding() {
+        use crate::review_confirm::{
+            is_blocking_severity, raised_by_confirmed_finding, ConfirmLimits, Disposition,
+        };
+
+        let review = ReviewOutput {
+            verdict: "comment".into(),
+            summary: "one serious concern".into(),
+            findings: vec![finding_at(
+                "critical",
+                "src/a.rs:1",
+                "the `let x = 1` is wrong",
+            )],
+            next_steps: vec![],
+            ..Default::default()
+        };
+        assert!(is_blocking_severity(&review.findings[0].severity));
+        // The production trigger: a comment with a blocking-severity finding
+        // must reach confirmation instead of being skipped.
+        assert!(
+            verdict_triggers_confirmation(&review.verdict)
+                || review
+                    .findings
+                    .iter()
+                    .any(|f| is_blocking_severity(&f.severity)),
+            "a comment carrying a critical finding must reach confirmation"
+        );
+
+        let all = pending_findings_for_confirm(&review, "fam", &[], &read_src_test);
+        assert_eq!(all.len(), 1);
+        let context = "the `let x = 1` is wrong";
+        let limits = ConfirmLimits::default();
+        let jobs: Vec<crate::review_confirm::ConfirmationJob> = all
+            .iter()
+            .map(|f| crate::review_confirm::ConfirmationJob {
+                plan: crate::review_confirm::FindingPlan {
+                    finding: f.clone(),
+                    reviewer_model: "real".into(),
+                    reviewer_family: "fam".into(),
+                    confirmer_chain: vec!["confirmer-model".into()],
+                    context: context.into(),
+                },
+                confirmers: vec!["confirmer-model".into()],
+            })
+            .collect();
+        let merged = crate::review_confirm::aggregate(&jobs, &limits, &mut |plan| {
+            vec![confirming_attempt(&plan.finding.id, &plan.context)]
+        });
+        assert_eq!(merged.decisions[0].disposition, Disposition::Confirmed);
+        assert!(merged.effective_blocking);
+
+        // The raise rule: a confirmed critical/high finding blocks even the
+        // reviewer's own `comment`.
+        assert!(raised_by_confirmed_finding(&merged, &review.verdict));
+        let mut corrected = review.clone();
+        corrected.verdict = merged.effective_verdict().into();
+        assert_eq!(corrected.verdict, "request_changes");
+        let (agg, bail) = gated_verdict(&corrected);
+        assert!(
+            bail,
+            "comment with a confirmed critical finding must block (aggregate {agg})"
+        );
+    }
+
+    /// The raises rule pinned for every blocking disposition, and NOT for a
+    /// demoted finding: a `comment` whose critical finding the confirmer
+    /// REJECTED (with two independent rejects) stays `comment` and exits 0.
+    #[test]
+    fn comment_with_critical_finding_blocks() {
+        use crate::review_confirm::{
+            raised_by_confirmed_finding, ConfirmLimits, Disposition, FindingDecision, FindingPlan,
+            PendingFinding,
+        };
+
+        let f = PendingFinding {
+            id: "id".into(),
+            severity: "critical".into(),
+            location: "src/a.rs:1".into(),
+            quote: None,
+            claim: "the `let x = 1` is wrong".into(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let j = crate::review_confirm::ConfirmationJob {
+            plan: FindingPlan {
+                finding: f,
+                reviewer_model: "real".into(),
+                reviewer_family: "fam".into(),
+                confirmer_chain: vec!["c1".into()],
+                context: "ctx the `let x = 1` is wrong".into(),
+            },
+            confirmers: vec!["c1".into()],
+        };
+        let limits = ConfirmLimits::default();
+
+        // Confirmed -> raised.
+        let confirmed =
+            crate::review_confirm::aggregate(std::slice::from_ref(&j), &limits, &mut |plan| {
+                vec![confirming_attempt(&plan.finding.id, &plan.context)]
+            });
+        assert!(raised_by_confirmed_finding(&confirmed, "comment"));
+        // An `approve` with a confirmed critical finding is raised too: the
+        // verdict the reviewer wrote never survives its own confirmed blocker.
+        assert!(raised_by_confirmed_finding(&confirmed, "approve"));
+
+        // No confirmer could be resolved (`not_run`): still blocking, so still
+        // raised. An unconfirmed finding is never a rejection either.
+        let not_run =
+            crate::review_confirm::aggregate(std::slice::from_ref(&j), &limits, &mut |_| {
+                Vec::new()
+            });
+        assert_eq!(not_run.decisions[0].disposition, Disposition::NotRun);
+        assert!(raised_by_confirmed_finding(&not_run, "comment"));
+
+        // Two independent rejects demote a critical: no confirmed finding
+        // remains, so the `comment` stands and must NOT be raised.
+        let demoted = crate::review_confirm::aggregate(&[j], &limits, &mut |plan| {
+            let id = plan.finding.id.clone();
+            ["c1", "c2"]
+                .iter()
+                .map(|m| {
+                    crate::review_confirm::confirmer_attempt_from_reply(
+                        m.to_string(),
+                        format!("fam-{m}"),
+                        3,
+                        &json!({
+                            "finding_id": id,
+                            "disposition": "reject",
+                            "quote": plan.context.trim(),
+                            "reason": "the guard exists",
+                        })
+                        .to_string(),
+                        &id,
+                        &plan.context,
+                    )
+                })
+                .collect()
+        });
+        assert_eq!(demoted.decisions[0].disposition, Disposition::Rejected);
+        assert!(
+            !demoted.decisions[0].blocking,
+            "a demoted finding does not block"
+        );
+        assert!(
+            !demoted.effective_blocking,
+            "with its only blocker demoted the review does not block"
+        );
+        assert!(
+            !raised_by_confirmed_finding(&demoted, "comment"),
+            "a critical rejected by independent confirmers must NOT raise the comment"
+        );
+        assert!(
+            !raised_by_confirmed_finding(&demoted, "approve"),
+            "a rejected finding must not raise an approve either"
+        );
+
+        // A `request_changes` with a confirmed finding keeps blocking: the
+        // rule only ever raises, so it leaves an already-blocking verdict
+        // alone (never lowers it).
+        assert!(!raised_by_confirmed_finding(
+            &crate::review_confirm::ConfirmedReview {
+                decisions: vec![FindingDecision {
+                    finding_id: "x".into(),
+                    ..confirmed.decisions[0].clone()
+                }],
+                demoted: vec![],
+                effective_blocking: true,
+                reviewer_family_recall: None,
+            },
+            "request_changes"
+        ));
+        assert!(confirmed.effective_blocking);
+        assert_eq!(confirmed.effective_verdict(), "request_changes");
+    }
 }
 
 #[cfg(test)]
@@ -14789,6 +15121,187 @@ mod loop_resolution_tests {
              verdict field was matched case-sensitively and this iteration \
              leaked through as RESOLVED."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D4.3: the loop must not resolve while an UNLOCATED CRITICAL or a `high`
+    // finding exists. Both halves were calibrated open: `count_blocking`
+    // ignored `high` whenever `--check` passed and ignored every finding
+    // without a concrete location, `decide_loop_resolution` treated an absent
+    // `--check` as satisfied, and the re-ask prompt for an unlocated block
+    // suggested "approve or comment".
+    // -----------------------------------------------------------------------
+
+    /// The regression. An `approve` (or `comment`) review that still carries
+    /// an unlocated `critical` finding must NOT resolve the loop, with or
+    /// without a passing `--check`, and the recorded `blocking_findings`
+    /// count must say so.
+    #[test]
+    fn loop_does_not_resolve_on_unlocated_critical() {
+        for verdict in ["approve", "comment"] {
+            for (check_configured, check_passed) in
+                [(true, Some(true)), (false, None), (true, Some(false))]
+            {
+                let review = ReviewOutput {
+                    verdict: verdict.into(),
+                    summary: "critical data loss path, could not pin the file".into(),
+                    findings: vec![Finding {
+                        severity: "critical".into(),
+                        title: "unbounded write can corrupt the ledger".into(),
+                        body: "the writer is not atomic and nothing bounds it".into(),
+                        // No location: the reviewer could not cite one.
+                        location: None,
+                        disposition: None,
+                    }],
+                    next_steps: vec![],
+                    ..Default::default()
+                };
+                let signals = loop_signals_from_review(
+                    DiffSubstance::Substantive,
+                    check_configured,
+                    check_passed,
+                    &review,
+                );
+                assert!(
+                    signals.blocking_findings >= 1,
+                    "an unlocated critical finding must count as blocking \
+                     (verdict={verdict}, check_passed={check_passed:?}); pre-fix \
+                     `count_blocking` dropped it for having no location"
+                );
+                assert!(
+                    !decide_loop_resolution(&signals, false),
+                    "an unlocated critical finding must NOT resolve the loop \
+                     (verdict={verdict}, check_passed={check_passed:?}); pre-fix \
+                     the location requirement hid it from `count_blocking` and \
+                     an `approve` verdict resolved"
+                );
+                // `--accept-on-green` is not an escape hatch either.
+                assert!(
+                    !decide_loop_resolution(&signals, true),
+                    "even under --accept-on-green, an unlocated critical must \
+                     NOT resolve (verdict={verdict}, check_passed={check_passed:?})"
+                );
+            }
+        }
+    }
+
+    /// The second half of D4.3: a `high` finding blocks even when the
+    /// objective check passes. A green build/test run says nothing about a
+    /// missing authorization check or a data-loss path, so only `medium` and
+    /// below are advisory on a green iteration.
+    #[test]
+    fn loop_does_not_resolve_on_high_finding_with_a_green_check() {
+        let with_location = |location: Option<&str>| ReviewOutput {
+            verdict: "approve".into(),
+            summary: "one high-severity concern".into(),
+            findings: vec![Finding {
+                severity: "high".into(),
+                title: "authorization check removed from the write path".into(),
+                body: "the handler no longer verifies the caller owns the row".into(),
+                location: location.map(str::to_string),
+                disposition: None,
+            }],
+            next_steps: vec![],
+            ..Default::default()
+        };
+        for location in [Some("crates/zoder-cli/src/agentic.rs:42"), None] {
+            let signals = loop_signals_from_review(
+                DiffSubstance::Substantive,
+                true,
+                Some(true), // --check passed
+                &with_location(location),
+            );
+            assert_eq!(
+                signals.blocking_findings, 1,
+                "a high finding must block even on a green check \
+                 (location={location:?}); pre-fix only `critical` blocked here"
+            );
+            assert!(
+                !decide_loop_resolution(&signals, false),
+                "a high finding on a green check must NOT resolve the loop \
+                 (location={location:?})"
+            );
+        }
+        // Lower severities stay advisory on a green check: the fix must not
+        // turn every finding into a blocker.
+        let mut medium = with_location(Some("crates/zoder-cli/src/agentic.rs:42"));
+        medium.findings[0].severity = "medium".into();
+        let signals =
+            loop_signals_from_review(DiffSubstance::Substantive, true, Some(true), &medium);
+        assert_eq!(signals.blocking_findings, 0);
+        assert!(
+            decide_loop_resolution(&signals, false),
+            "a medium finding on a green check with an approving verdict still resolves"
+        );
+    }
+
+    /// The three-sample majority must not overrule an unlocated critical
+    /// either: two fresh approvals on an unchanged diff used to win because
+    /// the veto only looked at LOCATED blocking findings.
+    #[test]
+    fn unchanged_diff_majority_does_not_overrule_an_unlocated_critical() {
+        let approve = |findings: Vec<Finding>| ReviewOutput {
+            verdict: "approve".into(),
+            summary: "no located defect".into(),
+            findings,
+            next_steps: vec![],
+            ..Default::default()
+        };
+        let unlocated_critical = Finding {
+            severity: "critical".into(),
+            title: "credential is logged".into(),
+            body: "the token reaches the trace sink".into(),
+            location: None,
+            disposition: None,
+        };
+        let current = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "blocked".into(),
+            ..Default::default()
+        };
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve(vec![unlocated_critical.clone()]), approve(vec![]),],
+                true,
+                true,
+            ),
+            "a fresh `approve` sample that still carries an unlocated critical must veto"
+        );
+        // An `high` finding stays non-vetoing in this path (unchanged
+        // behavior): only a critical is location-independent.
+        let unlocated_high = Finding {
+            severity: "high".into(),
+            ..unlocated_critical.clone()
+        };
+        assert!(
+            majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve(vec![unlocated_high]), approve(vec![])],
+                true,
+                true,
+            ),
+            "an unlocated high finding does not veto the three-sample majority"
+        );
+    }
+
+    /// The iteration record must name the reviewer that answered when the
+    /// completion path could not: `review_unlocated_no_evidence` is only
+    /// actionable if the record says which model produced it.
+    #[test]
+    fn iteration_record_names_the_reviewer_that_answered() {
+        let verdicts = vec![
+            json!({"model": "", "verdict": "comment"}),
+            json!({"model": "cerberus-reviewer", "verdict": "comment"}),
+        ];
+        assert_eq!(
+            reviewer_model_from_verdicts(&verdicts).as_deref(),
+            Some("cerberus-reviewer")
+        );
+        assert_eq!(reviewer_model_from_verdicts(&[]), None);
+        // A slot without a verdict (a skip record) is not evidence of who
+        // answered.
+        assert_eq!(reviewer_model_from_verdicts(&[json!({"model": "x"})]), None);
     }
 }
 
@@ -19847,6 +20360,259 @@ data: [DONE]\n\n";
         );
         // No reviewer was ever dispatched.
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D4.4 / D4.5: `zoder review` refuses a truncated diff, and reports an empty
+// diff as its own `empty_diff` result instead of an approval.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod review_refusal_tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
+
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "review-refusal-test"]);
+        run(&["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo)
+    }
+
+    /// Commit `body` into README.md on the CURRENT branch and return the SHA
+    /// it was committed on top of.
+    fn commit_change(repo: &Path, body: &str) -> String {
+        let parent = run_git(repo, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("README.md"), body).unwrap();
+        for args in [
+            &["add", "README.md"][..],
+            &["commit", "-q", "-m", "change"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        parent
+    }
+
+    fn caps(hunk: usize, diff: usize) -> crate::review_diff::ReviewCaps {
+        crate::review_diff::ReviewCaps {
+            max_hunk_bytes: hunk,
+            max_diff_bytes: diff,
+            max_chunks: 64,
+            max_tokens_floor: None,
+            from_route: false,
+        }
+    }
+
+    fn review_cli(repo: &Path, base: Option<&str>) -> crate::Cli {
+        let mut argv = vec!["zoder", "review", "-C", repo.to_str().unwrap()];
+        if let Some(b) = base {
+            argv.push("--base");
+            argv.push(b);
+        }
+        crate::Cli::try_parse_from(argv).expect("review cli")
+    }
+
+    /// D4.4 REGRESSION: `zoder review` must REFUSE a diff acquisition that was
+    /// cut off at the 1 MiB cap. Only the loop refused the marker, so a
+    /// `--max-diff-bytes` above the acquisition cap sent the reviewer a
+    /// partial diff and its approve stood.
+    ///
+    /// Fails on the base (the reviewer is dispatched and approves the partial
+    /// diff) and passes with the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_refuses_truncated_diff() {
+        let (_dir, repo) = init_repo();
+        // Isolate from whatever engine corpus/config the host has: the review
+        // is refused before any reviewer is resolved, and a stray config must
+        // not turn the refusal into a different failure.
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home = super::reviewer_chain_dispatch_tests::HomeGuard::new(home_dir.path());
+        // Well over the 1 MiB acquisition cap.
+        let mut body = String::from("seed\n");
+        for i in 0..60_000 {
+            body.push_str(&format!("line-{i:05}-padding-padding-padding\n"));
+        }
+        // The change is committed on `main` itself, so the ONLY base that is
+        // not HEAD is the commit before it.
+        let parent = commit_change(&repo, &body);
+
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::Branch, Some(&parent)).expect("build_diff");
+        assert!(
+            diff_is_truncated(&diff),
+            "fixture diff must exceed the acquisition cap (len={})",
+            diff.len()
+        );
+
+        // Backstop: even if acquisition produced an untruncated diff, the
+        // planner must refuse the marker rather than chunk a partial view.
+        let err = plan_loop_review(
+            &diff,
+            "branch",
+            "task\n",
+            caps(9_000, 200_000_000),
+            &[],
+            &[],
+            false,
+            &|_, _| String::new(),
+            8192,
+        )
+        .expect_err("a truncated diff must never be planned for review");
+        assert!(
+            err.to_string().contains("truncated during acquisition"),
+            "the refusal must name the truncation: {err}"
+        );
+
+        let cli = review_cli(&repo, Some(&parent));
+        let err = cmd_review(
+            &cli,
+            Some(parent.clone()),
+            ReviewScope::Branch,
+            None,
+            false,
+            false,
+            &[],
+            ReviewSizeOptions {
+                excludes: vec![],
+                // Above the acquisition cap: the configuration the base let
+                // through as an approve of a partial diff.
+                max_diff_bytes: Some(200_000_000),
+                max_hunk_bytes: None,
+                split_hunks: true,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("review must refuse a diff truncated during acquisition");
+        assert!(
+            err.to_string().contains("truncated during acquisition"),
+            "refusal must name the truncation: {err}"
+        );
+        assert!(
+            err.to_string().contains("refused"),
+            "refusal must be an explicit refusal, not a reviewer failure: {err}"
+        );
+    }
+
+    /// D4.5 REGRESSION: an empty diff is its OWN result (`empty_diff`), never
+    /// `approve`, and a `--base` equal to HEAD must not read as approval.
+    ///
+    /// Fails on the base (verdict `approve`, exit 0) and passes with the
+    /// `empty_diff` result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_reports_empty_diff_instead_of_approving() {
+        let (_dir, repo) = init_repo();
+        let head = run_git(&repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        let head = head.trim().to_string();
+
+        let (label, diff) =
+            build_diff(&repo, ReviewScope::Branch, Some(&head)).expect("build_diff");
+        assert!(diff.trim().is_empty(), "base == HEAD reviews nothing");
+        let label = empty_branch_label(&repo, ReviewScope::Branch, Some(&head), &label, &diff);
+        assert!(
+            label.contains("the base") && label.contains("is HEAD"),
+            "an empty range whose base IS HEAD must say so: {label}"
+        );
+
+        // The pure aggregation carries the distinct result, and the verdict
+        // it carries is NOT `approve`.
+        let out = ReviewOutput {
+            verdict: EMPTY_DIFF_VERDICT.into(),
+            summary: format!("{EMPTY_DIFF_RESULT}: no changes to review ({label})."),
+            ..Default::default()
+        };
+        let (agg, _all_failed, payload) = aggregate_review(
+            &[ReviewerSlot::Ok {
+                model: "n/a".into(),
+                review: out,
+            }],
+            0.0,
+            1,
+            1,
+            0,
+        );
+        assert_eq!(payload["result"].as_str(), Some(EMPTY_DIFF_RESULT));
+        assert_eq!(payload["empty_diff"].as_bool(), Some(true));
+        assert_ne!(
+            agg, "approve",
+            "an empty diff must never aggregate as approve"
+        );
+        assert_ne!(
+            verdict_rank(&agg),
+            0,
+            "an empty diff must not rank as approve"
+        );
+
+        // A real review has no `result`/`empty_diff` fields.
+        let (_, _, real) = aggregate_review(
+            &[ReviewerSlot::Ok {
+                model: "m".into(),
+                review: ReviewOutput {
+                    verdict: "approve".into(),
+                    summary: "clean".into(),
+                    ..Default::default()
+                },
+            }],
+            0.0,
+            1,
+            1,
+            0,
+        );
+        assert!(real.get("result").is_none());
+        assert!(real.get("empty_diff").is_none());
+
+        let cli = review_cli(&repo, Some(&head));
+        let err = cmd_review(
+            &cli,
+            Some(head.clone()),
+            ReviewScope::Branch,
+            None,
+            false,
+            false,
+            &[],
+            ReviewSizeOptions {
+                excludes: vec![],
+                max_diff_bytes: None,
+                max_hunk_bytes: None,
+                split_hunks: true,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("an empty diff must not exit 0 as an approval");
+        assert!(
+            err.to_string().contains(EMPTY_DIFF_RESULT),
+            "the empty diff must be reported as its own result: {err}"
+        );
     }
 }
 

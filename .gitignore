@@ -40,5 +40,5 @@ bench/raw/
 /t
 /.tmpbuild/
 
-# Local build dir used by the job (never /tmp)
-.cargo-target/
+# Local build target for this job workspace (kept on local disk, never /tmp).
+/.build-target/

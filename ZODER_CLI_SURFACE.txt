@@ -22,6 +22,7 @@ Commands:
   tui                 Launch the zerocode terminal UI, wired to the local zeroclaw engine. The matching zerocode + zeroclaw binaries ship alongside zoder; zerocode auto-starts an ephemeral daemon if none is running. Extra args are forwarded to zerocode (e.g. `--config-dir DIR`, `--theme NAME`)
   models              List the model corpus (free routing pool by default)
   agents              List zeroclaw agent aliases and their current availability/session status. Pass an alias to show only that agent
+  daemon              Probe the engine-daemon lifecycle: report whether a daemon is reachable at the engine socket, whether this process holds a live lease on it, and how many live leases the daemon directory holds. Read-only — it acquires no lease and stops nothing. Used by regression tests to watch two processes share one daemon
   update              Check for a newer zoder release and update to it. Without `--check`, re-runs the official installer to self-replace this binary
   route               Show the routing decision for a task without executing it
   consult             Rank models for a human to pick from: health (circuit-breaker) + coding capability + SWE Elo — the same signals the router uses. Use `--json` for machine output
@@ -1843,6 +1844,9 @@ Options:
 
       --allow-paid
           Allow paid models without interactive confirmation (scripts/CI)
+
+      --step-timeout <SECS>
+          Per-step wall-clock limit in seconds. A step that runs longer is killed and reported as a failure, so one wedged check cannot hang an unattended gate. Default: 1800 (generous on purpose)
 
       --json
           Emit machine-readable JSON to stdout (the GateReport + tool-probe, serialized). Suppresses the pretty renderer
