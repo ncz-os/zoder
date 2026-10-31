@@ -1912,6 +1912,95 @@ fn provider_route_corpus(cfg: &Config, public: &Corpus) -> anyhow::Result<Corpus
 }
 
 #[cfg(test)]
+mod engine_loader_tests {
+    use super::*;
+
+    /// A home with a provider config and NO `model_corpus.json` — a host that
+    /// installed zoder but never a model corpus.
+    fn write_corpusless_home(home: &std::path::Path) {
+        let body = json!({
+            "providers": [{
+                "id": "wiremock",
+                "base_url": "https://reviewer.example.invalid/v1",
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["zz-unpriced/"],
+            }],
+            "default_provider": "wiremock",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("engine")).unwrap();
+        std::fs::write(home.join("engine").join("config.toml"), "").unwrap();
+    }
+
+    /// `spend` and `report` read the ledger, not the model corpus. D5.6: they
+    /// used the whole-engine loader, so a host with no corpus installed could
+    /// not report what it had spent at all, and every run paid for a
+    /// multi-megabyte corpus deserialization it never consulted.
+    #[test]
+    fn spend_loads_config_without_a_corpus() {
+        let home = tempfile::tempdir().unwrap();
+        write_corpusless_home(home.path());
+        let engine_cfg = home.path().join("engine").join("config.toml");
+        assert!(
+            !home.path().join("model_corpus.json").exists(),
+            "the fixture must have no corpus"
+        );
+
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home.path());
+        // The routing loader still requires a corpus — that contract is
+        // unchanged, and it is what used to fail `zoder spend`.
+        assert!(
+            Engine::load_with_engine_config(Some(&engine_cfg)).is_err(),
+            "the routing loader must still refuse to run without a corpus"
+        );
+        let loaded = Engine::load_config_only(Some(&engine_cfg));
+        // The real command, through the real loader: the regression was that
+        // `spend` used the corpus-loading engine and failed here.
+        let spent = cmd_spend("month", None, None, false, None, true);
+        // `report` is the other corpus-free command (D5.6).
+        let reported = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cmd_report(
+                super::ReportPeriod::Month,
+                None,
+                10,
+                None,
+                None,
+                true,
+            ));
+        match prev {
+            Some(value) => std::env::set_var("ZODER_HOME", value),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        let reported = reported;
+
+        spent.expect("zoder spend must work on a host with no corpus installed");
+        reported.expect("zoder report must work on a host with no corpus installed");
+        let eng = loaded.expect("the config-only loader needs no corpus");
+        assert_eq!(eng.cfg.providers.len(), 1, "the provider config is loaded");
+        assert_eq!(eng.cfg.ledger_path, home.path().join("ledger.jsonl"));
+        assert_eq!(eng.corpus.count, 0, "the corpus is neither read nor needed");
+        assert_eq!(eng.route_corpus.count, 0, "no route projection is built");
+    }
+}
+
+#[cfg(test)]
 mod provider_route_corpus_tests {
     use super::*;
 
@@ -2076,7 +2165,54 @@ impl Engine {
     /// override travels as an explicit parameter instead, so nothing
     /// global is touched. See `crate::child_env` for the wider story
     /// about process-global state in a parallel test binary.
-    fn load_with_engine_config(engine_config: Option<&std::path::Path>) -> anyhow::Result<Self> {
+    ///
+    /// The legacy whole-engine read: `Config::load` plus the engine TOML
+    /// registry, the model corpus and the provider-scoped route projection.
+    /// This is the loader for anything that ROUTES (routing needs the corpus,
+    /// the policy gate and the alias registry). Commands that only read the
+    /// ledger must NOT pay for it: the corpus deserialization and its clone
+    /// dominate their wall time, and a host with no corpus installed gets an
+    /// error it has no use for. Use [`Engine::load_config_only`] there.
+    pub(crate) fn load_with_engine_config(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
+        let corpus = Corpus::load(&cfg.corpus_path)?;
+        let route_corpus = provider_route_corpus(&cfg, &corpus)?;
+        Ok(Self {
+            cfg,
+            corpus,
+            route_corpus,
+            engine_models,
+        })
+    }
+
+    /// The engine read for commands that never route: `Config::load` plus the
+    /// engine TOML registry (which `Config::load` cannot do on its own — the
+    /// engine `config.toml` is deliberately excluded from it). The corpus
+    /// fields stay empty and the corpus file is never opened, so `zoder spend`
+    /// and `zoder report` succeed when no corpus is installed.
+    ///
+    /// Anything that consults `engine.corpus` / `engine.route_corpus` must use
+    /// [`Engine::load`] instead: an empty corpus here would silently change a
+    /// routing decision.
+    pub(crate) fn load_config_only(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
+        Ok(Self {
+            cfg,
+            corpus: Corpus::default(),
+            route_corpus: Corpus::default(),
+            engine_models,
+        })
+    }
+
+    /// `Config::load` + the engine model registry, with the provider mappings
+    /// bound. Shared by both loaders so they cannot drift on validation.
+    fn load_cfg_and_registry(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<(Config, EngineModelRegistry)> {
         let mut cfg = Config::load()?;
         let engine_cfg_path = match engine_config {
             Some(p) => p.to_path_buf(),
@@ -2090,14 +2226,7 @@ impl Engine {
                     engine_cfg_path.display()
                 )
             })?;
-        let corpus = Corpus::load(&cfg.corpus_path)?;
-        let route_corpus = provider_route_corpus(&cfg, &corpus)?;
-        Ok(Self {
-            cfg,
-            corpus,
-            route_corpus,
-            engine_models,
-        })
+        Ok((cfg, engine_models))
     }
 
     /// Build an `Engine` from explicit in-memory parts — used by unit tests
@@ -13229,7 +13358,10 @@ fn cmd_spend(
     host: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+    // `spend` reads the ledger and never routes, so it must not pay for the
+    // corpus (a multi-MB deserialization it never consults) and must not fail
+    // on a host where no corpus is installed.
+    let eng = Engine::load_config_only(None)?;
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     let since = since.map(|s| parse_date(s, false)).transpose()?;
     let until = until.map(|s| parse_date(s, true)).transpose()?;
@@ -16676,7 +16808,9 @@ async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()
              no plan-usage API); got `{provider}`"
         );
     }
-    let eng = Engine::load()?;
+    // Only the provider's credential and base URL are read: no routing, no
+    // corpus.
+    let eng = Engine::load_config_only(None)?;
     let p = select_quota_provider(&eng.cfg.providers)?;
     let token = match p.auth.resolve() {
         Some(t) if !t.is_empty() => t,
@@ -16865,7 +16999,9 @@ fn auth_kind_label(a: &zoder_core::Auth) -> String {
 }
 
 fn cmd_providers(json: bool) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+    // Provider descriptors and plan windows come from the config and the tier
+    // catalog, never from the model corpus.
+    let eng = Engine::load_config_only(None)?;
     // The tier catalog is bundled + on-disk refreshable; same pattern as
     // Corpus. Loading it is best-effort: an unreadable / unparseable catalog
     // never breaks `zoder providers` — explicit windows still work, the
