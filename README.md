@@ -1101,10 +1101,22 @@ until then use the commands above or re-run the installer.)
 ### Using your own price and corpus files
 
 By default (`auto`) zoder treats the installed price and corpus files as
-public data it may refresh: when the engine's copy is missing or older than
-24 h (by file modification time), `zoder report` and `zoder tui` spawn a
-detached `zoder pricing refresh`, and `zoder pricing refresh` /
-`zoder refresh` always overwrite their target files.
+public data it may refresh: when the **data** inside the engine's copy is
+older than `$ZODER_PRICING_STALE_DAYS` (default 7) — read from the file's own
+`generated`/`generated_at` date, never its modification time, so re-writing or
+copying stale data cannot make it look fresh — `zoder report` and `zoder tui`
+spawn a detached `zoder pricing refresh`, and `zoder pricing refresh` /
+`zoder refresh` always overwrite their target files. A file with no
+parseable date falls back to the old 24 h mtime rule; `0` disables the
+data-age trigger (an old feed then prints one warning instead of refreshing).
+
+The engine catalog zoder writes (`<engine data dir>/pricing.json`) carries
+every priced row **plus an explicit `$0` entry for each model your config
+declares free or local** (a `billing = "free"` or flat-fee provider's
+`serves` prefixes, tagged `"source": "zoder-config-free"`). An absent row is
+not a statement that a model is free, and the engine prices what it cannot
+find its own way — that is how a local-only month tripped the engine's own
+monthly backstop at $170 while real billed usage was under $1.
 
 Set the pricing source to **`file`** to make the installed files
 authoritative: they are used exactly as installed — never re-pulled, never
@@ -1156,6 +1168,15 @@ updated there — it does not tell you to re-pull the public files. In auto
 mode it points at `zoder pricing refresh`. A file whose date cannot be
 parsed gets `age unknown` once. The threshold is `ZODER_CORPUS_STALE_DAYS`
 (integer days; an invalid value falls back to 7; `0` disables the warning).
+The engine refresh has its own threshold, `ZODER_PRICING_STALE_DAYS` (same
+parsing rules), so a host can refresh the engine copy tighter without making
+every installed-data warning noisier.
+
+**Unknown-cost rows in `zoder spend`.** The cost columns exclude rows whose
+cost could not be priced (they are counted separately as unknown-cost tokens
+and calls). When any were excluded, `zoder spend` prints one stderr line
+naming how many rows, and how many tokens and calls, were left out — the
+engine's monthly figure may be higher until those rows can be priced.
 
 Each file is measured by its own date rule: the pricing catalog by its
 `generated`/`generated_at` fields, the corpus by `generated_at`, then

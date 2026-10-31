@@ -52,10 +52,10 @@ use zoder_core::{
     BudgetVerdict, ChatRequest, ChatResult, Classification, Config, Corpus, CostSnapshot,
     CostVerdict, DaemonReadiness, Decision, EngineKind, EngineModelRegistry, EngineProviderRoute,
     EnrichmentOutcome, Entry, GooseProviderEnv, Gran, HealthStore, Ledger, Message, ModelEntry,
-    OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome, Provider,
-    ProviderError, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session, StaleSocketOutcome,
-    State, SubscriptionPlan, Theme, Tier, OVERLAY_SOURCE, PROBE_MAX_MODELS_PER_PROVIDER,
-    PROBE_PING_TIMEOUT_SECS,
+    ModelPrice, OpenAiProvider, Period, PolicyGate, PricingCatalog, PricingSource, ProbeOutcome,
+    Provider, ProviderError, Rollup, RoutableCandidate, Router, ScenarioRole, ScopeStat, Session,
+    StaleSocketOutcome, State, SubscriptionPlan, Theme, Tier, OVERLAY_SOURCE,
+    PROBE_MAX_MODELS_PER_PROVIDER, PROBE_PING_TIMEOUT_SECS,
 };
 use zoder_mcp_server::{run_server, RoutingContext as McpRoutingContext};
 
@@ -13131,6 +13131,32 @@ fn parse_date(s: &str, end_of_day: bool) -> anyhow::Result<chrono::DateTime<chro
     Ok(Utc.from_utc_datetime(&d.and_time(t)))
 }
 
+/// The stderr line naming the rows `zoder spend` could not price, if any.
+///
+/// `Rollup::cost_usd` deliberately EXCLUDES unknown-cost rows (their tokens
+/// and calls are segregated in `unknown_cost_*`), which is what the engine's
+/// own month figure does NOT do. Printing the table without a word about them
+/// made an incomplete total look complete (Z3): the operator compared
+/// `zoder spend month` with the engine's monthly number, saw a gap, and had
+/// nothing on screen explaining it.
+///
+/// Returns `None` when every row was priced, so a clean ledger prints
+/// nothing extra.
+fn spend_unknown_cost_note(roll: &std::collections::BTreeMap<String, Rollup>) -> Option<String> {
+    let rows = roll.values().filter(|r| r.unknown_cost_calls > 0).count();
+    if rows == 0 {
+        return None;
+    }
+    let tokens: u64 = roll.values().map(|r| r.unknown_cost_tokens).sum();
+    let calls: u64 = roll.values().map(|r| r.unknown_cost_calls).sum();
+    Some(format!(
+        "note: {rows} unknown-cost {} excluded from the cost columns above \
+         ({tokens} tokens, {calls} calls); their cost could not be priced. \
+         The engine's monthly figure may be higher until these rows are priced.",
+        if rows == 1 { "row" } else { "rows" }
+    ))
+}
+
 fn cmd_spend(
     period: &str,
     since: Option<&str>,
@@ -13166,6 +13192,9 @@ fn cmd_spend(
             );
         }
         println!("{:46} {:>12.4}", "TOTAL", total);
+        if let Some(note) = spend_unknown_cost_note(&roll) {
+            eprintln!("{note}");
+        }
         return Ok(());
     }
 
@@ -13192,6 +13221,9 @@ fn cmd_spend(
         );
     }
     println!("{:14} {:>12.4}", "TOTAL", total);
+    if let Some(note) = spend_unknown_cost_note(&roll) {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 
@@ -15624,7 +15656,9 @@ fn build_external_catalog(cat: &PricingCatalog, corpus: &Corpus) -> PricingCatal
             continue;
         }
         if let Some(price) = cat.lookup(&m.id) {
-            if price.is_priced() {
+            // A priced row, or an explicit $0 the feed/operator wrote: both
+            // are statements about the model, and both must reach the engine.
+            if price.is_priced() || !price.source.trim().is_empty() {
                 out.models.insert(m.id.clone(), price.clone());
                 if !m.leaf.is_empty() {
                     out.models
@@ -15637,8 +15671,14 @@ fn build_external_catalog(cat: &PricingCatalog, corpus: &Corpus) -> PricingCatal
     out
 }
 
-/// All priced entries of `cat`, used by the zoder build (the public feed is
-/// zoder's only cost source, so it prices every model the feed knows).
+/// Every row of `cat` except the ones that carry no rate AT ALL and no
+/// explicit statement either: priced entries, and explicit `$0` entries an
+/// operator (or `engine_catalog` below) deliberately wrote.
+///
+/// Used by the zoder build: the public feed is zoder's only cost source, so
+/// it prices every model the feed knows. Keeping an explicit zero here is
+/// what makes a free/local declaration survive the merge -- dropping it
+/// leaves the engine with no row and it prices the model its own way (Z3).
 fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
     let mut out = PricingCatalog {
         generated: cat.generated.clone(),
@@ -15648,11 +15688,72 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
         ..Default::default()
     };
     for (id, price) in &cat.models {
-        if price.is_priced() {
+        if price.is_priced() || !price.source.trim().is_empty() {
             out.models.insert(id.clone(), price.clone());
         }
     }
     out
+}
+
+/// The engine catalog zoder writes for the `zoder` build: every priced row of
+/// the feed plus an EXPLICIT $0 entry for each model its own config declares
+/// free or local.
+///
+/// Field incident (Z3): the file only ever carried models with a non-zero
+/// price, so a local model — which the public feed lists at $0, or does not
+/// list at all — was simply absent. The engine then had nothing to read for
+/// that model and priced it its own way; its monthly backstop tripped at $170
+/// while the real billed usage was under $1. An explicit zero row is a
+/// statement ("this model costs nothing"); an absent row is not.
+///
+/// Only cost-neutral providers contribute: a free local host or a flat-fee
+/// subscription is $0 marginal by construction (`BillingPosture`), so the
+/// engine is told exactly what zoder's own ledger already treats as free. A
+/// metered model is never pinned at $0 here.
+fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
+    let mut out = full_priced_catalog(cat);
+    for id in configured_free_models(cfg) {
+        // A model the feed prices stays priced: the operator's config cannot
+        // know a cloud rate the feed has, and zeroing it would understate
+        // spend.
+        if cat.models.get(&id).is_some_and(|p| p.is_priced()) {
+            continue;
+        }
+        out.models.entry(id).or_insert_with(|| ModelPrice {
+            source: FREE_ENGINE_ENTRY_SOURCE.to_string(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Provenance recorded on an explicit $0 engine entry, so an operator reading
+/// the engine copy can tell a config-declared free model from a feed rate.
+const FREE_ENGINE_ENTRY_SOURCE: &str = "zoder-config-free";
+
+/// Models the config declares free or local: the served prefixes of every
+/// free-tier / flat-fee provider.
+///
+/// A `serves` prefix is kept as written (`local/`), because that is how the
+/// engine reports a model it routed by prefix. This only ever PRODUCES $0
+/// entries for models the feed does not price, so the worst case is a $0 row
+/// that the operator declared free; the failure this guards against (a local
+/// model the engine has no row for) is the one that cost $170.
+fn configured_free_models(cfg: &Config) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut ids = BTreeSet::new();
+    for p in &cfg.providers {
+        // A cost-neutral provider (free local host, flat subscription) serves
+        // $0 models by construction: `BillingPosture` decides it, so the
+        // engine sees exactly the set zoder's own ledger treats as $0.
+        if !BillingPosture::from(p).is_cost_neutral() {
+            continue;
+        }
+        for prefix in p.serves.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            ids.insert(prefix.to_string());
+        }
+    }
+    ids
 }
 
 /// Publish per-token rates into the zeroclaw cost engine
@@ -15680,7 +15781,14 @@ fn publish_engine_catalog(
     let engine_path = zeroclaw_data_dir().join("pricing.json");
 
     let engine_cat = if zoder {
-        full_priced_catalog(cat)
+        // The config decides which of zoder's models are free/local; without
+        // it (a broken config) the engine still gets every priced row, just
+        // no explicit $0 declarations.
+        let cfg = Config::load_unvalidated().ok();
+        match cfg.as_ref() {
+            Some(cfg) => engine_catalog(cat, cfg),
+            None => full_priced_catalog(cat),
+        }
     } else {
         // zoder --external: require a configured external provider, then scope
         // to the paid models zoder actually knows about.
@@ -15725,7 +15833,8 @@ fn publish_engine_catalog(
         ));
     }
     engine_cat.save(&engine_path)?;
-    let priced = engine_cat.models.len();
+    let priced = engine_cat.models.values().filter(|p| p.is_priced()).count();
+    let declared_free = engine_cat.models.len() - priced;
     if json {
         println!(
             "{}",
@@ -15733,6 +15842,7 @@ fn publish_engine_catalog(
                 "external": true,
                 "engine_catalog": engine_path.display().to_string(),
                 "priced_models": priced,
+                "declared_free_models": declared_free,
             })
         );
     } else {
@@ -15741,6 +15851,11 @@ fn publish_engine_catalog(
             "  {label:<10} : {priced} model rates -> {}",
             engine_path.display()
         );
+        if declared_free > 0 {
+            println!(
+                "               (+{declared_free} config-declared free/local models written as explicit $0)"
+            );
+        }
         println!("               (restart/reload the daemon to apply)");
     }
     Ok(())
@@ -15917,6 +16032,40 @@ fn warn_data_age_at(
     Some(line)
 }
 
+/// The stderr line for engine pricing data that is old but whose automatic
+/// refresh was DISABLED (`$ZODER_PRICING_STALE_DAYS=0`, or a non-positive
+/// value). Once per process, stderr only, never fails the command.
+///
+/// Silently skipping a disabled refresh made a stalled feed invisible in auto
+/// mode: `zoder spend`/`report` read the same data the engine is pricing with,
+/// so the operator needs the age even when they opted out of auto-refreshing.
+fn warn_engine_data_age(
+    path: &Path,
+    cat: &PricingCatalog,
+    age_days: i64,
+    stale_days: i64,
+) -> Option<String> {
+    let mut state = data_age_state().lock().unwrap_or_else(|p| p.into_inner());
+    if !state
+        .warned
+        .insert(data_age_warn_key("pricing-refresh", path))
+    {
+        return None;
+    }
+    let date =
+        zoder_core::pricing::data_date(&cat.generated, cat.generated_at.as_deref().unwrap_or(""))
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+    let line = format!(
+        "zoder: warning: engine pricing data is {age_days} days old (generated {date}, \
+         source {}) and the automatic refresh is disabled ($ZODER_PRICING_STALE_DAYS={stale_days}); \
+         run `zoder pricing refresh` to update it",
+        cat.source.as_deref().unwrap_or("")
+    );
+    eprintln!("{line}");
+    Some(line)
+}
+
 /// The key that marks one installed file as already warned about.
 ///
 /// Keyed by the FILE, not just by its kind: `pricing` names two different
@@ -16060,16 +16209,27 @@ enum RefreshDecision {
     Warn,
 }
 
-/// The `path` and `data_date_age_days` parameters are part of the decision's
-/// signature so the caller hands over what it already gathered; the current
-/// verdict only needs the mtime for `auto` mode and the switch for `file`
-/// mode (the age warning is a separate step, emitted by the caller).
+/// The `path` is part of the decision's signature so the caller hands over
+/// what it already gathered.
+///
+/// `data_date_age_days` is the age of the DATA inside the file (its
+/// `generated_at`/`generated` date, via `zoder_core::pricing::data_date`),
+/// and `stale_days` is the configurable threshold
+/// ([`engine_refresh_stale_days`]).
+///
+/// The data date is what decides, not the mtime. A file rewritten five
+/// minutes ago from week-old data is stale, and a file copied months ago from
+/// today's data is not: the mtime says when a writer touched the file, never
+/// how old the rates are. The mtime is only the fallback for a file whose
+/// data carries no parseable date at all (and for a missing file), so an
+/// undated copy cannot pin the engine to whatever it says forever.
 fn daily_refresh_decision(
     zoder_build: bool,
     switch: FileSwitch,
     _path: &Path,
     mtime_age_secs: Option<i64>,
-    _data_date_age_days: Option<i64>,
+    data_date_age_days: Option<i64>,
+    stale_days: i64,
 ) -> RefreshDecision {
     if !zoder_build {
         return RefreshDecision::Skip;
@@ -16077,7 +16237,18 @@ fn daily_refresh_decision(
     if switch.is_file() {
         return RefreshDecision::Warn;
     }
-    // Auto mode: today's behaviour — stale (missing or >24h mtime) => spawn.
+    // `0` (or a negative value) disables the data-age trigger entirely: the
+    // operator opted out of age-based refreshing for this host.
+    if stale_days > 0 {
+        if let Some(age_days) = data_date_age_days {
+            return if age_days > stale_days {
+                RefreshDecision::Spawn
+            } else {
+                RefreshDecision::Skip
+            };
+        }
+    }
+    // Data age unknown (or the trigger disabled): fall back to the mtime.
     let stale = mtime_age_secs.map(|a| a > 24 * 60 * 60).unwrap_or(true);
     if stale {
         RefreshDecision::Spawn
@@ -16086,11 +16257,35 @@ fn daily_refresh_decision(
     }
 }
 
+/// How old the data inside the engine catalog may be before the daily
+/// refresh re-pulls it, in days.
+///
+/// `$ZODER_PRICING_STALE_DAYS` overrides the corpus default
+/// ([`zoder_core::corpus::DEFAULT_STALE_DAYS`], 7). A typo falls back to the
+/// default rather than silently disabling the check -- the outage this
+/// guards against was exactly "nobody noticed the data was old". `0` (or a
+/// negative value) disables the data-age trigger; the mtime fallback then
+/// still applies.
+fn engine_refresh_stale_days() -> i64 {
+    match std::env::var(zoder_core::corpus::STALE_DAYS_ENV_PRICING) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(zoder_core::corpus::DEFAULT_STALE_DAYS),
+        Err(_) => zoder_core::corpus::DEFAULT_STALE_DAYS,
+    }
+}
+
 /// Keep the pricing feed fresh without a daemon-side fetch or an external
-/// scheduler: when the engine catalog is missing or older than 24h, spawn a
-/// detached `pricing refresh` so the *next* run (and the ephemeral daemon it
-/// starts) sees current rates. Non-blocking and network-tolerant — a failed
-/// refresh just leaves the prior file in place.
+/// scheduler: when the DATA inside the engine catalog is older than
+/// [`engine_refresh_stale_days`] (default 7 days, `$ZODER_PRICING_STALE_DAYS`),
+/// spawn a detached `pricing refresh` so the *next* run (and the ephemeral
+/// daemon it starts) sees current rates. Non-blocking and network-tolerant —
+/// a failed refresh just leaves the prior file in place.
+///
+/// The age is read from the file's `generated_at`/`generated` metadata, never
+/// from its mtime: a re-write (or a copy, or a `touch`) of week-old data left
+/// the old check reporting "fresh" forever.
 ///
 /// In `file` pricing-source mode (env/config/managed marker) it never spawns:
 /// the installed files are authoritative and only their installer may update
@@ -16122,14 +16317,25 @@ fn maybe_spawn_daily_refresh() {
     // mode the daily refresh must not spawn, and a broken config must not be
     // a way to make it spawn anyway.
     let switch = effective_pricing_source_switch();
+    let stale_days = engine_refresh_stale_days();
     match daily_refresh_decision(
         is_zoder_build(),
         switch,
         &path,
         mtime_age_secs,
         data_date_age_days,
+        stale_days,
     ) {
-        RefreshDecision::Skip => {}
+        RefreshDecision::Skip => {
+            // The data is current enough to keep. Say so when it is older
+            // than the threshold but the trigger was disabled, so a stalled
+            // feed is never silent.
+            if stale_days <= 0 {
+                if let Some(age) = data_date_age_days.filter(|a| *a > 0) {
+                    warn_engine_data_age(&report_path, &cat, age, stale_days);
+                }
+            }
+        }
         RefreshDecision::Spawn => {
             if let Ok(exe) = std::env::current_exe() {
                 let _ = std::process::Command::new(exe)
@@ -23182,8 +23388,10 @@ mod engine_cost_accounting_tests {
     }
 
     fn paid_catalog() -> PricingCatalog {
-        let mut cat = PricingCatalog::default();
-        cat.generated = "2026-10-30".to_string();
+        let mut cat = PricingCatalog {
+            generated: "2026-10-30".to_string(),
+            ..Default::default()
+        };
         cat.models.insert(
             "deepseek/deepseek-r1".to_string(),
             ModelPrice {
@@ -23212,11 +23420,10 @@ mod engine_cost_accounting_tests {
                 "kind": "openai-chat",
                 "auth": { "type": "none" },
                 "billing": "free",
-                "serves": ["local/"],
-                "models": ["local/qwen3.8-coder"]
+                "serves": ["local/qwen3.8-coder"]
             }"#,
         );
-        let out = engine_catalog(&paid_catalog(), &cfg, &BTreeMap::new());
+        let out = engine_catalog(&paid_catalog(), &cfg);
         let free = out
             .models
             .get("local/qwen3.8-coder")
@@ -23246,9 +23453,14 @@ mod engine_cost_accounting_tests {
         );
         let mut cat = paid_catalog();
         // An explicit $0 the operator pinned in the installed catalog.
-        cat.models
-            .insert("internal/preview".to_string(), ModelPrice::default());
-        let out = engine_catalog(&cat, &cfg, &BTreeMap::new());
+        cat.models.insert(
+            "internal/preview".to_string(),
+            ModelPrice {
+                source: "operator".to_string(),
+                ..Default::default()
+            },
+        );
+        let out = engine_catalog(&cat, &cfg);
         let paid = out.models.get("deepseek/deepseek-r1").expect("paid entry");
         assert!(paid.is_priced(), "a metered model must keep its real rate");
         assert!(
@@ -23271,7 +23483,14 @@ mod engine_cost_accounting_tests {
         );
         // Week-old mtime, 1-day-old data -> nothing to do.
         assert_eq!(
-            daily_refresh_decision(true, FileSwitch::None, path, Some(8 * 24 * 3600), Some(1), 7),
+            daily_refresh_decision(
+                true,
+                FileSwitch::None,
+                path,
+                Some(8 * 24 * 3600),
+                Some(1),
+                7
+            ),
             RefreshDecision::Skip,
             "current data must not re-sync just because the file is old"
         );
@@ -23297,9 +23516,7 @@ mod engine_cost_accounting_tests {
     /// data warnings use.
     #[test]
     fn engine_refresh_stale_days_is_configurable() {
-        let _lock = test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _lock = test_env::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("ZODER_PRICING_STALE_DAYS").ok();
         std::env::remove_var("ZODER_PRICING_STALE_DAYS");
         assert_eq!(engine_refresh_stale_days(), 7);
@@ -23448,24 +23665,29 @@ mod pricing_source_file_tests {
     #[test]
     fn daily_refresh_decision_auto_spawns_when_mtime_stale() {
         let p = Path::new("/tmp/none/pricing.json");
-        // Missing file -> stale -> Spawn (auto mode).
+        // Missing file, no data date -> the mtime fallback says stale -> Spawn.
         assert_eq!(
-            daily_refresh_decision(true, FileSwitch::None, p, None, Some(1)),
+            daily_refresh_decision(true, FileSwitch::None, p, None, None, 7),
             RefreshDecision::Spawn
         );
-        // Fresh mtime (1h old) -> Skip even though data is a day old.
+        // Fresh mtime, one-day-old DATA -> Skip: the data decides.
         assert_eq!(
-            daily_refresh_decision(true, FileSwitch::None, p, Some(3600), Some(1)),
+            daily_refresh_decision(true, FileSwitch::None, p, Some(3600), Some(1), 7),
             RefreshDecision::Skip
         );
-        // >24h mtime -> Spawn.
+        // >24h mtime with current data -> still Skip (the data decides).
         assert_eq!(
-            daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), Some(1)),
+            daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), Some(1), 7),
+            RefreshDecision::Skip
+        );
+        // >24h mtime and no data date -> the fallback spawns.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), None, 7),
             RefreshDecision::Spawn
         );
         // Non-zoder build never spawns.
         assert_eq!(
-            daily_refresh_decision(false, FileSwitch::None, p, None, None),
+            daily_refresh_decision(false, FileSwitch::None, p, None, None, 7),
             RefreshDecision::Skip
         );
     }
@@ -23475,13 +23697,13 @@ mod pricing_source_file_tests {
         let p = Path::new("/tmp/none/pricing.json");
         for switch in [FileSwitch::Env, FileSwitch::Config, FileSwitch::Managed] {
             assert_eq!(
-                daily_refresh_decision(true, switch, p, None, Some(1)),
+                daily_refresh_decision(true, switch, p, None, Some(1), 7),
                 RefreshDecision::Warn,
                 "file mode ({switch:?}) must never spawn, even with a stale mtime"
             );
             // Fresh mtime still means no spawn.
             assert_eq!(
-                daily_refresh_decision(true, switch, p, Some(60), None),
+                daily_refresh_decision(true, switch, p, Some(60), None, 7),
                 RefreshDecision::Warn
             );
         }

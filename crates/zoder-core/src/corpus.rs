@@ -82,6 +82,14 @@ pub const DEFAULT_STALE_DAYS: i64 = 7;
 /// model corpus and the pricing catalog. `0` disables the warning.
 pub const STALE_DAYS_ENV: &str = "ZODER_CORPUS_STALE_DAYS";
 
+/// Environment variable that overrides [`DEFAULT_STALE_DAYS`] for the ENGINE
+/// pricing refresh only (the daily re-pull that keeps the cost engine's
+/// `<data_dir>/pricing.json` current). Kept separate from
+/// [`STALE_DAYS_ENV`]: a host may want a tighter refresh cadence without
+/// making every installed-data warning noisier (or vice versa). `0` disables
+/// the data-age trigger; the file-mtime fallback then still applies.
+pub const STALE_DAYS_ENV_PRICING: &str = "ZODER_PRICING_STALE_DAYS";
+
 /// Parse a corpus/pricing date, which publishers write as `YYYY-MM-DD`.
 ///
 /// RFC 3339 timestamps are accepted too (a builder that switches to a full
