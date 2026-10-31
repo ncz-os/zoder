@@ -222,6 +222,89 @@ mod reliability_deadline_tests {
         );
     }
 
+    /// D5.8: the pool must hand out ONE client per base URL, not build a
+    /// second one under a concurrent first use. Drive many `OpenAiProvider::new`
+    /// calls from several runtime threads at a cold URL and assert they all
+    /// observe the same identity: the pool builds under its lock, so nothing
+    /// can slip past the emptiness check and construct a private client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_construction_shares_one_client_per_base_url() {
+        let uri = "http://127.0.0.1:9/v1"; // never dialed; only client identity
+        let started = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let started = started.clone();
+            tasks.push(tokio::spawn(async move {
+                started.wait().await;
+                fixture(uri, 1000, 50).0.client_key().clone()
+            }));
+        }
+        let mut keys = Vec::new();
+        for task in tasks {
+            keys.push(task.await.expect("constructor task"));
+        }
+        let first = keys.first().expect("at least one key").clone();
+        assert!(
+            keys.iter().all(|k| k.same_as(&first)),
+            "concurrent construction for one base URL must yield one client"
+        );
+    }
+
+    /// D5.8: the pool key is the TRIMMED base URL, so a config that spells the
+    /// same gateway with and without a trailing slash still shares one client
+    /// (and therefore one connection pool). Without the trim before keying,
+    /// `…/v1` and `…/v1/` would each build a client.
+    #[tokio::test]
+    async fn trailing_slash_spellings_share_the_pooled_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let mut buf = [0u8; 1024];
+                        let n = match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                      content-length: 2\r\n\r\n[]",
+                                )
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (plain, _) = fixture(&uri, 5000, 5000);
+        let (slashed, _) = fixture(&format!("{uri}/"), 5000, 5000);
+        assert!(
+            plain.client_key().same_as(slashed.client_key()),
+            "base URLs differing only by a trailing slash must share one client"
+        );
+        let _ = plain.list_models().await.expect("first /models");
+        let _ = slashed.list_models().await.expect("second /models");
+
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second dispatch must reuse the first one's connection"
+        );
+    }
+
     #[tokio::test]
     async fn slow_prefill_gets_request_budget_not_stream_idle_budget() {
         let body = format!("{DELTA}{DONE}");
