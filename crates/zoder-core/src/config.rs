@@ -2562,6 +2562,20 @@ pub struct Config {
     /// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` > the built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_idle_timeout_between_events_s: Option<u64>,
+    /// Whole-run wall-clock deadline for `zoder loop`, in seconds.
+    ///
+    /// Distinct from the per-phase budgets: this bounds the entire run, not
+    /// one author turn, `--check` or review. When it expires the loop stops at
+    /// the next safe point, preserves the work it already captured, and still
+    /// emits its final JSON result.
+    ///
+    /// Unset derives the deadline from the fleet worker's 7,200 s job timeout
+    /// and keeps it strictly below that (6,300 s), so the loop always reaches
+    /// its own teardown before the worker's kill. `0` disables the deadline
+    /// and restores the pre-deadline behaviour. CLI precedence:
+    /// `zoder loop --deadline` > this key > the derived default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_deadline_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -4175,6 +4189,7 @@ impl Config {
             agent_idle_timeout_s: None,
             agent_idle_timeout_first_event_s: None,
             agent_idle_timeout_between_events_s: None,
+            loop_deadline_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,

@@ -1391,6 +1391,20 @@ enum Cmd {
         /// Run detached as a tracked background job.
         #[arg(long)]
         background: bool,
+        /// Whole-run wall-clock deadline for `zoder loop`, in seconds.
+        ///
+        /// Unlike `--loop-timeout` (which bounds ONE phase — an author turn,
+        /// the `--check`, or a review), this bounds the entire run. When it
+        /// expires the loop stops at the next safe point, commits what is on
+        /// disk, and still writes its final JSON result, instead of being
+        /// killed blind by the worker's own timeout.
+        ///
+        /// Default: derived from the worker's 7,200 s job timeout and kept
+        /// strictly below it (6,300 s: a tenth of the budget, minimum five
+        /// minutes, is left for teardown and reporting). Config key:
+        /// `loop_deadline_s`.
+        #[arg(long, value_name = "SECS")]
+        deadline: Option<u64>,
     },
     /// Print a resumable engine session id for the current working dir
     /// (codex `/transfer` equivalent) so a follow-up can `--session <id>`.
@@ -2432,8 +2446,18 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
+/// The instant this process started, captured on first read so every
+/// whole-run budget (the loop's `--deadline`) measures from the same origin
+/// rather than from the command's own entry point.
+pub(crate) fn process_start_instant() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
 #[tokio::main]
 async fn main() {
+    let _ = process_start_instant();
     // Restore default SIGPIPE handling so piping into `head`/`less` (which close
     // the reader early) ends the process quietly instead of panicking on a
     // broken pipe mid-table.
@@ -2664,9 +2688,32 @@ async fn run() -> anyhow::Result<()> {
             require_approval,
             allow_dangerous_check,
             background,
+            deadline,
         }) => {
             let agent_timeout_secs = cli.agent_timeout.unwrap_or(900);
             let loop_timeout_secs = cli.loop_timeout.unwrap_or(900);
+            // Whole-run deadline: `--deadline` > config `loop_deadline_s` >
+            // derived from the worker's 7,200 s timeout and kept below it.
+            let (deadline_secs, shared_daemon) = {
+                let cfg = Engine::load()
+                    .map(|engine| engine.cfg)
+                    // A config that does not load is already fatal inside the
+                    // loop; resolve the deadline from the built-in defaults
+                    // here rather than turning this into a second, differently
+                    // worded error before the loop's own diagnosis.
+                    .unwrap_or_else(|_| {
+                        zoder_core::Config::load_unvalidated_from(std::path::Path::new(
+                            "/nonexistent",
+                        ))
+                        .unwrap_or_else(|_| unreachable!("built-in defaults always parse"))
+                    });
+                (
+                    deadline.or(cfg.loop_deadline_s).unwrap_or_else(|| {
+                        agentic::default_loop_deadline_secs(agentic::WORKER_RUN_TIMEOUT_SECS)
+                    }),
+                    cfg.profile_defaults().shared_daemon(),
+                )
+            };
             agentic::cmd_loop(
                 &cli,
                 task,
@@ -2680,6 +2727,8 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 loop_timeout_secs,
                 agent_timeout_secs,
+                deadline_secs,
+                shared_daemon,
                 *allow_dangerous_check,
                 *require_approval,
             )
