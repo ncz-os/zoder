@@ -6501,7 +6501,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            return Err(budget_declined(cli.json, "budget_or_policy", &msg));
+            return Err(budget_declined(
+                cli.json,
+                &primary,
+                "budget_or_policy",
+                &msg,
+            ));
         }
     }
 
@@ -6544,7 +6549,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                return Err(budget_declined(cli.json, "over_budget", &msg));
+                return Err(budget_declined(cli.json, &primary, "over_budget", &msg));
             }
         }
     }
@@ -12266,7 +12271,12 @@ pub(crate) async fn agentic_turn(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            return Err(budget_declined(cli.json, "budget_or_policy", &msg));
+            return Err(budget_declined(
+                cli.json,
+                &primary,
+                "budget_or_policy",
+                &msg,
+            ));
         }
     }
 
@@ -12291,7 +12301,7 @@ pub(crate) async fn agentic_turn(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                return Err(budget_declined(cli.json, "over_budget", &msg));
+                return Err(budget_declined(cli.json, &primary, "over_budget", &msg));
             }
         }
     }
@@ -13348,21 +13358,31 @@ fn error_exit_code(error: &anyhow::Error) -> i32 {
 /// The over-budget case in particular used to emit the confirm PROMPT to
 /// stderr and then exit — a pipe saw a dangling "Type 'yes' to proceed" and no
 /// explanation.
-fn budget_declined(json: bool, reason: &str, msg: &str) -> anyhow::Error {
+fn budget_declined(json: bool, model: &str, reason: &str, msg: &str) -> anyhow::Error {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "outcome": "error",
-                "succeeded": false,
-                "code": EXIT_BUDGET_EXCEEDED,
-                "reason": reason,
-                "error": msg,
-                "details": { "msg": msg },
-            })
-        );
+        println!("{}", budget_declined_envelope(model, reason, msg));
     }
     budget_declined_error(msg)
+}
+
+/// The `--json` error object for a budget/policy decline.
+///
+/// A SUPERSET of [`exec_error_json`]: it carries every key that envelope has
+/// (`outcome`, `succeeded`, `model`, `error`) so a consumer written against the
+/// generic error contract keeps working unchanged, and adds the budget
+/// specifics (`code`, `reason`, `details`) so a caller can branch on
+/// "the budget stopped me" without string matching.
+#[cfg_attr(not(test), allow(dead_code))]
+fn budget_declined_envelope(model: &str, reason: &str, msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "error",
+        "succeeded": false,
+        "model": model,
+        "error": msg,
+        "code": EXIT_BUDGET_EXCEEDED,
+        "reason": reason,
+        "details": { "msg": msg },
+    })
 }
 
 fn confirm_paid(msg: &str) -> anyhow::Result<bool> {
@@ -23500,6 +23520,40 @@ mod budget_decline_exit_tests {
             .map_err(|e| e.context(budget_declined_error("x")))
             .unwrap_err();
         assert_eq!(error_exit_code(&message_only), 1, "message, not cause");
+    }
+
+    /// Review r3: the budget envelope must be a strict SUPERSET of the generic
+    /// `exec_error_json` contract, so a `--json` consumer written against the
+    /// error envelope sees every key it already relies on -- and gains the
+    /// budget specifics.
+    #[test]
+    fn the_budget_envelope_extends_the_generic_error_envelope() {
+        let generic = exec_error_json(Some("deepseek/deepseek-r1"), &anyhow::anyhow!("x"));
+        let budget = budget_declined_envelope(
+            "deepseek/deepseek-r1",
+            "over_budget",
+            "call declined: over budget",
+        );
+
+        // Every key the generic envelope defines is present with the same
+        // meaning.
+        for key in generic.as_object().unwrap().keys() {
+            assert!(
+                budget.get(key).is_some(),
+                "budget envelope must carry the generic key {key:?}: {budget}"
+            );
+        }
+        assert_eq!(budget["outcome"], "error");
+        assert_eq!(budget["succeeded"], false);
+        assert_eq!(budget["model"], "deepseek/deepseek-r1");
+        assert_eq!(budget["error"], "call declined: over budget");
+
+        // ...plus the budget specifics a caller can branch on.
+        assert_eq!(budget["code"], EXIT_BUDGET_EXCEEDED);
+        assert_eq!(budget["reason"], "over_budget");
+        assert_eq!(budget["details"]["msg"], "call declined: over budget");
+        // The code is a number, so `jq -e '.code == 78'` works.
+        assert!(budget["code"].is_number());
     }
 
     /// The decline message is preserved for humans and is non-empty, so the
