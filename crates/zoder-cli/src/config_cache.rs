@@ -3,10 +3,10 @@
 //!
 //! D10 (items 5 and 6 of the performance plan): a review touches both files
 //! on every routing decision — `RoutingContext::load` prices candidate
-//! models, `resolve_chain` reads health to rank them, and each reviewer
-//! dispatch repeats both. Both files are small but are re-parsed (and the
-//! pricing catalog re-validated for size, regular-file and permission
-//! checks) dozens of times per run.
+//! models through the catalog, `resolve_chain` reads health to rank them, and
+//! each reviewer dispatch repeats both. Both files are small but are
+//! re-parsed (and the pricing catalog re-validated for size, regular-file and
+//! permission checks) dozens of times per run.
 //!
 //! The cache is keyed by `(path, mtime, size)`: any write to either file
 //! — including the atomic rename `HealthStore::save` performs, which changes
@@ -15,17 +15,33 @@
 //! absent or unreadable file is re-tried every time, so an install that
 //! appears mid-run is picked up.
 //!
+//! What it is NOT for: a caller that loads the store to WRITE it back
+//! (`HealthStore::load` -> mutate -> `save`, or anything inside
+//! `HealthStore::mutate_locked`) must keep calling the loader directly. A
+//! read-modify-write over a cached snapshot would silently drop another
+//! writer's delta, which is exactly what the lock exists to prevent. Only
+//! READ paths (routing, ranking, pricing a call, reporting) use this module.
+//!
 //! Deliberately process-local and unbounded-by-one: a run has one home, so
 //! the map holds at most a handful of paths (tests create a tempdir per
 //! test). It is a plain `Mutex`, never held across an `await`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use model_health::HealthStore;
 use zoder_core::pricing::PricingCatalog;
+use zoder_core::HealthStore;
+
+/// Rebuild a store the cache serialized. The same decode `HealthStore::load`
+/// performs on the file — but with a `None` on error instead of the loader's
+/// quarantine-on-corruption, because the cache stores the store and never
+/// re-reads a file it already parsed.
+fn decode_store(bytes: &[u8]) -> Option<HealthStore> {
+    serde_json::from_slice::<HealthStore>(bytes).ok()
+}
 
 /// What makes a cached value still valid: the file's mtime and length.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,7 +68,17 @@ struct Entry<T> {
 }
 
 static PRICING: Mutex<Option<HashMap<PathBuf, Entry<PricingCatalog>>>> = Mutex::new(None);
-static HEALTH: Mutex<Option<HashMap<PathBuf, Entry<HealthStore>>>> = Mutex::new(None);
+/// The health store is cached as its JSON IMAGE, not as a `HealthStore`.
+/// `HealthStore` is deliberately not `Clone` (a snapshot that can be
+/// silently re-saved is how a stale read overwrites another writer's delta),
+/// and this module must not loosen that. Re-parsing the cached bytes yields
+/// the same value `HealthStore::load` would have produced from the same file;
+/// when the bytes somehow do not parse, the loader is simply called again.
+static HEALTH: Mutex<Option<HashMap<PathBuf, Entry<Vec<u8>>>>> = Mutex::new(None);
+
+/// How many loads this module actually performed (a miss), process-wide.
+/// Tests read the delta; nothing in production consults it.
+static MISSES: AtomicUsize = AtomicUsize::new(0);
 
 fn cache_get<T: Clone>(
     cache: &Mutex<Option<HashMap<PathBuf, Entry<T>>>>,
@@ -76,18 +102,32 @@ fn cache_put<T>(cache: &Mutex<Option<HashMap<PathBuf, Entry<T>>>>, path: &Path, 
         .insert(path.to_path_buf(), Entry { stamp, value });
 }
 
+/// Load `path` through `cache`, or hand back the entry that is still current.
+fn cached<T: Clone>(
+    cache: &Mutex<Option<HashMap<PathBuf, Entry<T>>>>,
+    path: &Path,
+    load: impl FnOnce(&Path) -> T,
+) -> T {
+    if let Some(hit) = cache_get(cache, path) {
+        return hit;
+    }
+    MISSES.fetch_add(1, Ordering::Relaxed);
+    let value = load(path);
+    // A failed load (an absent file yields the loader's empty default) is
+    // still cached only when the file EXISTS: `cache_put` refuses to key a
+    // path it cannot stat, so "not installed yet" is re-tried every call
+    // while "installed and empty" is reused.
+    cache_put(cache, path, value.clone());
+    value
+}
+
 /// The pricing catalog at `path`, re-parsed only when the file changed.
 ///
-/// Byte-for-byte the same result as [`PricingCatalog::load`] — the loader is
+/// Byte-for-byte the same value as [`PricingCatalog::load`] — the loader is
 /// the one place that decides absent/corrupt/insecure handling, and this
 /// only decides whether to call it.
 pub(crate) fn pricing_catalog(path: &Path) -> PricingCatalog {
-    if let Some(hit) = cache_get(&PRICING, path) {
-        return hit;
-    }
-    let cat = PricingCatalog::load(path);
-    cache_put(&PRICING, path, cat.clone());
-    cat
+    cached(&PRICING, path, PricingCatalog::load)
 }
 
 /// The health store at `path`, re-parsed only when the file changed.
@@ -97,13 +137,37 @@ pub(crate) fn pricing_catalog(path: &Path) -> PricingCatalog {
 /// invalidation. Callers that write WITHOUT the cache (a direct
 /// `HealthStore::load` -> modify -> `save`) still land on disk, and the
 /// mtime moves, so the cache cannot serve the pre-write value.
+///
+/// Read-only by construction: this hands back a detached copy, so a caller
+/// that mutates what it gets here still has to call `save`/`mutate_locked`
+/// for the change to exist.
 pub(crate) fn health_store(path: &Path) -> HealthStore {
-    if let Some(hit) = cache_get(&HEALTH, path) {
-        return hit;
+    let store = cached_health(path);
+    match store {
+        Some(store) => store,
+        // Unreachable for an image this module wrote; a loader call is the
+        // safe answer if it ever is.
+        None => HealthStore::load(path),
     }
-    let store = HealthStore::load(path);
-    cache_put(&HEALTH, path, store.clone());
-    store
+}
+
+/// The parse-and-cache half of [`health_store`]; `None` only when the cached
+/// image does not parse as a store, which means "call the loader".
+fn cached_health(path: &Path) -> Option<HealthStore> {
+    let image = cached(&HEALTH, path, |p| {
+        // The image must be what the LOADER would have produced, not the raw
+        // bytes: a corrupt on-disk store is quarantined by the loader, and a
+        // cache that mirrored the corrupt bytes would re-derive a different
+        // value on every read.
+        serde_json::to_vec(&HealthStore::load(p)).unwrap_or_default()
+    });
+    decode_store(&image)
+}
+
+/// The number of loads this module performed, process-wide. Tests assert on
+/// the DELTA a measured window caused.
+pub(crate) fn load_count() -> usize {
+    MISSES.load(Ordering::Relaxed)
 }
 
 /// Drop every cached entry. Tests use this so one test's tempdir cannot be
@@ -150,18 +214,31 @@ mod tests {
         let path = dir.path().join("health.json");
         clear();
         let mut written = HealthStore::load(&path);
-        written.record_classified_failure(
-            "m",
-            "503",
-            "p",
-            zoder_core::Classification::Capacity,
-        );
+        written.record_classified_failure("m", "503", "p", zoder_core::Classification::Capacity);
         written.save().unwrap();
+        let before = load_count();
         let a = health_store(&path);
         let b = health_store(&path);
+        let loads = load_count() - before;
+        assert_eq!(loads, 1, "an unchanged store is loaded once, then reused");
         assert_eq!(
             a.models.keys().collect::<Vec<_>>(),
             b.models.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_absent_file_is_retried_on_every_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-yet-installed.json");
+        clear();
+        let before = load_count();
+        let _ = pricing_catalog(&path);
+        let _ = pricing_catalog(&path);
+        assert_eq!(
+            load_count() - before,
+            2,
+            "a file that is not there has no stamp to key on, so it is never cached"
         );
     }
 
@@ -177,6 +254,10 @@ mod tests {
         let _ = pricing_catalog(&a);
         let _ = pricing_catalog(&b);
         let guard = PRICING.lock().unwrap();
-        assert_eq!(guard.as_ref().unwrap().len(), 2, "one entry per path");
+        assert_eq!(
+            guard.as_ref().unwrap().len(),
+            2,
+            "one entry per path"
+        );
     }
 }

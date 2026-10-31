@@ -1,0 +1,930 @@
+--- 
++++ 
+@@ -640,7 +640,9 @@
+     // the configured reviewer pin, then the head of the scenario reviewer
+     // chain. When none is resolvable (no engine, or a fully dynamic route) the
+     // per-route lookup is skipped and the general caps/default apply.
+-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
++    let health = eng
++        .as_ref()
++        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
+     let reviewer_chain: Vec<String> = match (&eng, &health) {
+         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
+             .map(|r| r.reviewer)
+@@ -694,13 +696,897 @@
+     // outside the chunk (bindings earlier in the enclosing function, imports,
+     // top-level definitions). Working-tree reviews read the files on disk;
+     // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
+-    let read_post_image = |path: &str| -> Option<String> {
++    //
++    // The reads go through ONE per-review cache (D10.7): this header, the
++    // false-undefined filter below and the confirm layer's grounding all ask
++    // about the same files, and each of them used to re-read (or re-run
++    // `git show` for) a file per chunk and per finding.
++    let post_image_source = |path: &str| -> Option<String> {
+         if label.starts_with("working-tree") {
+             std::fs::read_to_string(root.join(path)).ok()
+         } else {
+             run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
+         }
+     };
++    let post_images = Rc::new(PostImageCache::new());
++    let read_post_image = post_images.reader(post_image_source);
++    let context_on = crate::review_context::enabled();
++    let context_for = |chunk: &str, budget: usize| -> String {
++        if !context_on {
++            return String::new();
++        }
++        let context = crate::review_context::chunk_context(chunk, &read_post_image, budget);
++        if context.is_empty() {
++            context
++        } else {
++            format!(
++                "\n\nContext from the full post-change files (NOT part of the diff; do not \
++review it). These names exist outside the lines shown, so do not report them as undefined, \
++unbound, or missing imports:\n{context}"
++            )
++        }
++    };
++    let plan = plan_loop_review(
++        diff,
++        label,
++        preamble,
++        caps_for(caps_model),
++        zoderignore,
++        config_excludes,
++        context_on,
++        &context_for,
++        base_tokens,
++    )?;
++    // A reviewer fallback on the first chunk may be serving a model with a
++    // different context size; re-plan for it once (the same contract as
++    // `zoder review`).
++    let replan = |served: &str| -> Option<(Vec<String>, u32)> {
++        plan_loop_review(
++            diff,
++            label,
++            preamble,
++            caps_for(Some(served)),
++            zoderignore,
++            config_excludes,
++            context_on,
++            &context_for,
++            base_tokens,
++        )
++        .ok()
++        .map(|p| (p.users, p.max_tokens))
++    };
++    let (completion, reviewer_report) = complete_review_chunks(
++        cli,
++        Some(eng),
++        reviewer_override,
++        reviewer_chain,
++        author_models,
++        system,
++        &plan.users,
++        plan.max_tokens,
++        caps_model.map(str::to_string),
++        &replan,
++    )
++    .await
++    // Flatten the context chain (`review chunk 2/3: reviewer X: provider HTTP
++    // 500 ...`) into one message: the loop's per-iteration `review_error` and
++    // summary must name the provider failure, not just the chunk wrapper.
++    .map_err(|e| anyhow::anyhow!("{e:#}"))?;
++    let mut review = strict_review(&completion.content).ok_or_else(|| {
++        anyhow::anyhow!(
++            "review incomplete: aggregated verdict from {} was not a structured JSON review",
++            completion.model
++        )
++    })?;
++    review.escalation_reason = reviewer_report.escalation_reason.clone();
++    review.forced_family_conflict = reviewer_report.forced_family_conflict;
++    // Deterministic false-positive filter: a finding that calls a symbol
++    // undefined is dropped when the reviewed working tree defines or imports
++    // it. The evidence is kept in `filtered_findings` for the loop record.
++    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
++    filter_false_undefined_findings(&mut review, &read_worktree);
++    // `completion.chunks` is the final plan after a possible fallback re-plan;
++    // `plan.chunks` would under-report what the reviewer actually saw.
++    let chunks = completion.chunks;
++    // The per-REVIEWER view for the loop record: one entry for this review's
++    // reviewer (the loop dispatches one reviewer per review; the shape stays
++    // a list so the record keeps its contract when the loop ever fans out to
++    // a panel). `model` is the model that served the review; `verdict` is the
++    // aggregated verdict; `complete` = every chunk returned a STRUCTURED
++    // verdict on its FIRST attempt AND was served by the model that was
++    // REQUESTED for it (a mid-review fallback to a different model is
++    // incomplete, never complete). `complete_review_chunks` already bails on
++    // any chunk served by a different model, so a mixed-model review can
++    // never reach this code as `Ok` — the check is the record's own
++    // self-contained evidence, not a trust in the bail.
++    // On every Ok return path both model identities are `Some` (a successful
++    // call completed at least one chunk, which pinned them; an empty plan is
++    // rejected before dispatch). The `unwrap_or_default` below is therefore
++    // unreachable — it only keeps the borrow checker happy without a second
++    // error path for a state that cannot occur.
++    let chunk_complete = !reviewer_report.chunks.is_empty()
++        && reviewer_report
++            .chunks
++            .iter()
++            .all(|c| c.structured && c.served_model == c.requested_model);
++    let reviewer_verdicts = vec![json!({
++        "model": reviewer_report.served_model.clone().unwrap_or_default(),
++        "verdict": review.verdict,
++        "complete": chunk_complete,
++        "escalation_reason": reviewer_report.escalation_reason,
++        "forced_family_conflict": reviewer_report.forced_family_conflict,
++        "skipped_candidates": reviewer_report.skipped,
++    })];
++    Ok((
++        review,
++        Some(completion.model),
++        completion.cost_usd,
++        chunks,
++        reviewer_verdicts,
++    ))
++}
++
++/// Per-chunk completion record kept by [`complete_review_chunks`]: which model
++/// was requested for the chunk, which model actually served it, and whether it
++/// produced a structured verdict for the chunk.
++#[derive(Debug)]
++struct ChunkCompletion {
++    // Evidence kept for the chunk report's provenance (which model was
++    // requested vs served). In the loop's single-reviewer path every request
++    // is served by the model it was requested for (a substitution fails the
++    // review), so `served_model` is the identity the record uses; the
++    // requested id is retained so a future fan-out path can prove the match
++    // per chunk without re-dispatching.
++    #[allow(dead_code)]
++    requested_model: String,
++    served_model: String,
++    structured: bool,
++}
++
++/// One reviewer's view of its chunk plan: the requested/served models, the
++/// per-chunk structured-verdict evidence, and the chunk count the review was
++/// sized for.
++///
++/// `complete_review_chunks` handles ONE reviewer per call (its callers fan
++/// out to a panel by calling it once per slot), so the function returns
++/// exactly this one report — never more, never an empty vector. A `None`
++/// model identity means "no chunk completed": the fields are reported as
++/// ABSENT rather than fabricated as empty strings.
++#[derive(Debug)]
++struct ReviewerChunkReport {
++    /// The model the chunks were requested for. `None` only when no chunk
++    /// completed (empty report); on every successful call the first
++    /// completed chunk pinned it, so it is present.
++    requested_model: Option<String>,
++    /// The model that actually served the review. `None` only when no chunk
++    /// completed; when present it equals the served model of EVERY chunk
++    /// (a mixed-model review bails before returning).
++    served_model: Option<String>,
++    /// One entry per chunk of the review, in chunk order.
++    chunks: Vec<ChunkCompletion>,
++    /// Reviewer candidates skipped before the served candidate answered.
++    skipped: Vec<SkippedReviewCandidate>,
++    /// `None` when the first candidate answered; otherwise why the chain
++    /// escalated to another candidate.
++    escalation_reason: Option<String>,
++    /// The operator's explicit reviewer was in an author family and kept.
++    forced_family_conflict: bool,
++}
++
++/// Re-plans review chunks for a fallback reviewer: returns that reviewer's
++/// chunk prompts and output budget, or `None` to keep the current chunks.
++type ReplanFn<'a> = dyn Fn(&str) -> Option<(Vec<String>, u32)> + 'a;
++
++/// The chunk walker's mixed-model enforcement, as a pure predicate: `true`
++/// when a chunk was served by a model DIFFERENT from the one that pinned
++/// the review (the model that served the earlier chunks). A mixed-model
++/// review is a mixed-model approval, and a mixed-model approval is refused
++/// — the caller bails, so the review surfaces as incomplete, never as
++/// complete. The first chunk is never mixed by definition (it pins).
++fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
++    pinned_served != this_served
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn complete_review_chunks(
++    cli: &crate::Cli,
++    eng: Option<&Engine>,
++    model_override: Option<&str>,
++    reviewer_chain: &[String],
++    author_models: &[String],
++    system: &str,
++    users: &[String],
++    max_tokens: u32,
++    planned_model: Option<String>,
++    replan: &ReplanFn<'_>,
++) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
++    // A review with no engine cannot resolve a reviewer: say so instead of
++    // dispatching into an empty chain (the caller that loaded the engine has
++    // already reported the load failure).
++    let eng: &Engine = eng.ok_or_else(|| {
++        anyhow::anyhow!("review incomplete: no engine loaded, so no reviewer can be resolved")
++    })?;
++    // Chunks are sized for `planned_model`. When the first chunk is served by
++    // a different model (the chain fell back), the remaining review must be
++    // sized for THAT model; mixing models across chunks is refused below, so
++    // the switch can only happen on the first chunk and happens at most once.
++    let mut users: Vec<String> = users.to_vec();
++    let mut max_tokens = max_tokens;
++    let mut replanned = false;
++    // The model that served the review so far, pinned by the FIRST
++    // completed chunk — replanned or not. `None` only while no chunk has
++    // completed yet; the capture below (the `else` arm of the single model
++    // check) assigns it on the first success, and every later chunk must
++    // match the pinned value or the review bails as a mixed-model approval.
++    let mut served_model: Option<String> = None;
++    // The requested model is captured in the SAME single capture, so the two
++    // can never disagree about which dispatch established the review: no
++    // replan and a replan both go through it.
++    let mut requested_model: Option<String> = None;
++    // Per-chunk evidence: which model was requested, which served, and whether
++    // the chunk's structured verdict came back BEFORE any repair or fallback.
++    // A re-asked or re-dispatched chunk keeps its first (pre-repair)
++    // structured flag: a first-attempt parse failure is real incompleteness
++    // evidence, and a chunk that only parsed on repair is not "every chunk
++    // returned a structured verdict on its own".
++    let mut chunk_records: Vec<ChunkCompletion> = Vec::new();
++    let mut cost_usd = 0.0;
++    let mut receipts = Vec::new();
++    let mut merged = ReviewOutput {
++        verdict: "approve".into(),
++        ..ReviewOutput::default()
++    };
++    // Reviewer-chain evidence accumulated across chunks. The loop dispatches
++    // one reviewer per review, so this is the record of how that reviewer was
++    // reached: candidates skipped before it answered, why, and whether an
++    // explicit operator pin was kept despite a family conflict.
++    let mut skipped_candidates: Vec<SkippedReviewCandidate> = Vec::new();
++    let mut escalation_reason: Option<String> = None;
++    let mut forced_family_conflict = false;
++    let mut idx = 0usize;
++    while idx < users.len() {
++        // The "this is review part N of M" statement and the partial-diff
++        // notice live INSIDE the chunk prompt: the notice is constant, so it
++        // belongs to the cache-stable head, and the part number varies, so it
++        // belongs to the variable tail. Prepending the whole sentence here
++        // put the varying part number in FRONT of the head, so the leading
++        // bytes of chunk N+1 were never the leading bytes of chunk N and the
++        // cache could not hit at all.
++        //
++        // The historical layout (behind ZODER_REVIEW_STABLE_PREFIX=0) keeps
++        // the notice in front, because that layout has no cache-stable head
++        // to protect.
++        let user = if crate::review_baton::stable_prefix_enabled() {
++            users[idx].clone()
++        } else {
++            format!(
++                "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
++Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
++is not evidence of a defect. Report only defects established by the supplied code; do not \
++invent missing integration or compiler failures from omitted context.\n\n{}",
++                idx + 1, users.len(), users[idx]
++            )
++        };
++        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
++        // verdict gets one same-model repair; if the repair is still not a
++        // structured verdict, the candidate is recorded as `invalid_verdict`
++        // and the chain ADVANCES instead of failing the whole review (as long
++        // as another candidate remains). Transport failures inside
++        // `complete_once_tracked` already advance the chain and leave their
++        // own skip trail.
++        let mut invalid_models: Vec<(String, String)> = Vec::new();
++        let (completion, review, chunk_structured) = loop {
++            let outcome = complete_once_tracked(
++                cli,
++                served_model.as_deref().or(model_override),
++                reviewer_chain,
++                author_models,
++                &invalid_models,
++                system,
++                &user,
++                max_tokens,
++                eng,
++                false,
++            )
++            .await
++            .map_err(|failure: ChainFailure| {
++                anyhow!(
++                    "review chunk {}/{}: {}",
++                    idx + 1,
++                    users.len(),
++                    failure.message
++                )
++            })?;
++            cost_usd += outcome.completion.cost_usd;
++            receipts.extend(outcome.completion.receipts.clone());
++            skipped_candidates.extend(outcome.skipped);
++            if escalation_reason.is_none() {
++                escalation_reason = outcome.escalation_reason;
++            }
++            forced_family_conflict |= outcome.forced;
++            let completion = outcome.completion;
++            if idx == 0 && !replanned && served_model.is_none() {
++                if let Some(planned) = planned_model.as_deref() {
++                    if completion.model != planned {
++                        if let Some((new_users, new_tokens)) = replan(&completion.model) {
++                            if new_users != users || new_tokens != max_tokens {
++                                if !cli.quiet {
++                                    eprintln!(
++                                        "[zoder] reviewer {} served the first chunk instead of {planned}; \
++                                         re-planning chunks for it ({} -> {} chunk(s))",
++                                        completion.model,
++                                        users.len(),
++                                        new_users.len()
++                                    );
++                                }
++                                users = new_users;
++                                max_tokens = new_tokens;
++                                replanned = true;
++                                // Do NOT capture the model here: the
++                                // re-dispatched first chunk goes through the
++                                // loop's single model capture below.
++                                continue;
++                            }
++                        }
++                    }
++                }
++            }
++            // A chunk whose verdict only appeared on the repair retry keeps
++            // `structured: false`: a repaired verdict is not a first-attempt
++            // structured verdict.
++            if let Some(review) = strict_review(&completion.content) {
++                break (completion, review, true);
++            }
++            // A completion that ended at `finish_reason: "length"` with no
++            // answer content is NOT a verdict at all — the model spent the
++            // whole budget on hidden reasoning. Treat it exactly like the
++            // truncated-before-verdict case: one same-model repair with the
++            // doubled budget (capped by the same ceiling and context
++            // window). The dispatch loop's transient-retry path already saw
++            // this error and did NOT retry it — `retryable()` is false for a
++            // budget exhaustion, since a blind same-budget retry repeats the
++            // failure — so this repair is the ONLY retry of this model and
++            // the two never stack.
++            let budget_exhausted = completion.length_exhausted;
++            let repair_user = format!(
++                "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
++did not satisfy the review schema."
++            );
++            let repair_max_tokens = if budget_exhausted {
++                // The model burned `completion.max_tokens` (the budget it
++                // actually ran with) and came back empty; give it the
++                // doubled budget, capped by the reviewer ceiling AND by the
++                // model's configured context window when one is stated —
++                // never above what the model can hold.
++                let doubled = reviewer_retry_budget(completion.max_tokens);
++                // The review's engine is already in hand (D5.2): re-reading
++                // it here cost a second corpus load per exhausted chunk.
++                let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
++                    r.real_provider_for_model(&eng.cfg, &completion.model)
++                        .map(|p| p.id.clone())
++                });
++                let window = crate::context_opt::window_for(
++                    &eng.cfg,
++                    provider_id.as_deref().unwrap_or(""),
++                    &completion.model,
++                    None,
++                );
++                window
++                    .and_then(|w| u32::try_from(w).ok())
++                    .map_or(doubled, |w| doubled.min(w))
++            } else {
++                reviewer_retry_budget(max_tokens)
++            };
++            let repaired = complete_once_tracked(
++                cli,
++                Some(&completion.model),
++                &[],
++                author_models,
++                &[],
++                system,
++                &repair_user,
++                repair_max_tokens,
++                eng,
++                true,
++            )
++            .await;
++            match repaired {
++                Ok(repair) => {
++                    cost_usd += repair.completion.cost_usd;
++                    receipts.extend(repair.completion.receipts.clone());
++                    skipped_candidates.extend(repair.skipped);
++                    forced_family_conflict |= repair.forced;
++                    if let Some(review) = strict_review(&repair.completion.content) {
++                        break (repair.completion, review, false);
++                    }
++                    if budget_exhausted && repair.completion.length_exhausted {
++                        // Exhausted the budget TWICE: the model cannot
++                        // produce a verdict in this budget. Fail with a
++                        // message that names the model and both budgets,
++                        // and stop — no third request, no chain advance
++                        // pretending a verdict was attempted.
++                        let first = completion.max_tokens;
++                        let second = repair.completion.max_tokens;
++                        if first == second {
++                            anyhow::bail!(
++                                "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
++lower its reasoning effort or raise max_tokens",
++                                completion.model
++                            );
++                        }
++                        anyhow::bail!(
++                            "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
++lower its reasoning effort or raise max_tokens",
++                            completion.model
++                        );
++                    }
++                }
++                Err(failure) => {
++                    // A transport failure on the repair is not a verdict at
++                    // all; keep its skip trail and let the chain advance.
++                    skipped_candidates.extend(failure.skipped);
++                    forced_family_conflict |= failure.forced;
++                }
++            }
++            // Invalid twice (or the repair could not run): advance the chain.
++            skipped_candidates.push(SkippedReviewCandidate {
++                model: completion.model.clone(),
++                reason: "invalid_verdict".to_string(),
++            });
++            if escalation_reason.is_none() {
++                escalation_reason = Some("invalid_verdict".to_string());
++            }
++            invalid_models.push((completion.model.clone(), "invalid_verdict".to_string()));
++        };
++        let record = ChunkCompletion {
++            requested_model: completion.requested_model.clone(),
++            served_model: completion.model.clone(),
++            structured: chunk_structured,
++        };
++        // No `served != requested` check here: `complete_once` dispatches each
++        // candidate with the same id as both the requested and the dispatched
++        // model, so the two can never differ on a returned `Completion`. A
++        // provider-side substitution is refused earlier, inside
++        // `dispatch_reviewer_for_model`, which compares the provider's reported
++        // response model with the requested one (reviewer provenance
++        // mismatch) before any `Completion` is returned. What remains to
++        // enforce at this level is a mid-review FALLBACK to a different
++        // candidate, which the check below catches against the model that
++        // served the earlier chunks. Either way the bail IS the
++        // incompleteness path: `run_loop_review` maps the error to the
++        // iteration's `reviewer_unavailable` verdict with `review_error` set
++        // and `review_complete: false`.
++        // Single model capture AND the canonical mixed-model enforcement,
++        // shared by the replanned and non-replanned paths: the first
++        // COMPLETED chunk pins the served and requested models; every LATER
++        // chunk is then checked against the pinned `served_model` by the
++        // pure `mixed_model_chunk` predicate below and the review bails if
++        // the provider served it by a different model. A mid-review fallback
++        // to a different model is a mixed-model approval, and a mixed-model
++        // approval is refused — never accepted as a complete review.
++        if let Some(first) = &served_model {
++            if mixed_model_chunk(first, &completion.model) {
++                anyhow::bail!(
++                    "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
++                    idx + 1,
++                    users.len(),
++                    completion.model,
++                    first
++                );
++            }
++        } else {
++            served_model = Some(completion.model.clone());
++            requested_model = Some(completion.requested_model.clone());
++        }
++        chunk_records.push(record);
++        append_chunk_review(&mut merged, review, idx, users.len());
++        idx += 1;
++    }
++    // One report per reviewer: the requested and served models (ABSENT,
++    // never an empty string, when no chunk completed) plus the per-chunk
++    // structured-verdict evidence, in chunk order.
++    let report = ReviewerChunkReport {
++        requested_model,
++        served_model,
++        chunks: chunk_records,
++        skipped: skipped_candidates,
++        escalation_reason,
++        forced_family_conflict,
++    };
++    let completion = Completion {
++        requested_model: report.requested_model.clone().unwrap_or_default(),
++        model: report
++            .served_model
++            .clone()
++            .ok_or_else(|| anyhow!("no review chunks were generated"))?,
++        content: serde_json::to_string(&merged)?,
++        cost_usd,
++        receipts,
++        chunks: users.len(),
++        // The merged content is zoder's own JSON, never a raw provider
++        // completion, so no raw budget-exhaustion flag rides on it.
++        length_exhausted: false,
++        // `max_tokens` may have been re-planned for a fallback reviewer;
++        // the final value is the one every chunk ran at.
++        max_tokens,
++    };
++    Ok((completion, report))
++}
++
++/// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
++#[derive(Clone)]
++struct ReviewPlan {
++    caps: crate::review_diff::ReviewCaps,
++    window_tokens: Option<u64>,
++    prepared: crate::review_diff::PreparedDiff,
++    users: Vec<String>,
++    chunking: serde_json::Value,
++}
++
++fn single_review_budget(
++    window_tokens: Option<u64>,
++    reserved_tokens: u32,
++    max_diff_bytes: usize,
++    chunk_cap_bytes: usize,
++) -> usize {
++    match window_tokens {
++        None => chunk_cap_bytes,
++        Some(window) => ((window
++            .saturating_sub(u64::from(reserved_tokens))
++            .saturating_mul(zoder_core::context_opt::BYTES_PER_TOKEN)
++            .min(usize::MAX as u64)) as usize)
++            .min(max_diff_bytes),
++    }
++}
++
++fn review_plan_matches(
++    plan_caps: crate::review_diff::ReviewCaps,
++    plan_window_tokens: Option<u64>,
++    caps: crate::review_diff::ReviewCaps,
++    window_tokens: Option<u64>,
++) -> bool {
++    plan_caps == caps && plan_window_tokens == window_tokens
++}
++
++/// Build the per-chunk reviewer prompts for a prepared diff.
++///
++/// `preamble` is the per-review context block (the task under review, the
++/// validation output). It is placed AFTER the cache-stable head, never
++/// before it: a prefix cache is keyed on the leading bytes, so anything that
++/// varies per review and sits in front of the head breaks the cache on every
++/// review and re-bills the whole head.
++fn build_review_users(
++    label: &str,
++    focus_txt: &str,
++    preamble: &str,
++    prepared: &crate::review_diff::PreparedDiff,
++    context_budget: usize,
++    context_for: &dyn Fn(&str, usize) -> String,
++) -> Vec<String> {
++    // A chunked review is a fan of independent calls over one diff, so it is
++    // the one place a prompt cache pays for itself many times over — if the
++    // leading bytes are identical on every call. `review_baton` hoists the
++    // constant head (system prompt aside, which travels in the `system` slot,
++    // plus the diff map, the partial-diff notice and the focus line) and any
++    // byte-identical per-chunk context header into one shared prefix, then
++    // appends the preamble, the part banner and the chunk. Before it, the diff
++    // map was repeated on all 16 calls of a 16-chunk review.
++    let chunks: Vec<String> = prepared.chunks.clone();
++    let map = prepared.diff_map.clone().unwrap_or_default();
++    let wrapped_map = if map.is_empty() {
++        String::new()
++    } else {
++        format!(
++            "Diff map (deterministic; covers ALL chunks of this diff). Before reporting a symbol \
++as undefined, redefined, or recursively calling a missing function, check it against this map:\n{map}"
++        )
++    };
++    let rendered = crate::review_baton::render_review(
++        // The reviewer system prompt is passed separately to `complete_once`;
++        // the baton only needs the *body* prefix it must keep byte-stable.
++        "",
++        &wrapped_map,
++        label,
++        focus_txt,
++        &chunks,
++        preamble,
++        &|idx| {
++            context_for(
++                chunks.get(idx).map(String::as_str).unwrap_or_default(),
++                context_budget,
++            )
++        },
++    );
++    rendered.prompts
++}
++
++/// `--dry-run`: one line per reviewer slot with the chunk plan it would use.
++fn print_chunk_plans(slots: &[(String, &ReviewPlan, u32)]) {
++    println!("[zoder] chunk plan per reviewer:");
++    for (who, plan, tokens) in slots {
++        let sizes: Vec<String> = plan
++            .prepared
++            .chunks
++            .iter()
++            .map(|c| c.len().to_string())
++            .collect();
++        println!(
++            "[zoder]   {who}: {} chunk(s) [{}] max-hunk-bytes={} max-diff-bytes={} max-chunks={} max-tokens={} ({})",
++            plan.prepared.chunks.len(),
++            sizes.join(", "),
++            plan.caps.max_hunk_bytes,
++            plan.caps.max_diff_bytes,
++            plan.caps.max_chunks,
++            tokens,
++            if plan.caps.from_route {
++                "route default"
++            } else {
++                "general default"
++            }
++        );
++    }
++}
++
++/// Print exactly what `review` would send, without calling any model. Used by
++/// `--dry-run` and by the size/exclusion acceptance checks.
++fn print_review_dry_run(
++    label: &str,
++    raw_diff: &str,
++    prepared: &crate::review_diff::PreparedDiff,
++    prompts: &[String],
++    max_diff_bytes: usize,
++    max_hunk_bytes: usize,
++) {
++    println!("[zoder] dry-run: {label}");
++    println!(
++        "[zoder] diff bytes: {} raw, {} after exclusions",
++        raw_diff.len(),
++        prepared.filtered.len()
++    );
++    println!("[zoder] caps: max-diff-bytes={max_diff_bytes} max-hunk-bytes={max_hunk_bytes}");
++    if prepared.excluded.is_empty() {
++        println!("[zoder] excluded: none");
++    } else {
++        println!("[zoder] excluded: {}", prepared.excluded.render());
++    }
++    println!(
++        "[zoder] chunks: {} (diff map: {})",
++        prepared.chunks.len(),
++        prepared
++            .diff_map
++            .as_ref()
++            .map(|m| format!("{} bytes", m.len()))
++            .unwrap_or_else(|| "not needed (single chunk)".to_string())
++    );
++    if let Some(map) = &prepared.diff_map {
++        println!("[zoder] diff map:\n{map}");
++    }
++    // Print the assembled per-chunk prompts (map included), not the raw diff
++    // slices, so a dry-run shows exactly what each reviewer would receive.
++    for (i, prompt) in prompts.iter().enumerate() {
++        println!(
++            "[zoder] ---- prompt chunk {}/{} ({} bytes) ----",
++            i + 1,
++            prompts.len(),
++            prompt.len()
++        );
++        print!("{prompt}");
++        if !prompt.ends_with('\n') {
++            println!();
++        }
++    }
++}
++
++// Signature grows with review options; the size/exclusion knobs are bundled
++// into `ReviewSizeOptions`, so the arg count stays close to the historical one.
++#[allow(clippy::too_many_arguments)]
++pub(crate) async fn cmd_review(
++    cli: &crate::Cli,
++    base: Option<String>,
++    scope: ReviewScope,
++    panel: Option<String>,
++    background: bool,
++    adversarial: bool,
++    focus: &[String],
++    opts: ReviewSizeOptions,
++) -> anyhow::Result<()> {
++    let cwd = crate::agentic_cwd(cli)?;
++
++    // Background: re-exec self detached, then return the job id.
++    if background && active_job_dir().is_none() {
++        let id = spawn_background(
++            if adversarial {
++                "adversarial-review"
++            } else {
++                "review"
++            },
++            &cwd,
++        )?;
++        println!("{id}");
++        if !cli.quiet {
++            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
++        }
++        return Ok(());
++    }
++
++    let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
++    let label = empty_branch_label(&cwd, scope, base.as_deref(), &label, &diff);
++    // D4.4: `zoder review` refused nothing about a truncated diff — only the
++    // loop did — so with `--max-diff-bytes` above the 1 MiB acquisition cap
++    // the reviewer was shown a partial change and could approve it.
++    if diff_is_truncated(&diff) {
++        let reason = truncated_diff_refusal(MAX_GIT_DIFF_BYTES);
++        let failed = ReviewerSlot::Failed {
++            model: "(truncated)".into(),
++            err: reason.clone(),
++        };
++        let agg = emit_reviews(
++            cli,
++            &ReviewAggregate {
++                reviewers: &[failed],
++                cost_usd: 0.0,
++                requested: 1,
++                ok_models: 0,
++                failed_models: 1,
++                receipts: &[],
++                exclusions: None,
++                chunking: None,
++                confirm: &[],
++            },
++        );
++        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
++    }
++    if let Some(reason) = empty_diff_hides_uncommitted_work(&cwd, scope, &label, &diff) {
++        let failed = ReviewerSlot::Failed {
++            model: "(no diff)".into(),
++            err: reason.clone(),
++        };
++        let agg = emit_reviews(
++            cli,
++            &ReviewAggregate {
++                reviewers: &[failed],
++                cost_usd: 0.0,
++                requested: 1,
++                ok_models: 0,
++                failed_models: 1,
++                receipts: &[],
++                exclusions: None,
++                chunking: None,
++                confirm: &[],
++            },
++        );
++        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
++    }
++    // D4.5: an empty diff is its OWN result (`empty_diff`), never `approve`.
++    // `zoder review` has no validator to pass, so an approve here says
++    // "nothing was wrong" about a change nobody looked at — including a
++    // `--base` typo that reviewed an empty range.
++    if diff.trim().is_empty() {
++        let out = ReviewOutput {
++            verdict: EMPTY_DIFF_VERDICT.into(),
++            summary: format!("{EMPTY_DIFF_RESULT}: no changes to review ({label})."),
++            findings: vec![],
++            next_steps: vec![],
++            ..Default::default()
++        };
++        emit_reviews(
++            cli,
++            &ReviewAggregate {
++                reviewers: &[ReviewerSlot::Ok {
++                    model: String::from("n/a"),
++                    review: out,
++                }],
++                cost_usd: 0.0,
++                requested: 1,
++                ok_models: 1,
++                failed_models: 0,
++                receipts: &[],
++                exclusions: None,
++                chunking: None,
++                confirm: &[],
++            },
++        );
++        anyhow::bail!(
++            "{EMPTY_DIFF_RESULT}: no changes to review ({label}); nothing was reviewed, so \
++             this is not an approval. Check the scope and --base (an empty range usually means \
++             the base already contains the change)."
++        );
++    }
++
++    let system = if adversarial {
++        ADVERSARIAL_SYSTEM
++    } else {
++        REVIEW_SYSTEM
++    };
++
++    // Resolve the review caps and exclusions. Loading the engine here (not
++    // just below for the reviewer chain) lets `[review]` config participate;
++    // a config problem degrades to the built-in defaults rather than blocking
++    // a review.
++    // ONE engine load for the whole review (D5.2): the panel fan-out, the
++    // chunk writers, the repair path and the confirmer all borrow this
++    // instance instead of re-reading the config, the engine TOML and the
++    // model corpus per dispatch. A failed load still degrades to the
++    // built-in defaults (as before), but it is now loaded ONCE.
++    let eng = Engine::load().ok();
++    let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
++
++    // Resolve which reviewer will serve the default slot *before* chunking, so
++    // per-route size caps (`[review.route_defaults.<model>]`) can shape the
++    // chunks. The route identity mirrors the call path: an explicit `-m`, then
++    // the configured reviewer pin, then the head of the scenario reviewer
++    // chain. When none is resolvable (no engine, or a fully dynamic route) the
++    // per-route lookup is skipped and the general caps/default apply.
++    let health = eng
++        .as_ref()
++        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
++    let reviewer_chain: Vec<String> = match (&eng, &health) {
++        (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
++            .map(|r| r.reviewer)
++            .unwrap_or_default(),
++        _ => Vec::new(),
++    };
++    let reviewer_for_caps: Option<String> = cli
++        .model
++        .clone()
++        // `reviewer_model` is a comma-separated chain; size for its head.
++        .or_else(|| {
++            eng.as_ref().and_then(|e| {
++                e.cfg
++                    .reviewer_models_for(cli.agent.as_deref())
++                    .into_iter()
++                    .next()
++            })
++        })
++        .or_else(|| reviewer_chain.first().cloned());
++
++    let config_excludes = review_cfg
++        .as_ref()
++        .map(|r| r.exclude.clone())
++        .unwrap_or_default();
++    let root = crate::review_diff::repo_root(&cwd);
++    // Base/branch scopes read `.zoderignore` from the BASE revision so a change
++    // under review cannot exempt itself; only working-tree scope reads the
++    // working tree, where uncommitted edits are legitimately in scope.
++    let zoderignore = review_zoderignore_patterns(&cwd, &root, scope, base.as_deref());
++    let focus_txt = focus.join(" ");
++
++    // Per-reviewer sizing: every reviewer slot gets chunks sized for ITS
++    // model (`[review.route_defaults.<model>]`), so a panel may chunk
++    // differently per member. Agent aliases resolve to their configured model
++    // before the lookup.
++    let sizing_model = |m: &str| -> String {
++        eng.as_ref()
++            .and_then(|e| crate::configured_model_for_agent(e, Some(m)))
++            .unwrap_or_else(|| m.to_string())
++    };
++    let caps_for = |model: Option<&str>| {
++        let resolved = model.map(&sizing_model);
++        crate::review_diff::resolve_review_caps(
++            opts.max_hunk_bytes,
++            opts.max_diff_bytes,
++            review_cfg.as_ref(),
++            resolved.as_deref(),
++        )
++    };
++    // Cross-chunk context: names that exist in the post-change files but
++    // outside the chunk (bindings earlier in the enclosing function, imports,
++    // top-level definitions). Working-tree reviews read the files on disk;
++    // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
++    //
++    // The reads go through ONE per-review cache (D10.7): this header, the
++    // false-undefined filter below and the confirm layer's grounding all ask
++    // about the same files, and each of them used to re-read (or re-run
++    // `git show` for) a file per chunk and per finding.
++    let post_image_source = |path: &str| -> Option<String> {
++        if label.starts_with("working-tree") {
++            std::fs::read_to_string(root.join(path)).ok()
++        } else {
++            run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
++        }
++    };
++    let post_images = Rc::new(PostImageCache::new());
++    let read_post_image = post_images.reader(post_image_source);
+     let context_on = crate::review_context::enabled();
+     let context_for = |chunk: &str, budget: usize| -> String {
+         if !context_on {
+@@ -4485,7 +5371,7 @@
+         let eng = Engine::load();
+         let (reviewer_chain, review_cfg, caps_model) = match eng.as_ref() {
+             Ok(eng) => {
+-                let health = HealthStore::load(&eng.cfg.health_path);
++                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                 let chain = crate::resolve_chain(cli, eng, &health)
+                     .map(|r| r.reviewer)
+                     .unwrap_or_default();
+@@ -4513,7 +5399,7 @@
+                         models.push(primary);
+                     }
+                 }
+-                let health = HealthStore::load(&eng.cfg.health_path);
++                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                 if let Ok(routes) = crate::resolve_chain(cli, eng, &health) {
+                     for model in routes.primary {
+                         if !models.contains(&model) {
