@@ -1091,14 +1091,29 @@ mod tests {
         assert_eq!(env.run_command(&step), StepExec::Passed);
     }
 
+    // The default must be loose enough not to red a slow cold test suite;
+    // it exists to bound a hang, not to police duration. Asserted at
+    // compile time: the value is a `const`, so a runtime `assert!` would
+    // be a constant-value assertion (clippy `-D warnings` on CI).
+    const _: () = assert!(DEFAULT_GATE_STEP_TIMEOUT_SECS >= 600);
+
     #[test]
     fn default_gate_step_timeout_is_generous() {
-        // The default must be loose enough not to red a slow cold test
-        // suite; it exists to bound a hang, not to police duration.
-        assert!(
-            DEFAULT_GATE_STEP_TIMEOUT_SECS >= 600,
-            "default step timeout should be generous, got {DEFAULT_GATE_STEP_TIMEOUT_SECS}s"
-        );
+        // Behavioural companion to the `const _` bound above: the default
+        // must be wired through as a real timeout (not silently absent and
+        // not an instant one), so a step comfortably inside it still runs
+        // to completion rather than being cut off.
+        let default = Duration::from_secs(DEFAULT_GATE_STEP_TIMEOUT_SECS);
+        assert!(default >= Duration::from_secs(60), "got {default:?}");
+        let env = PathEnv::new().with_step_timeout(default);
+        let step = GateStep {
+            name: "inside-default".to_string(),
+            category: StepCategory::Test,
+            command: vec!["true".to_string()],
+            tool: "true".to_string(),
+            required: true,
+        };
+        assert_eq!(env.run_command(&step), StepExec::Passed);
     }
 
     // ----- probe_tools ----------------------------------------------------
