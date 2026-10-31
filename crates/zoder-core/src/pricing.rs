@@ -1190,8 +1190,20 @@ impl PricingCatalog {
                 };
                 let query_segments = segments(&ml);
                 let key_segments = segments(&kl);
-                let depth = query_segments.len().min(key_segments.len());
-                if query_segments[..depth] != key_segments[..depth] {
+                // The key's vendor chain must be a SUFFIX of the query's
+                // (nearest the leaf) -- never merely a leading prefix.
+                //
+                //   key `meta/llama-4-70b`  vs `together/meta/llama-4-70b`  -> ok
+                //   key `gpt-4o` (no vendor) vs `openai/gpt-4o`            -> ok
+                //   key `a/b`               vs `a/b/c`                      -> NO
+                //
+                // A `min(len)` prefix bound would accept the last case, and a
+                // strict equal-depth rule would reject the first two. Only the
+                // suffix rule expresses "same publisher, maybe behind a
+                // gateway" without re-attributing a model to another vendor.
+                if key_segments.len() > query_segments.len()
+                    || query_segments[..key_segments.len()] != key_segments[..]
+                {
                     continue;
                 }
             }
@@ -1615,6 +1627,41 @@ mod tests {
         assert_eq!(cat.cost("metered-but-missing", 1_000_000, 0), 0.0);
         assert_eq!(cat.cost("free-preview", 1_000_000, 0), 0.0);
         assert_eq!(cat.cost("metered-paid", 1_000_000, 0), 1.0);
+    }
+
+    /// A qualified query must not borrow a rate from a key whose vendor chain
+    /// diverges from the query's. The real hazard was `depth = min(len)`:
+    /// bounding the comparison by the SHORTER side let a key whose leading
+    /// vendor matched but whose chain then diverged still be accepted.
+    ///
+    /// The leaf gate already prevents `a/b/c` from matching `a/b` (their
+    /// leaves differ), so the meaningful case is same-leaf, diverging vendor:
+    /// `acme/together/llama-4` must not take `together/meta/llama-4`'s rate.
+    /// A pure gateway hop in front (`together/meta/llama-4` -> `meta/llama-4`)
+    /// remains a match -- see `lookup_does_not_suffix_match_a_different_model_name`.
+    #[test]
+    fn a_qualified_query_does_not_borrow_a_diverging_vendor_chain() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "together/meta/llama-4".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 3.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            cat.lookup("acme/together/llama-4").is_none(),
+            "a diverging vendor chain must not inherit the key's rate"
+        );
+        assert!(
+            cat.lookup("together/meta/llama-4").is_some(),
+            "an equal-depth exact key must still resolve"
+        );
+        assert!(
+            cat.lookup("acme/together/meta/llama-4").is_some(),
+            "a gateway hop ahead of the key's chain must still resolve"
+        );
     }
 
     /// A configured LOCAL model must never be priced as the paid cloud model

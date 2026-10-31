@@ -15724,9 +15724,14 @@ fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
         // routed, so a prefix declaration must also stamp every known feed row
         // under that prefix -- otherwise the $0 declaration sits under `local/`
         // where nothing looks it up, and the models under it stay unpriced.
-        let mut targets: Vec<String> = vec![id.clone()];
+        let mut targets: Vec<String> = Vec::new();
         if id.ends_with('/') {
+            // A bare prefix is a declaration over ids, not an id: the engine
+            // would never look up `local/`, so it is only a seed for matching
+            // feed rows.
             targets.extend(cat.models.keys().filter(|k| k.starts_with(&id)).cloned());
+        } else {
+            targets.push(id.clone());
         }
         for target in targets {
             // A model the feed prices stays priced: the operator's config
@@ -23402,6 +23407,30 @@ mod engine_cost_accounting_tests {
             }}"#
         ))
         .expect("test config parses")
+    }
+
+    /// A bare prefix with no feed rows under it must not be written as a model
+    /// entry: `local/` is not a model id the engine will ever look up, so the
+    /// row is dead weight and misrepresents the catalog.
+    #[test]
+    fn a_prefix_with_no_feed_rows_does_not_become_a_model_entry() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"]
+            }"#,
+        );
+        let out = engine_catalog(&paid_catalog(), &cfg);
+        assert!(
+            !out.models.contains_key("local/"),
+            "the bare prefix must not be written as a model: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+        assert!(out.models.contains_key("deepseek/deepseek-r1"));
     }
 
     /// A `serves` entry of `local/` declares EVERY model under that prefix free.
