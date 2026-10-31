@@ -1586,6 +1586,111 @@ mod tests {
         assert_eq!(cat.cost("metered-paid", 1_000_000, 0), 1.0);
     }
 
+    /// A configured LOCAL model must never be priced as the paid cloud model
+    /// that happens to share its short name.
+    ///
+    /// Field incident (Z3): a local `foo/deepseek-r1` was priced as a paid
+    /// cloud `deepseek-r1` because the leaf/suffix fallback returned the
+    /// highest-rate match. The qualified `foo/...` id is an explicit statement
+    /// of which model served the call: the short-name fallback may not
+    /// override it with another publisher's rate.
+    #[test]
+    fn a_qualified_local_model_is_never_priced_as_a_shared_cloud_name() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "deepseek/deepseek-r1".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.55,
+                output_usd_per_mtok: 2.19,
+                ..Default::default()
+            },
+        );
+        // Publisher-qualified local id: unknown, NOT the cloud rate.
+        assert!(
+            cat.lookup("foo/deepseek-r1").is_none(),
+            "a qualified local id must not borrow another publisher's price"
+        );
+        assert_eq!(
+            cat.classify_cost("foo/deepseek-r1", 1_000_000, 0, None),
+            CostVerdict::Unknown
+        );
+        // An UNQUALIFIED short name still resolves the cloud entry (the
+        // engine and older ledgers record bare ids).
+        assert!(cat.lookup("deepseek-r1").is_some());
+    }
+
+    /// Short-name fallback must be exact-or-nothing: an exact match always
+    /// wins, and an AMBIGUOUS leaf (two or more distinct publishers) is
+    /// reported as unknown instead of guessing the most expensive one.
+    ///
+    /// C6-P3 used to resolve the collision to the MAX-rate entry "to never
+    /// undercharge"; that chargeback conservative-turned-guess billed local
+    /// and third-party ids at a cloud model's price (Z3).
+    #[test]
+    fn ambiguous_leaf_is_unknown_not_the_most_expensive_match() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "openai/gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 2.50,
+                output_usd_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        cat.models.insert(
+            "azure/gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 5.0,
+                output_usd_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        // Two distinct publishers under the same leaf: no guessing.
+        assert!(
+            cat.lookup("vertex/gpt-4o").is_none(),
+            "ambiguous leaf must not resolve to a guessed price"
+        );
+        assert_eq!(
+            cat.classify_cost("vertex/gpt-4o", 1_000_000, 0, None),
+            CostVerdict::Unknown
+        );
+        // The same short name still picks its EXACT entry, whichever it is.
+        let exact = cat.lookup("azure/gpt-4o").expect("exact match");
+        assert!((exact.input_usd_per_mtok - 5.0).abs() < 1e-12);
+        let exact = cat.lookup("openai/gpt-4o").expect("exact match");
+        assert!((exact.input_usd_per_mtok - 2.50).abs() < 1e-12);
+        // And an exact short-name KEY beats a leaf collision.
+        let mut cat2 = PricingCatalog::default();
+        cat2.models.insert(
+            "gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.0,
+                ..Default::default()
+            },
+        );
+        cat2.models.insert(
+            "azure/gpt-4o".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 5.0,
+                ..Default::default()
+            },
+        );
+        let p = cat2.lookup("gpt-4o").expect("exact key");
+        assert!(
+            (p.input_usd_per_mtok - 1.0).abs() < 1e-12,
+            "the exact match must never be replaced by a pricier leaf match"
+        );
+        // A leaf that matches exactly ONE publisher still resolves.
+        cat2.models.insert(
+            "meta/llama-4-70b".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.2,
+                ..Default::default()
+            },
+        );
+        assert!(cat2.lookup("together/meta/llama-4-70b").is_some());
+    }
+
     #[test]
     fn lookup_does_not_suffix_match_a_different_model_name() {
         let mut cat = PricingCatalog::default();
@@ -1800,11 +1905,16 @@ mod tests {
         );
     }
 
-    /// C6-P3: a leaf-collision query resolves DETERMINISTICALLY and fail-safe --
-    /// the MAX-rate match is returned, and the result is identical across
-    /// repeated calls regardless of HashMap iteration order.
+    /// A leaf-collision query is DETERMINISTIC and refuses to guess: two or
+    /// more distinct publishers under the same short name resolve to no
+    /// price, identically across repeated calls, regardless of HashMap
+    /// iteration order.
+    ///
+    /// This replaces C6-P3's "return the MAX-rate match" rule, which was
+    /// stable but wrong: it priced a local/third-party id at the priciest
+    /// cloud model sharing its short name (Z3).
     #[test]
-    fn leaf_collision_returns_deterministic_max_price() {
+    fn leaf_collision_is_deterministic_and_refuses_to_guess() {
         let mut cat = PricingCatalog::default();
         cat.models.insert(
             "openai/gpt-4o".to_string(),
@@ -1822,25 +1932,12 @@ mod tests {
                 ..Default::default()
             },
         );
-        // The query leaf `gpt-4o` collides with both; the higher-rate azure
-        // entry (input 5.0) must win, stably.
-        let mut seen = None;
         for _ in 0..64 {
-            let p = cat.lookup("vertex/gpt-4o").expect("leaf match");
-            let r = p.input_usd_per_mtok;
-            match seen {
-                None => seen = Some(r),
-                Some(prev) => assert!(
-                    (prev - r).abs() < 1e-12,
-                    "lookup non-deterministic across calls: {prev} vs {r}"
-                ),
-            }
+            assert!(
+                cat.lookup("vertex/gpt-4o").is_none(),
+                "ambiguous leaf must stay unknown on every call"
+            );
         }
-        assert!(
-            (seen.unwrap() - 5.0).abs() < 1e-9,
-            "must return the MAX-rate (azure) match, got {}",
-            seen.unwrap()
-        );
     }
 }
 

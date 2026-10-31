@@ -39,3 +39,6 @@ bench/raw/
 # development artifacts — never commit them.
 /t
 /.tmpbuild/
+
+# Local build dir used by the job (never /tmp)
+.cargo-target/

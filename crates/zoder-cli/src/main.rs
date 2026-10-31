@@ -23157,6 +23157,208 @@ mod ledger_call_cost_tests {
 }
 
 #[cfg(test)]
+mod engine_cost_accounting_tests {
+    //! Z3 (cost accounting): what zoder hands the cost engine, what its own
+    //! lookup falls back to, when it decides the data is stale, and what
+    //! `zoder spend` says about rows it could not price.
+    //!
+    //! Every test runs against a `tempfile` `$ZODER_HOME` / data dir; nothing
+    //! touches the real home.
+
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn config(providers: &str) -> Config {
+        serde_json::from_str(&format!(
+            r#"{{
+                "providers": [{providers}],
+                "default_provider": "prov-a",
+                "corpus_path": "/nonexistent/corpus.json",
+                "ledger_path": "/nonexistent/ledger.jsonl",
+                "health_path": "/nonexistent/health.json"
+            }}"#
+        ))
+        .expect("test config parses")
+    }
+
+    fn paid_catalog() -> PricingCatalog {
+        let mut cat = PricingCatalog::default();
+        cat.generated = "2026-10-30".to_string();
+        cat.models.insert(
+            "deepseek/deepseek-r1".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.55,
+                output_usd_per_mtok: 2.19,
+                ..Default::default()
+            },
+        );
+        cat
+    }
+
+    /// A local/free provider's models are written to the engine catalog as
+    /// EXPLICIT $0 entries.
+    ///
+    /// Field incident (Z3): the engine copy only carried models with a
+    /// non-zero price, so local models were simply absent. The engine then
+    /// priced them "some other way" and its own monthly backstop tripped at
+    /// $170 while real billed usage was under $1. An explicit zero tells the
+    /// engine "this is free"; an absent row tells it nothing.
+    #[test]
+    fn free_and_local_models_are_written_as_explicit_zero_price_entries() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"],
+                "models": ["local/qwen3.8-coder"]
+            }"#,
+        );
+        let out = engine_catalog(&paid_catalog(), &cfg, &BTreeMap::new());
+        let free = out
+            .models
+            .get("local/qwen3.8-coder")
+            .expect("a local model must be an explicit entry");
+        assert!(
+            !free.is_priced(),
+            "the local model's entry must be an explicit $0, got {free:?}"
+        );
+        // The paid entry still carries its real rate.
+        assert!(out.models.contains_key("deepseek/deepseek-r1"));
+    }
+
+    /// A model that is configured on a metered provider is never pinned at $0
+    /// by the "declared free" sweep, and an operator's explicit zero in the
+    /// installed catalog survives the merge.
+    #[test]
+    fn declared_free_sweep_never_zeros_a_metered_model_and_keeps_explicit_zeros() {
+        let cfg = config(
+            r#"{
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        // An explicit $0 the operator pinned in the installed catalog.
+        cat.models
+            .insert("internal/preview".to_string(), ModelPrice::default());
+        let out = engine_catalog(&cat, &cfg, &BTreeMap::new());
+        let paid = out.models.get("deepseek/deepseek-r1").expect("paid entry");
+        assert!(paid.is_priced(), "a metered model must keep its real rate");
+        assert!(
+            out.models.contains_key("internal/preview"),
+            "an explicit $0 row must survive the merge"
+        );
+    }
+
+    /// The refresh decision reads the data's OWN generated-at date, not the
+    /// file mtime: a file written five minutes ago from week-old data is
+    /// stale.
+    #[test]
+    fn refresh_decision_uses_the_data_date_not_the_mtime() {
+        let path = Path::new("/nonexistent/pricing.json");
+        // Fresh mtime, 9-day-old data, default 7-day threshold -> spawn.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(60), Some(9), 7),
+            RefreshDecision::Spawn,
+            "old data must refresh even though the file was just written"
+        );
+        // Week-old mtime, 1-day-old data -> nothing to do.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(8 * 24 * 3600), Some(1), 7),
+            RefreshDecision::Skip,
+            "current data must not re-sync just because the file is old"
+        );
+        // Data age unknown: fall back to the mtime (never silently skip).
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, None, None, 7),
+            RefreshDecision::Spawn
+        );
+        // A configurable age: 2 days is stale when the threshold is 1.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(60), Some(2), 1),
+            RefreshDecision::Spawn
+        );
+        // 0 disables the data-age trigger; the mtime still drives it.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(60), Some(400), 0),
+            RefreshDecision::Skip
+        );
+    }
+
+    /// The data-age threshold is configurable via the env override and falls
+    /// back to the corpus default on garbage -- the same rule the installed
+    /// data warnings use.
+    #[test]
+    fn engine_refresh_stale_days_is_configurable() {
+        let _lock = test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("ZODER_PRICING_STALE_DAYS").ok();
+        std::env::remove_var("ZODER_PRICING_STALE_DAYS");
+        assert_eq!(engine_refresh_stale_days(), 7);
+        std::env::set_var("ZODER_PRICING_STALE_DAYS", "2");
+        assert_eq!(engine_refresh_stale_days(), 2);
+        std::env::set_var("ZODER_PRICING_STALE_DAYS", "garbage");
+        assert_eq!(engine_refresh_stale_days(), 7);
+        std::env::set_var("ZODER_PRICING_STALE_DAYS", "0");
+        assert_eq!(engine_refresh_stale_days(), 0);
+        match prev {
+            Some(v) => std::env::set_var("ZODER_PRICING_STALE_DAYS", v),
+            None => std::env::remove_var("ZODER_PRICING_STALE_DAYS"),
+        }
+    }
+
+    /// `zoder spend` prints a line naming the excluded unknown-cost rows and
+    /// how many there were. `Rollup` folds them out of the cost columns, so
+    /// printing nothing makes the table look complete (Z3).
+    #[test]
+    fn spend_prints_a_line_when_unknown_rows_were_excluded() {
+        let mut roll: BTreeMap<String, Rollup> = BTreeMap::new();
+        roll.insert(
+            "2026-10".to_string(),
+            Rollup {
+                cost_usd: 0.42,
+                tokens_in: 10,
+                tokens_out: 20,
+                calls: 3,
+                unknown_cost_tokens: 500,
+                unknown_cost_calls: 2,
+            },
+        );
+        let line = spend_unknown_cost_note(&roll).expect("a note is printed");
+        assert!(
+            line.contains("2") && line.contains("excluded"),
+            "the line must say how many rows were excluded: {line}"
+        );
+
+        // Nothing unknown -> no line at all.
+        let mut clean: BTreeMap<String, Rollup> = BTreeMap::new();
+        clean.insert("2026-10".to_string(), Rollup::default());
+        assert!(spend_unknown_cost_note(&clean).is_none());
+
+        // The per-model view counts them the same way.
+        let mut per_model: BTreeMap<String, Rollup> = BTreeMap::new();
+        per_model.insert(
+            "local/unknown-model".to_string(),
+            Rollup {
+                unknown_cost_tokens: 1,
+                unknown_cost_calls: 1,
+                ..Default::default()
+            },
+        );
+        let line = spend_unknown_cost_note(&per_model).expect("a note is printed");
+        assert!(line.contains("1 unknown-cost"), "{line}");
+    }
+}
+
+#[cfg(test)]
 mod pricing_source_file_tests {
     //! Offline regression tests for the `file` pricing-source switch (env
     //! `ZODER_PRICING_SOURCE`, config `[pricing] source = "file"`, or the
