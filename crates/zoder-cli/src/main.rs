@@ -13143,7 +13143,13 @@ fn parse_date(s: &str, end_of_day: bool) -> anyhow::Result<chrono::DateTime<chro
 /// Returns `None` when every row was priced, so a clean ledger prints
 /// nothing extra.
 fn spend_unknown_cost_note(roll: &std::collections::BTreeMap<String, Rollup>) -> Option<String> {
-    let rows = roll.values().filter(|r| r.unknown_cost_calls > 0).count();
+    // A row is "unknown cost" if EITHER counter is set: a row can carry
+    // unknown-cost tokens with `calls = 0`. Both are folded out of the cost
+    // columns, so both must be surfaced (Z3).
+    let rows = roll
+        .values()
+        .filter(|r| r.unknown_cost_calls > 0 || r.unknown_cost_tokens > 0)
+        .count();
     if rows == 0 {
         return None;
     }
@@ -23572,6 +23578,34 @@ mod engine_cost_accounting_tests {
         );
         let line = spend_unknown_cost_note(&per_model).expect("a note is printed");
         assert!(line.contains("1 unknown-cost"), "{line}");
+    }
+
+    /// A row can carry unknown-cost TOKENS with zero calls (an entry written
+    /// with token counts but `calls = 0`, which `Rollup` folds under
+    /// `cost_unknown`). Such a row is still excluded from the cost columns, so
+    /// hiding it because its call counter is zero understates the gap between
+    /// zoder's total and the engine's (Z3). Either counter marks the row.
+    #[test]
+    fn spend_counts_rows_with_unknown_tokens_but_zero_calls() {
+        let mut roll: BTreeMap<String, Rollup> = BTreeMap::new();
+        roll.insert(
+            "2026-10".to_string(),
+            Rollup {
+                unknown_cost_tokens: 900,
+                unknown_cost_calls: 0,
+                ..Default::default()
+            },
+        );
+        let line = spend_unknown_cost_note(&roll).expect("a tokens-only row must be reported");
+        assert!(line.contains("1 unknown-cost"), "{line}");
+        assert!(
+            line.contains("900"),
+            "the token count must be shown: {line}"
+        );
+        assert!(
+            line.contains("1 unknown-cost row "),
+            "singular row wording expected: {line}"
+        );
     }
 }
 
