@@ -23457,6 +23457,51 @@ mod budget_decline_exit_tests {
         );
     }
 
+    /// Review r2: the budget tag must be found through every wrapping shape a
+    /// caller can actually produce, not just the one `.context()` order.
+    ///
+    /// `anyhow::Error::new(anyhow_error)` does not compile (anyhow::Error is
+    /// not StdError), so the shapes below are the complete set: bare,
+    /// single/double context, `anyhow!(err).context(..)`, and `Result::context`.
+    /// Each must still exit 78, and a plain error must still exit 1.
+    #[test]
+    fn the_budget_code_survives_every_wrapping_shape() {
+        use anyhow::Context;
+
+        let bare = budget_declined_error("x");
+        assert_eq!(error_exit_code(&bare), EXIT_BUDGET_EXCEEDED, "bare");
+
+        let once = budget_declined_error("x").context("outer");
+        assert_eq!(error_exit_code(&once), EXIT_BUDGET_EXCEEDED, "context()");
+
+        let twice = once.context("outer2");
+        assert_eq!(error_exit_code(&twice), EXIT_BUDGET_EXCEEDED, "2x context");
+
+        let rewrapped = anyhow::anyhow!(budget_declined_error("x")).context("wrapped");
+        assert_eq!(
+            error_exit_code(&rewrapped),
+            EXIT_BUDGET_EXCEEDED,
+            "anyhow!(err).context()"
+        );
+
+        let via_result: anyhow::Error =
+            std::result::Result::<(), anyhow::Error>::Err(budget_declined_error("x"))
+                .context("ctx")
+                .unwrap_err();
+        assert_eq!(
+            error_exit_code(&via_result),
+            EXIT_BUDGET_EXCEEDED,
+            "Result::context"
+        );
+
+        // The tag as a CONTEXT MESSAGE is not the tag as a CAUSE: a caller
+        // that merely pastes the text must not inherit the exit code.
+        let message_only = (|| -> anyhow::Result<()> { anyhow::bail!("inner") })()
+            .map_err(|e| e.context(budget_declined_error("x")))
+            .unwrap_err();
+        assert_eq!(error_exit_code(&message_only), 1, "message, not cause");
+    }
+
     /// The decline message is preserved for humans and is non-empty, so the
     /// `zoder: error:` line still says why.
     #[test]
@@ -24128,6 +24173,73 @@ mod engine_cost_accounting_tests {
             "only the configured models are published: {:?}",
             out.models.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Review r2: a `serves` PREFIX expands to EVERY feed model it claims, and
+    /// only those. The catalog is keyed by full ids, so a declaration of
+    /// `deepseek/` must publish `deepseek/deepseek-r1` AND every sibling —
+    /// not a `deepseek/` row (a key nothing looks up) and not just the one id
+    /// a hand-written test happened to include.
+    ///
+    /// Boundaries pinned here:
+    ///   * `deepseek/` claims both deepseek models and nothing else;
+    ///   * a prefix never leaks across a vendor boundary (`deepseek/` must not
+    ///     claim `deepseek-r1-legacy` under another host);
+    ///   * a prefix with no feed rows behind it publishes NOTHING (a dead
+    ///     `gpt-` row would hide the fact the declaration reached nothing);
+    ///   * an explicit full id still resolves to exactly itself.
+    #[test]
+    fn a_metered_prefix_publishes_every_feed_model_it_claims_and_no_others() {
+        let cfg = config(
+            r#"{
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/", "nomatch-"]
+            }"#,
+        );
+        let mut cat = PricingCatalog::default();
+        for k in [
+            "deepseek/deepseek-r1",
+            "deepseek/deepseek-v3",
+            "deepseek/deepseek-chat",
+            "openai/deepseek-r1-legacy",
+            "anthropic/claude-sonnet-5",
+        ] {
+            cat.models.insert(
+                k.to_string(),
+                ModelPrice {
+                    input_usd_per_mtok: 1.0,
+                    output_usd_per_mtok: 2.0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let out = engine_catalog(&cat, &cfg);
+        let mut got: Vec<&String> = out.models.keys().collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![
+                "deepseek/deepseek-chat",
+                "deepseek/deepseek-r1",
+                "deepseek/deepseek-v3",
+            ],
+            "a prefix must publish every claimed feed model and no others"
+        );
+        for kept in &got {
+            assert!(
+                out.models[*kept].is_priced(),
+                "{kept} must carry its real rate"
+            );
+        }
+        // No prefix-shaped row is ever written.
+        assert!(!out.models.contains_key("deepseek/"), "no bare prefix row");
+        assert!(!out.models.contains_key("nomatch-"), "no dead prefix row");
     }
 
     /// A local id that shares its leaf with a paid cloud listing is never
