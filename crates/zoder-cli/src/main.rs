@@ -13372,7 +13372,6 @@ fn budget_declined(json: bool, model: &str, reason: &str, msg: &str) -> anyhow::
 /// generic error contract keeps working unchanged, and adds the budget
 /// specifics (`code`, `reason`, `details`) so a caller can branch on
 /// "the budget stopped me" without string matching.
-#[cfg_attr(not(test), allow(dead_code))]
 fn budget_declined_envelope(model: &str, reason: &str, msg: &str) -> serde_json::Value {
     serde_json::json!({
         "outcome": "error",
@@ -16185,20 +16184,31 @@ fn publish_engine_catalog(
         // The config decides WHICH models reach the engine at all (D8 step 2).
         // Without a readable config there is no way to know what this host
         // routes to, and guessing is what put the whole feed — and the local
-        // models' cloud look-alikes — in the engine's price table. Fail
-        // closed: publish nothing rather than a table of prices for models
-        // this host cannot call.
-        let cfg = Config::load_unvalidated().ok();
-        match cfg.as_ref() {
-            Some(cfg) => engine_catalog(cat, cfg),
-            None => {
+        // models' cloud look-alikes — in the engine's price table.
+        //
+        // Fail closed WITHOUT writing: overwriting `pricing.json` with an
+        // empty catalog would destroy a previously-good file (the engine then
+        // has no rate for any model, including the metered ones this host
+        // does route to) and turn a transient config problem into a silent
+        // pricing outage. Publishing the whole feed instead is the $170 bug.
+        // Leaving the last good catalog in place is the only option that is
+        // neither a guess nor a regression, so the caller is told and the
+        // file is left alone.
+        let cfg = match Config::load_unvalidated() {
+            Ok(cfg) => cfg,
+            Err(error) => {
                 eprintln!(
-                    "warning: no readable config; publishing no engine prices \
-                     (models are scoped to the configured providers)"
+                    "error: cannot read config ({error:#}); leaving {} unchanged \
+                     (engine prices are scoped to the configured providers and \
+                     cannot be scoped without a config)",
+                    engine_path.display()
                 );
-                PricingCatalog::default()
+                return Err(anyhow::anyhow!(
+                    "cannot read config, so the engine catalog was not rewritten: {error:#}"
+                ));
             }
-        }
+        };
+        engine_catalog(cat, &cfg)
     } else {
         // zoder --external: require a configured external provider, then scope
         // to the paid models zoder actually knows about.
@@ -24693,6 +24703,50 @@ mod pricing_source_file_tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+    }
+
+    /// Review r4: an unreadable config must not WRITE an empty engine catalog.
+    ///
+    /// The old fallback published `PricingCatalog::default()` over the
+    /// existing `pricing.json`. That destroys a previously-good file and
+    /// leaves the engine with no rate for any model -- including the metered
+    /// ones this host does route to -- turning a transient config problem
+    /// into a silent pricing outage. Publishing the whole feed instead is the
+    /// $170 bug. So: refuse, report, and leave the last good catalog intact.
+    #[test]
+    fn an_unreadable_config_leaves_the_engine_catalog_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let engine_dir = tempfile::tempdir().unwrap();
+        // A config file that exists but cannot be parsed as JSON.
+        std::fs::write(home.path().join("config.json"), "{ this is not json").unwrap();
+        // A previously-good engine catalog, which must survive.
+        let engine_path = engine_dir.path().join("data").join("pricing.json");
+        std::fs::create_dir_all(engine_path.parent().unwrap()).unwrap();
+        let good = r#"{"models":{"deepseek/deepseek-r1":{"input_usd_per_mtok":0.55,"output_usd_per_mtok":2.19}}}"#;
+        std::fs::write(&engine_path, good).unwrap();
+
+        let dir = engine_dir.path().to_str().unwrap().to_string();
+        with_env_home(home.path(), &[("ZEROCLAW_CONFIG_DIR", &dir)], || {
+            let mut cat = PricingCatalog::default();
+            cat.models.insert(
+                "deepseek/deepseek-r1".to_string(),
+                ModelPrice {
+                    input_usd_per_mtok: 0.55,
+                    output_usd_per_mtok: 2.19,
+                    ..Default::default()
+                },
+            );
+            let result = publish_engine_catalog(&cat, false, true, false);
+            assert!(
+                result.is_err(),
+                "an unreadable config must be reported, not silently published"
+            );
+            let after = std::fs::read_to_string(&engine_path).unwrap();
+            assert_eq!(
+                after, good,
+                "the last good engine catalog must be left byte-identical"
+            );
+        });
     }
 
     fn with_env_home<F: FnOnce()>(home: &Path, extra: &[(&str, &str)], f: F) {
