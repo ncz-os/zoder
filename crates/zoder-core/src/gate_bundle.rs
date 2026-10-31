@@ -503,14 +503,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Kill a timed-out step. On Unix the child leads its own process group
 /// (see `run_command`), so signalling the group takes scavenged
 /// grandchildren with it; the direct `kill` is the fallback.
+///
+/// The group signal is a syscall, not `Command::new("kill")`: the gate has
+/// to work on the stripped-down CI images that run it, which do not
+/// guarantee `/bin/kill` (it is not a POSIX-guaranteed external utility; in
+/// an interactive shell it is usually the builtin).
 fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .status();
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // `-pid` addresses the group the child leads (process_group(0)).
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
     }
     let _ = child.kill();
 }
@@ -1071,6 +1078,61 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the timeout must cut the step short, took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_timeout_kills_the_whole_step_process_group() {
+        // D4.7: a wedged step is often a wrapper whose real work is a
+        // GRANDCHILD (`sh -c "…"` around a slow tool). Killing only the
+        // direct child would orphan that grandchild, so the step is put in
+        // its own process group and the whole group is signalled. The sh
+        // here backgrounds a sleep and waits, so it leads a group that
+        // actually has a member to scavenge.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("grandchild.pid");
+        let env = PathEnv::new().with_step_timeout(Duration::from_millis(400));
+        let step = GateStep {
+            name: "wedged-wrapper".to_string(),
+            category: StepCategory::Test,
+            // The PID goes into the file before the wait, so the test knows
+            // exactly which process must be gone.
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()),
+            ],
+            tool: "sh".to_string(),
+            required: true,
+        };
+
+        assert_eq!(env.run_command(&step), StepExec::Failed);
+
+        let pid = std::fs::read_to_string(&pidfile)
+            .expect("the wrapper must have recorded the grandchild pid")
+            .trim()
+            .to_string();
+        assert!(!pid.is_empty(), "empty grandchild pid");
+        // Signal 0 probes for existence without delivering anything. Give the
+        // group signal a moment to be delivered and reaped, then require the
+        // grandchild to be gone. A pid that is already reaped reports ESRCH.
+        let pid_num: libc::pid_t = pid.parse().expect("numeric grandchild pid");
+        let mut alive = true;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only probes; it has no side effects.
+            let exists = unsafe { libc::kill(pid_num, 0) } == 0;
+            if exists {
+                std::thread::sleep(Duration::from_millis(20));
+            } else {
+                alive = false;
+                break;
+            }
+        }
+        assert!(
+            !alive,
+            "the timed-out step's grandchild (pid {pid}) must be killed with the \
+             step's process group, not orphaned"
         );
     }
 
