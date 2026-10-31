@@ -11433,11 +11433,15 @@ mod tests {
             !majority_loop_approval(&[approve.clone(), approve.clone(), located_block]),
             "a located blocking finding in any sample vetoes approval"
         );
-        // An UNLOCATED block is not a valid defect and does not veto a majority.
+        // An UNLOCATED critical is not evidence of safety and DOES veto a
+        // majority (D4.3): `count_blocking` no longer drops findings for
+        // lacking a location, and neither may this majority walk. The
+        // no-evidence handling (`mark_unlocated_no_evidence` →
+        // `comment_no_evidence`, which never resolves) is unchanged.
         let unlocated_block = review_with("request_changes", vec![unlocated_finding("critical")]);
         assert!(
-            majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
-            "an unlocated request_changes is comment-with-no-evidence, not a veto"
+            !majority_loop_approval(&[approve.clone(), approve.clone(), unlocated_block]),
+            "an unlocated critical in any sample vetoes approval"
         );
     }
 
@@ -20280,7 +20284,10 @@ mod review_refusal_tests {
             .trim()
             .to_string();
         std::fs::write(repo.join("README.md"), body).unwrap();
-        for args in [&["add", "README.md"][..], &["commit", "-q", "-m", "change"][..]] {
+        for args in [
+            &["add", "README.md"][..],
+            &["commit", "-q", "-m", "change"][..],
+        ] {
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
@@ -20432,8 +20439,15 @@ mod review_refusal_tests {
         );
         assert_eq!(payload["result"].as_str(), Some(EMPTY_DIFF_RESULT));
         assert_eq!(payload["empty_diff"].as_bool(), Some(true));
-        assert_ne!(agg, "approve", "an empty diff must never aggregate as approve");
-        assert_ne!(verdict_rank(&agg), 0, "an empty diff must not rank as approve");
+        assert_ne!(
+            agg, "approve",
+            "an empty diff must never aggregate as approve"
+        );
+        assert_ne!(
+            verdict_rank(&agg),
+            0,
+            "an empty diff must not rank as approve"
+        );
 
         // A real review has no `result`/`empty_diff` fields.
         let (_, _, real) = aggregate_review(
