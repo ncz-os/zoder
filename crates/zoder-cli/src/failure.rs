@@ -192,6 +192,11 @@ pub(crate) enum FailureCode {
     ReviewBlocked,
     /// The loop stopped without resolving the task.
     LoopExhausted,
+    /// The reviewer spent its whole output budget (twice) on hidden
+    /// reasoning and never produced a verdict. The operator must raise
+    /// `max_tokens` or lower the reasoning effort: an identical retry fails
+    /// identically, so this is NOT a transient budget window.
+    ReviewerBudgetExhausted,
     /// The author turn failed outright (no in-place timeout).
     AuthorFailed,
     /// The author turn hit its wall-clock budget.
@@ -227,6 +232,7 @@ impl FailureCode {
             FailureCode::ReviewersUnavailable => "reviewers_unavailable",
             FailureCode::ReviewBlocked => "review_blocked",
             FailureCode::LoopExhausted => "loop_exhausted",
+            FailureCode::ReviewerBudgetExhausted => "reviewer_budget_exhausted",
             FailureCode::AuthorFailed => "author_failed",
             FailureCode::AuthorTimeout => "author_timeout",
             FailureCode::PolicyViolation => "policy_violation",
@@ -259,6 +265,7 @@ impl FailureCode {
             | FailureCode::DiffTruncated
             | FailureCode::EmptyDiff
             | FailureCode::LoopExhausted
+            | FailureCode::ReviewerBudgetExhausted
             | FailureCode::Internal => FailureClass::Permanent,
         }
     }
@@ -282,6 +289,7 @@ impl FailureCode {
         FailureCode::EmptyDiff,
         FailureCode::NoReviewerModel,
         FailureCode::LoopExhausted,
+        FailureCode::ReviewerBudgetExhausted,
         FailureCode::AuthorFailed,
         FailureCode::AuthorTimeout,
         FailureCode::PolicyViolation,
@@ -915,7 +923,7 @@ mod tests {
     #[test]
     fn only_transient_is_retryable() {
         for c in FailureClass::ALL {
-            assert_eq!(c.retryable(), c == FailureClass::Transient, "{c}");
+            assert_eq!(c.retryable(), *c == FailureClass::Transient, "{c}");
         }
     }
 

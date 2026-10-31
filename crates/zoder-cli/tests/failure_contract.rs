@@ -16,9 +16,8 @@ use std::process::{Command, Output};
 /// The exit codes this contract assigns. They must match
 /// `docs/EXIT_CODES.md` and `crates/zoder-cli/src/failure.rs`.
 mod exit_code {
-    /// Unclassified failure: the pre-existing default. Every caller that
-    /// predates the contract keeps seeing this.
-    pub const UNCLASSIFIED: i32 = 1;
+    /// Unclassified failure: a failure the contract does not classify.
+    pub const UNCLASSIFIED: i32 = 50;
     pub const USAGE: i32 = 64;
     pub const CONFIG: i32 = 65;
     pub const DIFF_TOO_LARGE: i32 = 66;

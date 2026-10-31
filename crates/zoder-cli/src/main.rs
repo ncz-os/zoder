@@ -2845,7 +2845,7 @@ fn emit_json_failure(error: &anyhow::Error) {
         // never sees an empty stdout. The class is `internal` and the
         // exit code stays the historical `1`.
         let unclassified =
-            failure::ClassifiedFailure::new(failure::FailureClass::Internal, format!("{error:#}"));
+            failure::ClassifiedFailure::new(failure::FailureCode::Internal, format!("{error:#}"));
         println!(
             "{}",
             serde_json::to_string_pretty(&failure::error_envelope(&unclassified))
@@ -13193,7 +13193,7 @@ fn turn_failure_error(outcome: &str, detail: Option<&str>) -> anyhow::Error {
     // `budget_exceeded:` marker. The summary is the fallback.
     let probe = detail.unwrap_or(&summary);
     if let Some((class, reset)) = failure::classify_engine_budget_exceeded(probe) {
-        if class == failure::FailureClass::BudgetExceeded {
+        if class == failure::FailureCode::EngineBudgetExceeded {
             return failure::classified_budget_err(summary, reset);
         }
     }
