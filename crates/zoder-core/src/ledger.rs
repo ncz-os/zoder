@@ -183,6 +183,21 @@ fn one_call() -> u64 {
 }
 
 impl Entry {
+    /// True when this row was BILLED (pay-as-you-go), as opposed to served by
+    /// a flat-fee plan or a free route, whose marginal cost is $0.
+    ///
+    /// `billing: None` is a row written before the field existed: metered
+    /// history. Every unrecognised value is also treated as metered, so a
+    /// future posture can never silently stop counting toward the cap.
+    pub fn is_metered(&self) -> bool {
+        match self.billing.as_deref() {
+            Some("free") | Some("subscription") => false,
+            _ => true,
+        }
+    }
+}
+
+impl Entry {
     /// The effective publisher host for rollups/filters: the stored `host` if
     /// present, otherwise derived from the model id on the fly so historical
     /// entries (written before `host` existed) still bucket by publisher.
@@ -1382,12 +1397,24 @@ fn reservation_owner_lock_path(ledger_path: &Path, marker: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The current month's BILLED spend, for the pre-call cap.
+///
+/// Only `billing = "metered"` rows count. A `subscription` or `free` row is
+/// $0 marginal by construction (the plan is paid for monthly; the free route
+/// costs nothing to serve), so including it lets a provider's usage
+/// telemetry drive the cap toward a limit nothing was billed against — the
+/// phantom `budget_exceeded` that stopped every job on one host at $170 while
+/// real billed usage was under $1 (Z3, Incident B).
+///
+/// A row written before the `billing` field existed carries `None` and counts
+/// as metered: it is metered history, and dropping it would forget real spend.
 fn month_to_date_from_entries(entries: &[Entry]) -> anyhow::Result<f64> {
     let bucket = Utc::now().format("%Y-%m").to_string();
     let mut rollup = Rollup::default();
     for entry in entries
         .iter()
         .filter(|entry| Period::Month.bucket(&entry.ts_utc) == bucket)
+        .filter(|entry| entry.is_metered())
     {
         accumulate_rollup(&mut rollup, entry)?;
     }
@@ -1666,6 +1693,77 @@ mod tests {
         let err = led.month_to_date_usd().unwrap_err().to_string();
         assert!(err.contains("malformed"), "{err}");
         assert!(err.contains("line(s) 2"), "{err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // D8 step 1: the month-to-date cap sums only what was actually BILLED.
+    // ---------------------------------------------------------------------
+
+    /// A `billing = "subscription"` or `billing = "free"` row is $0 marginal
+    /// by construction. If a provider reports usage telemetry on such a row
+    /// the numeric cost can be non-zero (an overage estimate, a plan-included
+    /// call priced at list), and summing it drives the monthly cap toward a
+    /// limit nothing was billed against — the phantom `budget_exceeded` that
+    /// stopped every job on one host (Z3, Incident B).
+    #[test]
+    fn month_to_date_ignores_free_and_subscription_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut metered = entry(&now, "cloud/m", 0.50, 10, 10, 1);
+        metered.billing = Some("metered".into());
+        let mut subscription = entry(&now, "plan/m", 5.00, 10, 10, 1);
+        subscription.billing = Some("subscription".into());
+        let mut free = entry(&now, "local/m", 3.00, 10, 10, 1);
+        free.billing = Some("free".into());
+        for e in [&metered, &subscription, &free] {
+            led.record(e).unwrap();
+        }
+        let got = led.month_to_date_usd().unwrap();
+        assert!(
+            (got - 0.50).abs() < 1e-9,
+            "only the metered row counts toward the cap, got {got}"
+        );
+    }
+
+    /// Rows written before the `billing` field existed carry `billing: None`.
+    /// Every one of them is metered history (the posture field was added
+    /// later, and the pre-field writer only ever recorded metered routes), so
+    /// they must keep counting — otherwise the cap would forget real spend.
+    #[test]
+    fn old_rows_without_billing_count_as_metered() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // `entry()` leaves billing = None, i.e. an old row.
+        led.record(&entry(&now, "cloud/m", 0.75, 10, 10, 1))
+            .unwrap();
+        let got = led.month_to_date_usd().unwrap();
+        assert!(
+            (got - 0.75).abs() < 1e-9,
+            "a row without `billing` is metered history and must count, got {got}"
+        );
+    }
+
+    /// Unknown-cost row semantics are unchanged by the metered filter: a
+    /// metered row whose price is unknown still fails the read closed, so the
+    /// gate asks instead of silently treating it as $0.
+    #[test]
+    fn unknown_cost_metered_row_still_fails_the_cap_read_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let mut unknown = entry(
+            &Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            "cloud/uncatalogued",
+            0.0,
+            10,
+            10,
+            1,
+        );
+        unknown.cost_unknown = true;
+        unknown.billing = Some("metered".into());
+        led.record(&unknown).unwrap();
+        assert!(led.month_to_date_usd().is_err());
     }
 
     #[test]
