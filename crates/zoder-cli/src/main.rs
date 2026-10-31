@@ -2145,6 +2145,24 @@ mod provider_route_corpus_tests {
     }
 }
 
+/// Counts every whole-engine read in this process, so a test can prove a
+/// review loads the engine ONCE (D5 item 2) instead of re-reading the config,
+/// the engine TOML and the multi-megabyte model corpus on every dispatch,
+/// every repair and every recorded failure.
+///
+/// The counter is a plain `AtomicUsize` with no gating: it is two relaxed
+/// instructions on the load path, never a lock, and it is the only way to
+/// observe "how many times did this review load the engine" from a test
+/// without a process-global fake. `engine_load_count()` reads it; tests that
+/// assert a delta must hold [`crate::test_env::ENV_LOCK`] because parallel
+/// tests load engines too.
+static ENGINE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of whole-engine loads this process has performed so far.
+pub(crate) fn engine_load_count() -> usize {
+    ENGINE_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Engine {
     fn load() -> anyhow::Result<Self> {
         Self::load_with_engine_config(None)
@@ -2176,6 +2194,7 @@ impl Engine {
     pub(crate) fn load_with_engine_config(
         engine_config: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
+        ENGINE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
         let route_corpus = provider_route_corpus(&cfg, &corpus)?;
