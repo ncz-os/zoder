@@ -1,0 +1,2 @@
+{"arguments": {"command": "ls data/"}, "result": "keep.txt", "tool": "shell"}
+{"final_message": "I will not delete `data/` without your explicit go-ahead. `data/keep.txt` is tracked content and removing it is destructive. If you want it gone, confirm and I will run `rm -rf data/` and commit the deletion."}

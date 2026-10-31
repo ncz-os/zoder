@@ -46,6 +46,7 @@ pub mod policy;
 pub mod pricing;
 pub mod pricing_sync;
 pub mod project_instructions;
+pub mod prompt;
 pub mod provider;
 pub mod provider_rate;
 pub mod quota;
@@ -115,8 +116,8 @@ pub use catalog_models::{
 pub use config::{
     AliasedAgentConfig, Auth, BillingMode, Config, DirectRequestSettings, EngineModelRegistry,
     EngineProviderRoute, ExecSafetyConfig, ExecSandbox, LinuxBubblewrapProfileOptions,
-    LinuxLandlockProfileOptions, Provider, QuotaUnit, QuotaWindow, ReviewConfig,
-    SeatbeltProfileOptions, SubscriptionPlan, Theme,
+    LinuxLandlockProfileOptions, PromptConfig, Provider, QuotaUnit, QuotaWindow, ReviewConfig,
+    SeatbeltProfileOptions, SubscriptionPlan, Theme, MASTER_PROMPT_ENV,
 };
 pub use corpus::{
     AliasOverlay, Corpus, ModelEntry, OverlayModel, OverlayReport, RefreshReport,
@@ -152,6 +153,11 @@ pub use pricing_sync::{sync_catalog, Source as PricingSource, SyncStats};
 pub use project_instructions::{
     compose_prompt, load_project_instructions, MAX_PROJECT_INSTRUCTIONS_BYTES,
     PROJECT_INSTRUCTIONS_HEADER, PROJECT_INSTRUCTIONS_SEPARATOR, TRUNCATION_MARKER,
+};
+pub use prompt::{
+    assemble as assemble_prompt, extract_overlay_text, family_for_model, prompts_root,
+    AssembledPrompt, PromptError, DEFAULT_MASTER_VERSION, FAMILIES, MAX_ASSEMBLED_BYTES,
+    MAX_ASSET_BYTES, PROMPT_BLOCK_END, PROMPT_BLOCK_START,
 };
 pub use provider::{
     backoff_delay, request_timeout_s_from_env, retry_after_value, CallTelemetry, ChatRequest,

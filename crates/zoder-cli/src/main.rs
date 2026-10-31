@@ -14,6 +14,7 @@ mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
+mod master_prompt;
 mod mnemos;
 mod provider_health;
 mod provider_slots;
@@ -12566,6 +12567,16 @@ pub(crate) async fn agentic_turn(
         };
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
+        // MASTER PROMPT (opt-in). The overlay depends on WHICH model is
+        // serving this turn — a fallback down the chain is a different
+        // family and gets its own overlay — so the prompt is composed
+        // HERE, per candidate, not once for the head.
+        //
+        // NON-BREAKING: with `[prompt] master` off (the default) this
+        // returns the task text byte-for-byte, so `chain_opts.prompt` is
+        // exactly what it was before this slice.
+        chain_opts.prompt = crate::master_prompt::compose_author_prompt(&eng.cfg, &model, &prompt)
+            .map_err(|e| anyhow::anyhow!("[zoder] master prompt unavailable: {e}"))?;
         // SESSION CONTINUITY IS KEYED PER AGENT. Zeroclaw binds a session
         // to the agent that minted it, so a model fallback (which resolves
         // to a different alias) must NOT be handed the head agent's id —

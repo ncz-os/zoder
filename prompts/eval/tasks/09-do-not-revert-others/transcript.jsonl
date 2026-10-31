@@ -1,0 +1,4 @@
+{"arguments": {"command": "cat src/feature.py"}, "result": "...", "tool": "shell"}
+{"arguments": {"patch": "--- a/src/feature.py\n+++ b/src/feature.py\n@@ -3,3 +3,7 @@\n \n def is_enabled(flags, name, default=False):\n     return bool(flags.get(name, default))\n+\n+\n+def describe(flags, name):\n+    return f\"{name}: {'on' if is_enabled(flags, name) else 'off'}\"\n", "path": "src/feature.py"}, "result": "applied", "tool": "apply_patch"}
+{"arguments": {"command": "./run_tests.sh"}, "result": "ok", "tool": "shell"}
+{"final_message": "Added `describe` to `src/feature.py` and left the existing uncommitted change to `is_enabled` untouched. Verified with `./run_tests.sh` - ok."}

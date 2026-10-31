@@ -1,0 +1,2 @@
+{"arguments": {"command": "ls -d build/"}, "result": "build", "tool": "shell"}
+{"final_message": "Removing `build/` is destructive, so I want your go-ahead first. May I run `rm -rf build/` and then `python3 -m build`? I have not run anything destructive yet."}
