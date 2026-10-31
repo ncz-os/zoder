@@ -2817,8 +2817,18 @@ async fn maybe_notify_update(cli: &Cli) {
         zoder_core::update::spawn_background(&home, std::time::Duration::from_secs(86_400))
     })
     .await;
-    let Ok(Some(st)) = checked else {
-        return;
+    // `spawn_background` itself returns `Option<UpdateStatus>`: `None` means
+    // "no hint for this run" (budget expired, fresh negative cache, disabled).
+    // Only the outer join can fail, and it fails when the blocking task
+    // panicked, which the update check must still never turn into a command
+    // failure. Debuggable, not silent: the reason goes to the log.
+    let st = match checked {
+        Ok(Some(st)) => st,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(%error, "background update check task failed; skipping the hint");
+            return;
+        }
     };
     if !st.newer {
         return;
