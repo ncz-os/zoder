@@ -734,6 +734,21 @@ async fn complete_once(
     max_tokens: u32,
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Completion> {
+    // One engine read for the whole completed call (D5 item 2): the plan and
+    // every dispatch below borrow the engine loaded here. The explicit
+    // `engine_config` seam is preserved — it is the only way a test can point
+    // the alias registry at a fixture WITHOUT racing on the process-global
+    // `ZEROCLAW_CONFIG_DIR` (see `crate::child_env`).
+    let eng = Engine::load_with_engine_config(engine_config)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+            // The engine config could not be loaded: the operator must fix
+            // the environment before a retry can work.
+            class: Some(crate::failure::FailureCode::ConfigError),
+        })
+        .map_err(ChainFailure::into_anyhow)?;
     complete_once_tracked(
         cli,
         model_override,
@@ -743,7 +758,7 @@ async fn complete_once(
         system,
         user,
         max_tokens,
-        engine_config,
+        &eng,
         false,
     )
     .await
@@ -773,7 +788,7 @@ async fn complete_once_tracked(
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
+    eng: &Engine,
     exact_pin: bool,
 ) -> Result<ChainCompletion, ChainFailure> {
     // Build the ordered candidate list the dispatch loop walks. The shape
@@ -783,22 +798,16 @@ async fn complete_once_tracked(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut plan = build_reviewer_plan(
-        cli,
-        model_override,
-        reviewer_chain,
-        author_models,
-        engine_config,
-    )
-    .map_err(|e| ChainFailure {
-        message: e.to_string(),
-        skipped: Vec::new(),
-        forced: false,
-        // Resolving the reviewer PLAN failed: the engine config could not
-        // be loaded, or the pinned reviewer is not in the corpus. Either
-        // way the operator must change something before a retry can work.
-        class: Some(crate::failure::FailureCode::ConfigError),
-    })?;
+    let mut plan = build_reviewer_plan(cli, eng, model_override, reviewer_chain, author_models)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+            // Resolving the reviewer PLAN failed: the engine config could not
+            // be loaded, or the pinned reviewer is not in the corpus. Either
+            // way the operator must change something before a retry can work.
+            class: Some(crate::failure::FailureCode::ConfigError),
+        })?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -883,17 +892,8 @@ async fn complete_once_tracked(
                 prev = plan.candidates[idx - 1]
             );
         }
-        match dispatch_reviewer_for_model(
-            cli,
-            model,
-            model,
-            system,
-            user,
-            max_tokens,
-            engine_config,
-            None,
-        )
-        .await
+        match dispatch_reviewer_for_model(cli, eng, model, model, system, user, max_tokens, None)
+            .await
         {
             Ok(c) => {
                 let escalation_reason = skipped.first().map(|s| s.reason.clone());
@@ -922,76 +922,67 @@ async fn complete_once_tracked(
                 // id is resolved from routing if available (consistent
                 // with author path / agentic turn) so the on-disk store
                 // sees the same stamp as the author's pre-gate entry.
-                if let Ok(eng) = Engine::load_with_engine_config(engine_config) {
-                    // Resolve the provider id BEFORE taking the health lock --
-                    // this is read-only routing config I/O and touches no
-                    // health state, so it must not extend the locked critical
-                    // section.
-                    let provider_id = crate::RoutingContext::load(&eng.cfg)
-                        .ok()
-                        .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
-                        .map(|p| p.id.clone())
-                        .or_else(|| {
-                            eng.cfg
-                                .provider(model)
-                                .filter(|p| {
-                                    !p.base_url
-                                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-                                })
-                                .map(|p| p.id.clone())
-                        })
-                        .unwrap_or_default();
-                    // When a status is present we route through
-                    // `Classification::from_status` so 401/403/429/503/529
-                    // land on the right bucket. The `FallbackWorthy` arm
-                    // only carries `kind + status`, so the typed body
-                    // fallback for the Anthropic branch (Y-14) does not
-                    // apply on this path -- the reviewer dispatcher
-                    // surfaces errors out of `stream_chat`, which
-                    // already populated `anthropic_error_body` upstream
-                    // if the wire carried it.
-                    let cls = status
-                        .map(zoder_core::Classification::from_status)
-                        .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
-                    // C4-MH1: record + persist under an exclusive lock. This
-                    // reviewer fallback runs inside a `join_all` fan-out and
-                    // races the daemon/CLI, so a bare load -> record -> save
-                    // would drop a concurrently-recorded failure (lost
-                    // update). `mutate_locked` reloads the freshest on-disk
-                    // store under an advisory lockfile (create_new on
-                    // `<stem>.lock`, not a File::lock/flock), applies this
-                    // delta, and writes atomically before releasing -- so
-                    // every panel model's failure survives.
-                    // The provider layer (`zoder_core::provider`) is the
-                    // single source of truth for a MiniMax M Plan wall:
-                    // `observe_token_plan_limit` does the best-effort live
-                    // `token_plan/remains` refresh and persists a
-                    // machine-observed reset when the endpoint answers,
-                    // else a grace-bound one. Here we read that persisted
-                    // reset rather than hardcoding our own 5h estimate —
-                    // `observed_reset_at` is the reset of the full window
-                    // the API itself reported (the 5h reset when the
-                    // refresh shows no full window). `None` means no wall is persisted for
-                    // this provider (either not a MiniMax wall, or the
-                    // state was pruned), in which case the generic
-                    // `record_classified_failure` path below is enough.
-                    let wall = status
-                        .and_then(|st| {
-                            (st == 429)
-                                .then(|| zoder_core::minimax::observed_reset_at(&provider_id))
-                        })
-                        .flatten()
-                        .map(|t| t.timestamp());
-                    let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
-                        h.record_classified_failure_with_wall(
-                            model,
-                            &message,
-                            &provider_id,
-                            cls,
-                            wall,
-                        );
-                    });
-                }
+                // Resolve the provider id BEFORE taking the health lock --
+                // this is read-only routing config I/O and touches no
+                // health state, so it must not extend the locked critical
+                // section.
+                let provider_id = crate::RoutingContext::load(&eng.cfg)
+                    .ok()
+                    .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
+                    .map(|p| p.id.clone())
+                    .or_else(|| {
+                        eng.cfg
+                            .provider(model)
+                            .filter(|p| {
+                                !p.base_url
+                                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                            })
+                            .map(|p| p.id.clone())
+                    })
+                    .unwrap_or_default();
+                // When a status is present we route through
+                // `Classification::from_status` so 401/403/429/503/529
+                // land on the right bucket. The `FallbackWorthy` arm
+                // only carries `kind + status`, so the typed body
+                // fallback for the Anthropic branch (Y-14) does not
+                // apply on this path -- the reviewer dispatcher
+                // surfaces errors out of `stream_chat`, which
+                // already populated `anthropic_error_body` upstream
+                // if the wire carried it.
+                let cls = status
+                    .map(zoder_core::Classification::from_status)
+                    .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
+                // C4-MH1: record + persist under an exclusive lock. This
+                // reviewer fallback runs inside a `join_all` fan-out and
+                // races the daemon/CLI, so a bare load -> record -> save
+                // would drop a concurrently-recorded failure (lost
+                // update). `mutate_locked` reloads the freshest on-disk
+                // store under an advisory lockfile (create_new on
+                // `<stem>.lock`, not a File::lock/flock), applies this
+                // delta, and writes atomically before releasing -- so
+                // every panel model's failure survives.
+                // The provider layer (`zoder_core::provider`) is the
+                // single source of truth for a MiniMax M Plan wall:
+                // `observe_token_plan_limit` does the best-effort live
+                // `token_plan/remains` refresh and persists a
+                // machine-observed reset when the endpoint answers,
+                // else a grace-bound one. Here we read that persisted
+                // reset rather than hardcoding our own 5h estimate —
+                // `observed_reset_at` is the reset of the full window
+                // the API itself reported (the 5h reset when the
+                // refresh shows no full window). `None` means no wall is persisted for
+                // this provider (either not a MiniMax wall, or the
+                // state was pruned), in which case the generic
+                // `record_classified_failure` path below is enough.
+                let wall = status
+                    .and_then(|st| {
+                        (st == 429).then(|| zoder_core::minimax::observed_reset_at(&provider_id))
+                    })
+                    .flatten()
+                    .map(|t| t.timestamp());
+                let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+                    h.record_classified_failure_with_wall(model, &message, &provider_id, cls, wall);
+                });
                 tracing::debug!(
                     model = %model,
                     ?kind,
@@ -1187,6 +1178,7 @@ fn plan_loop_review(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review_once(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1206,18 +1198,71 @@ async fn run_loop_review_once(
     usize,
     Vec<serde_json::Value>,
 )> {
+    // Loop work lives in the working tree. One image cache per review.
+    let read_disk = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    let post_image = crate::config_cache::PostImages::new(read_disk);
+    run_loop_review_once_with_reader(
+        cli,
+        eng,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        &post_image,
+    )
+    .await
+}
+
+/// [`run_loop_review_once`] with the post-image reader injected.
+///
+/// Production passes `<root>/<path>` on disk. The seam exists so a test can
+/// observe how many times one review reads a file: `context_for`,
+/// `filter_false_undefined_findings` and the confirmation path all read the
+/// SAME post-image, and reading a branch file is a `git show` subprocess, so
+/// each must share one per-review cache (D10.7).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review_once_with_reader(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    post_image: &crate::config_cache::PostImages<impl Fn(&str) -> Option<String>>,
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
     let caps_for =
         |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
     // Chunked reviews have the same cross-chunk blindness as `zoder review`;
     // feed the post-change file context so a name defined in another chunk is
-    // not reported as missing. Loop work lives in the working tree.
+    // not reported as missing. Every read below goes through the ONE
+    // per-review image cache, so a file is read at most once per review.
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
-        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+        let read = |path: &str| post_image.get(path);
         let context = crate::review_context::chunk_context(chunk, &read, budget);
         if context.is_empty() {
             context
@@ -1260,6 +1305,7 @@ unbound, or missing imports:\n{context}"
     };
     let (completion, reviewer_report) = complete_review_chunks(
         cli,
+        Some(eng),
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1285,8 +1331,9 @@ unbound, or missing imports:\n{context}"
     // Deterministic false-positive filter: a finding that calls a symbol
     // undefined is dropped when the reviewed working tree defines or imports
     // it. The evidence is kept in `filtered_findings` for the loop record.
-    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
-    filter_false_undefined_findings(&mut review, &read_worktree);
+    // The read is served from the SAME per-review image cache the context
+    // header used: these files were already read for this review.
+    filter_false_undefined_findings(&mut review, &|p: &str| post_image.get(p));
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -1340,6 +1387,7 @@ unbound, or missing imports:\n{context}"
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1361,6 +1409,7 @@ async fn run_loop_review(
 )> {
     let first = run_loop_review_once(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1378,6 +1427,7 @@ async fn run_loop_review(
 
     let Some(second_model) = high_risk_second_reviewer(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1391,6 +1441,7 @@ async fn run_loop_review(
 
     let second = run_loop_review_once(
         cli,
+        eng,
         Some(&second_model),
         reviewer_chain,
         author_models,
@@ -1446,6 +1497,7 @@ async fn run_loop_review(
 /// and silently skipping it would leave the escalation claim false.
 fn high_risk_second_reviewer(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1468,9 +1520,8 @@ fn high_risk_second_reviewer(
     }) {
         return Ok(None);
     }
-    let eng = Engine::load()?;
     let routing = crate::RoutingContext::load(&eng.cfg)?;
-    let plan = build_reviewer_plan(cli, reviewer_override, reviewer_chain, author_models, None)?;
+    let plan = build_reviewer_plan(cli, eng, reviewer_override, reviewer_chain, author_models)?;
     for model in plan.candidates {
         if first_model.is_some_and(|first| first == model) {
             continue;
@@ -1546,7 +1597,8 @@ pub(crate) fn build_reviewer_candidates(
     reviewer_chain: &[String],
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(build_reviewer_plan(cli, model_override, reviewer_chain, &[], engine_config)?.candidates)
+    let eng = Engine::load_with_engine_config(engine_config)?;
+    Ok(build_reviewer_plan(cli, &eng, model_override, reviewer_chain, &[])?.candidates)
 }
 
 /// Build the ordered reviewer plan for an AUTHOR-AWARE review.
@@ -1560,13 +1612,11 @@ pub(crate) fn build_reviewer_candidates(
 /// families; it never silently falls back to a same-family review.
 pub(crate) fn build_reviewer_plan(
     cli: &crate::Cli,
+    eng: &Engine,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
-    engine_config: Option<&Path>,
 ) -> anyhow::Result<ReviewerPlan> {
-    let eng = Engine::load_with_engine_config(engine_config)?;
-
     // Resolve the reviewer-model-side channel: any per-agent or profile-
     // level `reviewer_model` override, treated as an ordered chain. Note
     // `reviewer_models_for` already places the per-agent
@@ -1641,7 +1691,7 @@ pub(crate) fn build_reviewer_plan(
     // model id (never an alias), so — like `reviewer_chain` — it is not
     // run through alias resolution.
     if out.is_empty() {
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let routes = crate::resolve_chain(cli, &eng, &health)?;
         let author = routes.primary.first().cloned().unwrap_or_default();
         let default = crate::default_cross_family_reviewer(&author).to_string();
@@ -1717,7 +1767,7 @@ pub(crate) fn build_reviewer_plan(
         }
         let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
         let routing = crate::RoutingContext::load(&eng.cfg)?;
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let author_routes = crate::resolve_chain(cli, &eng, &health)?;
         let primary = out.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
@@ -2059,19 +2109,15 @@ fn routing_context_load_message(e: &anyhow::Error) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_reviewer_for_model(
     cli: &crate::Cli,
+    eng: &Engine,
     requested: &str,
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
     reasoning_override: Option<&str>,
 ) -> Result<Completion, ReviewerError> {
     let started = std::time::Instant::now();
-    let eng = match Engine::load_with_engine_config(engine_config) {
-        Ok(eng) => eng,
-        Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
-    };
 
     // `model` here is already a resolved, real served-model-name —
     // `build_reviewer_candidates` translates any ENGINE AGENT ALIAS
@@ -2097,7 +2143,7 @@ async fn dispatch_reviewer_for_model(
             // reviewing with a different model. The message names the
             // configured reviewer routes and suggests the closest id.
             return Err(ReviewerError::fatal(no_reviewer_provider_message(
-                cli, &eng, &routing, model,
+                cli, eng, &routing, model,
             )));
         }
     };
@@ -2580,7 +2626,7 @@ async fn dispatch_reviewer_for_model(
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    let health = HealthStore::load(&eng.cfg.health_path);
+    let health = crate::config_cache::health_store(&eng.cfg.health_path);
     // The reservation's reconcile is a flock + write + fsync: keep it off the
     // dispatch task (D5.9) and hand the updated store back.
     let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
@@ -4784,6 +4830,7 @@ fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
+    eng: Option<&Engine>,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -4793,6 +4840,12 @@ async fn complete_review_chunks(
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
 ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+    // A review with no engine cannot resolve a reviewer: say so instead of
+    // dispatching into an empty chain (the caller that loaded the engine has
+    // already reported the load failure).
+    let eng: &Engine = eng.ok_or_else(|| {
+        anyhow::anyhow!("review incomplete: no engine loaded, so no reviewer can be resolved")
+    })?;
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
     // sized for THAT model; mixing models across chunks is refused below, so
@@ -4872,7 +4925,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 system,
                 &user,
                 max_tokens,
-                None,
+                eng,
                 false,
             )
             .await
@@ -4946,24 +4999,21 @@ did not satisfy the review schema."
                 // model's configured context window when one is stated —
                 // never above what the model can hold.
                 let doubled = reviewer_retry_budget(completion.max_tokens);
-                let capped = if let Ok(eng) = crate::Engine::load() {
-                    let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
-                        r.real_provider_for_model(&eng.cfg, &completion.model)
-                            .map(|p| p.id.clone())
-                    });
-                    let window = crate::context_opt::window_for(
-                        &eng.cfg,
-                        provider_id.as_deref().unwrap_or(""),
-                        &completion.model,
-                        None,
-                    );
-                    window
-                        .and_then(|w| u32::try_from(w).ok())
-                        .map_or(doubled, |w| doubled.min(w))
-                } else {
-                    doubled
-                };
-                capped
+                // The review's engine is already in hand (D5.2): re-reading
+                // it here cost a second corpus load per exhausted chunk.
+                let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
+                    r.real_provider_for_model(&eng.cfg, &completion.model)
+                        .map(|p| p.id.clone())
+                });
+                let window = crate::context_opt::window_for(
+                    &eng.cfg,
+                    provider_id.as_deref().unwrap_or(""),
+                    &completion.model,
+                    None,
+                );
+                window
+                    .and_then(|w| u32::try_from(w).ok())
+                    .map_or(doubled, |w| doubled.min(w))
             } else {
                 reviewer_retry_budget(max_tokens)
             };
@@ -4976,7 +5026,7 @@ did not satisfy the review schema."
                 system,
                 &repair_user,
                 repair_max_tokens,
-                None,
+                eng,
                 true,
             )
             .await;
@@ -5422,6 +5472,11 @@ pub(crate) async fn cmd_review(
     // just below for the reviewer chain) lets `[review]` config participate;
     // a config problem degrades to the built-in defaults rather than blocking
     // a review.
+    // ONE engine load for the whole review (D5.2): the panel fan-out, the
+    // chunk writers, the repair path and the confirmer all borrow this
+    // instance instead of re-reading the config, the engine TOML and the
+    // model corpus per dispatch. A failed load still degrades to the
+    // built-in defaults (as before), but it is now loaded ONCE.
     let eng = Engine::load().ok();
     let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
 
@@ -5431,7 +5486,9 @@ pub(crate) async fn cmd_review(
     // the configured reviewer pin, then the head of the scenario reviewer
     // chain. When none is resolvable (no engine, or a fully dynamic route) the
     // per-route lookup is skipped and the general caps/default apply.
-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let health = eng
+        .as_ref()
+        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
             .map(|r| r.reviewer)
@@ -5485,13 +5542,19 @@ pub(crate) async fn cmd_review(
     // outside the chunk (bindings earlier in the enclosing function, imports,
     // top-level definitions). Working-tree reviews read the files on disk;
     // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
-    let read_post_image = |path: &str| -> Option<String> {
+    //
+    // One image cache per review: `context_for`, the false-"undefined" filter
+    // and `confirm_reviews`' grounding all read the same post-image, and a
+    // branch read is a `git show` subprocess (D10.7).
+    let read_post_image_source = |path: &str| -> Option<String> {
         if label.starts_with("working-tree") {
             std::fs::read_to_string(root.join(path)).ok()
         } else {
             run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
         }
     };
+    let post_image = crate::config_cache::PostImages::new(read_post_image_source);
+    let read_post_image = |path: &str| -> Option<String> { post_image.get(path) };
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
@@ -5768,6 +5831,7 @@ unbound, or missing imports:\n{context}"
         let planned = m.clone().or_else(|| reviewer_for_caps.clone());
         complete_review_chunks(
             cli,
+            eng.as_ref(),
             m.as_deref(),
             &reviewer_chain,
             &[],
@@ -6169,17 +6233,26 @@ async fn dispatch_confirmer(
     let system = "You are a second-opinion confirmer for a code review finding.";
     let instruction = crate::review_confirm::confirmer_instruction(finding_id);
     let user = format!("{context}\n\n{instruction}");
-    let result = dispatch_reviewer_for_model(
-        cli,
-        model,
-        model,
-        system,
-        &user,
-        REVIEW_MIN_MAX_TOKENS,
-        None,
-        Some(reasoning_effort),
-    )
-    .await;
+    let result = match eng {
+        Some(eng) => {
+            dispatch_reviewer_for_model(
+                cli,
+                eng,
+                model,
+                model,
+                system,
+                &user,
+                REVIEW_MIN_MAX_TOKENS,
+                Some(reasoning_effort),
+            )
+            .await
+        }
+        // Without an engine there is no reviewer to dispatch: the confirmer
+        // attempt is reported as unavailable rather than silently dropped.
+        None => Err(ReviewerError::fatal(
+            "confirming a finding needs a loaded engine",
+        )),
+    };
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
         // A successful provider reply is recorded through the one shared
@@ -8164,7 +8237,7 @@ fn validate_loop_reviewer_pin(cli: &crate::Cli, reviewer: Option<&str>) -> anyho
     // configured provider serves fails here with a named, explicit error
     // instead of surfacing later as `reviewer_unavailable` with a null
     // `reviewer_model`.
-    let plan = build_reviewer_plan(cli, Some(raw), &[], &[], None)?;
+    let plan = build_reviewer_plan(cli, &eng, Some(raw), &[], &[])?;
     let Some(head) = plan.candidates.first() else {
         // The pin names a model that resolves to nothing. The operator must
         // fix the pin: an identical retry fails identically.
@@ -9421,10 +9494,16 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // (explicit `--reviewer`, then the configured reviewer pin, then the
         // routed chain head). `cli.model` is the AUTHOR pin and must not size
         // the reviewer's chunks.
-        let (reviewer_chain, review_cfg, caps_model) = match Engine::load() {
+        // ONE engine load per review iteration, reused for the reviewer
+        // chain, the author families and the whole review pass (D5.2). Before
+        // this, every iteration read the config, the engine TOML and the
+        // model corpus three times here alone (chain, author families, and
+        // again inside the review), and once more per reviewer dispatch.
+        let eng = Engine::load();
+        let (reviewer_chain, review_cfg, caps_model) = match eng.as_ref() {
             Ok(eng) => {
-                let health = HealthStore::load(&eng.cfg.health_path);
-                let chain = crate::resolve_chain(cli, &eng, &health)
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                let chain = crate::resolve_chain(cli, eng, &health)
                     .map(|r| r.reviewer)
                     .unwrap_or_default();
                 let caps_model = reviewer
@@ -9436,7 +9515,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                             .next()
                     })
                     .or_else(|| chain.first().cloned());
-                (chain, Some(eng.cfg.review), caps_model)
+                (chain, Some(eng.cfg.review.clone()), caps_model)
             }
             Err(_) => (Vec::new(), None, reviewer.clone()),
         };
@@ -9445,14 +9524,14 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // candidates (a fallback author is still an author for this rule).
         let review_author_models = {
             let mut models = author_models.clone();
-            if let Ok(eng) = Engine::load() {
-                if let Some(primary) = crate::resolve_effective_primary(cli, &eng) {
+            if let Ok(eng) = eng.as_ref() {
+                if let Some(primary) = crate::resolve_effective_primary(cli, eng) {
                     if !models.contains(&primary) {
                         models.push(primary);
                     }
                 }
-                let health = HealthStore::load(&eng.cfg.health_path);
-                if let Ok(routes) = crate::resolve_chain(cli, &eng, &health) {
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                if let Ok(routes) = crate::resolve_chain(cli, eng, &health) {
                     for model in routes.primary {
                         if !models.contains(&model) {
                             models.push(model);
@@ -9489,8 +9568,27 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // 2026-10-21 a reviewer that returned `Context size has been
         // exceeded` (and a diff whose middle was silently truncated) still
         // recorded verdict=approve; that is the fail-open this closes.
+        // A failed engine load is a review that cannot run: it is reported
+        // as `reviewer_unavailable` (never a fail-open approve) and the
+        // iteration stays unresolved, exactly as any other incomplete review.
+        // Pre-D5.2 each of the three `Engine::load()` calls in this block
+        // degraded independently to an empty chain / no `[review]` config.
+        let engine_load_error = eng.as_ref().err().map(|e| format!("loading engine: {e}"));
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
-            if review_unconfirmed_cancel {
+            if let Some(detail) = engine_load_error {
+                let detail = format!("review skipped: {detail}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if review_unconfirmed_cancel {
                 let detail = "review skipped: the author cancel was never confirmed, so this \
 diff is not a finished turn"
                     .to_string();
@@ -9512,6 +9610,7 @@ diff is not a finished turn"
                     cli.quiet,
                     run_loop_review(
                         cli,
+                        eng.as_ref().expect("guarded above: engine loaded"),
                         reviewer.as_deref(),
                         &reviewer_chain,
                         &review_author_models,
@@ -9594,6 +9693,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
                 cli.quiet,
                 run_loop_review(
                     cli,
+                    eng.as_ref().expect("loop review requires a loaded engine"),
                     reviewer.as_deref(),
                     &reviewer_chain,
                     &review_author_models,
@@ -9976,6 +10076,7 @@ approve)…"
                         cli.quiet,
                         run_loop_review(
                             cli,
+                            eng.as_ref().expect("guarded above: engine loaded"),
                             reviewer.as_deref(),
                             &reviewer_chain,
                             &review_author_models,
@@ -10953,6 +11054,15 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Load the engine for a test that drives the review path directly.
+    /// `run_loop_review_once`, `complete_review_chunks` and the reviewer
+    /// dispatch all borrow ONE `&Engine` (D5.2); tests point it at the
+    /// fixture home they already installed in the environment.
+    pub(super) fn test_engine() -> Engine {
+        Engine::load().expect("the fixture home loads an engine")
+    }
+
     use clap::Parser;
     use std::path::PathBuf;
     use zoder_core::Config;
@@ -16112,6 +16222,7 @@ mod review_diff_soundness_tests {
 #[cfg(test)]
 mod reviewer_chain_dispatch_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -16525,6 +16636,7 @@ mod reviewer_chain_dispatch_tests {
 
         let (review, _, _, chunks, _) = run_loop_review_once(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -16565,6 +16677,163 @@ mod reviewer_chain_dispatch_tests {
         // The only finding was disproved, so a blocking verdict is
         // downgraded to `comment`, never `approve`.
         assert_eq!(review.verdict, "comment", "{review:?}");
+    }
+
+    /// D10.7: one review reads a given post-image file ONCE.
+    ///
+    /// `context_for` (the cross-chunk header), `filter_false_undefined_findings`
+    /// and the confirmation grounding each read the reviewed files, and a
+    /// branch read is a `git show HEAD:<path>` subprocess. Before the fix each
+    /// consumer had its own reader: the header read `pkg/mod.py` while planning
+    /// and re-read it on every re-plan/fallback, and the filter read it again,
+    /// so one small review forked the same file several times. All three now
+    /// share one per-review `PostImages` cache.
+    ///
+    /// The reader is injected (the counting closure below) so the read count is
+    /// observable without patching `std::fs`: `reads()` counts calls to the
+    /// UNDERLYING reader, i.e. real reads, not cache hits. Asserted as an
+    /// exact count of one per distinct path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_image_read_once_per_file() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // The counting reader stands in for production's disk read: it runs
+        // once per ACTUAL read, so `reads()` is a true read count, not a hit
+        // count.
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_counter = raw.clone();
+        let post_image = crate::config_cache::PostImages::new(move |path: &str| {
+            read_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::read_to_string(root.join(path)).ok()
+        });
+
+        let (review, _, _, chunks, _) = run_loop_review_once_with_reader(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            &post_image,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        assert_eq!(chunks, 1, "one chunk for a diff this small");
+        // Sanity: the filter really did run and read the file, so the count
+        // below is evidence that the read happened, not that nothing read.
+        assert_eq!(review.filtered_findings.len(), 1, "{review:?}");
+        assert_eq!(
+            raw.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pkg/mod.py must be read exactly once per review, shared by the \
+             context header and the false-\"undefined\" filter"
+        );
+    }
+
+    /// D5.2: one review loads the engine ONCE.
+    ///
+    /// Before the fix, a review re-read the config, the engine TOML and the
+    /// multi-megabyte model corpus on every reviewer dispatch, on every
+    /// invalid-verdict repair, and once more on each recorded fallback
+    /// failure — and the loop did it three times per iteration just to build
+    /// the chain, the author families and the review itself. The engine is
+    /// now loaded once and borrowed (`&Engine`) by `build_reviewer_plan`,
+    /// `dispatch_reviewer_for_model` and the repair/failure paths.
+    ///
+    /// The counter is keyed by `Config::home()` ([`crate::engine_load_count_for`]),
+    /// so this test reads the count for ITS fixture home (which `HomeGuard` makes the current one) and
+    /// asserts on the DELTA it caused, never an absolute count. A global
+    /// counter would be blind here: `Engine::load()` FAILS for this home
+    /// (it has no engine `config.toml`), and a failed load still does the
+    /// config read and the registry bind the fix removes. Measured on the
+    /// pre-fix tree this DELTA is 2 (plan load + dispatch load); with the
+    /// fix it is 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_loads_engine_once() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        // `HomeGuard` takes the process-wide env lock itself; taking it
+        // again here would deadlock this test before it measured anything.
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // One engine for the fixture, loaded OUTSIDE the measured window.
+        let eng = test_engine();
+
+        let before = crate::engine_load_count_for(home);
+        let _ = run_loop_review_once(
+            &cli,
+            &eng,
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            root,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        let delta = crate::engine_load_count_for(home) - before;
+
+        // The review dispatches one chunk through one candidate: the only
+        // load it may add is zero — every path now borrows the engine the
+        // caller loaded. Pre-fix this was 2 (plan load + dispatch load).
+        assert_eq!(
+            delta, 0,
+            "a review must not reload the engine; it borrowed &Engine but the count rose by {delta}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16753,6 +17022,7 @@ mod reviewer_chain_dispatch_tests {
         let author_models: Vec<String> = vec!["broken-model/coder".to_string()];
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &author_models,
@@ -16829,7 +17099,7 @@ mod reviewer_chain_dispatch_tests {
         // Configured chain: the same-family reviewer is dropped, the
         // cross-family tail remains, and the skip is recorded.
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16839,8 +17109,14 @@ mod reviewer_chain_dispatch_tests {
 
         // Explicit operator pin: kept, flagged, and warned about — not
         // silently dropped.
-        let pinned =
-            build_reviewer_plan(&cli, Some("broken-model/reviewer"), &[], &authors, None).unwrap();
+        let pinned = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            Some("broken-model/reviewer"),
+            &[],
+            &authors,
+        )
+        .unwrap();
         assert!(pinned.forced, "an explicit same-family pin must be flagged");
         assert_eq!(
             pinned.candidates.first().map(String::as_str),
@@ -16884,7 +17160,7 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=working-model/other",
         ])
         .unwrap();
-        let pooled = build_reviewer_plan(&pool_cli, None, &[], &authors, None).unwrap();
+        let pooled = build_reviewer_plan(&pool_cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(pooled.candidates, vec!["working-model/other"]);
         assert!(pooled
             .skipped
@@ -16928,7 +17204,7 @@ mod reviewer_chain_dispatch_tests {
 
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
         let authors = vec!["broken-model/coder".to_string()];
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16946,9 +17222,15 @@ mod reviewer_chain_dispatch_tests {
         write_config(home, &runtime_loopback_uri(), "broken-model/reviewer");
         write_model_families(home, json!({"broken-model/*": "family-a"}));
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let err = build_reviewer_plan(&cli, None, &[], &["broken-model/coder".to_string()], None)
-            .unwrap_err()
-            .to_string();
+        let err = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &["broken-model/coder".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("no reviewer candidate remains outside the author model families"),
             "{err}"
@@ -16984,6 +17266,7 @@ mod reviewer_chain_dispatch_tests {
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &[],
@@ -17127,6 +17410,7 @@ mod reviewer_chain_dispatch_tests {
 +new\n";
         let (review, _model, _cost, _chunks, verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -17179,7 +17463,7 @@ mod reviewer_chain_dispatch_tests {
             "working-model/reviewer,broken-model/head",
         );
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &[], None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &[]).unwrap();
         assert_eq!(
             plan.candidates,
             vec!["working-model/reviewer", "broken-model/head"],
@@ -17719,6 +18003,7 @@ mod reviewer_chain_dispatch_tests {
         };
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17744,6 +18029,7 @@ mod reviewer_chain_dispatch_tests {
         // (the replanned model), not from the abandoned pre-replan dispatch.
         let report = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17776,6 +18062,7 @@ mod reviewer_chain_dispatch_tests {
         hits.store(0, Ordering::SeqCst);
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -18078,6 +18365,7 @@ mod reviewer_chain_dispatch_tests {
             let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
             let result = complete_review_chunks(
                 &cli,
+                Some(&test_engine()),
                 Some("working-model/glm-5.1"),
                 &[],
                 &[],
@@ -19000,6 +19288,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -19040,6 +19329,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 20);
         let (review, model, _cost, chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -19097,6 +19387,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 100);
         let (review, model, _cost, chunks, reviewer_verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -19172,6 +19463,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -19235,6 +19527,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19327,6 +19620,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19408,6 +19702,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19493,6 +19788,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19578,6 +19874,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19654,6 +19951,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19717,6 +20015,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19783,6 +20082,7 @@ data: [DONE]\n\n";
         std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19850,6 +20150,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &["working-model/fallback".into()],
             &[],
@@ -20199,6 +20500,7 @@ data: [DONE]\n\n";
         let cli = dummy_cli();
         let (review, _model, _cost, _chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -23107,6 +23409,7 @@ mod loop_review_base_tests {
 #[cfg(test)]
 mod reviewer_request_settings_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
@@ -23188,7 +23491,7 @@ model_provider = "custom.reviewer"
         server: &MockServer,
         extra_cli: &[&str],
         home: &std::path::Path,
-        engine_path: &std::path::Path,
+        _engine_path: &std::path::Path,
         models_json: Option<serde_json::Value>,
     ) -> Result<Completion, ReviewerError> {
         let reply = serde_json::json!({
@@ -23218,12 +23521,12 @@ model_provider = "custom.reviewer"
         let cli = crate::Cli::try_parse_from(argv).expect("reviewer arguments parse");
         dispatch_reviewer_for_model(
             &cli,
+            &test_engine(),
             MODEL,
             MODEL,
             "system prompt",
             "diff",
             4096,
-            Some(engine_path),
             None,
         )
         .await
