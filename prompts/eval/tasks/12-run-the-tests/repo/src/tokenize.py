@@ -2,4 +2,4 @@
 
 
 def tokens(text):
-    return text.split()
+    return text.split(",")

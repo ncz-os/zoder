@@ -70,6 +70,14 @@ run ends, so the working tree stays clean for the delivery check.
 
 See `prompts/eval/README.md` for the full table and the criterion kinds.
 
+Every task is scored against the **result** tree — the starting `repo/`
+with the transcript's tool calls applied — not against the starting tree.
+A task must never be satisfiable by doing nothing: for every task that
+ships a `run_tests.sh`, the acceptance script fails on the starting tree
+and exits 0 on the result tree. `scripts/tests/prompt-eval-tests.py`
+enforces that, so a fixture cannot drift into passing for the wrong
+reason.
+
 ## 2. Live mode (opt-in)
 
 Live mode sends each task to a real route and scores the result with the

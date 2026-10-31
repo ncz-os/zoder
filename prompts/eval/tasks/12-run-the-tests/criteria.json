@@ -13,6 +13,10 @@
     "tool": "apply_patch"
   },
   {
+    "kind": "check_exit_zero",
+    "script": "run_tests.sh"
+  },
+  {
     "kind": "final_message_contains",
     "text": "./run_tests.sh"
   }

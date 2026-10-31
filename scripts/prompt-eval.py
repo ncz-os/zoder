@@ -230,6 +230,30 @@ def score_criterion(criterion: dict, workdir: Path, transport: FakeTransport) ->
         if kind == "path_exists":
             return (exists, f"{rel} exists" if exists else f"{rel} is missing")
         return (not exists, f"{rel} absent" if exists else f"{rel} still present")
+    if kind == "check_exit_zero":
+        # The task's OWN acceptance script must exit 0 in the result
+        # tree.  This is the criterion that ties the machine-checkable
+        # criteria to the script the transcript actually runs, so the two
+        # cannot drift apart: if `run_tests.sh` fails, the task fails.
+        script = criterion.get("script", "run_tests.sh")
+        target = workdir / script
+        if not target.is_file():
+            return (False, f"{script} is missing from the result tree")
+        try:
+            proc = subprocess.run(
+                ["/bin/sh", str(target)],
+                cwd=workdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return (False, f"{script} could not run: {e}")
+        ok = proc.returncode == 0
+        detail = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+        tail = detail[-1] if detail else ""
+        return (ok, f"{script} exited 0 ({tail})" if ok else f"{script} exited {proc.returncode}")
     if kind == "final_message_contains":
         needle = criterion.get("text", "")
         ok = needle in transport.final_message

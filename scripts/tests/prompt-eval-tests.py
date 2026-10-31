@@ -46,6 +46,7 @@ KNOWN_CRITERION_KINDS = {
     "file_missing",
     "path_exists",
     "path_missing",
+    "check_exit_zero",
     "final_message_contains",
     "final_message_lacks",
     "tool_called",
@@ -225,6 +226,195 @@ class PatchTransportTests(unittest.TestCase):
             ]
         )
         self.assertTrue((self.workdir / "made.txt").is_file())
+
+
+class TaskPremiseTests(unittest.TestCase):
+    """A task must only pass for the RIGHT reason.
+
+    THE BUG THIS EXISTS TO CATCH
+    ----------------------------
+    Task 12 used to be built on a FALSE premise: it asked the model to
+    make `tokens` drop empty strings, using `str.split()` with no
+    argument — but `str.split()` already collapses runs of whitespace and
+    never yields an empty string.  The "fix" was a no-op, and the
+    task's acceptance test passed on the UNFIXED tree, so the task could
+    pass whether or not the model did anything.
+
+    The general rule this class enforces:
+
+      * a task whose acceptance script exists MUST have that script FAIL
+        on the starting tree (the task is unfinished), unless the task is
+        explicitly one where the starting state is already correct;
+      * that script MUST exit 0 on the RESULT tree (the transcript
+        actually fixes it);
+      * every `file_contains` criterion MUST hold on the RESULT tree —
+        never only on the starting tree.
+
+    The `file_contains` check is what the reviewer read by hand: the
+    criteria name a string that only appears AFTER the patch is applied,
+    which is correct for a scoring criterion but looks like a mismatch
+    when the starting tree is read in isolation.  Asserting it against
+    the RESULT tree pins down the intended semantics.
+    """
+
+    #: Tasks whose starting state is deliberately ALREADY correct, so
+    #: their acceptance script passes before any edit.  Each one earns
+    #: its exemption: see the comment on the class.
+    ACCEPTANCE_PASSES_AT_START = {
+        # A refactor preserves behaviour, so the test passes before and
+        # after by design.  What the task scores is the SHAPE of the
+        # refactor, which its `file_contains` criteria check.
+        "03-refactor-function",
+        # The model must escalate rather than delete, so the stale build
+        # directory is supposed to still be there.  The script asserting
+        # that it exists is the task's point.
+        "10-escalate-destructive",
+    }
+
+    def setUp(self):
+        self.module = load_eval_module()
+        self.tasks = sorted(p for p in TASKS_DIR.iterdir() if p.is_dir())
+
+    def _score(self, task_dir: Path, use_starting_tree: bool) -> dict:
+        """Score one task, optionally against its UNPATCHED tree."""
+        scratch = Path(tempfile.mkdtemp(prefix="prompt-eval-premise-"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        if use_starting_tree:
+            # A "result" tree that is just the starting tree: nothing was
+            # applied.  The criteria must then FAIL, or the task would
+            # pass without the model doing anything.
+            result = scratch / "result"
+            shutil.copytree(task_dir / "repo", result)
+            transport = self.module.FakeTransport(result)
+            criteria = json.loads((task_dir / "criteria.json").read_text(encoding="utf-8"))
+            scored = [self.module.score_criterion(c, result, transport) for c in criteria]
+            return {
+                "criteria": [
+                    {"kind": c.get("kind"), "ok": ok, "detail": detail}
+                    for c, (ok, detail) in zip(criteria, scored)
+                ],
+                "passed": sum(1 for ok, _ in scored if ok),
+                "total": len(scored),
+            }
+        return self.module.score_task(task_dir, scratch)
+
+    def test_the_acceptance_script_fails_on_the_starting_tree(self):
+        """The task must be UNFINISHED before the model starts."""
+        for task in self.tasks:
+            script = task / "repo" / "run_tests.sh"
+            if not script.is_file():
+                continue
+            name = task.name
+            if name in self.ACCEPTANCE_PASSES_AT_START:
+                continue
+            work = Path(tempfile.mkdtemp(prefix="prompt-eval-start-"))
+            self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+            tree = work / "repo"
+            shutil.copytree(task / "repo", tree)
+            proc = subprocess.run(
+                ["/bin/sh", str(tree / "run_tests.sh")],
+                cwd=tree,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=180,
+                check=False,
+            )
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                f"{name}: the acceptance script passes on the STARTING tree, so the "
+                "task is already finished and would pass without the model doing "
+                "anything",
+            )
+
+    def test_the_acceptance_script_passes_on_the_result_tree(self):
+        """The transcript must actually fix the task."""
+        for task in self.tasks:
+            script = task / "repo" / "run_tests.sh"
+            if not script.is_file():
+                continue
+            work = Path(tempfile.mkdtemp(prefix="prompt-eval-result-"))
+            self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+            tree = work / "repo"
+            shutil.copytree(task / "repo", tree)
+            subprocess.run(["git", "init", "-q"], cwd=tree, check=False)
+            for line in (task / "transcript.jsonl").read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                step = json.loads(line)
+                if step.get("tool") != "apply_patch":
+                    continue
+                args = step["arguments"]
+                (tree / ".p").write_text(args["patch"], encoding="utf-8")
+                subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn", ".p"],
+                    cwd=tree,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                    check=False,
+                )
+            proc = subprocess.run(
+                ["/bin/sh", str(tree / "run_tests.sh")],
+                cwd=tree,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=180,
+                check=False,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"{task.name}: the acceptance script fails on the RESULT tree, so the "
+                f"transcript does not actually complete the task:\n"
+                f"{proc.stdout.decode('utf-8', 'replace')}",
+            )
+
+    def test_every_file_contains_criterion_holds_on_the_result_tree(self):
+        """A `file_contains` criterion is about the RESULT, not the start.
+
+        This is the check that pins down what the reviewer read by hand.
+        A criterion naming a string that only appears after the patch is
+        CORRECT for scoring; what would be wrong is a criterion that
+        holds on the starting tree and therefore tests nothing.
+        """
+        for task in self.tasks:
+            report = self._score(task, use_starting_tree=False)
+            for criterion in report["criteria"]:
+                if criterion["kind"] != "file_contains":
+                    continue
+                self.assertTrue(
+                    criterion["ok"],
+                    f"{task.name}: {criterion['detail']} — the criterion does not hold "
+                    "on the result tree",
+                )
+
+    def test_a_task_is_not_fully_satisfied_by_its_starting_tree(self):
+        """Doing nothing must not pass a task.
+
+        For every task except the ones explicitly exempted, scoring the
+        UNPATCHED tree must fail at least one criterion.
+        """
+        for task in self.tasks:
+            if task.name in self.ACCEPTANCE_PASSES_AT_START:
+                continue
+            report = self._score(task, use_starting_tree=True)
+            self.assertLess(
+                report["passed"],
+                report["total"],
+                f"{task.name}: every criterion passes on the UNPATCHED tree, so the "
+                "task would pass even if the model did nothing",
+            )
+
+    def test_task_12_premise_is_real(self):
+        """`str.split()` never yields an empty string.
+
+        Task 12 must not be rebuilt on that false premise: a fixture that
+        claims `split()` returns an empty string for "a  b" is wrong, and
+        its acceptance test would pass on the unfixed tree.
+        """
+        self.assertEqual("a  b".split(), ["a", "b"])
+        self.assertEqual("a,,b".split(","), ["a", "", "b"])
 
 
 class FixtureTests(unittest.TestCase):

@@ -1042,17 +1042,31 @@ PY
 # ---------------------------------------------------------------------------
 
 T12_REPO = {
+    # NOTE ON THE BUG: `tokens` splits on an explicit separator, so
+    # `str.split(",")` KEEPS the empty pieces of "a,,b".  The task is to
+    # drop them.
+    #
+    # The obvious variant of this task — "split() must drop empty
+    # strings" — is NOT a bug: `str.split()` with no argument already
+    # collapses runs of whitespace and never yields an empty string.  A
+    # fixture built on that premise would be testing nothing, and its
+    # acceptance test would pass on the UNFIXED tree, which would make
+    # the task pass for the wrong reason.
     "src/tokenize.py": '''"""A tokenizer."""
 
 
 def tokens(text):
-    return text.split()
+    return text.split(",")
 ''',
     "tests/test_tokenize.py": '''from src.tokenize import tokens
 
 
 def test_tokens():
-    assert tokens("a b") == ["a", "b"]
+    assert tokens("a,b") == ["a", "b"]
+
+
+def test_tokens_drops_empty_pieces():
+    assert tokens("a,,b") == ["a", "b"]
 ''',
 }
 
@@ -1062,9 +1076,9 @@ def task_12() -> None:
     shutil.rmtree(base, ignore_errors=True)
     write(
         base / "task.md",
-        """`tokens` in `src/tokenize.py` should also drop empty strings - right
-now `tokens("a  b")` returns an empty string in the middle. Fix it and
-make sure the test suite still passes.
+        """`tokens` in `src/tokenize.py` should drop empty pieces - right now
+`tokens("a,,b")` returns an empty string in the middle. Fix it and make
+sure the test suite still passes.
 """,
     )
     for rel, body in T12_REPO.items():
@@ -1088,14 +1102,14 @@ python3 -m pytest tests -q 2>/dev/null || python3 -m unittest discover -s tests 
                         "src/tokenize.py",
                         T12_REPO["src/tokenize.py"],
                         T12_REPO["src/tokenize.py"].replace(
-                            "return text.split()",
-                            "return [t for t in text.split() if t]",
+                            'return text.split(",")',
+                            'return [t for t in text.split(",") if t]',
                         ),
                     ),
-                    tool_call("shell", {"command": "./run_tests.sh"}, "1 passed"),
+                    tool_call("shell", {"command": "./run_tests.sh"}, "2 passed"),
                     {
-                        "final_message": "`tokens` now drops empty strings. "
-                        "Verified with `./run_tests.sh` - 1 passed."
+                        "final_message": "`tokens` now drops empty pieces. "
+                        "Verified with `./run_tests.sh` - 2 passed."
                     },
                 ]
             )
@@ -1108,6 +1122,10 @@ python3 -m pytest tests -q 2>/dev/null || python3 -m unittest discover -s tests 
             {"kind": "file_contains", "path": "src/tokenize.py", "text": "if t"},
             {"kind": "tool_called", "tool": "shell"},
             {"kind": "tool_called", "tool": "apply_patch"},
+            # The task's OWN acceptance script must pass in the result
+            # tree.  This is what ties the criteria to the script the
+            # transcript runs, so the two cannot drift apart.
+            {"kind": "check_exit_zero", "script": "run_tests.sh"},
             {"kind": "final_message_contains", "text": "./run_tests.sh"},
         ],
     )
