@@ -2798,27 +2798,41 @@ async fn run() -> anyhow::Result<()> {
 /// invocation wants clean machine output (`--json`) or it is the `update`
 /// command itself. Cached + opt-out via `ZODER_NO_UPDATE_CHECK=1`; any failure
 /// (offline, etc.) is silently ignored.
+///
+/// The check runs on a background thread and this task waits at most
+/// [`zoder_core::update::BACKGROUND_BUDGET`] for it
+/// ([`zoder_core::update::spawn_background`]), so a short command — every fleet
+/// subprocess included — never pays the update check's network latency. When
+/// the budget expires the hint is dropped for this run; the detached check
+/// still records its outcome, so a failed check is not retried for the whole
+/// retry interval.
 async fn maybe_notify_update(cli: &Cli) {
     if cli.json || matches!(cli.cmd, Some(Cmd::Update { .. })) {
         return;
     }
     let home = Config::home();
-    if let Some(st) =
-        zoder_core::update::check_cached(&home, std::time::Duration::from_secs(86_400)).await
-    {
-        if st.newer {
-            let p = Pal::new();
-            eprintln!(
-                "{}",
-                p.dim(&format!(
-                    "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
-                    st.current,
-                    st.latest,
-                    zoder_core::update::release_url()
-                ))
-            );
-        }
+    // The budget wait parks the calling thread, so the check runs on the
+    // blocking pool instead of stalling a runtime worker.
+    let checked = tokio::task::spawn_blocking(move || {
+        zoder_core::update::spawn_background(&home, std::time::Duration::from_secs(86_400))
+    })
+    .await;
+    let Ok(Some(st)) = checked else {
+        return;
+    };
+    if !st.newer {
+        return;
     }
+    let p = Pal::new();
+    eprintln!(
+        "{}",
+        p.dim(&format!(
+            "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
+            st.current,
+            st.latest,
+            zoder_core::update::release_url()
+        ))
+    );
 }
 
 /// `zoder update [--check]`: report whether a newer release exists; without
