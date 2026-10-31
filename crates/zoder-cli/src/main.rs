@@ -2159,6 +2159,10 @@ mod provider_route_corpus_tests {
 static ENGINE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Number of whole-engine loads this process has performed so far.
+///
+/// Test-only by construction: no production code reads the counter, so the
+/// non-test build would report it as dead code.
+#[cfg(test)]
 pub(crate) fn engine_load_count() -> usize {
     ENGINE_LOADS.load(std::sync::atomic::Ordering::Relaxed)
 }
