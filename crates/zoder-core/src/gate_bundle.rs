@@ -65,6 +65,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::gate::{GateEnv, GateStep, StepExec};
 
@@ -350,15 +351,34 @@ impl InstallHint {
 ///    anything else. Stdout/stderr are deliberately NOT captured here
 ///    (the gate rendering stays purely about pass/fail); a future slice
 ///    can plumb them through if a reviewer-facing view needs them.
+///  - Every step runs with `working_dir` as its current directory (when
+///    set) and is bounded by `step_timeout`: a step that outlives the
+///    timeout is killed and reported as `Failed`. Without either, a gate
+///    run for `--root DIR` would execute in the caller's cwd and a wedged
+///    step (a hung lint, a test that waits on stdin) would hang the whole
+///    gate for an unattended worker.
 #[derive(Debug, Default, Clone)]
 pub struct PathEnv {
     /// Extra search directories to consider BEFORE `PATH`. Tests use
     /// this to inject a fake tool without polluting the real PATH.
     pub extra_dirs: Vec<PathBuf>,
+    /// Directory each spawned step runs in. `None` keeps the caller's
+    /// cwd (the historic behaviour).
+    pub working_dir: Option<PathBuf>,
+    /// Per-step wall-clock limit. `None` means no limit.
+    pub step_timeout: Option<Duration>,
 }
 
+/// Default per-step timeout for `zoder gate` steps, in seconds.
+///
+/// Deliberately generous: a cold Rust `cargo test` on a big workspace is
+/// minutes, and a false timeout turns a green gate red. The point is to
+/// bound a wedged step, not to police slow ones.
+pub const DEFAULT_GATE_STEP_TIMEOUT_SECS: u64 = 1800;
+
 impl PathEnv {
-    /// Build a `PathEnv` with no extra dirs.
+    /// Build a `PathEnv` with no extra dirs, no working dir override and
+    /// no step timeout.
     pub fn new() -> Self {
         Self::default()
     }
@@ -367,7 +387,21 @@ impl PathEnv {
     pub fn with_extra_dirs<I: IntoIterator<Item = PathBuf>>(dirs: I) -> Self {
         Self {
             extra_dirs: dirs.into_iter().collect(),
+            ..Self::default()
         }
+    }
+
+    /// Run every step with `dir` as its current directory.
+    pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    /// Bound every step by `timeout` (see [`PathEnv::run_command`] for
+    /// what an overrun looks like).
+    pub fn with_step_timeout(mut self, timeout: Duration) -> Self {
+        self.step_timeout = Some(timeout);
+        self
     }
 
     /// Search the configured paths for `binary`. Returns `true` if a
@@ -396,6 +430,13 @@ impl PathEnv {
     /// failure (e.g. ENOENT, EACCES) is also `Failed`, not a panic —
     /// the gate must never panic on a missing tool; the runner routes
     /// the failure into the report per the fail-closed contract.
+    ///
+    /// The child runs in `working_dir` when one is configured (so
+    /// `zoder gate --root DIR` checks DIR, not the caller's cwd) and is
+    /// killed if it outlives `step_timeout`. A timed-out step is
+    /// `Failed`: under Strict a hanging required step must not be able
+    /// to keep the gate from ever reporting, and it certainly must not
+    /// read as a pass.
     pub fn run_command(&self, step: &GateStep) -> StepExec {
         if step.command.is_empty() {
             // A zero-arg step is a programmer error in the baseline.
@@ -406,12 +447,72 @@ impl PathEnv {
         if step.command.len() > 1 {
             cmd.args(&step.command[1..]);
         }
-        match cmd.status() {
-            Ok(status) if status.success() => StepExec::Passed,
-            Ok(_) => StepExec::Failed,
-            Err(_) => StepExec::Failed,
+        if let Some(dir) = &self.working_dir {
+            cmd.current_dir(dir);
+        }
+        let Some(timeout) = self.step_timeout else {
+            return match cmd.status() {
+                Ok(status) if status.success() => StepExec::Passed,
+                Ok(_) => StepExec::Failed,
+                Err(_) => StepExec::Failed,
+            };
+        };
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        // Put the step in its own process group so a timeout kills the
+        // whole tree (a `cargo test` that spawned workers, a shell
+        // wrapper) instead of orphaning children that keep the gate's
+        // stdout busy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let Ok(mut child) = cmd.spawn() else {
+            return StepExec::Failed;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        StepExec::Passed
+                    } else {
+                        StepExec::Failed
+                    };
+                }
+                Ok(None) => {}
+                Err(_) => return StepExec::Failed,
+            }
+            if Instant::now() >= deadline {
+                kill_child_tree(&mut child);
+                // Reap so we do not leave a zombie behind.
+                let _ = child.wait();
+                return StepExec::Failed;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
+}
+
+/// How often the timeout loop re-checks a running step. Small enough
+/// that the reported overrun is close to the configured limit, large
+/// enough not to spin a core while a long `cargo test` runs.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Kill a timed-out step. On Unix the child leads its own process group
+/// (see `run_command`), so signalling the group takes scavenged
+/// grandchildren with it; the direct `kill` is the fallback.
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .status();
+    }
+    let _ = child.kill();
 }
 
 impl GateEnv for PathEnv {
@@ -879,6 +980,125 @@ mod tests {
             required: true,
         };
         assert_eq!(env.run_step(&step), StepExec::Failed);
+    }
+
+    // ----- D4.7: steps run in the configured root, under a timeout -------
+
+    /// A step whose command returns `Passed` only when the child's cwd is
+    /// `dir`. Written as a shell one-liner so the assertion is about the
+    /// real spawn cwd, not about anything the test sets up.
+    #[cfg(unix)]
+    fn cwd_asserting_step(dir: &Path) -> GateStep {
+        let expected = dir.display().to_string();
+        GateStep {
+            name: "cwd".to_string(),
+            category: StepCategory::Lint,
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("test \"$(pwd -P)\" = \"{expected}\""),
+            ],
+            tool: "sh".to_string(),
+            required: true,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_runs_in_the_configured_working_dir() {
+        // D4.7 regression: `zoder gate --root DIR` must run its steps in
+        // DIR. Pre-fix `run_command` never set `current_dir`, so every
+        // step ran in whoever's cwd launched the gate.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_real = std::fs::canonicalize(root.path()).expect("canonicalize root");
+        let env = PathEnv::new().with_working_dir(root.path());
+        assert_eq!(
+            env.run_command(&cwd_asserting_step(&root_real)),
+            StepExec::Passed,
+            "a step run with `--root` must see that root as its cwd"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_without_working_dir_does_not_run_in_the_root() {
+        // Counter-test for the one above: with no working dir the step
+        // keeps the caller's cwd, so the root-asserting command fails.
+        // Without this the cwd test could pass for the wrong reason.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_real = std::fs::canonicalize(root.path()).expect("canonicalize root");
+        let env = PathEnv::new();
+        assert_eq!(
+            env.run_command(&cwd_asserting_step(&root_real)),
+            StepExec::Failed,
+            "baseline: with no working dir the step must NOT appear to run in the root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_plan_with_working_dir_asserts_the_step_cwd_end_to_end() {
+        // The same guarantee through the real runner, which is the path
+        // `zoder gate` uses.
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_real = std::fs::canonicalize(root.path()).expect("canonicalize root");
+        let env = PathEnv::new().with_working_dir(root.path());
+        let plan = vec![cwd_asserting_step(&root_real)];
+        let (results, status) = crate::gate::run_plan(&plan, crate::gate::GateMode::Strict, &env);
+        assert_eq!(status, crate::gate::GateStatus::Green);
+        assert!(matches!(
+            results[0].outcome,
+            crate::gate::StepOutcome::Passed
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_fails_a_step_that_exceeds_the_step_timeout() {
+        // D4.7: a wedged step must not hang the gate. A step that sleeps
+        // far longer than the timeout is killed and reported Failed.
+        let env = PathEnv::new().with_step_timeout(Duration::from_millis(200));
+        let step = GateStep {
+            name: "slow".to_string(),
+            category: StepCategory::Test,
+            command: vec!["sleep".to_string(), "30".to_string()],
+            tool: "sleep".to_string(),
+            required: true,
+        };
+        let started = Instant::now();
+        assert_eq!(env.run_command(&step), StepExec::Failed);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout must cut the step short, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_lets_a_step_finish_inside_the_step_timeout() {
+        // Counter-test: the timeout must not turn a fast, passing step
+        // red. Same shape as the timeout test, with a step that exits
+        // immediately.
+        let env = PathEnv::new().with_step_timeout(Duration::from_secs(30));
+        let step = GateStep {
+            name: "fast".to_string(),
+            category: StepCategory::Test,
+            command: vec!["true".to_string()],
+            tool: "true".to_string(),
+            required: true,
+        };
+        assert_eq!(env.run_command(&step), StepExec::Passed);
+    }
+
+    #[test]
+    fn default_gate_step_timeout_is_generous() {
+        // The default must be loose enough not to red a slow cold test
+        // suite; it exists to bound a hang, not to police duration.
+        assert!(
+            DEFAULT_GATE_STEP_TIMEOUT_SECS >= 600,
+            "default step timeout should be generous, got {DEFAULT_GATE_STEP_TIMEOUT_SECS}s"
+        );
     }
 
     // ----- probe_tools ----------------------------------------------------
