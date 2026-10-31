@@ -23578,6 +23578,117 @@ mod engine_cost_accounting_tests {
         );
     }
 
+    /// A `serves` entry is a PREFIX, not a model id (`mimax-`, `gpt-`,
+    /// `local/`), and the engine only looks up the full id it routed. The
+    /// catalog must therefore carry `local/qwen3.8-coder`, never the bare
+    /// `local/`: a key no lookup ever produces is dead weight, and it hides
+    /// the fact that the declaration did not reach the model.
+    ///
+    /// The earlier rule distinguished "ends with `/`" (expand) from
+    /// "everything else" (insert as written), so every delimiter-free prefix
+    /// (`mimax-`, `gpt-`) was written verbatim. That is the shape
+    /// `config.standalone.toml` ships.
+    #[test]
+    fn a_delimiter_free_serves_prefix_is_expanded_to_full_model_ids() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["llama-"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        cat.models
+            .insert("local/llama-3.3-70b".to_string(), ModelPrice::default());
+        let out = engine_catalog(&cat, &cfg);
+        assert!(
+            !out.models.contains_key("llama-"),
+            "a prefix is not a model id: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            out.models.contains_key("local/llama-3.3-70b"),
+            "the model the feed knows under the prefix must carry the $0 row"
+        );
+    }
+
+    /// A full model id in `serves` is used as-is; it never invents rows for
+    /// other ids that happen to share its textual prefix.
+    #[test]
+    fn a_full_model_id_in_serves_is_never_treated_as_a_prefix() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/qwen3.8-coder"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        cat.models
+            .insert("local/qwen3.8-coder".to_string(), ModelPrice::default());
+        cat.models
+            .insert("local/qwen3.8-coder-max".to_string(), ModelPrice::default());
+        let out = engine_catalog(&cat, &cfg);
+        assert!(out.models.contains_key("local/qwen3.8-coder"));
+        assert!(
+            !out.models
+                .get("local/qwen3.8-coder-max")
+                .is_some_and(|p| p.source == FREE_ENGINE_ENTRY_SOURCE),
+            "a full id must not prefix-match its neighbours"
+        );
+    }
+
+    /// A row that carries a `source` but no rate at all is not a price. It is
+    /// the shape a partial feed or a hand-edited catalog produces (a
+    /// `{"source": "litellm"}` object with both rates omitted), and the
+    /// loader accepts it because a complete zero pair is legitimate. Admitting
+    /// it into the engine catalog writes a rate-less row the engine cannot
+    /// bill from — neither a rate nor an explicit $0 declaration.
+    #[test]
+    fn a_source_with_no_rate_is_not_published_as_a_rate() {
+        let mut with_orphan = paid_catalog();
+        with_orphan.models.insert(
+            "vendor/orphan".to_string(),
+            ModelPrice {
+                source: "litellm".to_string(),
+                ..Default::default()
+            },
+        );
+        // An explicit $0 an operator wrote is still kept.
+        with_orphan.models.insert(
+            "internal/pinned-free".to_string(),
+            ModelPrice {
+                source: "operator".to_string(),
+                ..Default::default()
+            },
+        );
+        let cfg = config(
+            r#"{
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/"]
+            }"#,
+        );
+        let out = engine_catalog(&with_orphan, &cfg);
+        assert!(
+            !out.models.contains_key("vendor/orphan"),
+            "a feed row with a source but no rate carries no statement to publish"
+        );
+        assert!(
+            out.models.contains_key("internal/pinned-free"),
+            "a deliberate explicit $0 must still be published"
+        );
+    }
+
     fn paid_catalog() -> PricingCatalog {
         let mut cat = PricingCatalog {
             generated: "2026-10-30".to_string(),
@@ -23790,6 +23901,62 @@ mod engine_cost_accounting_tests {
         assert!(
             line.contains("1 unknown-cost row "),
             "singular row wording expected: {line}"
+        );
+    }
+    /// The note counts LEDGER ROWS that could not be priced, not map buckets.
+    ///
+    /// It is interpolated into "N unknown-cost rows", so counting buckets
+    /// renames months and models as "rows": a single unpriced month folded
+    /// into one bucket reads as "1 row" even when it excluded 40 calls, and a
+    /// `--by-model` view names models. The counts live on the same buckets the
+    /// rows land in (`unknown_cost_calls` / `unknown_cost_tokens` carry the
+    /// folded row counts), and only non-zero buckets contribute, so summing
+    /// them yields the row count the wording promises.
+    #[test]
+    fn spend_note_counts_ledger_rows_not_rollup_buckets() {
+        let mut roll: BTreeMap<String, Rollup> = BTreeMap::new();
+        // One month bucket holding three unpriced rows.
+        roll.insert(
+            "2026-10".to_string(),
+            Rollup {
+                unknown_cost_calls: 3,
+                unknown_cost_tokens: 120,
+                ..Default::default()
+            },
+        );
+        // A priced month must not be counted as an unknown-cost row.
+        roll.insert(
+            "2026-09".to_string(),
+            Rollup {
+                cost_usd: 1.0,
+                calls: 5,
+                ..Default::default()
+            },
+        );
+        let line = spend_unknown_cost_note(&roll).expect("a note is printed");
+        assert!(
+            line.contains("3 unknown-cost rows"),
+            "three unpriced rows in one month bucket must read as three rows: {line}"
+        );
+    }
+
+    /// A row can carry unknown-cost TOKENS with `calls = 0`; it must count as
+    /// one row, not as zero (the old filter keyed on the call counter alone).
+    #[test]
+    fn spend_note_counts_a_tokens_only_row_as_one_row() {
+        let mut roll: BTreeMap<String, Rollup> = BTreeMap::new();
+        roll.insert(
+            "2026-10".to_string(),
+            Rollup {
+                unknown_cost_calls: 0,
+                unknown_cost_tokens: 1,
+                ..Default::default()
+            },
+        );
+        let line = spend_unknown_cost_note(&roll).expect("a note is printed");
+        assert!(
+            line.contains("1 unknown-cost row "),
+            "a tokens-only bucket is one unpriced row, not zero: {line}"
         );
     }
 }
