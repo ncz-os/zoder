@@ -16292,9 +16292,14 @@ mod reviewer_chain_dispatch_tests {
     /// now loaded once and borrowed (`&Engine`) by `build_reviewer_plan`,
     /// `dispatch_reviewer_for_model` and the repair/failure paths.
     ///
-    /// The counter is process-global, so this test holds `ENV_LOCK` (the same
-    /// lock every other engine-touching test uses) and asserts on the DELTA
-    /// it caused, never an absolute count.
+    /// The counter is keyed by `Config::home()` ([`crate::engine_load_count_for`]),
+    /// so this test reads the count for ITS fixture home (which `HomeGuard` makes the current one) and
+    /// asserts on the DELTA it caused, never an absolute count. A global
+    /// counter would be blind here: `Engine::load()` FAILS for this home
+    /// (it has no engine `config.toml`), and a failed load still does the
+    /// config read and the registry bind the fix removes. Measured on the
+    /// pre-fix tree this DELTA is 2 (plan load + dispatch load); with the
+    /// fix it is 0.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn review_loads_engine_once() {
         let home_dir = tempfile::tempdir().unwrap();
@@ -16325,7 +16330,7 @@ mod reviewer_chain_dispatch_tests {
         // One engine for the fixture, loaded OUTSIDE the measured window.
         let eng = test_engine();
 
-        let before = crate::engine_load_count();
+        let before = crate::engine_load_count_for(home);
         let _ = run_loop_review_once(
             &cli,
             &eng,
@@ -16344,11 +16349,11 @@ mod reviewer_chain_dispatch_tests {
         )
         .await
         .expect("the loop review completes against the mock reviewer");
-        let delta = crate::engine_load_count() - before;
+        let delta = crate::engine_load_count_for(home) - before;
 
         // The review dispatches one chunk through one candidate: the only
         // load it may add is zero — every path now borrows the engine the
-        // caller loaded. Pre-fix this was >= 2 (plan + dispatch).
+        // caller loaded. Pre-fix this was 2 (plan load + dispatch load).
         assert_eq!(
             delta, 0,
             "a review must not reload the engine; it borrowed &Engine but the count rose by {delta}"

@@ -2150,21 +2150,66 @@ mod provider_route_corpus_tests {
 /// the engine TOML and the multi-megabyte model corpus on every dispatch,
 /// every repair and every recorded failure.
 ///
-/// The counter is a plain `AtomicUsize` with no gating: it is two relaxed
-/// instructions on the load path, never a lock, and it is the only way to
-/// observe "how many times did this review load the engine" from a test
-/// without a process-global fake. `engine_load_count()` reads it; tests that
-/// assert a delta must hold [`crate::test_env::ENV_LOCK`] because parallel
-/// tests load engines too.
-static ENGINE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Number of whole-engine loads this process has performed so far.
+/// A test measures the DELTA this review caused, and the delta must be exact:
+/// `Engine::load()` FAILS for a fixture home with no engine `config.toml`, but
+/// a load that failed still did the config read and the engine-registry bind
+/// this work removes. So the counter is keyed by `Config::home()`, the view
+/// [`engine_load_count_for`] reads, and a load of some OTHER home (a
+/// neighbouring test holding [`crate::test_env::ENV_LOCK`]) cannot move it.
 ///
-/// Test-only by construction: no production code reads the counter, so the
-/// non-test build would report it as dead code.
+/// Each write is one relaxed `fetch_add` on the loaded home's counter. Outside
+/// tests the counter is a plain atomic that nothing reads; the per-home map
+/// and both readers are `#[cfg(test)]`.
 #[cfg(test)]
-pub(crate) fn engine_load_count() -> usize {
-    ENGINE_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+static ENGINE_LOADS_BY_HOME: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn engine_load_counters() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+> {
+    ENGINE_LOADS_BY_HOME.get_or_init(Default::default)
+}
+
+/// The counter [`Engine::load_with_engine_config`] bumps for `home`. Handed out
+/// by value so the loader bumps it without holding the registry lock.
+fn engine_load_counter_for(home: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    #[cfg(test)]
+    {
+        engine_load_counters()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(home.to_path_buf())
+            .or_default()
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        // No per-home reader exists outside tests; keep the hot path
+        // allocation-free with the single process-wide counter.
+        let _ = home;
+        static SHARED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicUsize>> =
+            std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .clone()
+    }
+}
+
+/// Number of whole-engine loads performed so far for `home` in this process.
+/// A home this process has not loaded an engine for reads 0. Read it while
+/// holding [`crate::test_env::ENV_LOCK`] (every test that redirects
+/// `ZODER_HOME` does).
+#[cfg(test)]
+pub(crate) fn engine_load_count_for(home: &Path) -> usize {
+    engine_load_counters()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(home)
+        .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 impl Engine {
@@ -2198,7 +2243,10 @@ impl Engine {
     pub(crate) fn load_with_engine_config(
         engine_config: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
-        ENGINE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Counted BEFORE the fallible reads: a load that fails on a missing
+        // corpus still did the config read and the registry bind, which is
+        // exactly the work D5 item 2 removes from a review.
+        engine_load_counter_for(&Config::home()).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
         let corpus = Corpus::load(&cfg.corpus_path)?;
         let route_corpus = provider_route_corpus(&cfg, &corpus)?;
