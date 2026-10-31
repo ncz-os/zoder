@@ -134,22 +134,41 @@ pub(crate) const REAP_GRACE: Duration = Duration::from_millis(1500);
 /// cancel` only allows a worker `CANCEL_TERM_GRACE` to tear down before it
 /// escalates to SIGKILL (see `cancel_background_process_group`).
 const SIGNAL_REAP_GRACE: Duration = Duration::from_millis(750);
-/// Budget for the ACP `session/cancel` handshake before we start killing.
-pub(crate) const REAP_CANCEL_BUDGET: Duration = Duration::from_millis(750);
-
-/// The cancel budget for a deployment profile.
+/// Budget for the ACP `session/cancel` handshake before we start killing,
+/// PER SESSION.
 ///
-/// Fleet keeps the tuned 750 ms (`REAP_CANCEL_BUDGET`). A standalone host has
-/// no shared-daemon contention to clear, so it gets a longer settle window.
-/// This is the profile hook the in-flight daemon session-cancel work reads;
-/// the fleet value must stay exactly what it is today.
+/// Aligned with [`zoder_core::CANCEL_SETTLE_BUDGET`] (5 s), the same window the
+/// loop's author-phase watchdog grants one cancel: one connect + initialize +
+/// `session/cancel` round trip against a busy shared daemon routinely takes
+/// most of this, which is why a whole-phase budget of 750 ms left every session
+/// after the first one unasked.
+pub(crate) const REAP_CANCEL_BUDGET: Duration = zoder_core::CANCEL_SETTLE_BUDGET;
+
+/// The cancel budget for a deployment profile — per session.
+///
+/// Fleet keeps the settled per-session window ([`REAP_CANCEL_BUDGET`]). A
+/// standalone host has no shared-daemon contention to clear, so it gets a
+/// LONGER window: the profile's standalone budget is a floor on top of the
+/// fleet settle window, which keeps the documented profile ordering intact
+/// now that the fleet value is the 5 s settle budget rather than 750 ms.
+///
+/// Either way the value applies per SESSION, never to the whole phase.
 pub(crate) fn cancel_budget_for(mode: zoder_core::config::DeploymentMode) -> Duration {
     match mode {
-        // Fleet behaviour is unchanged: the tuned constant is the fleet value.
         zoder_core::config::DeploymentMode::Fleet => REAP_CANCEL_BUDGET,
-        zoder_core::config::DeploymentMode::Standalone => Duration::from_millis(
-            zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms(),
-        ),
+        zoder_core::config::DeploymentMode::Standalone => {
+            // The profile expresses the standalone budget against the old
+            // 750 ms fleet floor; the delta above that floor is what "a
+            // standalone host can afford a longer settle window" means. Carry
+            // the delta on top of the settled fleet window so the ordering
+            // survives the fleet value moving from 750 ms to
+            // CANCEL_SETTLE_BUDGET.
+            const LEGACY_FLEET_FLOOR_MS: u64 = 750;
+            let profile_ms =
+                zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms();
+            REAP_CANCEL_BUDGET
+                + Duration::from_millis(profile_ms.saturating_sub(LEGACY_FLEET_FLOOR_MS))
+        }
     }
 }
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
@@ -901,45 +920,51 @@ impl Drop for ReapGuard {
 ///
 /// `socket` is passed in rather than resolved from the environment so a test
 /// can point this at a path that does not exist, which is that case.
+/// Test-only count of cancel attempts that reached the transport, so a test
+/// can assert a session was ASKED rather than merely recorded.
+#[cfg(test)]
+static ATTEMPT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
-    // The budget covers the WHOLE phase, not each session: a loop that drove
-    // nine sessions must not spend nine budgets before the first kill.
-    let deadline = Instant::now() + budget;
+    // The budget is PER SESSION, not for the whole phase. A phase budget
+    // (750 ms in the fleet profile) was spent by the FIRST session's connect +
+    // initialize + cancel round trip, leaving the retry planner a near-zero
+    // slice and the remaining sessions never asked at all ("cancel budget
+    // exhausted with 1 session(s) left"): a session nobody asked is a session
+    // still editing the tree while we tear it down. Each session therefore gets
+    // its own window instead.
+    //
     // Drain repeatedly: the engine can mint a session while we are cancelling
     // (a fallback transition, a fresh turn), and that session is exactly the
     // one still editing the tree. One snapshot would leave it uncancelled.
-    // Bounded as well as time-bounded: a deadline alone does not stop a loop
-    // whose cancels all fail instantly while the engine keeps minting.
+    // Bounded as well as time-bounded: a floor alone does not stop a loop whose
+    // cancels all fail instantly while the engine keeps minting.
     for _ in 0..MAX_CANCEL_PASSES {
         // One lock per pass; a pass covers every session that appeared since
         // the last one.
-        let (pending, still_pending) = {
+        let pending: Vec<String> = {
             let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
             let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
             let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-            let pending: Vec<String> = sessions
+            sessions
                 .iter()
                 .filter(|id| !cancelled.contains(*id) && !unreachable.contains(*id))
                 .cloned()
-                .collect();
-            (pending.clone(), pending.len())
+                .collect()
         };
         if pending.is_empty() {
             return;
         }
         for id in pending {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                if still_pending > 0 {
-                    eprintln!(
-                        "[zoder] cancel budget exhausted with {still_pending} session(s) \
-                         left to the reap"
-                    );
-                }
-                return;
-            }
+            // A per-session window, then move on to the next session: this one
+            // is asked exactly once here and, if unconfirmed, its own retries
+            // run inside this window before the next session gets its own.
+            let deadline = Instant::now() + budget;
             cancel_session_with_retries(socket, &id, deadline).await;
         }
+        // Every session in this pass has now been ASKED at least once. The
+        // loop repeats only to catch sessions minted during the pass, and
+        // `MAX_CANCEL_PASSES` bounds that; nothing is left unasked by design.
     }
 }
 
@@ -957,6 +982,8 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
     if remaining.is_zero() {
         return;
     }
+    #[cfg(test)]
+    ATTEMPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     match zoder_core::cancel_session(socket, id, remaining).await {
         Ok(()) => {
             eprintln!("[zoder] cancelled agent session {id}");
@@ -1121,9 +1148,14 @@ fn retry_plan(left: Duration) -> (usize, Vec<Duration>, Duration) {
     };
     // Half of what is left goes to the attempts, half to the backoff — the
     // daemon needs time to drain, and we need time to hear the answer.
-    let attempt_total = (left / 2).min(CANCEL_RETRY_BUDGET * retries as u32);
-    let per_attempt =
-        (attempt_total / retries as u32).clamp(Duration::from_millis(1), CANCEL_RETRY_BUDGET);
+    let attempt_total = (left / 2)
+        .min(CANCEL_RETRY_BUDGET * retries as u32)
+        // One retry is always granted a minimal, non-zero slice even when the
+        // per-session budget is already spent: "unconfirmed" must mean the
+        // daemon stayed silent to a request that reached it, never that a
+        // session was skipped because the clock ran out.
+        .max(MIN_ATTEMPT);
+    let per_attempt = (attempt_total / retries as u32).clamp(MIN_ATTEMPT, CANCEL_RETRY_BUDGET);
     let backoff_total = left.saturating_sub(per_attempt * retries as u32);
     // Scale the nominal curve down proportionally, preserving its shape.
     let scale = if nominal_backoff.is_zero() {
@@ -1158,7 +1190,18 @@ fn retry_attempt_budget(left: Duration) -> Duration {
 /// budget is nearly spent -- a cancel cut off before it reaches the socket
 /// teaches us nothing, and "not confirmed" must mean the daemon stayed silent,
 /// not that we hung up on it.
-const RETRY_ATTEMPT_FLOOR: Duration = Duration::from_millis(150);
+///
+/// The floor is deliberately small relative to [`CANCEL_RETRY_BACKOFF`]: at a
+/// per-session budget of [`REAP_CANCEL_BUDGET`] a floor of one nominal backoff
+/// delay would leave room for the FIRST attempt and nothing else, so an
+/// unconfirmed cancel would be reported as "asked once" without the retries
+/// the three-attempt policy promises.
+const RETRY_ATTEMPT_FLOOR: Duration = Duration::from_millis(100);
+
+/// The least an attempt is ever cut to. Above zero on purpose: a cancel handed
+/// a zero-length window is cut off before it reaches the socket, which reads as
+/// "the daemon stayed silent" when the daemon was never asked.
+const MIN_ATTEMPT: Duration = Duration::from_millis(1);
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn retry_unconfirmed_cancel(socket: &Path, id: &str) -> UnconfirmedCancelOutcome {
@@ -3125,30 +3168,119 @@ mod tests {
         kill_exact(bystander);
     }
 
-    /// The cancel budget is for the PHASE, not per session. A loop that drove
-    /// nine sessions must not spend nine budgets before the first kill; with
-    /// nothing left in the budget it stops and lets the reap run.
+    /// Counts cancel attempts so a test can assert that a session was ASKED,
+    /// not merely recorded. Incremented in `cancel_session_with_retries` for
+    /// every attempt that actually reaches the transport.
+
+    /// A daemon socket that accepts connections and never answers. Every
+    /// cancel attempt against it therefore burns its whole window, which is
+    /// what makes a phase-wide budget (the old behaviour) starve the sessions
+    /// after the first one.
+    fn silent_daemon(dir: &Path) -> PathBuf {
+        let socket = dir.join("silent-daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind silent daemon");
+        // Accept forever and answer nothing: hold the connections open so a
+        // cancel attempt blocks on its read until its own deadline.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => return,
+                }
+            }
+        });
+        socket
+    }
+
+    /// Every session recorded must be ASKED at least once, even when the
+    /// first session's attempt consumes the whole budget. The old phase-wide
+    /// budget stopped as soon as it was spent, leaving the remaining sessions
+    /// never asked ("cancel budget exhausted with N session(s) left"): a
+    /// session nobody asked is a session still editing the tree while the
+    /// workspace is torn down under it.
     #[tokio::test]
-    async fn the_cancel_budget_covers_every_session_not_each_one() {
-        let socket = PathBuf::from("/nonexistent/zoder-cancel-budget-probe.sock");
+    async fn every_recorded_session_is_asked_at_least_once() {
+        let ids = ["asked-once-a", "asked-once-b", "asked-once-c"];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = silent_daemon(dir.path());
+        ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
         {
             let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            note_session("budget-probe-a");
-            note_session("budget-probe-b");
-            note_session("budget-probe-c");
+            for id in ids {
+                note_session(id);
+            }
+        }
+        let recorded = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(
+            recorded >= ids.len(),
+            "fixture: sessions recorded = {recorded}"
+        );
+        // A tiny budget: the FIRST session's connect+read spends it all. Only
+        // per-session budgeting still asks the other two.
+        cancel_recorded_sessions(&socket, Duration::from_millis(30)).await;
+        let attempts = ATTEMPT_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            attempts >= ids.len(),
+            "every recorded session must be asked at least once: {attempts} attempt(s) for {} sessions",
+            ids.len()
+        );
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+    }
+
+    /// Two live sessions each get their own full settle window: the phase
+    /// covers both instead of spending the first session's attempt on the
+    /// whole fleet. With a phase-wide budget only the first would be asked.
+    #[tokio::test]
+    async fn fleet_budget_covers_two_sessions() {
+        let ids = ["fleet-budget-1", "fleet-budget-2"];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = silent_daemon(dir.path());
+        ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            for id in ids {
+                note_session(id);
+            }
         }
         let started = Instant::now();
-        // A zero budget must send nothing at all: not even a connect attempt
-        // to a daemon that happens to be running on this host.
-        cancel_recorded_sessions(&socket, Duration::ZERO).await;
+        cancel_recorded_sessions(&socket, Duration::from_millis(40)).await;
+        let elapsed = started.elapsed();
+        let attempts = ATTEMPT_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "an exhausted budget must stop immediately, not cancel session by session"
+            attempts >= 2,
+            "both sessions must be asked; only {attempts} attempt(s) were made"
         );
-        for id in ["budget-probe-a", "budget-probe-b", "budget-probe-c"] {
-            let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-            seen.retain(|s| s != id);
-        }
+        // Two per-session windows, not one: the phase is bounded by the sum.
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "the phase must give the second session its own window, not stop after the first"
+        );
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
     }
 
     /// The panic-unwind and signal teardown use this list to send blocking

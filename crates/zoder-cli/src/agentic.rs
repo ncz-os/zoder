@@ -10939,6 +10939,59 @@ mod tests {
     use std::path::PathBuf;
     use zoder_core::Config;
 
+    /// The whole-run deadline must land strictly BELOW the worker's timeout,
+    /// so the loop stops itself and can still commit, emit the final JSON
+    /// result and tear down — instead of being killed mid-run with no result
+    /// at all. Before this, nothing bounded the run: two compounding
+    /// unconfirmed-cancel iterations could spend all 7,200 s.
+    #[test]
+    fn loop_run_deadline_ends_run_before_worker_timeout() {
+        let deadline = default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS);
+        assert!(
+            deadline < WORKER_RUN_TIMEOUT_SECS,
+            "the loop deadline ({deadline} s) must land below the worker timeout \
+             ({WORKER_RUN_TIMEOUT_SECS} s), or the worker kills the run before the \
+             loop can emit its final result"
+        );
+        // And not so far below that it throws away usable run time: the
+        // headroom is the cleanup window, not most of the budget.
+        assert!(
+            deadline > WORKER_RUN_TIMEOUT_SECS / 2,
+            "the deadline ({deadline} s) must leave real run time, not just a \
+             cleanup window"
+        );
+        // The bound really is the deadline: just before it the run continues,
+        // at it the run stops.
+        let started = Instant::now();
+        let dl = LoopDeadline::new(deadline, started);
+        let just_before = started + Duration::from_secs(deadline - 1);
+        assert!(!dl.expired_at(just_before), "the run must not stop early");
+        let at = started + Duration::from_secs(deadline);
+        assert!(dl.expired_at(at), "the run must stop at the deadline");
+        assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// On a SHARED daemon the FIRST unconfirmed author cancel stops the loop.
+    /// Two-in-a-row is only proof when this loop owns the daemon; on a fleet
+    /// host the second miss just queues behind other tenants' turns for
+    /// another full per-phase budget, which is how a run spends the worker's
+    /// whole timeout and gets killed blind.
+    #[test]
+    fn shared_daemon_unconfirmed_cancel_aborts_first_time() {
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(true),
+            1,
+            "a shared daemon must abort on the FIRST unconfirmed cancel"
+        );
+        // The standalone threshold is unchanged: one miss is a slow daemon.
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(false),
+            UNCONFIRMED_CANCEL_ABORT_THRESHOLD,
+            "a daemon serving this loop alone keeps the two-strike threshold"
+        );
+        assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
     /// `~/.zoder` read-only, so
     /// `RoutingContext::load` failed at `open_lock_file` before any model
