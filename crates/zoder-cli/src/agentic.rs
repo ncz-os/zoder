@@ -1143,18 +1143,71 @@ async fn run_loop_review_once(
     usize,
     Vec<serde_json::Value>,
 )> {
+    // Loop work lives in the working tree. One image cache per review.
+    let read_disk = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    let post_image = crate::config_cache::PostImages::new(read_disk);
+    run_loop_review_once_with_reader(
+        cli,
+        eng,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        &post_image,
+    )
+    .await
+}
+
+/// [`run_loop_review_once`] with the post-image reader injected.
+///
+/// Production passes `<root>/<path>` on disk. The seam exists so a test can
+/// observe how many times one review reads a file: `context_for`,
+/// `filter_false_undefined_findings` and the confirmation path all read the
+/// SAME post-image, and reading a branch file is a `git show` subprocess, so
+/// each must share one per-review cache (D10.7).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review_once_with_reader(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    post_image: &crate::config_cache::PostImages<impl Fn(&str) -> Option<String>>,
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
     let caps_for =
         |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
     // Chunked reviews have the same cross-chunk blindness as `zoder review`;
     // feed the post-change file context so a name defined in another chunk is
-    // not reported as missing. Loop work lives in the working tree.
+    // not reported as missing. Every read below goes through the ONE
+    // per-review image cache, so a file is read at most once per review.
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
-        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+        let read = |path: &str| post_image.get(path);
         let context = crate::review_context::chunk_context(chunk, &read, budget);
         if context.is_empty() {
             context
@@ -1223,8 +1276,9 @@ unbound, or missing imports:\n{context}"
     // Deterministic false-positive filter: a finding that calls a symbol
     // undefined is dropped when the reviewed working tree defines or imports
     // it. The evidence is kept in `filtered_findings` for the loop record.
-    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
-    filter_false_undefined_findings(&mut review, &read_worktree);
+    // The read is served from the SAME per-review image cache the context
+    // header used: these files were already read for this review.
+    filter_false_undefined_findings(&mut review, &|p: &str| post_image.get(p));
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -5404,13 +5458,19 @@ pub(crate) async fn cmd_review(
     // outside the chunk (bindings earlier in the enclosing function, imports,
     // top-level definitions). Working-tree reviews read the files on disk;
     // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
-    let read_post_image = |path: &str| -> Option<String> {
+    //
+    // One image cache per review: `context_for`, the false-"undefined" filter
+    // and `confirm_reviews`' grounding all read the same post-image, and a
+    // branch read is a `git show` subprocess (D10.7).
+    let read_post_image_source = |path: &str| -> Option<String> {
         if label.starts_with("working-tree") {
             std::fs::read_to_string(root.join(path)).ok()
         } else {
             run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
         }
     };
+    let post_image = crate::config_cache::PostImages::new(read_post_image_source);
+    let read_post_image = |path: &str| -> Option<String> { post_image.get(path) };
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
@@ -16282,6 +16342,85 @@ mod reviewer_chain_dispatch_tests {
         // The only finding was disproved, so a blocking verdict is
         // downgraded to `comment`, never `approve`.
         assert_eq!(review.verdict, "comment", "{review:?}");
+    }
+
+    /// D10.7: one review reads a given post-image file ONCE.
+    ///
+    /// `context_for` (the cross-chunk header), `filter_false_undefined_findings`
+    /// and the confirmation grounding each read the reviewed files, and a
+    /// branch read is a `git show HEAD:<path>` subprocess. Before the fix each
+    /// consumer had its own reader: the header read `pkg/mod.py` while planning
+    /// and re-read it on every re-plan/fallback, and the filter read it again,
+    /// so one small review forked the same file several times. All three now
+    /// share one per-review `PostImages` cache.
+    ///
+    /// The reader is injected (the counting closure below) so the read count is
+    /// observable without patching `std::fs`: `reads()` counts calls to the
+    /// UNDERLYING reader, i.e. real reads, not cache hits. Asserted as an
+    /// exact count of one per distinct path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_image_read_once_per_file() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // The counting reader stands in for production's disk read: it runs
+        // once per ACTUAL read, so `reads()` is a true read count, not a hit
+        // count.
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_counter = raw.clone();
+        let post_image = crate::config_cache::PostImages::new(move |path: &str| {
+            read_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::read_to_string(root.join(path)).ok()
+        });
+
+        let (review, _, _, chunks, _) = run_loop_review_once_with_reader(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            &post_image,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        assert_eq!(chunks, 1, "one chunk for a diff this small");
+        // Sanity: the filter really did run and read the file, so the count
+        // below is evidence that the read happened, not that nothing read.
+        assert_eq!(review.filtered_findings.len(), 1, "{review:?}");
+        assert_eq!(
+            raw.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pkg/mod.py must be read exactly once per review, shared by the \
+             context header and the false-\"undefined\" filter"
+        );
     }
 
     /// D5.2: one review loads the engine ONCE.

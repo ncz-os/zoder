@@ -218,7 +218,6 @@ pub(crate) fn clear() {
 pub(crate) struct PostImages<F> {
     read: F,
     cache: RefCell<HashMap<String, Option<String>>>,
-    reads: std::cell::Cell<usize>,
 }
 
 impl<F: Fn(&str) -> Option<String>> PostImages<F> {
@@ -226,7 +225,6 @@ impl<F: Fn(&str) -> Option<String>> PostImages<F> {
         Self {
             read,
             cache: RefCell::new(HashMap::new()),
-            reads: std::cell::Cell::new(0),
         }
     }
 
@@ -235,19 +233,11 @@ impl<F: Fn(&str) -> Option<String>> PostImages<F> {
         if let Some(hit) = self.cache.borrow().get(path) {
             return hit.clone();
         }
-        self.reads.set(self.reads.get() + 1);
         let value = (self.read)(path);
         self.cache
             .borrow_mut()
             .insert(path.to_string(), value.clone());
         value
-    }
-
-    /// How many times the underlying reader ran (once per distinct path).
-    /// Test-only: production only cares that the read happened once.
-    #[cfg(test)]
-    pub(crate) fn reads(&self) -> usize {
-        self.reads.get()
     }
 }
 
