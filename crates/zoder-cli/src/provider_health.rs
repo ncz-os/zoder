@@ -382,6 +382,46 @@ mod tests {
         }
     }
 
+    /// D5.9: the gate's store IO (lock + read + fsync, and the half-open
+    /// claim write) runs on the blocking pool, so it never stalls the async
+    /// worker that is about to make the provider call.
+    ///
+    /// On a current-thread runtime there is exactly one worker. If `decide` ran
+    /// inline, the decide and the concurrent tick would serialize; running it
+    /// on the blocking pool lets the tick fire while the store is being
+    /// mutated, and forbids any await inside the locked mutation (the tick
+    /// could never be polled then, and `block_on` would panic).
+    #[test]
+    fn gate_store_io_runs_off_the_async_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("health.json");
+        HealthStore::load(&path).save().expect("seed store");
+
+        let ticks = std::cell::Cell::new(0_u32);
+        let decision = runtime.block_on(async {
+            let decided = decide_async(&path, "model-x", now());
+            let ticked = async {
+                tokio::task::yield_now().await;
+                ticks.set(ticks.get() + 1);
+            };
+            let (decision, ()) = tokio::join!(decided, ticked);
+            decision
+        });
+        assert!(
+            matches!(decision, Precheck::NeedsProbe { half_open: false }),
+            "a never-seen model still needs its first probe"
+        );
+        assert_eq!(
+            ticks.get(),
+            1,
+            "the concurrent tick must run while the gate awaits its store IO"
+        );
+    }
+
     /// Only providers named in `[health].providers` are gated; a provider is
     /// never gated by its id or endpoint unless the operator opts it in.
     #[test]
