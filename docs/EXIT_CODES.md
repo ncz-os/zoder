@@ -4,12 +4,12 @@ The machine-readable failure contract for `zoder review` and `zoder loop`.
 
 Before 2026-10-31 every failure of `zoder review` / `zoder loop` exited `1`
 with free text on stderr. A fleet worker that drives those commands could not
-tell a TRANSIENT failure (the provider was down, the engine was unreachable,
-the budget reset is pending) from a PERMANENT one (the diff is too large to
-ever review, the reviewer pin names a model that does not exist, the command
-was misused). The only available signal was a substring match against a
-human-readable message — brittle, and impossible to keep stable while the
-prose improved.
+tell a TRANSIENT failure (the provider was down, the engine was unreachable)
+from a PERMANENT one (the diff is too large to ever review, the loop ran out of
+iterations) or from a CONFIG one (the reviewer pin names a model that does not
+exist, the command was misused). The only available signal was a substring
+match against a human-readable message — brittle, and impossible to keep
+stable while the prose improved.
 
 This document is the stable contract. Every statement cites the file and
 function it comes from.
@@ -17,7 +17,8 @@ function it comes from.
 ## Sources
 
 - `crates/zoder-cli/src/failure.rs`: the whole vocabulary —
-  `FailureClass` (`code`, `exit_code`, `retryable`), `ClassifiedFailure`
+  `FailureClass` (`as_str`, `exit_code`, `retryable`), `FailureCode`
+  (`code`, `class`, `exit_code`, `retryable`), `ClassifiedFailure`
   (`to_json`), `ClassifiedFailureError`, `classify_error`,
   `classify_message`, `classify_engine_budget_exceeded`, `error_envelope`.
 - `crates/zoder-cli/src/main.rs`: `main` (the exit code), `run` (the `--json`
@@ -28,49 +29,100 @@ function it comes from.
 - `crates/zoder-cli/src/review_diff.rs`: `prepare_review_diff_with_chunks`,
   `review_diff_chunks`.
 
-## The vocabulary
+## Two levels: the code and the class
 
-Nine classes. Each has a STABLE string code, a process exit code, and a
-`retryable` flag.
+- `code` is the SPECIFIC failure (`FailureCode`, the frozen list below). It is
+  what a caller dispatches on, and it never changes meaning.
+- `class` is the RETRY POLICY the caller applies (`FailureClass`): one of
+  transient, permanent, config, budget or blocked — see the class table below.
 
-| Class code           | Exit | Retryable | Meaning                                                                                   |
-| -------------------- | ---- | --------- | ----------------------------------------------------------------------------------------- |
-| `config`             | 65   | no        | The environment is misconfigured: an unreadable/invalid config, a `--reviewer` pin naming an unbacked model, exclusions that emptied the diff. |
-| `usage`              | 64   | no        | The command was used incorrectly: a scope that cannot be satisfied, a free-policy refusal, mutually exclusive flags. |
-| `budget_exceeded`    | 67   | no        | A budget was exhausted: the per-call cap, the month-to-date spend cap, the reviewer's output budget (twice), or the external engine's own `budget_exceeded:` refusal. |
-| `reviewer_unavailable` | 68 | yes       | No reviewer produced a verdict: the chain was exhausted, the reviewer returned no verdict twice, every panel member failed, or the review was incomplete. |
-| `review_blocked`     | 69   | no        | The review COMPLETED and blocked the change (`request_changes` / `reject` / `block`). |
-| `diff_too_large`     | 66   | no        | The diff is larger than the configured review budget (per-diff bytes, per-hunk bytes, chunk count) or was truncated during acquisition. |
-| `cancelled`          | 70   | yes       | The run was cancelled, or a required cancellation was never confirmed by the engine. |
-| `engine_unreachable` | 71   | yes       | The agent engine (the `zeroclaw` daemon) could not be reached: not running, stale socket, or it died during startup. |
-| `internal`           | 72   | no        | An unclassified internal failure: a bug, or a condition the classification does not cover yet. |
+Several codes share a class, and the class fixes the exit code.
+
+## The five classes
+
+| Class       | Exit | Retryable | Meaning                                                                                     |
+| ----------- | ---- | --------- | ------------------------------------------------------------------------------------------- |
+| `transient` | 20   | yes       | The same invocation may succeed later: the provider was down, the engine was unreachable.    |
+| `permanent` | 50   | no        | The same invocation fails identically and nothing is misconfigured. Nothing to fix, nothing to retry. |
+| `config`    | 40   | no        | An operator must change something: a bad config, a bad `--reviewer` pin, the reviewer's output budget. |
+| `budget`    | 30   | no        | A budget window is exhausted. Wait for `retry_after_s` / `resets_at` before retrying.       |
+| `blocked`   | 10   | no        | Nothing is broken: the review completed and refused the change.                              |
 
 `retryable` answers exactly one question: "is this the same request failing,
-or is something in the environment broken?" It is a hint, not a guarantee.
+or is something in the environment broken?" It is a hint, not a guarantee. A
+`budget` failure becomes retryable once its window resets, which the envelope
+says with `retry_after_s`.
 
-The codes are the CONTRACT. They never change meaning, and a code is never
-reused for a different class.
+## The named codes
+
+Every code below is frozen. It is never renamed, removed, or reused for a
+different failure.
+
+| Code                        | Class       | Exit | Meaning                                                                                                   |
+| --------------------------- | ----------- | ---- | --------------------------------------------------------------------------------------------------------- |
+| `review_blocked`            | `blocked`   | 10   | The review COMPLETED and blocked the change (`request_changes` / `reject` / `block`).                      |
+| `reviewers_unavailable`     | `transient` | 20   | No reviewer produced a verdict; `detail.reviewers` names what each model hit.                              |
+| `diff_too_large`            | `permanent` | 50   | The diff is above the configured review budget (bytes, hunks, chunks).                                     |
+| `diff_truncated`            | `permanent` | 50   | The diff was cut off during acquisition, so the tail was never seen.                                       |
+| `empty_diff`                | `permanent` | 50   | The scope produced no diff: nothing was reviewed, so this is NOT an approval.                              |
+| `no_reviewer_model`         | `config`    | 40   | No reviewer model could be resolved from `--reviewer`, the agent pin or `[review].reviewer_model`.         |
+| `loop_exhausted`            | `permanent` | 50   | The loop stopped without resolving the task.                                                               |
+| `reviewer_budget_exhausted` | `config`    | 40   | The reviewer spent its whole output budget (twice) on hidden reasoning. Raise `max_tokens` or lower the reasoning effort. |
+| `author_failed`             | `transient` | 20   | The author turn failed outright (no in-place timeout).                                                     |
+| `author_timeout`            | `transient` | 20   | The author turn hit its wall-clock budget.                                                                 |
+| `policy_violation`          | `config`    | 40   | The run was refused by policy (for example the free-only policy).                                          |
+| `engine_budget_exceeded`    | `budget`    | 30   | The EXTERNAL engine refused for budget; `detail.resets_at` when known.                                     |
+| `engine_unreachable`        | `transient` | 20   | The agent engine (the `zeroclaw` daemon) could not be reached at all.                                      |
+| `cancel_unconfirmed`        | `transient` | 20   | A cancel was never confirmed by the engine; the worktree is tainted.                                       |
+| `worktree_tainted`          | `transient` | 20   | The worktree was left in an unknown state (see `cancel_unconfirmed`).                                      |
+| `config`                    | `config`    | 40   | An environment / config problem: an unreadable or invalid config, a bad `--engine` value.                  |
+| `usage`                     | `config`    | 40   | The invocation itself is wrong: mutually exclusive flags, a scope that cannot be satisfied.                |
+| `internal`                  | `permanent` | 50   | A bug, or a failure this contract does not classify yet.                                                    |
+
+Two codes map to a READER-AWARE class on purpose:
+
+- `reviewer_budget_exhausted` is `config`, not `budget`: the reviewer's OUTPUT
+  budget was spent twice and never produced a verdict, so an identical retry
+  fails identically. The operator must raise `max_tokens` or lower the
+  reasoning effort. Only the external engine's own refusal
+  (`engine_budget_exceeded`) is the retryable, window-based `budget` class.
+- `empty_diff` and `diff_truncated` are `permanent`, not `config`: a wrong
+  `--base` or a truncated acquisition is not an operator setting to repair;
+  the same invocation fails identically. The messages explain the cause.
 
 ## Exit codes
 
-- `0` — success.
-- `1` — ANY failure that is not classified. This is the pre-existing
-  behaviour and it stays the default, so every caller that predates this
-  contract keeps working unchanged.
-- `64..=72` — one code per classified failure class (see the table above).
+The ladder is a single frozen numbering. One `FailureClass` per rung below
+75; `permanent` shares the `internal` rung by design (a permanent failure IS an
+internal-class outcome: nothing to fix, nothing to retry).
 
-`64`, `65`, `66` and `69` follow the `sysexits.h` convention (`EX_USAGE`,
-`EX_DATAERR`, `EX_NOINPUT`, `EX_UNAVAILABLE`). `67`, `68`, `70`, `71` and `72`
-are zoder-specific extensions of the same band.
+- `0` — success (approved / resolved).
+- `10` — blocked: the review completed and said no.
+- `20` — transient: retry the same invocation.
+- `30` — budget: wait for the window to reset.
+- `40` — config: an operator has to change something.
+- `50` — internal / permanent: a bug, an identical repeat failure, or an
+  unclassified error.
+- `75` — reserved for the oneshot refusal band. Never assigned to a review /
+  loop code.
+
+Every classified failure is NON-ZERO, so a caller that only tests "did it
+fail" (the fleet worker) is unaffected by the contract.
+
+An UNCLASSIFIED failure (an error the contract cannot classify) prints the
+envelope with code `internal` and exits `50`: it is the `permanent` /
+`internal` rung, and it is a gap in the contract worth reporting.
 
 The exit code and the JSON `class` always agree: the dispatcher in `main`
 derives the exit code from the same classified failure that the JSON
-carries (`main`: `failure::classify_error(&e)` → `classified.exit_code()`).
+carries (`main`: `failure::classify_error(&e)` → `classified.exit_code()`,
+falling back to `UNCLASSIFIED_EXIT_CODE`, which is `50`).
 
 ## The `--json` shape
 
-In `--json` mode the failure information is JSON, never prose. Two shapes,
-depending on whether the command produced a result object first.
+Everything on stdout is exactly ONE JSON document, on success and on failure.
+Two failure shapes, depending on whether the command produced a result object
+first.
 
 ### The command produced a result
 
@@ -88,16 +140,16 @@ parses.
   "cost_usd": 0.0,
   "reviewers": [ ... ],
   "failure": {
-    "class": "review_blocked",
     "code": "review_blocked",
-    "retryable": false,
-    "message": "review blocked: aggregate verdict `request_changes` requests changes (a blocking review must not exit 0)"
+    "class": "blocked",
+    "detail": { "message": "review blocked: aggregate verdict `request_changes` requests changes (a blocking review must not exit 0)" }
   }
 }
 ```
 
 The `zoder loop` payload carries the same `failure` object next to its
-`kind`, `resolved`, `iterations` and `log` fields.
+`kind`, `resolved`, `iterations` and `log` fields, plus the loop's
+`teardown.reason`.
 
 ### The command produced no result
 
@@ -106,25 +158,30 @@ The failure is printed as its own `error` object — the same keys, under
 
 ```json
 {
+  "ok": false,
   "error": {
-    "class": "budget_exceeded",
-    "code": "budget_exceeded",
-    "retryable": false,
-    "message": "budget_exceeded: quota exhausted",
-    "budget_reset_at": "2026-11-01T00:00:00Z"
+    "code": "engine_budget_exceeded",
+    "class": "budget",
+    "retry_after_s": 3600,
+    "detail": {
+      "message": "budget_exceeded: quota exhausted",
+      "resets_at": "2026-11-01T00:00:00Z"
+    }
   }
 }
 ```
 
 ### The `failure` / `error` object
 
-| Field             | Type    | Always present | Meaning                                                       |
-| ----------------- | ------- | -------------- | ------------------------------------------------------------- |
-| `class`           | string  | yes            | The stable class code (see the table above).                   |
-| `code`            | string  | yes            | The same value as `class`, under the name a caller usually expects. |
-| `retryable`       | boolean | yes            | Whether the same invocation may usefully be retried as-is.     |
-| `message`         | string  | yes            | The operator-facing human message.                             |
-| `budget_reset_at` | string  | no             | The moment the external engine's budget window resets. Present ONLY when the engine reported one; never fabricated. |
+| Field                         | Type    | Always present | Meaning                                                        |
+| ----------------------------- | ------- | -------------- | -------------------------------------------------------------- |
+| `code`                        | string  | yes            | The stable code (see the table above).                          |
+| `class`                       | string  | yes            | The retry policy the code carries.                              |
+| `retry_after_s`               | integer | no             | Seconds until `resets_at`. Present ONLY when the engine gave a reset timestamp in the future; never fabricated. |
+| `detail`                      | object  | yes            | Free-form; `message` is always present.                         |
+| `detail.message`              | string  | yes            | The operator-facing human message.                              |
+| `detail.reviewers`            | array   | no             | Per-model `{model, err_kind}` for `reviewers_unavailable`.      |
+| `detail.resets_at`            | string  | no             | The engine's reset timestamp, verbatim, when it reported one.   |
 
 ### Backward compatibility
 
@@ -149,71 +206,64 @@ budget_exceeded: quota exhausted, resets at 2026-11-01T00:00:00Z
 ```
 
 Both shapes are recognized by `classify_engine_budget_exceeded`
-(`failure.rs`), which maps them to the `budget_exceeded` class and extracts
-the reset timestamp when one is present. The recognition runs:
+(`failure.rs`), which maps them to `engine_budget_exceeded` (class `budget`)
+and extracts the reset timestamp when one is present. The recognition runs:
 
 - on the engine's own turn detail, in `turn_failure_error` (`main.rs`), so a
-  failed agentic turn carries the class and the timestamp; and
+  failed agentic turn carries the code and the timestamp; and
 - on the whole error chain, in `classify_error` (`failure.rs`), so a failure
   that reaches the dispatcher without an explicit classification still lands
-  in the right class instead of the unclassified bucket.
+  on the right code instead of the unclassified bucket.
 
 The reset timestamp is carried verbatim. It is never invented, and it is
 absent when the engine did not report one.
 
-## How the classes are assigned
+## How the codes are assigned
 
-| Failure site                                                    | Class                  |
-| --------------------------------------------------------------- | ---------------------- |
-| `cmd_review`: the branch diff is empty but the tree is dirty       | `usage`                |
-| `cmd_review`: exclusions emptied a non-empty diff                | `config`               |
-| `cmd_review`: 0 of N reviewers completed                         | `reviewer_unavailable` |
-| `cmd_review`: a partial panel (some reviewers failed)            | `reviewer_unavailable` |
-| `cmd_review`: the aggregate verdict blocks the change            | `review_blocked`       |
-| `cmd_review` / `cmd_loop`: the reviewer exhausted its output budget twice | `budget_exceeded` |
-| `cmd_loop`: the `--reviewer` pin names no served model            | `config`               |
-| `cmd_loop`: the author turn violated the free policy             | `usage`                |
-| `cmd_loop`: the engine never confirmed the author cancellation    | `cancelled`            |
-| `cmd_loop`: the loop ended unresolved                             | derived from the recorded evidence (see below) |
-| `review_diff`: the diff is above the byte / hunk / chunk budget   | `diff_too_large`       |
-| `review_diff`: the diff was truncated during acquisition          | `diff_too_large`       |
-| `main`: the engine config could not be loaded                     | `config`               |
-| `main`: the agent engine could not be reached                     | `engine_unreachable`   |
-| `main`: the engine's `budget_exceeded:` refusal                   | `budget_exceeded`      |
+| Failure site                                                                 | Code                        |
+| ---------------------------------------------------------------------------- | --------------------------- |
+| `cmd_review`: the scope produced no diff (for example `--base` equal to HEAD) | `empty_diff`                |
+| `cmd_review`: exclusions emptied a non-empty diff                            | `config`                    |
+| `cmd_review`: 0 of N reviewers completed                                     | `reviewers_unavailable`     |
+| `cmd_review`: a partial panel (some reviewers failed)                        | `reviewers_unavailable`     |
+| `cmd_review`: the aggregate verdict blocks the change                        | `review_blocked`            |
+| `cmd_review` / `cmd_loop`: the reviewer exhausted its output budget twice    | `reviewer_budget_exhausted` |
+| `cmd_loop`: the `--reviewer` pin names no served model                       | `no_reviewer_model`         |
+| `cmd_loop`: the author turn violated the free policy                         | `policy_violation`          |
+| `cmd_loop`: the engine never confirmed the author cancellation               | `cancel_unconfirmed`        |
+| `cmd_loop`: the worktree was left in an unknown state                        | `worktree_tainted`          |
+| `cmd_loop`: the loop ended unresolved                                        | `loop_exhausted`            |
+| `review_diff`: the diff is above the byte / hunk / chunk budget              | `diff_too_large`            |
+| `review_diff`: the diff was truncated during acquisition                     | `diff_truncated`            |
+| `main`: the engine config could not be loaded                                | `config`                    |
+| `main`: the agent engine could not be reached                                | `engine_unreachable`        |
+| `main`: the engine's `budget_exceeded:` refusal                              | `engine_budget_exceeded`    |
+| `main`: the invocation was used incorrectly                                  | `usage`                     |
 
-An UNCLASSIFIED failure stays in the `internal` class for the JSON envelope
-and exits `1`. The classification is best-effort and never guesses: an
-unrecognized message is simply unclassified.
+The classification is best-effort and never guesses: an unrecognized message
+stays unclassified, which prints as `internal` and exits `50`.
 
-### The loop's unresolved exit
-
-The loop's exit class is derived from the evidence the loop already records
-— the `review_error` / `author_error` of the LAST iteration — so it is the
-same text the operator already sees:
-
-- a recorded budget refusal → `budget_exceeded` (with the reset timestamp);
-- a recorded reviewer failure → `reviewer_unavailable`;
-- a recorded cancellation problem → `cancelled`;
-- no iterations at all (the author never ran) → `engine_unreachable`;
-- anything else → `internal`.
-
-## Reading the class in a fleet worker
+## Reading the code in a fleet worker
 
 ```sh
-# The class is the stable signal; the exit code is the convenience.
+# The class is the retry policy; the exit code is the convenience.
 zoder --json review > review.json; rc=$?
 case "$rc" in
   0)  echo "review approved" ;;
-  68) echo "reviewer unavailable — retry" ;;
-  69) echo "review blocked — do not retry the same diff" ;;
-  67) echo "budget exhausted — wait for the reset" ;;
+  10) echo "review blocked — do not retry the same diff" ;;
+  20) echo "transient — retry the same invocation" ;;
+  30) echo "budget exhausted — wait for resets_at" ;;
+  40) echo "config — an operator must fix something" ;;
+  50) echo "permanent / internal — do not retry, report it" ;;
   *)  echo "failed (rc=$rc)" ;;
 esac
 ```
 
-A worker that wants the class rather than the code reads it from the JSON:
+A worker that wants the specific code rather than the class reads it from the
+JSON:
 
 ```sh
 zoder --json review > review.json || true
+jq -r '.failure.code // .error.code // "unclassified"' review.json
 jq -r '.failure.class // .error.class // "unclassified"' review.json
 ```

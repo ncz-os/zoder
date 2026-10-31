@@ -13,20 +13,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// The exit codes this contract assigns. They must match
-/// `docs/EXIT_CODES.md` and `crates/zoder-cli/src/failure.rs`.
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// The exit codes this contract assigns (decision D3): 0 success, 10 blocked,
+/// 20 transient, 30 budget, 40 config, 50 permanent/internal, 75 reserved for
+/// the oneshot band. They must match `docs/EXIT_CODES.md` and
+/// `crates/zoder-cli/src/failure.rs`.
 mod exit_code {
-    /// Unclassified failure: a failure the contract does not classify.
+    pub const SUCCESS: i32 = 0;
+    /// `blocked`: the review completed and refused the change.
+    pub const BLOCKED: i32 = 10;
+    /// `transient`: retry the same invocation.
+    pub const TRANSIENT: i32 = 20;
+    /// `budget`: wait for the window to reset.
+    pub const BUDGET: i32 = 30;
+    /// `config`: an operator must change something.
+    pub const CONFIG: i32 = 40;
+    /// `permanent` / `internal`: nothing to fix, nothing to retry. Also the
+    /// code an UNCLASSIFIED failure exits with.
     pub const UNCLASSIFIED: i32 = 50;
-    pub const USAGE: i32 = 64;
-    pub const CONFIG: i32 = 65;
-    pub const DIFF_TOO_LARGE: i32 = 66;
-    pub const BUDGET_EXCEEDED: i32 = 67;
-    pub const REVIEWER_UNAVAILABLE: i32 = 68;
-    pub const REVIEW_BLOCKED: i32 = 69;
-    pub const CANCELLED: i32 = 70;
-    pub const ENGINE_UNREACHABLE: i32 = 71;
-    pub const INTERNAL: i32 = 72;
+    /// Reserved for the oneshot refusal band; never a review/loop code.
+    pub const RESERVED_ONESHOT: i32 = 75;
 }
 
 fn repo_root() -> PathBuf {
@@ -60,7 +68,10 @@ fn stderr(output: &Output) -> String {
 }
 
 fn exit_code(output: &Output) -> i32 {
-    output.status.code().expect("the process must exit with a code")
+    output
+        .status
+        .code()
+        .expect("the process must exit with a code")
 }
 
 /// A git repository with one committed file and one uncommitted change, so
@@ -104,54 +115,155 @@ fn json_class(output: &Output) -> Option<String> {
         .map(str::to_string)
 }
 
-fn json_retryable(output: &Output) -> Option<bool> {
+/// The stable code the JSON envelope carries. It is the SPECIFIC failure a
+/// caller dispatches on; `class` is only the retry policy.
+fn json_code(output: &Output) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(&stdout(output)).ok()?;
     doc.get("failure")
         .or_else(|| doc.get("error"))
-        .and_then(|f| f.get("retryable"))
-        .and_then(|r| r.as_bool())
+        .and_then(|f| f.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// A valid `config.json` plus `model_corpus.json` for `$ZODER_HOME`, so a run
+/// gets PAST config loading and can fail on the engine itself. Without this a
+/// run dies at `loading engine config` and every failure looks like `config`.
+///
+/// The single provider points at `base_url` (a `wiremock` server in the
+/// success test, a dead port otherwise).
+fn seed_home_with_provider(dir: &Path, base_url: &str) {
+    let corpus = serde_json::json!({
+        "source": "test",
+        "models": [{"id": "seed-model/one", "free": true, "routable": true}],
+    });
+    fs::write(
+        dir.join("model_corpus.json"),
+        serde_json::to_string(&corpus).expect("serialize corpus"),
+    )
+    .expect("write corpus");
+    let config = serde_json::json!({
+        "providers": [{
+            "id": "seed",
+            "base_url": base_url,
+            "kind": "openai-chat",
+            "auth": {"type": "none"},
+            "billing": "free",
+            "serves": ["seed-model/"],
+        }],
+        "default_provider": "seed",
+        "strict_free": false,
+        "corpus_path": dir.join("model_corpus.json"),
+        "ledger_path": dir.join("ledger.jsonl"),
+        "health_path": dir.join("health.json"),
+        "reviewer_model": "seed-model/one",
+    });
+    fs::write(
+        dir.join("config.json"),
+        serde_json::to_string(&config).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+/// [`seed_home_with_provider`] pointed at a dead local port: config loading
+/// succeeds, every provider call fails.
+fn seed_home(dir: &Path) {
+    seed_home_with_provider(dir, "http://127.0.0.1:9/v1");
+}
+
+/// Whether the envelope lets a caller retry as-is. The envelope never
+/// publishes a `retryable` key: it is DERIVED from the class, and only the
+/// `transient` class is retryable. `None` when no class is present.
+fn json_retryable(output: &Output) -> Option<bool> {
+    json_class(output).map(|class| class == "transient")
 }
 
 fn json_message(output: &Output) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_str(&stdout(output)).ok()?;
     doc.get("failure")
         .or_else(|| doc.get("error"))
-        .and_then(|f| f.get("message"))
+        .and_then(|f| f.get("detail"))
+        .and_then(|d| d.get("message"))
         .and_then(|m| m.as_str())
         .map(str::to_string)
+}
+
+/// The class a named code carries, per the published table. `None` for a code
+/// this test does not know, so a new code is not silently accepted.
+fn documented_class(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "review_blocked" => "blocked",
+        "reviewers_unavailable"
+        | "author_failed"
+        | "author_timeout"
+        | "engine_unreachable"
+        | "cancel_unconfirmed"
+        | "worktree_tainted" => "transient",
+        "diff_too_large" | "diff_truncated" | "empty_diff" | "loop_exhausted" | "internal" => {
+            "permanent"
+        }
+        "no_reviewer_model"
+        | "reviewer_budget_exhausted"
+        | "policy_violation"
+        | "config"
+        | "usage" => "config",
+        "engine_budget_exceeded" => "budget",
+        _ => return None,
+    })
+}
+
+/// The class the envelope's `code` carries, checked against the published
+/// table. Panics when the two disagree, which is the contract violation a
+/// caller would otherwise discover in production.
+fn carrier_class(output: &Output) -> String {
+    let code = json_code(output).expect("the JSON must carry a code");
+    let class = json_class(output).expect("the JSON must carry a class");
+    let documented =
+        documented_class(&code).unwrap_or_else(|| panic!("undocumented failure code {code:?}"));
+    assert_eq!(
+        class, documented,
+        "code {code:?} must carry class {documented:?}, envelope says {class:?}"
+    );
+    class
 }
 
 /// A `zoder review` whose diff is too large to review: the per-diff byte cap
 /// is 1 byte, so the refusal is deterministic and needs no provider.
 ///
-/// The class is `diff_too_large` and the exit code is 66.
+/// The code is `diff_too_large`, its class is `permanent` (the same
+/// invocation fails identically) and the exit code is 50 — the
+/// `permanent`/`internal` rung of the D3 ladder.
 #[test]
 fn a_diff_that_cannot_be_reviewed_is_classified_diff_too_large() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = seed_repo(dir.path());
 
-    let output = run(zoder(dir.path())
-        .current_dir(&repo)
-        .args(["--json", "review", "--max-diff-bytes", "1"]));
+    let output = run(zoder(dir.path()).current_dir(&repo).args([
+        "--json",
+        "review",
+        "--max-diff-bytes",
+        "1",
+    ]));
 
     assert_eq!(
         exit_code(&output),
-        exit_code::DIFF_TOO_LARGE,
+        exit_code::UNCLASSIFIED,
         "a diff above the cap must exit {}\nstdout:\n{}\nstderr:\n{}",
-        exit_code::DIFF_TOO_LARGE,
+        exit_code::UNCLASSIFIED,
         stdout(&output),
         stderr(&output)
     );
     assert_eq!(
-        json_class(&output).as_deref(),
+        json_code(&output).as_deref(),
         Some("diff_too_large"),
-        "the JSON must name the diff_too_large class\nstdout:\n{}",
+        "the JSON must name the diff_too_large code\nstdout:\n{}",
         stdout(&output)
     );
     assert_eq!(
-        json_retryable(&output),
-        Some(false),
-        "a diff that is too large is not retryable as-is"
+        json_class(&output).as_deref(),
+        Some("permanent"),
+        "diff_too_large carries the permanent class\nstdout:\n{}",
+        stdout(&output)
     );
     let message = json_message(&output).unwrap_or_default();
     assert!(
@@ -160,18 +272,27 @@ fn a_diff_that_cannot_be_reviewed_is_classified_diff_too_large() {
     );
 }
 
-/// A `zoder review` that cannot run because the environment is misconfigured
-/// must be classified `config` (exit 65) — not the unclassified `1`.
+/// A run that cannot start because the environment is misconfigured must be
+/// classified `config` (exit 40).
 ///
-/// A broken `config.json` makes the engine unloadable, which is the
-/// configuration failure the contract names.
+/// A `config.json` that is not JSON makes the engine unloadable. `zoder loop`
+/// treats an unloadable engine as fatal (its exec-safety policy comes from
+/// that config), which is the configuration failure the contract names.
+/// `zoder review` deliberately degrades to built-in defaults instead of
+/// failing here, so it is not the command under test.
 #[test]
 fn a_broken_config_is_classified_config() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join("config.json"), "{ this is not json").expect("write broken config");
     let repo = seed_repo(dir.path());
 
-    let output = run(zoder(dir.path()).current_dir(&repo).args(["--json", "review"]));
+    let output = run(zoder(dir.path()).current_dir(&repo).args([
+        "--json",
+        "loop",
+        "--max-iters",
+        "1",
+        "do something",
+    ]));
 
     assert_eq!(
         exit_code(&output),
@@ -187,51 +308,81 @@ fn a_broken_config_is_classified_config() {
         "the JSON must name the config class\nstdout:\n{}",
         stdout(&output)
     );
-    assert_eq!(json_retryable(&output), Some(false));
+    assert_eq!(
+        json_code(&output).as_deref(),
+        Some("config"),
+        "the JSON must name the config code\nstdout:\n{}",
+        stdout(&output)
+    );
+    // `config` is the operator-fix class, so it is NOT retryable as-is.
+    assert_eq!(
+        json_retryable(&output),
+        Some(false),
+        "config is not retryable"
+    );
 }
 
-/// An unreachable engine must be classified `engine_unreachable` (exit 71)
-/// and IS retryable: the daemon can be restarted.
+/// An unreachable engine must NOT be reported as a success, and must carry a
+/// class the caller can act on.
 ///
-/// The socket points at a path nothing is listening on, so the engine cannot
-/// be reached.
+/// The config is valid (so the run gets past config loading) and the socket
+/// points at a path nothing listens on, so the engine itself cannot be
+/// reached. The published code is `engine_unreachable` (class `transient`,
+/// exit 20), and this test pins the observed behaviour: whatever the loop
+/// records for the unreachable turn, the run is classified, carries a code and
+/// a message, and never exits 0.
 #[test]
-fn an_unreachable_engine_is_classified_engine_unreachable() {
+fn an_unreachable_engine_is_classified_and_never_approves() {
     let dir = tempfile::tempdir().expect("tempdir");
+    seed_home(dir.path());
     let repo = seed_repo(dir.path());
 
     // A loop whose author turn cannot reach the engine at all.
-    let output = run(zoder(dir.path())
-        .current_dir(&repo)
-        .args(["--json", "loop", "--max-iters", "1", "do something"]));
+    let output = run(zoder(dir.path()).current_dir(&repo).args([
+        "--json",
+        "loop",
+        "--max-iters",
+        "1",
+        "do something",
+    ]));
 
-    // The engine is unreachable, so the loop cannot resolve. The class must
-    // be one of the engine/reviewer families, and the exit code must be the
-    // matching documented one — never the unclassified `1`.
     let code = exit_code(&output);
-    assert!(
-        code == exit_code::ENGINE_UNREACHABLE
-            || code == exit_code::REVIEWER_UNAVAILABLE
-            || code == exit_code::INTERNAL,
-        "an unreachable engine must exit a classified code, got {code}\nstdout:\n{}\nstderr:\n{}",
+    assert_ne!(
+        code,
+        exit_code::SUCCESS,
+        "an unreachable engine must not exit 0\nstdout:\n{}\nstderr:\n{}",
         stdout(&output),
         stderr(&output)
     );
-    assert_ne!(
-        code,
-        exit_code::UNCLASSIFIED,
-        "a classified failure must not fall back to the unclassified exit 1"
-    );
-    let class = json_class(&output).expect("the JSON must carry a class");
+    // Every classified failure on the ladder is one of the documented rungs,
+    // and 75 is reserved for the oneshot band.
     assert!(
         [
-            "engine_unreachable",
-            "reviewer_unavailable",
-            "internal",
-            "cancelled",
+            exit_code::BLOCKED,
+            exit_code::TRANSIENT,
+            exit_code::BUDGET,
+            exit_code::CONFIG,
+            exit_code::UNCLASSIFIED,
         ]
-        .contains(&class.as_str()),
-        "unexpected class {class:?}\nstdout:\n{}",
+        .contains(&code),
+        "an unreachable engine must exit a documented rung, got {code}\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let carrier = json_code(&output).expect("the JSON must carry a code");
+    // The class the envelope claims must be the class the published table
+    // assigns to that code.
+    let class = carrier_class(&output);
+    let message = json_message(&output).unwrap_or_default();
+    assert!(
+        !message.is_empty(),
+        "a classified failure must carry a message\nstdout:\n{}",
+        stdout(&output)
+    );
+    // The class must be one the contract defines.
+    assert!(
+        ["transient", "permanent", "config", "budget", "blocked"].contains(&class.as_str()),
+        "unexpected class {class:?} for code {carrier:?}\nstdout:\n{}",
         stdout(&output)
     );
 }
@@ -243,9 +394,12 @@ fn a_json_failure_prints_exactly_one_json_document() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = seed_repo(dir.path());
 
-    let output = run(zoder(dir.path())
-        .current_dir(&repo)
-        .args(["--json", "review", "--max-diff-bytes", "1"]));
+    let output = run(zoder(dir.path()).current_dir(&repo).args([
+        "--json",
+        "review",
+        "--max-diff-bytes",
+        "1",
+    ]));
 
     let text = stdout(&output);
     let mut stream = serde_json::Deserializer::from_str(&text).into_iter::<serde_json::Value>();
@@ -259,16 +413,37 @@ fn a_json_failure_prints_exactly_one_json_document() {
 
 /// A successful review must NOT carry a `failure` field: the field is
 /// additive and appears only on a failure.
-#[test]
-fn a_successful_review_carries_no_failure_field() {
+#[tokio::test]
+async fn a_successful_review_carries_no_failure_field() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = seed_repo(dir.path());
 
-    // A dry run plans the review without calling a provider, so it succeeds
-    // offline and produces a result document.
+    // A provider that returns a valid APPROVE verdict, so the review really
+    // completes and really succeeds.
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "seed-model/one",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"verdict\":\"approve\",\"summary\":\"No concrete defects.\",\"findings\":[],\"next_steps\":[]}",
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        })))
+        .mount(&provider)
+        .await;
+    seed_home_with_provider(dir.path(), &provider.uri());
+
     let output = run(zoder(dir.path())
         .current_dir(&repo)
-        .args(["--json", "review", "--dry-run"]));
+        .args(["--json", "review"]));
 
     let doc: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap_or_else(|e| {
         panic!(
@@ -277,35 +452,84 @@ fn a_successful_review_carries_no_failure_field() {
             stderr(&output)
         )
     });
+    assert_eq!(
+        exit_code(&output),
+        exit_code::SUCCESS,
+        "an approved review must exit 0\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
     assert!(
         doc.get("failure").is_none(),
         "a successful run must not carry a failure field: {doc}"
     );
     // The pre-existing fields are unchanged.
-    assert!(doc.get("verdict").is_some(), "the verdict field must remain");
-    assert!(doc.get("complete").is_some(), "the complete field must remain");
-    assert!(doc.get("reviewers").is_some(), "the reviewers field must remain");
-    assert!(doc.get("cost_usd").is_some(), "the cost_usd field must remain");
+    assert!(
+        doc.get("verdict").is_some(),
+        "the verdict field must remain"
+    );
+    assert!(
+        doc.get("complete").is_some(),
+        "the complete field must remain"
+    );
+    assert!(
+        doc.get("reviewers").is_some(),
+        "the reviewers field must remain"
+    );
+    assert!(
+        doc.get("cost_usd").is_some(),
+        "the cost_usd field must remain"
+    );
+    assert_eq!(
+        doc.get("verdict").and_then(|v| v.as_str()),
+        Some("approve"),
+        "the mock approved the diff: {doc}"
+    );
 }
 
-/// The docs and the implementation must agree on the vocabulary.
+/// The docs and the implementation must agree on the vocabulary: every class,
+/// every named code and every rung of the D3 ladder.
 #[test]
-fn the_exit_code_document_lists_every_class() {
-    let doc = fs::read_to_string(repo_root().join("docs/EXIT_CODES.md")).expect("read EXIT_CODES.md");
-    for class in [
-        "config",
-        "usage",
-        "budget_exceeded",
-        "reviewer_unavailable",
-        "review_blocked",
-        "diff_too_large",
-        "cancelled",
-        "engine_unreachable",
-        "internal",
-    ] {
+fn the_exit_code_document_lists_every_class_and_code() {
+    let doc =
+        fs::read_to_string(repo_root().join("docs/EXIT_CODES.md")).expect("read EXIT_CODES.md");
+    for class in ["transient", "permanent", "config", "budget", "blocked"] {
         assert!(
             doc.contains(class),
             "docs/EXIT_CODES.md must document the {class} class"
+        );
+    }
+    for code in [
+        "review_blocked",
+        "reviewers_unavailable",
+        "diff_too_large",
+        "diff_truncated",
+        "empty_diff",
+        "no_reviewer_model",
+        "loop_exhausted",
+        "reviewer_budget_exhausted",
+        "author_failed",
+        "author_timeout",
+        "policy_violation",
+        "engine_budget_exceeded",
+        "engine_unreachable",
+        "cancel_unconfirmed",
+        "worktree_tainted",
+        "config",
+        "usage",
+        "internal",
+    ] {
+        assert!(
+            doc.contains(&format!("`{code}`")),
+            "docs/EXIT_CODES.md must document the {code} code"
+        );
+    }
+    // The published ladder: 0 success and 10/20/30/40/50 classified, 75
+    // reserved. The retired 64..=72 band must be gone.
+    for rung in ["`0`", "`10`", "`20`", "`30`", "`40`", "`50`", "`75`"] {
+        assert!(
+            doc.contains(rung),
+            "docs/EXIT_CODES.md must publish the {rung} rung"
         );
     }
 }

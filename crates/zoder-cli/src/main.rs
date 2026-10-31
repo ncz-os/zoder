@@ -2714,9 +2714,11 @@ async fn main() {
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
         // The failure contract (see `docs/EXIT_CODES.md`): a CLASSIFIED
-        // failure exits with its own documented code, and an UNCLASSIFIED
-        // failure keeps the historical exit `1` so every pre-existing
-        // caller keeps working unchanged.
+        // failure exits with the code its class documents, and an
+        // UNCLASSIFIED failure exits `UNCLASSIFIED_EXIT_CODE` (50, the
+        // `internal` / `permanent` rung) — every classified failure stays
+        // non-zero, which is the only thing a caller that predates the
+        // contract relied on.
         let exit_code = match failure::classify_error(&e) {
             Some(classified) => classified.exit_code(),
             None => failure::UNCLASSIFIED_EXIT_CODE,
@@ -3046,10 +3048,18 @@ async fn run() -> anyhow::Result<()> {
 ///   NOT by printing a second document.
 /// * no result -> the failure is printed as `{"error": {...}}`.
 fn emit_json_failure(error: &anyhow::Error) {
+    // The command already printed its result document, and the failure is
+    // attached INSIDE it (see `agentic::emit_reviews` /
+    // `agentic::cmd_loop_run`, which set the flag before returning). Printing
+    // anything here would be a SECOND JSON document on stdout.
+    if failure::result_was_emitted() {
+        return;
+    }
     let Some(classified) = failure::classify_error(error) else {
         // Unclassifiable: still emit a parseable object so a JSON consumer
         // never sees an empty stdout. The class is `internal` and the
-        // exit code stays the historical `1`.
+        // exit code is `UNCLASSIFIED_EXIT_CODE` (50, the `internal` /
+        // `permanent` rung), exactly as the envelope says.
         let unclassified =
             failure::ClassifiedFailure::new(failure::FailureCode::Internal, format!("{error:#}"));
         println!(
