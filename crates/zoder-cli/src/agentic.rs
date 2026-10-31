@@ -14168,7 +14168,22 @@ not run to max_iters"
                 .collect()
         });
         assert_eq!(demoted.decisions[0].disposition, Disposition::Rejected);
-        assert!(!raised_by_confirmed_finding(&demoted, "comment"));
+        assert!(
+            !demoted.decisions[0].blocking,
+            "a demoted finding does not block"
+        );
+        assert!(
+            !demoted.effective_blocking,
+            "with its only blocker demoted the review does not block"
+        );
+        assert!(
+            !raised_by_confirmed_finding(&demoted, "comment"),
+            "a critical rejected by independent confirmers must NOT raise the comment"
+        );
+        assert!(
+            !raised_by_confirmed_finding(&demoted, "approve"),
+            "a rejected finding must not raise an approve either"
+        );
 
         // A `request_changes` with a confirmed finding keeps blocking: the
         // rule only ever raises, so it leaves an already-blocking verdict
