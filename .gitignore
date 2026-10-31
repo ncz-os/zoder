@@ -46,3 +46,4 @@ bench/raw/
 # Local build target for this job workspace (kept on local disk, never /tmp).
 /.build-target/
 /.build-tmp/
+/.scratch/

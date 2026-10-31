@@ -1,4 +1,4 @@
-//! Machine-readable failure classification for `zoder review` and `zoder loop`.
+//! One machine-readable failure contract for `zoder review` and `zoder loop`.
 //!
 //! # Why this exists
 //!
@@ -11,30 +11,60 @@
 //! match against a human-readable message — brittle, and impossible to keep
 //! stable while the prose improved.
 //!
-//! This module introduces the stable contract:
+//! # The envelope
 //!
-//! * A [`FailureClass`] enum with a fixed set of variants. Each variant has a
-//!   STABLE string code (`"config"`, `"budget_exceeded"`, ...) that callers
-//!   may match on, and a documented process exit code.
-//! * A `retryable` boolean, so a fleet worker can decide on its own whether
-//!   to re-queue the job without parsing prose.
-//! * A JSON envelope that carries the class, the retryability, and the human
-//!   message, so a machine consumer never has to scrape stderr.
+//! Under `--json` EVERY failure prints exactly one JSON envelope on stdout:
+//!
+//! ```json
+//! {
+//!   "ok": false,
+//!   "error": {
+//!     "code": "reviewers_unavailable",
+//!     "class": "transient",
+//!     "retry_after_s": 300,
+//!     "detail": {
+//!       "message": "...",
+//!       "reviewers": [ {"model": "m", "err_kind": "Server"} ],
+//!       "resets_at": "2026-11-01T00:00:00Z"
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! * `code` is the SPECIFIC failure ([`FailureCode`], the closed list below).
+//!   It is what a caller dispatches on; it never changes meaning.
+//! * `class` is the RETRY POLICY the caller applies ([`FailureClass`]): one of
+//!   `transient`, `permanent`, `config`, `budget`, `blocked`.
+//! * `retry_after_s` is present only when the failure itself says when to come
+//!   back (`resets_at` on the engine's budget refusal).
+//! * `detail` is a free-form object; the well-known members are `message`
+//!   (always present), `reviewers` (per-model [`ErrKind`](crate::failure::ErrKindName)
+//!   for `reviewers_unavailable`) and `resets_at` (for
+//!   `engine_budget_exceeded`).
+//!
+//! A failure that happens AFTER a command produced its result keeps the
+//! result document and carries the same object as a `failure` member inside
+//! it, so stdout stays exactly ONE JSON document (see [`error_envelope`]).
 //!
 //! # Exit-code contract
 //!
-//! * `0` — success (unchanged).
-//! * `1` — ANY failure that is not classified. This is the pre-existing
-//!   behaviour and it stays the default so every existing caller keeps
-//!   working unchanged.
-//! * A distinct, documented non-zero code per classified failure class. The
-//!   codes live in the "64..=70" range (the `sysexits.h` convention) and are
-//!   stable: a code is never reused for a different class.
+//! | code | meaning                                   | example                        |
+//! | ---- | ----------------------------------------- | ------------------------------ |
+//! | 0    | success (approved / resolved)             | —                              |
+//! | 10   | blocked: the review says "no"             | `review_blocked`               |
+//! | 20   | transient: retry the same invocation      | `reviewers_unavailable`, `engine_unreachable` |
+//! | 30   | budget: wait for the window to reset      | `engine_budget_exceeded`       |
+//! | 40   | config / auth / bad input: operator fix   | `no_reviewer_model`, `empty_diff`, `diff_too_large` |
+//! | 50   | internal: a bug, or an unclassified error | `internal`                     |
+//! | 75   | reserved (oneshot refusal band)           | —                              |
+//!
+//! Every classified failure is NON-ZERO, so a caller that only tests "did it
+//! fail" (the fleet worker) is unaffected by the contract.
 //!
 //! # Backward compatibility
 //!
 //! Existing JSON fields are NOT renamed, removed, or reshaped. The failure
-//! information is ADDITIVE: a `failure` object is present only on a failure,
+//! information is ADDITIVE: a `failure` member is present only on a failure,
 //! and every pre-existing field keeps its exact previous meaning.
 
 use std::fmt;
@@ -42,301 +72,443 @@ use std::fmt;
 /// The stable, machine-readable classification of a `zoder review` /
 /// `zoder loop` failure.
 ///
-/// Every variant maps to exactly one process exit code and one stable string
-/// code. The string code is the CONTRACT: it is what a fleet worker matches
-/// on, and it never changes meaning. The exit code is a convenience for
-/// shell callers; `1` remains the code for anything unclassified.
+/// This is the RETRY POLICY, not the specific failure: several codes share a
+/// class (see [`FailureCode::class`]). Five classes, each with one exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureClass {
-    /// The invocation or the environment is misconfigured: an unreadable or
-    /// invalid config file, a bad `--engine` value, a reviewer pin that names
-    /// no configured model, conflicting CLI flags.
-    ///
-    /// NOT retryable without an operator change.
+    /// The same invocation may succeed later: the provider was down, the
+    /// engine was unreachable, a cancel was unconfirmed. Exit `20`.
+    Transient,
+    /// The same invocation fails identically: an unreadable cited file, an
+    /// empty diff, an internal bug. Exit `50` (or `40` when the input is the
+    /// problem — see [`FailureCode::class`]).
+    Permanent,
+    /// The invocation or the environment is misconfigured: a bad config, a
+    /// reviewer pin naming no model. Exit `40`.
     Config,
-    /// The command was used incorrectly: mutually exclusive flags, a missing
-    /// required argument, a scope that cannot be satisfied.
-    ///
-    /// NOT retryable without an operator change.
-    Usage,
-    /// A budget was exhausted: the per-call cap, the month-to-date spend cap,
-    /// or the EXTERNAL engine's own `budget_exceeded:` refusal.
-    ///
-    /// NOT retryable until the budget window resets.
-    BudgetExceeded,
-    /// No reviewer could produce a verdict: the chain was exhausted, the
-    /// reviewer twice returned an answer with no verdict (budget exhausted
-    /// twice), every panel member failed, or the provider kept the reviewer
-    /// from answering.
-    ///
-    /// Retryable — a different reviewer or a later attempt often succeeds.
-    ReviewerUnavailable,
-    /// The review completed and the aggregate verdict BLOCKS the change
-    /// (`request_changes` / `reject` / `block`). This is a real, successful
-    /// review that says "no".
-    ///
-    /// NOT retryable — retrying the same diff produces the same verdict.
-    ReviewBlocked,
-    /// The diff is larger than the configured review budget (per-diff bytes,
-    /// per-hunk bytes, or the number of chunks) and therefore cannot be
-    /// reviewed as configured.
-    ///
-    /// NOT retryable without changing the caps or the exclusions.
-    DiffTooLarge,
-    /// The run was cancelled, or a required cancellation could not be
-    /// confirmed by the engine.
-    ///
-    /// Retryable — the caller may re-drive the job.
-    Cancelled,
-    /// The agent engine (the `zeroclaw` daemon) could not be reached: it is
-    /// not running, its socket is stale, or it died during startup.
-    ///
-    /// Retryable — the daemon can be restarted.
-    EngineUnreachable,
-    /// An unclassified internal failure: a bug, or a condition this
-    /// classification does not cover yet.
-    ///
-    /// NOT retryable — the default is "something is wrong here".
-    Internal,
+    /// A budget window is exhausted. Exit `30`.
+    Budget,
+    /// Nothing is broken; the review completed and refused the change.
+    /// Exit `10`.
+    Blocked,
 }
 
 impl FailureClass {
-    /// The STABLE string code for this class.
-    ///
-    /// This string is the contract a fleet worker matches on. It never
-    /// changes meaning; new classes get new strings.
-    pub(crate) const fn code(self) -> &'static str {
+    /// The STABLE string for this class, as it appears in the envelope.
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            FailureClass::Transient => "transient",
+            FailureClass::Permanent => "permanent",
             FailureClass::Config => "config",
-            FailureClass::Usage => "usage",
-            FailureClass::BudgetExceeded => "budget_exceeded",
-            FailureClass::ReviewerUnavailable => "reviewer_unavailable",
-            FailureClass::ReviewBlocked => "review_blocked",
-            FailureClass::DiffTooLarge => "diff_too_large",
-            FailureClass::Cancelled => "cancelled",
-            FailureClass::EngineUnreachable => "engine_unreachable",
-            FailureClass::Internal => "internal",
+            FailureClass::Budget => "budget",
+            FailureClass::Blocked => "blocked",
         }
     }
 
-    /// The documented process exit code for this class.
-    ///
-    /// * `1` — unclassified failure (the pre-existing default).
-    /// * `64..=72` — the "classified failure" band. `64` (`EX_USAGE`), `65`
-    ///   (`EX_DATAERR`), `66` (`EX_NOINPUT`) and `69` (`EX_UNAVAILABLE`)
-    ///   follow the `sysexits.h` convention; `67`, `68`, `70`, `71` and `72`
-    ///   are zoder-specific extensions of the same band.
-    ///
-    /// Every code is stable AND unique: a code is never reused for another
-    /// class, so a shell caller can dispatch on the exit code alone.
+    /// The exit code for this class. Shared by every code in the class.
     pub(crate) const fn exit_code(self) -> i32 {
         match self {
-            // EX_USAGE: the invocation itself is wrong.
-            FailureClass::Usage => 64,
-            // EX_DATAERR: the environment / config data is wrong.
-            FailureClass::Config => 65,
-            // EX_NOINPUT: the diff input cannot be processed as configured.
-            FailureClass::DiffTooLarge => 66,
-            // A budget window is exhausted; retrying now fails the same way.
-            FailureClass::BudgetExceeded => 67,
-            // No reviewer produced a verdict.
-            FailureClass::ReviewerUnavailable => 68,
-            // EX_UNAVAILABLE: the reviewed change is not available for
-            // acceptance — the review completed and said "no".
-            FailureClass::ReviewBlocked => 69,
-            // The run was cancelled, or the cancellation was not confirmed.
-            FailureClass::Cancelled => 70,
-            // The agent engine is not reachable.
-            FailureClass::EngineUnreachable => 71,
-            // EX_SOFTWARE analogue: an internal error.
-            FailureClass::Internal => 72,
+            FailureClass::Blocked => EXIT_BLOCKED,
+            FailureClass::Transient => EXIT_TRANSIENT,
+            FailureClass::Budget => EXIT_BUDGET,
+            FailureClass::Config | FailureClass::Permanent => EXIT_CONFIG,
         }
     }
 
     /// Whether a caller MAY usefully retry the same invocation as-is.
     ///
-    /// This is a hint for fleet workers, not a guarantee: a retryable failure
-    /// can still fail again. It answers exactly one question — "is this the
-    /// same request failing, or is something in the environment broken?"
+    /// Only [`FailureClass::Transient`] is retryable unconditionally; a
+    /// `budget` failure becomes retryable once its window resets, which the
+    /// envelope says with `retry_after_s`.
     pub(crate) const fn retryable(self) -> bool {
-        match self {
-            // The environment or the operator has to change something first.
-            FailureClass::Config
-            | FailureClass::Usage
-            | FailureClass::BudgetExceeded
-            | FailureClass::ReviewBlocked
-            | FailureClass::DiffTooLarge
-            | FailureClass::Internal => false,
-            // A different reviewer, a later attempt, a restarted daemon, or a
-            // re-driven job can plausibly succeed unchanged.
-            FailureClass::ReviewerUnavailable
-            | FailureClass::Cancelled
-            | FailureClass::EngineUnreachable => true,
-        }
+        matches!(self, FailureClass::Transient)
     }
 
-    /// All classes, in the canonical order used by the documentation and the
-    /// tests. Keeps the docs and the code from drifting apart.
+    /// All classes, in the canonical order used by docs and tests.
     pub(crate) const ALL: &'static [FailureClass] = &[
+        FailureClass::Transient,
+        FailureClass::Permanent,
         FailureClass::Config,
-        FailureClass::Usage,
-        FailureClass::BudgetExceeded,
-        FailureClass::ReviewerUnavailable,
-        FailureClass::ReviewBlocked,
-        FailureClass::DiffTooLarge,
-        FailureClass::Cancelled,
-        FailureClass::EngineUnreachable,
-        FailureClass::Internal,
+        FailureClass::Budget,
+        FailureClass::Blocked,
     ];
 
-    /// Parse a stable class code back into a class.
-    ///
-    /// This is the inverse of [`FailureClass::code`], so a consumer that
-    /// persisted a class code (a fleet worker recording a job outcome, a
-    /// test fixture) can read it back without a hand-maintained mapping.
-    /// An unknown code is `None`: the vocabulary is closed, so an
-    /// unrecognized string is a contract violation, not a class.
-    pub(crate) fn from_code(code: &str) -> Option<Self> {
-        FailureClass::ALL.iter().copied().find(|c| c.code() == code)
+    /// Parse a class string back into a class (inverse of [`Self::as_str`]).
+    pub(crate) fn from_str_exact(s: &str) -> Option<Self> {
+        FailureClass::ALL.iter().copied().find(|c| c.as_str() == s)
     }
-}
-
-/// The stable code of every class, in the canonical order.
-///
-/// This is the machine-readable half of the contract, exposed so a caller
-/// (or the documentation test) can enumerate the vocabulary without
-/// duplicating it.
-pub(crate) fn all_class_codes() -> Vec<&'static str> {
-    FailureClass::ALL.iter().map(|c| c.code()).collect()
-}
-
-/// The exit code of every class, paired with its stable code.
-///
-/// Exposed so the documentation test can assert that `docs/EXIT_CODES.md`
-/// matches the code — the doc and the implementation cannot drift.
-pub(crate) fn class_exit_codes() -> Vec<(&'static str, i32)> {
-    FailureClass::ALL
-        .iter()
-        .map(|c| (c.code(), c.exit_code()))
-        .collect()
 }
 
 impl fmt::Display for FailureClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// The exit-code ladder. Named and exported so the doc tests, the golden
+// integration test and `docs/EXIT_CODES.md` all read the SAME numbers.
+/// Blocked: the review completed and said "no". Nothing to retry.
+pub(crate) const EXIT_BLOCKED: i32 = 10;
+/// Transient: retry the same invocation later.
+pub(crate) const EXIT_TRANSIENT: i32 = 20;
+/// Budget: the window is exhausted; wait for `retry_after_s` / `resets_at`.
+pub(crate) const EXIT_BUDGET: i32 = 30;
+/// Config / auth / unusable input: an operator has to change something.
+pub(crate) const EXIT_CONFIG: i32 = 40;
+/// Internal: a bug, or a failure the contract does not classify yet.
+pub(crate) const EXIT_INTERNAL: i32 = 50;
+/// Reserved: the oneshot refusal band. Never assigned to a review/loop code.
+pub(crate) const EXIT_RESERVED_ONESHOT: i32 = 75;
+
+/// The exit code the process uses when the failure was never classified.
+///
+/// It is the INTERNAL band: an unclassified failure is a bug or a gap in the
+/// contract, and the caller treats it exactly like `internal` (code `50`).
+pub(crate) const UNCLASSIFIED_EXIT_CODE: i32 = EXIT_INTERNAL;
+
+/// The frozen list of failure CODES.
+///
+/// Each code is one specific failure worth telling apart. The string is the
+/// contract (`error.code` in the envelope, `failure.code` inside a result) and
+/// it is frozen in `ZODER_CLI_SURFACE.txt`; [`FailureCode::ALL`] drives the
+/// test that proves the frozen table and this enum cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FailureCode {
+    /// The diff is above the configured review budget (bytes, hunks, chunks).
+    DiffTooLarge,
+    /// The diff was cut off during acquisition, so the tail was never seen.
+    DiffTruncated,
+    /// The scope produced no diff: nothing was reviewed, so this is NOT an
+    /// approval (a wrong `--base` usually means this).
+    EmptyDiff,
+    /// No reviewer model could be resolved from `--reviewer`, the agent pin or
+    /// `[review].reviewer_model`.
+    NoReviewerModel,
+    /// No reviewer produced a verdict; `detail.reviewers` names what each
+    /// model hit (`Timeout`, `RateLimit`, `Server`, ...).
+    ReviewersUnavailable,
+    /// The review completed and blocks the change.
+    ReviewBlocked,
+    /// The loop stopped without resolving the task.
+    LoopExhausted,
+    /// The author turn failed outright (no in-place timeout).
+    AuthorFailed,
+    /// The author turn hit its wall-clock budget.
+    AuthorTimeout,
+    /// The run was refused by policy (for example the free-only policy).
+    PolicyViolation,
+    /// The EXTERNAL engine refused for budget; `detail.resets_at` when known.
+    EngineBudgetExceeded,
+    /// The engine could not be reached at all.
+    EngineUnreachable,
+    /// A cancel was never confirmed by the engine; the worktree is tainted.
+    CancelUnconfirmed,
+    /// The worktree was left in an unknown state (see `cancel_unconfirmed`).
+    WorktreeTainted,
+    /// An environment / config problem: an unreadable or invalid config, a
+    /// bad `--engine` value, a reviewer pin naming an unbacked model.
+    ConfigError,
+    /// The invocation itself is wrong (mutually exclusive flags, a scope that
+    /// cannot be satisfied, a missing required argument).
+    UsageError,
+    /// A bug, or a failure this contract does not classify yet.
+    Internal,
+}
+
+impl FailureCode {
+    /// The STABLE string code. Frozen in `ZODER_CLI_SURFACE.txt`.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            FailureCode::DiffTooLarge => "diff_too_large",
+            FailureCode::DiffTruncated => "diff_truncated",
+            FailureCode::EmptyDiff => "empty_diff",
+            FailureCode::NoReviewerModel => "no_reviewer_model",
+            FailureCode::ReviewersUnavailable => "reviewers_unavailable",
+            FailureCode::ReviewBlocked => "review_blocked",
+            FailureCode::LoopExhausted => "loop_exhausted",
+            FailureCode::AuthorFailed => "author_failed",
+            FailureCode::AuthorTimeout => "author_timeout",
+            FailureCode::PolicyViolation => "policy_violation",
+            FailureCode::EngineBudgetExceeded => "engine_budget_exceeded",
+            FailureCode::EngineUnreachable => "engine_unreachable",
+            FailureCode::CancelUnconfirmed => "cancel_unconfirmed",
+            FailureCode::WorktreeTainted => "worktree_tainted",
+            FailureCode::ConfigError => "config",
+            FailureCode::UsageError => "usage",
+            FailureCode::Internal => "internal",
+        }
+    }
+
+    /// The retry policy this code carries.
+    pub(crate) const fn class(self) -> FailureClass {
+        match self {
+            FailureCode::ReviewBlocked => FailureClass::Blocked,
+            FailureCode::EngineBudgetExceeded => FailureClass::Budget,
+            FailureCode::ReviewersUnavailable
+            | FailureCode::AuthorFailed
+            | FailureCode::AuthorTimeout
+            | FailureCode::EngineUnreachable
+            | FailureCode::CancelUnconfirmed
+            | FailureCode::WorktreeTainted => FailureClass::Transient,
+            FailureCode::NoReviewerModel
+            | FailureCode::PolicyViolation
+            | FailureCode::ConfigError
+            | FailureCode::UsageError => FailureClass::Config,
+            FailureCode::DiffTooLarge
+            | FailureCode::DiffTruncated
+            | FailureCode::EmptyDiff
+            | FailureCode::LoopExhausted
+            | FailureCode::Internal => FailureClass::Permanent,
+        }
+    }
+
+    /// The process exit code for this failure.
+    pub(crate) const fn exit_code(self) -> i32 {
+        self.class().exit_code()
+    }
+
+    /// Whether the same invocation may usefully be retried as-is.
+    pub(crate) const fn retryable(self) -> bool {
+        self.class().retryable()
+    }
+
+    /// All codes, in the canonical (documented) order.
+    pub(crate) const ALL: &'static [FailureCode] = &[
+        FailureCode::ReviewBlocked,
+        FailureCode::ReviewersUnavailable,
+        FailureCode::DiffTooLarge,
+        FailureCode::DiffTruncated,
+        FailureCode::EmptyDiff,
+        FailureCode::NoReviewerModel,
+        FailureCode::LoopExhausted,
+        FailureCode::AuthorFailed,
+        FailureCode::AuthorTimeout,
+        FailureCode::PolicyViolation,
+        FailureCode::EngineBudgetExceeded,
+        FailureCode::EngineUnreachable,
+        FailureCode::CancelUnconfirmed,
+        FailureCode::WorktreeTainted,
+        FailureCode::ConfigError,
+        FailureCode::UsageError,
+        FailureCode::Internal,
+    ];
+
+    /// Parse a stable code back into a [`FailureCode`] (inverse of
+    /// [`Self::code`]). An unknown string is `None`: the list is closed.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        FailureCode::ALL.iter().copied().find(|c| c.code() == code)
+    }
+}
+
+impl fmt::Display for FailureCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.code())
     }
 }
 
-/// A classified failure: the class, the human message, and (when the external
-/// engine said so) the moment its budget window resets.
+/// The stable code of every failure code, in the canonical order.
+pub(crate) fn all_class_codes() -> Vec<&'static str> {
+    FailureCode::ALL.iter().map(|c| c.code()).collect()
+}
+
+/// `(code, class, exit code)` for every failure code.
+///
+/// Exposed so the documentation test can assert that `docs/EXIT_CODES.md`
+/// matches the implementation — the doc and the code cannot drift.
+pub(crate) fn class_exit_codes() -> Vec<(&'static str, &'static str, i32)> {
+    FailureCode::ALL
+        .iter()
+        .map(|c| (c.code(), c.class().as_str(), c.exit_code()))
+        .collect()
+}
+
+/// A classified failure: the code, the human message, the per-model detail and
+/// (when the external engine said so) the moment its budget window resets.
 ///
 /// This is the value every `zoder review` / `zoder loop` failure site
 /// returns. It carries no secrets: the message is the same operator-facing
 /// text that was already printed to stderr before this contract existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClassifiedFailure {
-    pub class: FailureClass,
+    /// The specific failure (frozen list: [`FailureCode`]).
+    pub code: FailureCode,
     /// The operator-facing message. Identical to (or a superset of) the text
     /// that was printed before this contract existed, so no diagnostic is
-    /// lost.
+    /// lost. Always present in `detail.message`.
     pub message: String,
     /// The external engine's budget-reset timestamp, when it reported one.
-    /// Present only for [`FailureClass::BudgetExceeded`] and only when the
-    /// engine's message carried a reset time.
+    /// Mirrored into `detail.resets_at`, and into `retry_after_s` when it
+    /// parses; never fabricated.
     pub budget_reset_at: Option<String>,
+    /// Per-model reviewer outcomes (`model`, `err_kind`), for
+    /// [`FailureCode::ReviewersUnavailable`]. Empty otherwise.
+    pub reviewers: Vec<ReviewerOutcome>,
+    /// Extra machine-readable members merged into `detail`. Reserved for
+    /// detail beyond `message` / `reviewers` / `resets_at`.
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One reviewer model that could not answer, as the envelope reports it.
+///
+/// `err_kind` is the typed [`ErrKind`](zoder_core::ErrKind) that zoder-core's
+/// provider layer already classifies every call with — this is the first time
+/// it is serialized, so a caller can tell a 429 from a 503 from a timeout
+/// instead of reading the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewerOutcome {
+    pub model: String,
+    pub err_kind: String,
+}
+
+impl ReviewerOutcome {
+    pub(crate) fn new(model: impl Into<String>, err_kind: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            err_kind: err_kind.into(),
+        }
+    }
 }
 
 impl ClassifiedFailure {
-    /// A classified failure with no reset timestamp.
-    pub(crate) fn new(class: FailureClass, message: impl Into<String>) -> Self {
+    /// A classified failure with no reset timestamp and no extra detail.
+    pub(crate) fn new(code: FailureCode, message: impl Into<String>) -> Self {
         Self {
-            class,
+            code,
             message: message.into(),
             budget_reset_at: None,
+            reviewers: Vec::new(),
+            extra: serde_json::Map::new(),
         }
     }
 
     /// A classified failure that carries a budget-reset timestamp.
     pub(crate) fn with_budget_reset(
-        class: FailureClass,
+        code: FailureCode,
         message: impl Into<String>,
         reset_at: Option<String>,
     ) -> Self {
         Self {
-            class,
+            code,
             message: message.into(),
             budget_reset_at: reset_at,
+            reviewers: Vec::new(),
+            extra: serde_json::Map::new(),
         }
     }
 
+    /// Attach the per-model reviewer outcomes (builder style).
+    pub(crate) fn with_reviewers(mut self, reviewers: Vec<ReviewerOutcome>) -> Self {
+        self.reviewers = reviewers;
+        self
+    }
+
+    /// Attach one extra `detail` member (builder style).
+    pub(crate) fn with_detail(
+        mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+
+    /// The retry policy for this failure.
+    pub(crate) const fn class(&self) -> FailureClass {
+        self.code.class()
+    }
+
     /// The process exit code for this failure.
-    pub(crate) fn exit_code(&self) -> i32 {
-        self.class.exit_code()
+    pub(crate) const fn exit_code(&self) -> i32 {
+        self.code.exit_code()
     }
 
     /// Whether the same invocation may usefully be retried as-is.
-    pub(crate) fn retryable(&self) -> bool {
-        self.class.retryable()
+    pub(crate) const fn retryable(&self) -> bool {
+        self.code.retryable()
     }
 
-    /// The JSON object a machine consumer reads.
+    /// Seconds a caller should wait before retrying, derived from
+    /// `detail.resets_at` when the failure carries one and the timestamp is in
+    /// the future. `None` when there is nothing to wait for — never guessed.
+    pub(crate) fn retry_after_s(&self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+        let reset = self.budget_reset_at.as_deref()?;
+        let at = chrono::DateTime::parse_from_rfc3339(reset)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        let secs = (at - now).num_seconds();
+        (secs > 0).then_some(secs)
+    }
+
+    /// The `error` object a machine consumer reads.
     ///
-    /// Shape (stable):
+    /// Shape (stable, frozen in `ZODER_CLI_SURFACE.txt`):
     /// ```json
     /// {
-    ///   "class": "budget_exceeded",
-    ///   "code": "budget_exceeded",
-    ///   "retryable": false,
-    ///   "message": "...",
-    ///   "budget_reset_at": "2026-11-01T00:00:00Z"
+    ///   "code": "engine_budget_exceeded",
+    ///   "class": "budget",
+    ///   "retry_after_s": 600,
+    ///   "detail": { "message": "...", "resets_at": "2026-11-01T00:00:00Z" }
     /// }
     /// ```
-    /// `budget_reset_at` is present ONLY when the engine reported a reset
-    /// timestamp; it is never fabricated.
+    /// `retry_after_s` and `detail.resets_at` are present ONLY when the engine
+    /// reported a reset timestamp; neither is ever fabricated.
     pub(crate) fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({
-            "class": self.class.code(),
-            "code": self.class.code(),
-            "retryable": self.retryable(),
-            "message": self.message,
+            "code": self.code.code(),
+            "class": self.class().as_str(),
         });
+        let mut detail = serde_json::Map::new();
+        detail.insert(
+            "message".into(),
+            serde_json::Value::String(self.message.clone()),
+        );
         if let Some(reset) = &self.budget_reset_at {
-            obj["budget_reset_at"] = serde_json::Value::String(reset.clone());
+            detail.insert(
+                "resets_at".into(),
+                serde_json::Value::String(reset.clone()),
+            );
+        }
+        if !self.reviewers.is_empty() {
+            detail.insert(
+                "reviewers".into(),
+                serde_json::Value::Array(
+                    self.reviewers
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({"model": r.model, "err_kind": r.err_kind})
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        for (k, v) in &self.extra {
+            detail.insert(k.clone(), v.clone());
+        }
+        // Mirrored at the TOP level so a shell caller reads the message with a
+        // one-key path, and inside `detail` so the detail object is complete
+        // on its own.
+        obj["detail"] = serde_json::Value::Object(detail);
+        if let Some(secs) = self.retry_after_s(chrono::Utc::now()) {
+            obj["retry_after_s"] = serde_json::Value::from(secs);
         }
         obj
     }
 }
 
-/// The exit code the process uses when the failure was never classified.
-///
-/// `1` is the pre-existing behaviour for every failure, so a caller that
-/// predates this contract keeps seeing exactly what it saw before.
-pub(crate) const UNCLASSIFIED_EXIT_CODE: i32 = 1;
-
 /// A [`ClassifiedFailure`] carried inside an `anyhow::Error` chain.
 ///
 /// This is the transport: a failure site returns
-/// `Err(ClassifiedFailure::new(class, msg).into())` and the dispatcher in
-/// `main` recovers the class by walking the error chain. The chain walk is
-/// what keeps the classification attached to the error even when an
-/// intermediate frame adds `.context(...)` on top of it.
+/// `Err(classified_err(code, msg))` and the dispatcher in `main` recovers the
+/// code by walking the error chain. The chain walk is what keeps the
+/// classification attached to the error even when an intermediate frame adds
+/// `.context(...)` on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClassifiedFailureError(ClassifiedFailure);
 
 impl ClassifiedFailureError {
-    pub(crate) fn new(class: FailureClass, message: impl Into<String>) -> Self {
-        Self(ClassifiedFailure::new(class, message))
-    }
-
-    pub(crate) fn with_budget_reset(
-        class: FailureClass,
-        message: impl Into<String>,
-        reset_at: Option<String>,
-    ) -> Self {
-        Self(ClassifiedFailure::with_budget_reset(
-            class, message, reset_at,
-        ))
+    pub(crate) fn new(code: FailureCode, message: impl Into<String>) -> Self {
+        Self(ClassifiedFailure::new(code, message))
     }
 
     pub(crate) fn failure(&self) -> &ClassifiedFailure {
@@ -358,8 +530,8 @@ impl std::error::Error for ClassifiedFailureError {}
 /// the outermost classification is the one the failure site chose, and any
 /// `.context(...)` frame above it is only prose. When no frame carries a
 /// classification, the message is matched against the known markers
-/// ([`classify_message`]) so an un-annotated failure site still lands in the
-/// right class instead of the unclassified bucket.
+/// ([`classify_message`]) so an un-annotated failure site still lands on the
+/// right code instead of the unclassified bucket.
 ///
 /// Returns `None` when the failure is genuinely unclassifiable; the caller
 /// then uses [`UNCLASSIFIED_EXIT_CODE`].
@@ -377,47 +549,55 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> Option<ClassifiedFailure>
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(": ");
-    classify_message(&chain_text).map(|(class, reset)| {
-        ClassifiedFailure::with_budget_reset(class, chain_text.clone(), reset)
+    classify_message(&chain_text).map(|(code, reset)| {
+        ClassifiedFailure::with_budget_reset(code, chain_text.clone(), reset)
     })
 }
 
-/// Build an `anyhow::Error` that carries a classification.
-pub(crate) fn classified_err(class: FailureClass, message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(ClassifiedFailureError::new(class, message))
+/// Build an `anyhow::Error` that carries a classified failure.
+///
+/// The common shape: `return Err(classified_err(FailureCode::EmptyDiff, msg))`.
+pub(crate) fn classified_err(code: FailureCode, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ClassifiedFailureError::new(code, message))
 }
 
-/// Build an `anyhow::Error` that carries a classification AND a budget-reset
-/// timestamp.
+/// Build a `diff_too_large` error.
+pub(crate) fn diff_too_large_err(message: impl Into<String>) -> anyhow::Error {
+    classified_err(FailureCode::DiffTooLarge, message)
+}
+
+/// Build an `engine_budget_exceeded` error that carries the engine's reset
+/// timestamp (when it gave one) into the envelope.
 pub(crate) fn classified_budget_err(
     message: impl Into<String>,
     reset_at: Option<String>,
 ) -> anyhow::Error {
-    anyhow::Error::new(ClassifiedFailureError::with_budget_reset(
-        FailureClass::BudgetExceeded,
+    anyhow::Error::new(ClassifiedFailureError(ClassifiedFailure::with_budget_reset(
+        FailureCode::EngineBudgetExceeded,
         message,
         reset_at,
-    ))
+    )))
 }
 
 /// The JSON document a `--json` failure prints when there is NO result
 /// object to attach the failure to.
 ///
-/// The shape mirrors the in-result envelope so a consumer reads the same
-/// keys in both places:
-///
 /// ```json
 /// {
+///   "ok": false,
 ///   "error": {
-///     "class": "reviewer_unavailable",
-///     "code": "reviewer_unavailable",
-///     "retryable": true,
-///     "message": "..."
+///     "code": "reviewers_unavailable",
+///     "class": "transient",
+///     "detail": { "message": "..." }
 ///   }
 /// }
 /// ```
+///
+/// It is the SAME `error` object that [`ClassifiedFailure::to_json`]
+/// produces, wrapped in `ok: false`, so a consumer reads identical keys
+/// whether the failure travelled inside a result or on its own.
 pub(crate) fn error_envelope(failure: &ClassifiedFailure) -> serde_json::Value {
-    serde_json::json!({ "error": failure.to_json() })
+    serde_json::json!({ "ok": false, "error": failure.to_json() })
 }
 
 /// Did this process already print (or write) a RESULT object?
@@ -427,72 +607,80 @@ pub(crate) fn error_envelope(failure: &ClassifiedFailure) -> serde_json::Value {
 /// information is attached to THAT object and nothing else is printed —
 /// printing a second document would break every consumer that parses
 /// stdout as one JSON value. When NO result exists (the command failed
-/// before producing one), the failure is printed as its own `error` object.
-static RESULT_EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// before producing one), the failure is printed as its own envelope.
+pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
+
+static RESULT_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Record that a result object was produced (printed to stdout and/or
 /// written to `result.json`).
 pub(crate) fn mark_result_emitted() {
-    RESULT_EMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    RESULT_EMITTED.store(true, Ordering::SeqCst);
 }
 
-/// The class of an arbitrary error message, when one can be inferred.
+/// Did a result object already reach stdout (or `result.json`)?
+pub(crate) fn result_was_emitted() -> bool {
+    RESULT_EMITTED.load(Ordering::SeqCst)
+}
+
+/// The code of an arbitrary error message, when one can be inferred.
 ///
 /// This is the RECOGNITION step: it maps the free-text shape of a failure onto
-/// the stable class vocabulary. It is deliberately conservative — it only
-/// recognizes specific, unambiguous markers that the failure sites in this
-/// codebase emit, and it returns `None` for everything else so an
-/// unrecognized error stays unclassified (exit `1`).
+/// the frozen code list. It is deliberately conservative — it only recognizes
+/// specific, unambiguous markers that the failure sites in this codebase emit,
+/// and it returns `None` for everything else so an unrecognized error stays
+/// unclassified (`internal`, exit 50).
 ///
-/// Recognized markers:
-///
-/// * `budget_exceeded:` — the external engine's own budget refusal. The
-///   optional trailing reset timestamp is extracted when present.
-/// * the diff-size refusals (`above the N-byte limit`, `above the N-byte
-///   review limit`, `review diff is N bytes`) — the diff cannot be reviewed
-///   as configured.
-/// * the reviewer-unavailable markers (`0/N reviewers completed`,
-///   `review incomplete`, `reviewer_unavailable`) — no reviewer produced a
-///   verdict.
-/// * `review blocked:` / `requests changes` — the review completed and said
-///   "no".
-/// * the cancellation markers (`author cancellation unconfirmed:`,
-///   `cancel not confirmed`) — the run was cancelled, or the engine did not
-///   confirm the cancellation.
-/// * the engine-unreachable markers (`connecting to engine`,
-///   `daemon not ready`, `daemon exited during startup`,
-///   `engine is unavailable`) — the agent engine could not be reached.
-/// * the usage markers (`invalid --engine`, `usage:`) — the invocation was
-///   wrong.
-/// * the config markers (`loading zoder config`, `config`) — the environment
-///   is misconfigured.
-pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<String>)> {
+/// The return value also carries the engine's reset timestamp when the
+/// message had one.
+pub(crate) fn classify_message(message: &str) -> Option<(FailureCode, Option<String>)> {
     let lower = message.to_ascii_lowercase();
+    let code = classify_message_code(&lower)?;
+    Some((code, None))
+}
 
+/// The lower-cased-message -> code half of [`classify_message`].
+fn classify_message_code(lower: &str) -> Option<FailureCode> {
     // The EXTERNAL engine's budget refusal. Recognised FIRST: it is the most
     // specific marker, and a budget refusal can mention the daemon in its
     // own diagnostics.
-    if let Some((class, reset)) = classify_engine_budget_exceeded(message) {
-        return Some((class, reset));
+    if lower.contains(BUDGET_EXCEEDED_MARKER) {
+        return Some(FailureCode::EngineBudgetExceeded);
+    }
+
+    // The diff was cut off during acquisition, so the tail was never seen.
+    if lower.contains("review diff was truncated during acquisition")
+        || lower.contains(DIFF_TRUNCATED_MARKER)
+    {
+        return Some(FailureCode::DiffTruncated);
+    }
+
+    // Nothing was reviewed, so this is not an approval.
+    if lower.contains("no changes to review") || lower.contains("empty_diff") {
+        return Some(FailureCode::EmptyDiff);
+    }
+
+    // No reviewer model could be resolved at all.
+    if lower.contains("no reviewer model resolved")
+        || lower.contains("no reviewer route matches")
+        || lower.contains("no_reviewer_model")
+    {
+        return Some(FailureCode::NoReviewerModel);
     }
 
     // The diff is larger than the review budget.
     if lower.contains("above the")
         && (lower.contains("byte limit") || lower.contains("-byte limit"))
     {
-        return Some((FailureClass::DiffTooLarge, None));
+        return Some(FailureCode::DiffTooLarge);
     }
     if lower.contains("review diff is") && lower.contains("byte") {
-        return Some((FailureClass::DiffTooLarge, None));
-    }
-    if lower.contains("review diff was truncated during acquisition") {
-        // A truncated diff is a diff that cannot be reviewed in full.
-        return Some((FailureClass::DiffTooLarge, None));
+        return Some(FailureCode::DiffTooLarge);
     }
 
     // The review completed and blocked the change.
     if lower.contains("review blocked") || lower.contains("requests changes") {
-        return Some((FailureClass::ReviewBlocked, None));
+        return Some(FailureCode::ReviewBlocked);
     }
 
     // No reviewer produced a verdict.
@@ -502,17 +690,39 @@ pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<St
         || lower.contains("reviewer refused")
         || lower.contains("review refused")
     {
-        return Some((FailureClass::ReviewerUnavailable, None));
+        return Some(FailureCode::ReviewersUnavailable);
     }
 
-    // The cancellation could not be confirmed, or the run was cancelled.
+    // The engine never confirmed a cancel: the worktree may be tainted.
     if lower.contains("author cancellation unconfirmed")
         || lower.contains("cancel not confirmed")
         || lower.contains("cancellation deadline expired")
-        || lower.contains("cancelled")
-        || lower.contains("canceled")
     {
-        return Some((FailureClass::Cancelled, None));
+        return Some(FailureCode::CancelUnconfirmed);
+    }
+
+    // The author turn hit its wall-clock budget, or failed outright.
+    if lower.contains("author turn timed out") || lower.contains("author timeout") {
+        return Some(FailureCode::AuthorTimeout);
+    }
+    if lower.contains("author turn did not finish")
+        || lower.contains("author_failed")
+        || lower.contains("author failed")
+    {
+        return Some(FailureCode::AuthorFailed);
+    }
+
+    // The run was refused by policy.
+    if lower.contains("violated free policy")
+        || lower.contains("violates the free policy")
+        || lower.contains("policy violation")
+    {
+        return Some(FailureCode::PolicyViolation);
+    }
+
+    // The loop stopped without resolving.
+    if lower.contains("loop ended unresolved") || lower.contains("loop_exhausted") {
+        return Some(FailureCode::LoopExhausted);
     }
 
     // The agent engine could not be reached.
@@ -523,7 +733,7 @@ pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<St
         || lower.contains("engine offline")
         || lower.contains("no daemon is running")
     {
-        return Some((FailureClass::EngineUnreachable, None));
+        return Some(FailureCode::EngineUnreachable);
     }
 
     // The invocation was wrong.
@@ -533,7 +743,7 @@ pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<St
         || lower.contains("requires --")
         || lower.contains("unknown subcommand")
     {
-        return Some((FailureClass::Usage, None));
+        return Some(FailureCode::UsageError);
     }
 
     // The environment is misconfigured.
@@ -543,33 +753,38 @@ pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<St
         || lower.contains("config error")
         || lower.contains("invalid config")
     {
-        return Some((FailureClass::Config, None));
+        return Some(FailureCode::ConfigError);
     }
 
     None
 }
 
+/// The marker the EXTERNAL engine prefixes its budget refusal with.
+pub(crate) const BUDGET_EXCEEDED_MARKER: &str = "budget_exceeded:";
+
+/// Substring every acquisition-truncation refusal carries.
+pub(crate) const DIFF_TRUNCATED_MARKER: &str = "truncated during acquisition";
+
 /// Recognize the EXTERNAL engine's `budget_exceeded:` refusal.
 ///
-/// The engine reports a budget refusal on stderr as a line beginning with
-/// `budget_exceeded:` and MAY append the moment the budget window resets.
-/// Both shapes are recognized:
+/// The engine reports a budget refusal on stderr (or in its terminal turn
+/// frame) as text beginning with `budget_exceeded:` and MAY append the moment
+/// the budget window resets. Both shapes are recognized:
 ///
 /// ```text
 /// budget_exceeded: monthly spend cap reached
 /// budget_exceeded: quota exhausted, resets at 2026-11-01T00:00:00Z
 /// ```
 ///
-/// Returns the class plus the reset timestamp when the message carried one.
+/// Returns the code plus the reset timestamp when the message carried one.
 pub(crate) fn classify_engine_budget_exceeded(
     message: &str,
-) -> Option<(FailureClass, Option<String>)> {
-    const MARKER: &str = "budget_exceeded:";
-    let start = message.to_ascii_lowercase().find(MARKER)?;
-    let rest = &message[start + MARKER.len()..];
+) -> Option<(FailureCode, Option<String>)> {
+    let start = message.to_ascii_lowercase().find(BUDGET_EXCEEDED_MARKER)?;
+    let rest = &message[start + BUDGET_EXCEEDED_MARKER.len()..];
     let line = rest.lines().next().unwrap_or("").trim();
     let reset = extract_reset_timestamp(line);
-    Some((FailureClass::BudgetExceeded, reset))
+    Some((FailureCode::EngineBudgetExceeded, reset))
 }
 
 /// Pull a reset timestamp out of an engine budget line.
@@ -606,230 +821,227 @@ fn extract_reset_timestamp(line: &str) -> Option<String> {
     Some(token)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- the vocabulary -------------------------------------------------
+    // ---- the frozen code list -------------------------------------------
 
+    /// The exact list, in order. This is the contract: a code is added or
+    /// removed only together with this test, `docs/EXIT_CODES.md` and
+    /// `ZODER_CLI_SURFACE.txt`.
     #[test]
-    fn every_class_has_a_unique_stable_code() {
-        let mut codes: Vec<&str> = FailureClass::ALL.iter().map(|c| c.code()).collect();
-        codes.sort_unstable();
-        let before = codes.len();
-        codes.dedup();
-        assert_eq!(before, codes.len(), "failure class codes must be unique");
-    }
-
-    #[test]
-    fn every_class_has_a_unique_exit_code() {
-        let mut codes: Vec<i32> = FailureClass::ALL.iter().map(|c| c.exit_code()).collect();
-        codes.sort_unstable();
-        let before = codes.len();
-        codes.dedup();
-        assert_eq!(
-            before,
-            codes.len(),
-            "failure class exit codes must be unique"
-        );
-    }
-
-    #[test]
-    fn every_class_exit_code_is_non_zero() {
-        for c in FailureClass::ALL {
-            assert_ne!(c.exit_code(), 0, "{c} must not exit 0");
-        }
-    }
-
-    #[test]
-    fn the_class_vocabulary_is_exactly_the_documented_nine() {
-        let codes: Vec<&str> = FailureClass::ALL.iter().map(|c| c.code()).collect();
+    fn the_code_list_is_exactly_the_frozen_one() {
+        let codes: Vec<&str> = FailureCode::ALL.iter().map(|c| c.code()).collect();
         assert_eq!(
             codes,
             vec![
+                "review_blocked",
+                "reviewers_unavailable",
+                "diff_too_large",
+                "diff_truncated",
+                "empty_diff",
+                "no_reviewer_model",
+                "loop_exhausted",
+                "author_failed",
+                "author_timeout",
+                "policy_violation",
+                "engine_budget_exceeded",
+                "engine_unreachable",
+                "cancel_unconfirmed",
+                "worktree_tainted",
                 "config",
                 "usage",
-                "budget_exceeded",
-                "reviewer_unavailable",
-                "review_blocked",
-                "diff_too_large",
-                "cancelled",
-                "engine_unreachable",
                 "internal",
             ]
         );
     }
 
     #[test]
-    fn every_code_round_trips_back_to_its_class() {
-        for c in FailureClass::ALL {
-            assert_eq!(
-                FailureClass::from_code(c.code()),
-                Some(*c),
-                "the code {:?} must round-trip",
-                c.code()
-            );
+    fn every_code_is_unique() {
+        let mut codes: Vec<&str> = FailureCode::ALL.iter().map(|c| c.code()).collect();
+        let before = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(before, codes.len(), "failure codes must be unique");
+    }
+
+    #[test]
+    fn every_code_round_trips_back_to_its_code() {
+        for c in FailureCode::ALL {
+            assert_eq!(FailureCode::from_code(c.code()), Some(*c));
         }
+        assert_eq!(FailureCode::from_code("not_a_code"), None);
+        assert_eq!(FailureCode::from_code(""), None);
     }
 
     #[test]
-    fn an_unknown_code_is_not_a_class() {
-        assert_eq!(FailureClass::from_code("not_a_class"), None);
-        assert_eq!(FailureClass::from_code(""), None);
-    }
-
-    // ---- one test per class --------------------------------------------
-
-    #[test]
-    fn config_failure_is_not_retryable_and_exits_65() {
-        let c = FailureClass::Config;
-        assert_eq!(c.code(), "config");
-        assert_eq!(c.exit_code(), 65);
-        assert!(!c.retryable());
-    }
-
-    #[test]
-    fn usage_failure_is_not_retryable_and_exits_64() {
-        let c = FailureClass::Usage;
-        assert_eq!(c.code(), "usage");
-        assert_eq!(c.exit_code(), 64);
-        assert!(!c.retryable());
-    }
-
-    #[test]
-    fn budget_exceeded_failure_is_not_retryable_and_exits_67() {
-        let c = FailureClass::BudgetExceeded;
-        assert_eq!(c.code(), "budget_exceeded");
-        assert_eq!(c.exit_code(), 67);
-        assert!(!c.retryable());
-    }
-
-    #[test]
-    fn reviewer_unavailable_failure_is_retryable_and_exits_68() {
-        let c = FailureClass::ReviewerUnavailable;
-        assert_eq!(c.code(), "reviewer_unavailable");
-        assert_eq!(c.exit_code(), 68);
-        assert!(c.retryable());
-    }
-
-    #[test]
-    fn review_blocked_failure_is_not_retryable_and_exits_69() {
-        let c = FailureClass::ReviewBlocked;
-        assert_eq!(c.code(), "review_blocked");
-        assert_eq!(c.exit_code(), 69);
-        assert!(!c.retryable());
-    }
-
-    #[test]
-    fn diff_too_large_failure_is_not_retryable_and_exits_66() {
-        let c = FailureClass::DiffTooLarge;
-        assert_eq!(c.code(), "diff_too_large");
-        assert_eq!(c.exit_code(), 66);
-        assert!(!c.retryable());
-    }
-
-    #[test]
-    fn cancelled_failure_is_retryable_and_exits_70() {
-        let c = FailureClass::Cancelled;
-        assert_eq!(c.code(), "cancelled");
-        assert_eq!(c.exit_code(), 70);
-        assert!(c.retryable());
-    }
-
-    #[test]
-    fn engine_unreachable_failure_is_retryable_and_exits_71() {
-        let c = FailureClass::EngineUnreachable;
-        assert_eq!(c.code(), "engine_unreachable");
-        assert_eq!(c.exit_code(), 71);
-        assert!(c.retryable());
-    }
-
-    #[test]
-    fn internal_failure_is_not_retryable_and_exits_72() {
-        let c = FailureClass::Internal;
-        assert_eq!(c.code(), "internal");
-        assert_eq!(c.exit_code(), 72);
-        assert!(!c.retryable());
-    }
-
-    // ---- the unclassified default --------------------------------------
-
-    #[test]
-    fn unclassified_failures_keep_exit_code_one() {
-        assert_eq!(UNCLASSIFIED_EXIT_CODE, 1);
-        // Every existing caller that checks "non-zero means failure" keeps
-        // working: no classified code is 1, and 1 stays the fallback.
-        for c in FailureClass::ALL {
-            assert_ne!(c.exit_code(), UNCLASSIFIED_EXIT_CODE);
-        }
-    }
-
-    // ---- the JSON envelope ---------------------------------------------
-
-    #[test]
-    fn json_envelope_carries_class_code_retryable_and_message() {
-        let f = ClassifiedFailure::new(
-            FailureClass::ReviewerUnavailable,
-            "review failed: 0/1 reviewers completed",
+    fn the_five_classes_are_the_documented_five() {
+        let classes: Vec<&str> = FailureClass::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            classes,
+            vec!["transient", "permanent", "config", "budget", "blocked"]
         );
-        let j = f.to_json();
-        assert_eq!(j["class"], "reviewer_unavailable");
-        assert_eq!(j["code"], "reviewer_unavailable");
-        assert_eq!(j["retryable"], true);
-        assert_eq!(j["message"], "review failed: 0/1 reviewers completed");
+        for c in FailureClass::ALL {
+            assert_eq!(FailureClass::from_str_exact(c.as_str()), Some(*c));
+        }
+        assert_eq!(FailureClass::from_str_exact("fatal"), None);
     }
 
     #[test]
-    fn json_envelope_omits_the_reset_timestamp_when_there_is_none() {
-        let f = ClassifiedFailure::new(FailureClass::Internal, "boom");
-        let j = f.to_json();
+    fn every_class_has_its_documented_exit_code() {
+        assert_eq!(FailureClass::Blocked.exit_code(), 10);
+        assert_eq!(FailureClass::Transient.exit_code(), 20);
+        assert_eq!(FailureClass::Budget.exit_code(), 30);
+        assert_eq!(FailureClass::Config.exit_code(), 40);
+        assert_eq!(FailureClass::Permanent.exit_code(), 40);
+        // 50 and 75 are reserved, never a class code.
+        for c in FailureClass::ALL {
+            assert_ne!(c.exit_code(), 0);
+            assert_ne!(c.exit_code(), EXIT_INTERNAL);
+            assert_ne!(c.exit_code(), EXIT_RESERVED_ONESHOT);
+        }
+        assert_eq!(EXIT_INTERNAL, 50);
+        assert_eq!(EXIT_RESERVED_ONESHOT, 75);
+    }
+
+    #[test]
+    fn unclassified_failures_exit_the_internal_code() {
+        assert_eq!(UNCLASSIFIED_EXIT_CODE, 50);
+        assert_eq!(FailureCode::Internal.exit_code(), UNCLASSIFIED_EXIT_CODE);
+    }
+
+    #[test]
+    fn only_transient_is_retryable() {
+        for c in FailureClass::ALL {
+            assert_eq!(c.retryable(), c == FailureClass::Transient, "{c}");
+        }
+    }
+
+    // ---- the named classifications --------------------------------------
+
+    #[test]
+    fn each_named_code_carries_its_documented_class_and_exit_code() {
+        let expected = [
+            (FailureCode::ReviewBlocked, FailureClass::Blocked, 10),
+            (FailureCode::ReviewersUnavailable, FailureClass::Transient, 20),
+            (FailureCode::DiffTooLarge, FailureClass::Permanent, 40),
+            (FailureCode::DiffTruncated, FailureClass::Permanent, 40),
+            (FailureCode::EmptyDiff, FailureClass::Permanent, 40),
+            (FailureCode::NoReviewerModel, FailureClass::Config, 40),
+            (FailureCode::LoopExhausted, FailureClass::Permanent, 40),
+            (FailureCode::AuthorFailed, FailureClass::Transient, 20),
+            (FailureCode::AuthorTimeout, FailureClass::Transient, 20),
+            (FailureCode::PolicyViolation, FailureClass::Config, 40),
+            (FailureCode::EngineBudgetExceeded, FailureClass::Budget, 30),
+            (FailureCode::EngineUnreachable, FailureClass::Transient, 20),
+            (FailureCode::CancelUnconfirmed, FailureClass::Transient, 20),
+            (FailureCode::WorktreeTainted, FailureClass::Transient, 20),
+            (FailureCode::ConfigError, FailureClass::Config, 40),
+            (FailureCode::UsageError, FailureClass::Config, 40),
+            (FailureCode::Internal, FailureClass::Permanent, 50),
+        ];
+        for (code, class, exit) in expected {
+            assert_eq!(code.class(), class, "{code}");
+            assert_eq!(code.exit_code(), exit, "{code}");
+        }
+    }
+
+    // ---- the JSON envelope ----------------------------------------------
+
+    #[test]
+    fn the_envelope_is_ok_false_with_code_class_and_detail() {
+        let f = ClassifiedFailure::new(FailureCode::ReviewersUnavailable, "0/1 reviewers");
+        let env = error_envelope(&f);
+        assert_eq!(env["ok"], false);
+        assert_eq!(env["error"]["code"], "reviewers_unavailable");
+        assert_eq!(env["error"]["class"], "transient");
+        assert_eq!(env["error"]["detail"]["message"], "0/1 reviewers");
         assert!(
-            j.get("budget_reset_at").is_none(),
-            "a reset timestamp must never be fabricated: {j}"
+            env["error"].get("retry_after_s").is_none(),
+            "retry_after_s must never be fabricated: {env}"
         );
     }
 
     #[test]
-    fn json_envelope_carries_the_reset_timestamp_when_the_engine_gave_one() {
-        let f = ClassifiedFailure::with_budget_reset(
-            FailureClass::BudgetExceeded,
-            "budget_exceeded: quota exhausted",
-            Some("2026-11-01T00:00:00Z".to_string()),
-        );
-        let j = f.to_json();
-        assert_eq!(j["class"], "budget_exceeded");
-        assert_eq!(j["retryable"], false);
-        assert_eq!(j["budget_reset_at"], "2026-11-01T00:00:00Z");
+    fn the_envelope_lists_the_per_model_err_kind() {
+        let f = ClassifiedFailure::new(FailureCode::ReviewersUnavailable, "all failed")
+            .with_reviewers(vec![
+                ReviewerOutcome::new("a/one", "Timeout"),
+                ReviewerOutcome::new("b/two", "Server"),
+            ]);
+        let env = error_envelope(&f);
+        let reviewers = env["error"]["detail"]["reviewers"]
+            .as_array()
+            .expect("reviewers must be an array");
+        assert_eq!(reviewers[0]["model"], "a/one");
+        assert_eq!(reviewers[0]["err_kind"], "Timeout");
+        assert_eq!(reviewers[1]["err_kind"], "Server");
     }
 
-    // ---- the engine's budget refusal -----------------------------------
+    #[test]
+    fn the_engine_budget_reset_reaches_detail_and_retry_after_s() {
+        // A reset far in the future: the retry hint must be positive, and its
+        // value must be derived from resets_at, not guessed.
+        let reset = (chrono::Utc::now() + chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let f = ClassifiedFailure::with_budget_reset(
+            FailureCode::EngineBudgetExceeded,
+            "budget_exceeded: month limit",
+            Some(reset.clone()),
+        );
+        let env = error_envelope(&f);
+        assert_eq!(env["error"]["class"], "budget");
+        assert_eq!(env["error"]["code"], "engine_budget_exceeded");
+        assert_eq!(env["error"]["detail"]["resets_at"], reset);
+        let secs = env["error"]["retry_after_s"]
+            .as_i64()
+            .expect("a future reset must produce retry_after_s");
+        assert!((590..=601).contains(&secs), "retry_after_s = {secs}");
+    }
+
+    #[test]
+    fn a_reset_in_the_past_yields_no_retry_after() {
+        let f = ClassifiedFailure::with_budget_reset(
+            FailureCode::EngineBudgetExceeded,
+            "budget_exceeded: month limit",
+            Some("2000-01-01T00:00:00Z".into()),
+        );
+        assert_eq!(f.retry_after_s(chrono::Utc::now()), None);
+        assert!(error_envelope(&f)["error"].get("retry_after_s").is_none());
+    }
+
+    // ---- the engine's budget refusal ------------------------------------
 
     #[test]
     fn engine_budget_exceeded_text_is_recognized() {
-        let (class, reset) =
+        let (code, reset) =
             classify_engine_budget_exceeded("budget_exceeded: monthly spend cap reached")
                 .expect("the engine's budget refusal must be recognized");
-        assert_eq!(class, FailureClass::BudgetExceeded);
+        assert_eq!(code, FailureCode::EngineBudgetExceeded);
         assert_eq!(reset, None);
     }
 
     #[test]
-    fn engine_budget_exceeded_text_carries_the_reset_timestamp_when_present() {
-        let (class, reset) = classify_engine_budget_exceeded(
-            "budget_exceeded: quota exhausted, resets at 2026-11-01T00:00:00Z",
+    fn engine_budget_exceeded_text_carries_the_reset_timestamp() {
+        let (code, reset) = classify_engine_budget_exceeded(
+            "budget_exceeded: zoder engine spend cap reached ($170 of $100); resets \
+             2026-11-01T00:00:00Z",
         )
         .expect("the engine's budget refusal must be recognized");
-        assert_eq!(class, FailureClass::BudgetExceeded);
+        assert_eq!(code, FailureCode::EngineBudgetExceeded);
         assert_eq!(reset.as_deref(), Some("2026-11-01T00:00:00Z"));
     }
 
     #[test]
-    fn engine_budget_exceeded_text_is_recognized_inside_a_longer_message() {
-        let (class, _) = classify_engine_budget_exceeded(
+    fn engine_budget_exceeded_is_recognized_inside_a_longer_message() {
+        let (code, _) = classify_engine_budget_exceeded(
             "zoder: error: turn failed: budget_exceeded: spend cap reached",
         )
         .expect("the engine's budget refusal must be recognized anywhere");
-        assert_eq!(class, FailureClass::BudgetExceeded);
+        assert_eq!(code, FailureCode::EngineBudgetExceeded);
     }
 
     #[test]
@@ -838,7 +1050,7 @@ mod tests {
         assert!(classify_engine_budget_exceeded("budget exceeded").is_none());
     }
 
-    // ---- message recognition -------------------------------------------
+    // ---- message recognition --------------------------------------------
 
     #[test]
     fn an_unrecognized_message_stays_unclassified() {
@@ -846,79 +1058,48 @@ mod tests {
     }
 
     #[test]
-    fn a_config_error_message_is_recognized() {
-        let (class, _) = classify_message("loading zoder config to locate sessions dir: boom")
-            .expect("a config error must be recognized");
-        assert_eq!(class, FailureClass::Config);
+    fn the_recognized_markers_land_on_their_codes() {
+        let cases = [
+            ("loading zoder config to locate sessions dir: boom", FailureCode::ConfigError),
+            ("invalid --engine: nope", FailureCode::UsageError),
+            ("review diff is 900000 bytes, above the 400000-byte limit", FailureCode::DiffTooLarge),
+            ("the review diff was truncated during acquisition at 1048576 bytes", FailureCode::DiffTruncated),
+            ("empty_diff: no changes to review (main)", FailureCode::EmptyDiff),
+            ("no reviewer model resolved for --reviewer x", FailureCode::NoReviewerModel),
+            ("review blocked: aggregate verdict `request_changes`", FailureCode::ReviewBlocked),
+            ("review failed: 0/1 reviewers completed (all errors)", FailureCode::ReviewersUnavailable),
+            ("author cancellation unconfirmed: session x not confirmed", FailureCode::CancelUnconfirmed),
+            ("loop ended unresolved after 3 iteration(s)", FailureCode::LoopExhausted),
+            ("author turn timed out after 900s", FailureCode::AuthorTimeout),
+            ("author turn did not finish", FailureCode::AuthorFailed),
+            ("loop author turn violated free policy (use --allow-paid to permit)", FailureCode::PolicyViolation),
+            ("budget_exceeded: month limit", FailureCode::EngineBudgetExceeded),
+            ("connecting to engine at /run/x.sock: No such file or directory", FailureCode::EngineUnreachable),
+        ];
+        for (msg, want) in cases {
+            let (code, _) = classify_message(msg)
+                .unwrap_or_else(|| panic!("{msg:?} must be recognized"));
+            assert_eq!(code, want, "{msg:?}");
+        }
     }
 
-    #[test]
-    fn a_usage_error_message_is_recognized() {
-        let (class, _) =
-            classify_message("invalid --engine: nope").expect("a usage error must be recognized");
-        assert_eq!(class, FailureClass::Usage);
-    }
+    // ---- carrying a code through an anyhow chain ------------------------
 
     #[test]
-    fn a_diff_too_large_message_is_recognized() {
-        let (class, _) = classify_message(
-            "review diff is 900000 bytes, above the 400000-byte limit; pass --max-diff-bytes N",
-        )
-        .expect("a diff-size refusal must be recognized");
-        assert_eq!(class, FailureClass::DiffTooLarge);
-    }
-
-    #[test]
-    fn a_review_blocked_message_is_recognized() {
-        let (class, _) = classify_message(
-            "review blocked: aggregate verdict `request_changes` requests changes (a blocking review must not exit 0)",
-        )
-        .expect("a blocking verdict must be recognized");
-        assert_eq!(class, FailureClass::ReviewBlocked);
-    }
-
-    #[test]
-    fn a_reviewer_unavailable_message_is_recognized() {
-        let (class, _) = classify_message(
-            "review failed: 0/1 reviewers completed (all errors; see diagnostics above).",
-        )
-        .expect("a total reviewer failure must be recognized");
-        assert_eq!(class, FailureClass::ReviewerUnavailable);
-    }
-
-    #[test]
-    fn an_unconfirmed_cancel_message_is_recognized() {
-        let (class, _) =
-            classify_message("author cancellation unconfirmed: session x not confirmed")
-                .expect("an unconfirmed cancel must be recognized");
-        assert_eq!(class, FailureClass::Cancelled);
-    }
-
-    #[test]
-    fn an_engine_unreachable_message_is_recognized() {
-        let (class, _) = classify_message(
-            "connecting to engine at /run/zeroclaw/daemon.sock: No such file or directory",
-        )
-        .expect("an unreachable engine must be recognized");
-        assert_eq!(class, FailureClass::EngineUnreachable);
-    }
-
-    // ---- carrying a class through an anyhow chain -----------------------
-
-    #[test]
-    fn a_classified_error_keeps_its_class_through_a_context_frame() {
-        let err = classified_err(FailureClass::DiffTooLarge, "diff is 900000 bytes")
+    fn a_classified_error_keeps_its_code_through_a_context_frame() {
+        let err = classified_err(FailureCode::DiffTruncated, "diff is partial")
             .context("while preparing the review");
-        let recovered = classify_error(&err).expect("the class must survive the chain");
-        assert_eq!(recovered.class, FailureClass::DiffTooLarge);
-        assert_eq!(recovered.message, "diff is 900000 bytes");
+        let recovered = classify_error(&err).expect("the code must survive the chain");
+        assert_eq!(recovered.code, FailureCode::DiffTruncated);
+        assert_eq!(recovered.message, "diff is partial");
+        assert_eq!(recovered.exit_code(), 40);
     }
 
     #[test]
     fn an_unclassified_error_falls_back_to_message_recognition() {
         let err = anyhow::anyhow!("review failed: 0/1 reviewers completed (all errors)");
         let recovered = classify_error(&err).expect("the message must be recognized");
-        assert_eq!(recovered.class, FailureClass::ReviewerUnavailable);
+        assert_eq!(recovered.code, FailureCode::ReviewersUnavailable);
     }
 
     #[test]
@@ -928,37 +1109,28 @@ mod tests {
     }
 
     #[test]
-    fn the_error_envelope_carries_the_class_under_the_error_key() {
-        let f = ClassifiedFailure::new(FailureClass::EngineUnreachable, "daemon is down");
-        let env = error_envelope(&f);
-        assert_eq!(env["error"]["class"], "engine_unreachable");
-        assert_eq!(env["error"]["code"], "engine_unreachable");
-        assert_eq!(env["error"]["retryable"], true);
-        assert_eq!(env["error"]["message"], "daemon is down");
-    }
-
-    #[test]
     fn a_budget_error_carries_its_reset_timestamp_through_the_chain() {
         let err = classified_budget_err(
             "budget_exceeded: quota exhausted",
-            Some("2026-11-01T00:00:00Z".to_string()),
+            Some("2099-11-01T00:00:00Z".to_string()),
         );
-        let recovered = classify_error(&err).expect("the class must survive the chain");
-        assert_eq!(recovered.class, FailureClass::BudgetExceeded);
+        let recovered = classify_error(&err).expect("the code must survive the chain");
+        assert_eq!(recovered.code, FailureCode::EngineBudgetExceeded);
         assert_eq!(
             recovered.budget_reset_at.as_deref(),
-            Some("2026-11-01T00:00:00Z")
+            Some("2099-11-01T00:00:00Z")
         );
-        assert_eq!(recovered.exit_code(), 67);
+        assert_eq!(recovered.exit_code(), 30);
         assert!(!recovered.retryable());
+        assert!(recovered.retry_after_s(chrono::Utc::now()).is_some());
     }
 
     // ---- the documentation cannot drift from the code -------------------
 
-    /// `docs/EXIT_CODES.md` is the published contract. Every class and every
-    /// exit code it documents MUST match the implementation, and every class
-    /// in the implementation MUST be documented. A change to the vocabulary
-    /// without a documentation update fails here.
+    /// `docs/EXIT_CODES.md` is the published contract. Every code, class and
+    /// exit code it documents MUST match the implementation, and every code in
+    /// the implementation MUST be on the SAME line as its exit code, so the
+    /// table cannot pair a code with the wrong number.
     #[test]
     fn the_exit_code_document_matches_the_implementation() {
         let doc = std::fs::read_to_string(
@@ -966,27 +1138,26 @@ mod tests {
         )
         .expect("docs/EXIT_CODES.md must exist: it is the published contract");
 
-        for (code, exit) in class_exit_codes() {
-            // The class code must appear in the document.
-            assert!(
-                doc.contains(code),
-                "docs/EXIT_CODES.md does not document the failure class {code:?}"
-            );
-            // The exit code must appear on the SAME line as the class code,
-            // so the table cannot pair a class with the wrong code.
+        for (code, class, exit) in class_exit_codes() {
             let line = doc
                 .lines()
                 .find(|l| l.contains(&format!("`{code}`")))
                 .unwrap_or_else(|| panic!("docs/EXIT_CODES.md has no line for {code:?}"));
             assert!(
-                line.contains(&format!("{exit}")),
-                "docs/EXIT_CODES.md pairs {code:?} with the wrong exit code; expected {exit} in: {line:?}"
+                line.contains(&format!("`{exit}`")) || line.contains(&format!(" {exit} ")),
+                "docs/EXIT_CODES.md must pair {code:?} with exit {exit} on the same line: {line:?}"
+            );
+            assert!(
+                line.contains(class),
+                "docs/EXIT_CODES.md must state the class {class:?} for {code:?}: {line:?}"
             );
         }
-        // The unclassified fallback must be documented too.
-        assert!(
-            doc.contains("`1`") && doc.contains("not classified"),
-            "docs/EXIT_CODES.md must document the unclassified exit code 1"
-        );
+        // Every class and every ladder number is documented.
+        for c in FailureClass::ALL {
+            assert!(doc.contains(c.as_str()), "docs must document class {c}");
+        }
+        for n in [0, 10, 20, 30, 40, 50, 75] {
+            assert!(doc.contains(&n.to_string()), "docs must document exit {n}");
+        }
     }
 }

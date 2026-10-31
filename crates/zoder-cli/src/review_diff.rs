@@ -839,7 +839,7 @@ pub fn review_diff_chunks(
                 // A single diff section that cannot be split is a diff that
                 // cannot be reviewed as configured: `diff_too_large`.
                 return Err(crate::failure::classified_err(
-                    crate::failure::FailureClass::DiffTooLarge,
+                    crate::failure::FailureCode::DiffTooLarge,
                     format!(
                         "one diff section is {} bytes with no split point, above the {}-byte review limit; pass --max-hunk-bytes N to raise it",
                         section.len(),
@@ -869,7 +869,7 @@ pub fn review_diff_chunks(
                 // An oversized hunk that was not split: the diff cannot be
                 // reviewed as configured, so the class is `diff_too_large`.
                 return Err(crate::failure::classified_err(
-                    crate::failure::FailureClass::DiffTooLarge,
+                    crate::failure::FailureCode::DiffTooLarge,
                     format!(
                         "one diff hunk is {} bytes, above the {}-byte review limit; pass --max-hunk-bytes N to raise it, or omit --no-split-hunks to split it automatically",
                         header.len() + hunk.len(),
@@ -1151,7 +1151,7 @@ pub fn prepare_review_diff_with_chunks(
         // `diff_too_large`: the operator must raise the cap or exclude
         // files, and an identical retry fails identically.
         return Err(crate::failure::classified_err(
-            crate::failure::FailureClass::DiffTooLarge,
+            crate::failure::FailureCode::DiffTooLarge,
             format!(
                 "review diff is {} bytes, above the {}-byte limit; pass --max-diff-bytes N (or set [review].max_diff_bytes) to raise it, or --exclude <glob> to drop generated files",
                 filtered.len(),
