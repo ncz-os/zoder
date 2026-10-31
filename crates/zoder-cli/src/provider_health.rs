@@ -107,8 +107,11 @@ fn note_skip(model: &str, provider: &str, until_unix: i64, reason: &str) -> Stri
     )
 }
 
-fn decide(health_path: &std::path::Path, model: &str, at: i64) -> Precheck {
-    let ttl = ttl_secs();
+/// Resolve the gate decision. Reads `health.json` and may rewrite it to claim
+/// a half-open probe: small blocking fsync IO, so callers on the async runtime
+/// run it through `spawn_blocking` ([`decide_async`]), which resolves the TTL
+/// on the task and passes it in here.
+fn decide_with_ttl(health_path: &std::path::Path, model: &str, at: i64, ttl: i64) -> Precheck {
     let mut decision = None;
     let locked = HealthStore::mutate_locked(health_path, |h| {
         let m = h.models.entry(model.to_string()).or_default();
@@ -127,6 +130,95 @@ fn decide(health_path: &std::path::Path, model: &str, at: i64) -> Precheck {
             .map(|m| m.precheck_at(at, ttl))
             .unwrap_or(Precheck::NeedsProbe { half_open: false }),
     }
+}
+
+/// The gate decision off the async task.
+///
+/// The store read (and the possible half-open claim write) both take the
+/// health-store lock and fsync; that is milliseconds of blocking IO on a task
+/// that is about to make a network call. The blocking thread gets the TTL the
+/// async task resolved, so the environment is still read on the task and the
+/// decision is identical to the synchronous version.
+async fn decide_async(health_path: &std::path::Path, model: &str, at: i64) -> Precheck {
+    let ttl = ttl_secs();
+    let path = health_path.to_path_buf();
+    let key = model.to_string();
+    match tokio::task::spawn_blocking(move || decide_with_ttl(&path, &key, at, ttl)).await {
+        Ok(decision) => decision,
+        // A panicked/cancelled blocking task must not take the gate down: the
+        // synchronous decision still yields the same answer.
+        Err(_) => decide_with_ttl(health_path, model, at, ttl),
+    }
+}
+
+/// Record a gate outcome without blocking the async task for the store's
+/// fsync. Used by [`admit`]; the synchronous helpers stay available to callers
+/// that are already off the runtime. A panicked blocking task falls back to
+/// the synchronous write so an outcome is never silently dropped.
+async fn record_failure_async(
+    health_path: &std::path::Path,
+    provider_id: &str,
+    model: &str,
+    classification: Classification,
+    retry_after: Option<Duration>,
+    reason: &str,
+) {
+    let (path, key, key_model) = (
+        health_path.to_path_buf(),
+        provider_id.to_string(),
+        model.to_string(),
+    );
+    let key_reason = reason.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        record_failure(
+            &path,
+            &key,
+            &key_model,
+            classification,
+            retry_after,
+            &key_reason,
+        );
+    })
+    .await;
+    if join.is_err() {
+        record_failure(
+            health_path,
+            provider_id,
+            model,
+            classification,
+            retry_after,
+            reason,
+        );
+    }
+}
+
+/// [`record_success`] off the async task (see [`record_failure_async`]).
+async fn record_success_async(health_path: &std::path::Path, provider_id: &str, model: &str) {
+    let (path, key, key_model) = (
+        health_path.to_path_buf(),
+        provider_id.to_string(),
+        model.to_string(),
+    );
+    let join = tokio::task::spawn_blocking(move || record_success(&path, &key, &key_model)).await;
+    if join.is_err() {
+        record_success(health_path, provider_id, model);
+    }
+}
+
+/// Read the newest retry horizon for `model` off the async task.
+async fn retry_horizon_async(health_path: &std::path::Path, model: &str, fallback: i64) -> i64 {
+    let path = health_path.to_path_buf();
+    let key = model.to_string();
+    let join = tokio::task::spawn_blocking(move || {
+        HealthStore::load(&path)
+            .models
+            .get(&key)
+            .and_then(|m| m.gate.as_ref())
+            .and_then(|g| g.retry_not_before_unix)
+            .unwrap_or(fallback)
+    })
+    .await;
+    join.unwrap_or(fallback)
 }
 
 fn classify(error: &zoder_core::ProviderError) -> Classification {
@@ -206,7 +298,7 @@ pub(crate) async fn admit(
     model: &str,
 ) -> Result<Value, String> {
     let at = now();
-    match decide(health_path, model, at) {
+    match decide_async(health_path, model, at).await {
         Precheck::Fresh { checked_at_unix } => Ok(json!({
             "state": "healthy",
             "source": "cache",
@@ -238,7 +330,7 @@ pub(crate) async fn admit(
             };
             match failure {
                 None => {
-                    record_success(health_path, &provider_cfg.id, model);
+                    record_success_async(health_path, &provider_cfg.id, model).await;
                     Ok(json!({
                         "state": "healthy",
                         "source": if half_open { "half_open_probe" } else { "probe" },
@@ -246,20 +338,16 @@ pub(crate) async fn admit(
                     }))
                 }
                 Some((class, retry_after, reason)) => {
-                    record_failure(
+                    record_failure_async(
                         health_path,
                         &provider_cfg.id,
                         model,
                         class,
                         retry_after,
                         &reason,
-                    );
-                    let until = HealthStore::load(health_path)
-                        .models
-                        .get(model)
-                        .and_then(|m| m.gate.as_ref())
-                        .and_then(|g| g.retry_not_before_unix)
-                        .unwrap_or(at);
+                    )
+                    .await;
+                    let until = retry_horizon_async(health_path, model, at).await;
                     Err(note_skip(model, &provider_cfg.id, until, &reason))
                 }
             }
@@ -292,6 +380,46 @@ mod tests {
             max_concurrent: None,
             max_requests_per_minute: None,
         }
+    }
+
+    /// D5.9: the gate's store IO (lock + read + fsync, and the half-open
+    /// claim write) runs on the blocking pool, so it never stalls the async
+    /// worker that is about to make the provider call.
+    ///
+    /// On a current-thread runtime there is exactly one worker. If `decide` ran
+    /// inline, the decide and the concurrent tick would serialize; running it
+    /// on the blocking pool lets the tick fire while the store is being
+    /// mutated, and forbids any await inside the locked mutation (the tick
+    /// could never be polled then, and `block_on` would panic).
+    #[test]
+    fn gate_store_io_runs_off_the_async_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("health.json");
+        HealthStore::load(&path).save().expect("seed store");
+
+        let ticks = std::cell::Cell::new(0_u32);
+        let decision = runtime.block_on(async {
+            let decided = decide_async(&path, "model-x", now());
+            let ticked = async {
+                tokio::task::yield_now().await;
+                ticks.set(ticks.get() + 1);
+            };
+            let (decision, ()) = tokio::join!(decided, ticked);
+            decision
+        });
+        assert!(
+            matches!(decision, Precheck::NeedsProbe { half_open: false }),
+            "a never-seen model still needs its first probe"
+        );
+        assert_eq!(
+            ticks.get(),
+            1,
+            "the concurrent tick must run while the gate awaits its store IO"
+        );
     }
 
     /// Only providers named in `[health].providers` are gated; a provider is

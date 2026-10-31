@@ -2528,15 +2528,19 @@ async fn dispatch_reviewer_for_model(
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    let mut health = HealthStore::load(&eng.cfg.health_path);
-    if let Err(e) = crate::reconcile_policy_checked_turn(
+    let health = HealthStore::load(&eng.cfg.health_path);
+    // The reservation's reconcile is a flock + write + fsync: keep it off the
+    // dispatch task (D5.9) and hand the updated store back.
+    let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
         ledger_reservation,
         &ledger_entry,
         "reviewer turn",
-        &mut health,
+        health,
         model,
-        policy_failure.as_deref(),
-    ) {
+        policy_failure.clone(),
+    )
+    .await;
+    if let Err(e) = reconciled {
         // Policy violation: NOT fallback-worthy. The verified-cost
         // / paid-without-opt-in failure is a structural invariant; we
         // must not silently bury it by trying the next candidate.

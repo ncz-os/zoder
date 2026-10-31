@@ -295,6 +295,50 @@ pub(crate) fn record_turn_entry(
         .with_context(|| format!("reconciling reserved {turn_kind} spend"))
 }
 
+/// [`reconcile_policy_checked_turn`] off the async task.
+///
+/// Both halves do small blocking IO: the ledger write (flock + write + fsync)
+/// and the health-store update (lock + read + fsync). The caller's ordering is
+/// preserved — the ledger is still written before the policy failure is
+/// persisted or returned — only the thread the fsync runs on changes. The
+/// updated health store is handed back, so the caller's copy still sees it.
+pub(crate) async fn reconcile_policy_checked_turn_async(
+    reservation: BillableReservation,
+    entry: &Entry,
+    turn_kind: &'static str,
+    health: HealthStore,
+    health_model: &str,
+    policy_failure: Option<String>,
+) -> (anyhow::Result<()>, HealthStore) {
+    let entry = entry.clone();
+    let health_model = health_model.to_string();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut health = health;
+        let result = reconcile_policy_checked_turn(
+            reservation,
+            &entry,
+            turn_kind,
+            &mut health,
+            &health_model,
+            policy_failure.as_deref(),
+        );
+        // The caller still needs the post-update store even when the turn
+        // reported a violation, so hand it back instead of dropping it.
+        (result, health)
+    })
+    .await;
+    match joined {
+        Ok((result, health)) => (result, health),
+        // A panicked/cancelled blocking task must not look like success.
+        Err(join) => (
+            Err(anyhow::anyhow!(
+                "policy check during {turn_kind}: ledger task failed: {join}"
+            )),
+            HealthStore::default(),
+        ),
+    }
+}
+
 /// Classify an observed paid outcome independently of the pre-dispatch route.
 /// A backend can silently change models or billing posture after that route was
 /// approved, so every dispatch site must apply this to the actual result.
@@ -2761,27 +2805,51 @@ async fn run() -> anyhow::Result<()> {
 /// invocation wants clean machine output (`--json`) or it is the `update`
 /// command itself. Cached + opt-out via `ZODER_NO_UPDATE_CHECK=1`; any failure
 /// (offline, etc.) is silently ignored.
+///
+/// The check runs on a background thread and this task waits at most
+/// [`zoder_core::update::BACKGROUND_BUDGET`] for it
+/// ([`zoder_core::update::spawn_background`]), so a short command — every fleet
+/// subprocess included — never pays the update check's network latency. When
+/// the budget expires the hint is dropped for this run; the detached check
+/// still records its outcome, so a failed check is not retried for the whole
+/// retry interval.
 async fn maybe_notify_update(cli: &Cli) {
     if cli.json || matches!(cli.cmd, Some(Cmd::Update { .. })) {
         return;
     }
     let home = Config::home();
-    if let Some(st) =
-        zoder_core::update::check_cached(&home, std::time::Duration::from_secs(86_400)).await
-    {
-        if st.newer {
-            let p = Pal::new();
-            eprintln!(
-                "{}",
-                p.dim(&format!(
-                    "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
-                    st.current,
-                    st.latest,
-                    zoder_core::update::release_url()
-                ))
-            );
+    // The budget wait parks the calling thread, so the check runs on the
+    // blocking pool instead of stalling a runtime worker.
+    let checked = tokio::task::spawn_blocking(move || {
+        zoder_core::update::spawn_background(&home, std::time::Duration::from_secs(86_400))
+    })
+    .await;
+    // `spawn_background` itself returns `Option<UpdateStatus>`: `None` means
+    // "no hint for this run" (budget expired, fresh negative cache, disabled).
+    // Only the outer join can fail, and it fails when the blocking task
+    // panicked, which the update check must still never turn into a command
+    // failure. Debuggable, not silent: the reason goes to the log.
+    let st = match checked {
+        Ok(Some(st)) => st,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(%error, "background update check task failed; skipping the hint");
+            return;
         }
+    };
+    if !st.newer {
+        return;
     }
+    let p = Pal::new();
+    eprintln!(
+        "{}",
+        p.dim(&format!(
+            "zoder {} → a new release v{} is available. Run `zoder update` ({}).",
+            st.current,
+            st.latest,
+            zoder_core::update::release_url()
+        ))
+    );
 }
 
 /// `zoder update [--check]`: report whether a newer release exists; without
@@ -14402,7 +14470,7 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconcile_probe_success(
+async fn reconcile_probe_success(
     cli: &Cli,
     eng: &Engine,
     gate: &PolicyGate,
@@ -14410,8 +14478,8 @@ fn reconcile_probe_success(
     model_id: &str,
     result: ChatResult,
     reservation: BillableReservation,
-    health: &mut HealthStore,
-) -> anyhow::Result<()> {
+    health: HealthStore,
+) -> (anyhow::Result<()>, HealthStore) {
     let tokens_in = result.prompt_tokens.unwrap_or(0);
     let tokens_out = result.completion_tokens.unwrap_or(result.tokens_out);
     let posture = eng
@@ -14477,14 +14545,17 @@ fn reconcile_probe_success(
         tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    reconcile_policy_checked_turn(
+    // D5.9: the ledger write (flock + fsync) and the health-store update run
+    // on a blocking thread; the caller gets the updated store back.
+    reconcile_policy_checked_turn_async(
         reservation,
         &entry,
         "health probe",
         health,
         model_id,
-        policy_failure.as_deref(),
+        policy_failure.clone(),
     )
+    .await
 }
 
 /// Pick the probe for `health --probe`.
@@ -14624,7 +14695,7 @@ async fn run_probe_default(
         match provider.stream_chat(&req, None).await {
             Ok(result) => {
                 let ms = t.elapsed().as_millis() as f64;
-                reconcile_probe_success(
+                let (reconciled, updated) = reconcile_probe_success(
                     cli,
                     eng,
                     &gate,
@@ -14632,8 +14703,11 @@ async fn run_probe_default(
                     id,
                     result,
                     reservation,
-                    health,
-                )?;
+                    std::mem::take(health),
+                )
+                .await;
+                *health = updated;
+                reconciled?;
                 health.record_success(id, ms);
                 if !quiet {
                     eprintln!("  ok   {id}  {ms:.0}ms");
@@ -14979,7 +15053,7 @@ async fn run_probe_all(
                 match tokio::time::timeout(ping_budget, provider.stream_chat(&req, None)).await {
                     Ok(Ok(result)) => {
                         let ms = t.elapsed().as_millis() as f64;
-                        reconcile_probe_success(
+                        let (reconciled, updated) = reconcile_probe_success(
                             cli,
                             eng,
                             &gate,
@@ -14987,8 +15061,11 @@ async fn run_probe_all(
                             model_id,
                             result,
                             reservation,
-                            health,
-                        )?;
+                            std::mem::take(health),
+                        )
+                        .await;
+                        *health = updated;
+                        reconciled?;
                         health.record_classified_success(
                             model_id,
                             ms,
