@@ -1133,44 +1133,75 @@ impl PricingCatalog {
             return Some(p);
         }
         let ml = model.to_ascii_lowercase();
+        // An EXACT case-insensitive key is the same match as the exact one
+        // above, only spelled differently: accept it outright.
+        if let Some((_, p)) = self
+            .models
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == ml)
+        {
+            return Some(p);
+        }
+        // Short-name (leaf/suffix) fallback. It exists for id-vs-display-name
+        // drift (`deepseek-flash` for `deepseek/deepseek-flash`), NOT for
+        // re-attributing a call to another publisher.
+        //
+        // Two rules, both from the Z3 field incidents:
+        //   * a QUALIFIED id (`foo/bar`) is an explicit statement of which
+        //     model served the call; its leaf may not be borrowed from a
+        //     different publisher (`foo/deepseek-r1` is not
+        //     `deepseek/deepseek-r1`), so only an unqualified short name may
+        //     resolve one;
+        //   * an ambiguous leaf (two or more DISTINCT publishers under the
+        //     same short name) resolves to no price at all. C6-P3 picked the
+        //     MAX-rate match "to never undercharge"; that guess billed local
+        //     and third-party ids at the priciest cloud model's rates. Cost
+        //     unknown is honest and surfaces as such; a guessed price is not.
+        //
+        // The old rule was also order-dependent on a HashMap, so the only
+        // deterministic answers here are "the one match" and "none".
+        let qualified = ml.contains('/');
         let leaf = ml.rsplit('/').next().unwrap_or(&ml);
-        // C6-P3: a leaf/suffix fallback can match several distinct keys (e.g.
-        // `openai/gpt-4o` and `azure/gpt-4o` both leaf `gpt-4o`). Iterating a
-        // HashMap yields an arbitrary winner, so the returned price would be
-        // non-deterministic across runs. Resolve the collision deterministically
-        // AND fail-safe: pick the match with the highest effective rate
-        // (conservative for chargeback -- never undercharge), tie-broken by the
-        // lexicographically-first key so the result is stable regardless of map
-        // iteration order.
-        let rate = |p: &ModelPrice| -> f64 {
-            let mut r = p.usd_per_mtok;
-            if p.input_usd_per_mtok > r {
-                r = p.input_usd_per_mtok;
-            }
-            if p.output_usd_per_mtok > r {
-                r = p.output_usd_per_mtok;
-            }
-            r
-        };
-        let mut best: Option<(&String, &ModelPrice)> = None;
+        if leaf.is_empty() {
+            return None;
+        }
+        let mut found: Option<(&String, &ModelPrice)> = None;
         for (k, v) in self.models.iter() {
             let kl = k.to_ascii_lowercase();
+            if kl == ml {
+                continue; // counted by the exact pass above
+            }
             let key_leaf = kl.rsplit('/').next().unwrap_or(&kl);
-            if kl == ml || key_leaf == leaf {
-                best = Some(match best {
-                    None => (k, v),
-                    Some((bk, bv)) => {
-                        let (bv_r, v_r) = (rate(bv), rate(v));
-                        if v_r > bv_r || (v_r == bv_r && k.as_str() < bk.as_str()) {
-                            (k, v)
-                        } else {
-                            (bk, bv)
-                        }
-                    }
-                });
+            if key_leaf != leaf {
+                continue;
+            }
+            // A qualified query never borrows from a different publisher. The
+            // vendor segments (everything before the leaf) must match with
+            // equal depth, so `together/meta/llama-4` matches the catalog's
+            // `meta/llama-4` (same vendor, one gateway hop) but neither
+            // `openai/gpt-4o` (another publisher) nor
+            // `together/mistral/llama-4` (another vendor).
+            if qualified {
+                let segments = |s: &str| -> Vec<String> {
+                    s.rsplit('/')
+                        .skip(1)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                };
+                let query_segments = segments(&ml);
+                let key_segments = segments(&kl);
+                let depth = query_segments.len().min(key_segments.len());
+                if query_segments[..depth] != key_segments[..depth] {
+                    continue;
+                }
+            }
+            match found {
+                None => found = Some((k, v)),
+                // Same leaf under a second publisher: ambiguous, do not guess.
+                Some(_) => return None,
             }
         }
-        best.map(|(_, v)| v)
+        found.map(|(_, v)| v)
     }
 
     /// Chargeback for a call (legacy `f64` interface — collapses
@@ -1688,7 +1719,11 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(cat2.lookup("llama-4-70b").is_some());
+        // Same publisher, different gateway host: the vendor segment matches.
         assert!(cat2.lookup("together/meta/llama-4-70b").is_some());
+        // ...but a DIFFERENT vendor under the same gateway does not borrow it.
+        assert!(cat2.lookup("together/mistral/llama-4-70b").is_none());
     }
 
     #[test]
