@@ -13233,13 +13233,29 @@ fn parse_date(s: &str, end_of_day: bool) -> anyhow::Result<chrono::DateTime<chro
 /// Returns `None` when every row was priced, so a clean ledger prints
 /// nothing extra.
 fn spend_unknown_cost_note(roll: &std::collections::BTreeMap<String, Rollup>) -> Option<String> {
-    // A row is "unknown cost" if EITHER counter is set: a row can carry
-    // unknown-cost tokens with `calls = 0`. Both are folded out of the cost
-    // columns, so both must be surfaced (Z3).
-    let rows = roll
-        .values()
-        .filter(|r| r.unknown_cost_calls > 0 || r.unknown_cost_tokens > 0)
-        .count();
+    // The note says "N rows", so it must count ROWS. The buckets are months
+    // (`spend month`) or models (`--by-model`), and a bucket's counters hold
+    // the values FOLDED into it — `accumulate_rollup` adds every unpriced
+    // row's tokens and its `calls` (default 1) into the same two fields, so
+    // neither counter is a row count: one row can carry 120 tokens, and
+    // `calls = 0` is a legal row. The old code counted non-empty BUCKETS and
+    // called them rows, so one month with 40 unpriced calls printed
+    // "1 unknown-cost row".
+    //
+    // `unknown_cost_rows` is the row count `accumulate_rollup` keeps for
+    // exactly this line. The `> 1`/`== 1` fallback covers a bundle built
+    // without it (a caller that summed tokens and calls by hand): such a
+    // bundle is one row unless it says otherwise.
+    let mut rows: u64 = 0;
+    for bucket in roll.values() {
+        rows = rows.saturating_add(if bucket.unknown_cost_rows > 0 {
+            bucket.unknown_cost_rows
+        } else if bucket.unknown_cost_calls > 0 || bucket.unknown_cost_tokens > 0 {
+            1
+        } else {
+            0
+        });
+    }
     if rows == 0 {
         return None;
     }
@@ -15761,9 +15777,9 @@ fn build_external_catalog(cat: &PricingCatalog, corpus: &Corpus) -> PricingCatal
             continue;
         }
         if let Some(price) = cat.lookup(&m.id) {
-            // A priced row, or an explicit $0 the feed/operator wrote: both
-            // are statements about the model, and both must reach the engine.
-            if price.is_priced() || !price.source.trim().is_empty() {
+            // A priced row, or an explicit $0 the operator pinned: both are
+            // statements about the model, and both must reach the engine.
+            if is_publishable(price) {
                 out.models.insert(m.id.clone(), price.clone());
                 if !m.leaf.is_empty() {
                     out.models
@@ -15774,6 +15790,33 @@ fn build_external_catalog(cat: &PricingCatalog, corpus: &Corpus) -> PricingCatal
         }
     }
     out
+}
+
+/// Whether a catalog row says anything an engine can bill from.
+///
+/// Two shapes are statements: a non-zero rate, and an explicit `$0` an
+/// operator pinned (`source` = `operator`, or [`FREE_ENGINE_ENTRY_SOURCE`]).
+///
+/// A non-empty `source` on its own is NOT: `source` is provenance, and a row
+/// can carry it while omitting every rate (`{"source": "litellm"}` from a
+/// partial feed, or a hand-edited catalog). Publishing that row hands the
+/// engine neither a rate nor an explicit free declaration — it is rate-less
+/// filler that looks priced.
+fn is_publishable(price: &ModelPrice) -> bool {
+    price.is_priced() || is_operator_pinned_zero(&price.source)
+}
+
+/// Provenance an operator writes to pin a model at an explicit $0, and the
+/// provenance [`engine_catalog`] stamps on a config-declared free model.
+const OPERATOR_PINNED_ZERO_SOURCE: &str = "operator";
+
+/// An explicit-$0 provenance tag: the operator's, or a config-free stamp
+/// (which a re-read of a previously published catalog carries).
+fn is_operator_pinned_zero(source: &str) -> bool {
+    matches!(
+        source.trim(),
+        OPERATOR_PINNED_ZERO_SOURCE | FREE_ENGINE_ENTRY_SOURCE
+    )
 }
 
 /// Every row of `cat` except the ones that carry no rate AT ALL and no
@@ -15793,7 +15836,7 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
         ..Default::default()
     };
     for (id, price) in &cat.models {
-        if price.is_priced() || !price.source.trim().is_empty() {
+        if is_publishable(price) {
             out.models.insert(id.clone(), price.clone());
         }
     }
@@ -15818,18 +15861,35 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
 fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
     let mut out = full_priced_catalog(cat);
     for id in configured_free_models(cfg) {
-        // A `serves` entry may be a full model id (`local/qwen3.8-coder`) or a
-        // bare prefix (`local/`). The engine looks models up by the full id it
-        // routed, so a prefix declaration must also stamp every known feed row
-        // under that prefix -- otherwise the $0 declaration sits under `local/`
-        // where nothing looks it up, and the models under it stay unpriced.
-        let mut targets: Vec<String> = Vec::new();
-        if id.ends_with('/') {
-            // A bare prefix is a declaration over ids, not an id: the engine
-            // would never look up `local/`, so it is only a seed for matching
-            // feed rows.
-            targets.extend(cat.models.keys().filter(|k| k.starts_with(&id)).cloned());
+        // A `serves` entry is usually a PREFIX (`local/`, `mimax-`, `gpt-`):
+        // routing matches it with `str::starts_with`, and the engine looks
+        // models up by the full id it routed. So the only rows worth writing
+        // are the feed ids the prefix claims — a declaration written under
+        // the prefix itself is a key no lookup ever produces.
+        //
+        // A delimiter-bounded id (`local/qwen3.8-coder`) can be BOTH a feed id
+        // and the textual head of another one (`...-max`); there the exact
+        // entry is the model and the neighbour is a different model. A bare
+        // prefix (`llama-`, `local/`) is matched as a prefix only.
+        //
+        // An entry that is neither a feed id nor a prefix of one is still a
+        // model the operator declared free (a local server the feed does not
+        // list), so a delimiter-bounded one is written as written.
+        let is_prefix_shaped = id.ends_with('/') || !id.contains('/');
+        let mut targets: Vec<String> = if cat.models.contains_key(id.as_str()) && !is_prefix_shaped
+        {
+            vec![id.clone()]
         } else {
+            cat.models
+                .keys()
+                .filter(|k| k.starts_with(id.as_str()) && k.as_str() != id.as_str())
+                .cloned()
+                .collect()
+        };
+        // Never write a declared PREFIX as if it were a model: no lookup
+        // produces `llama-`, so the row is dead weight that hides the fact
+        // that the declaration reached nothing.
+        if targets.is_empty() && !is_prefix_shaped {
             targets.push(id.clone());
         }
         for target in targets {
@@ -15852,11 +15912,13 @@ fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
 /// the engine copy can tell a config-declared free model from a feed rate.
 const FREE_ENGINE_ENTRY_SOURCE: &str = "zoder-config-free";
 
-/// Models the config declares free or local: the served prefixes of every
+/// Models the config declares free or local: the `serves` entries of every
 /// free-tier / flat-fee provider.
 ///
-/// A `serves` prefix is kept as written (`local/`), because that is how the
-/// engine reports a model it routed by prefix. This only ever PRODUCES $0
+/// An entry is usually a PREFIX (`local/`, `mimax-`), which is how routing
+/// matches a model to a provider (`str::starts_with`); [`engine_catalog`]
+/// expands it against the feed. It is returned as written because only the
+/// caller knows the feed ids it may describe. This only ever PRODUCES $0
 /// entries for models the feed does not price, so the worst case is a $0 row
 /// that the operator declared free; the failure this guards against (a local
 /// model the engine has no row for) is the one that cost $170.
@@ -23602,7 +23664,7 @@ mod engine_cost_accounting_tests {
         );
         let mut cat = paid_catalog();
         cat.models
-            .insert("local/llama-3.3-70b".to_string(), ModelPrice::default());
+            .insert("llama-3.3-70b".to_string(), ModelPrice::default());
         let out = engine_catalog(&cat, &cfg);
         assert!(
             !out.models.contains_key("llama-"),
@@ -23610,7 +23672,7 @@ mod engine_cost_accounting_tests {
             out.models.keys().collect::<Vec<_>>()
         );
         assert!(
-            out.models.contains_key("local/llama-3.3-70b"),
+            out.models.contains_key("llama-3.3-70b"),
             "the model the feed knows under the prefix must carry the $0 row"
         );
     }
@@ -23849,6 +23911,7 @@ mod engine_cost_accounting_tests {
                 calls: 3,
                 unknown_cost_tokens: 500,
                 unknown_cost_calls: 2,
+                unknown_cost_rows: 2,
             },
         );
         let line = spend_unknown_cost_note(&roll).expect("a note is printed");
@@ -23889,6 +23952,7 @@ mod engine_cost_accounting_tests {
             Rollup {
                 unknown_cost_tokens: 900,
                 unknown_cost_calls: 0,
+                unknown_cost_rows: 1,
                 ..Default::default()
             },
         );
@@ -23921,6 +23985,7 @@ mod engine_cost_accounting_tests {
             Rollup {
                 unknown_cost_calls: 3,
                 unknown_cost_tokens: 120,
+                unknown_cost_rows: 3,
                 ..Default::default()
             },
         );
@@ -23950,6 +24015,7 @@ mod engine_cost_accounting_tests {
             Rollup {
                 unknown_cost_calls: 0,
                 unknown_cost_tokens: 1,
+                unknown_cost_rows: 1,
                 ..Default::default()
             },
         );

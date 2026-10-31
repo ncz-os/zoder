@@ -1113,10 +1113,13 @@ data-age trigger (an old feed then prints one warning instead of refreshing).
 The engine catalog zoder writes (`<engine data dir>/pricing.json`) carries
 every priced row **plus an explicit `$0` entry for each model your config
 declares free or local** (a `billing = "free"` or flat-fee provider's
-`serves` prefixes, tagged `"source": "zoder-config-free"`). An absent row is
-not a statement that a model is free, and the engine prices what it cannot
-find its own way — that is how a local-only month tripped the engine's own
-monthly backstop at $170 while real billed usage was under $1.
+`serves` prefixes, tagged `"source": "zoder-config-free"`). A `serves` entry
+is a *prefix*: it is expanded to the full model ids the price feed lists
+under it, because the engine looks a model up by the id it routed, never by
+a prefix. A declaration that claims no feed model at all is not written.
+An absent row is not a statement that a model is free, and the engine prices
+what it cannot find its own way — that is how a local-only month tripped the
+engine's own monthly backstop at $170 while real billed usage was under $1.
 
 Set the pricing source to **`file`** to make the installed files
 authoritative: they are used exactly as installed — never re-pulled, never

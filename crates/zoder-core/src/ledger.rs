@@ -279,6 +279,12 @@ pub struct Rollup {
     /// known-cost token/call denominator so `$0` is never inferred.
     pub unknown_cost_tokens: u64,
     pub unknown_cost_calls: u64,
+    /// How many LEDGER ROWS were folded into the unknown-cost fields above.
+    ///
+    /// Separate from both of them: a row's token count is not its row count,
+    /// and `calls = 0` is a legal row (so the call counter cannot stand in
+    /// either). Only a bundle that folds unpriced rows sets this.
+    pub unknown_cost_rows: u64,
 }
 
 fn accumulate_rollup(rollup: &mut Rollup, entry: &Entry) -> anyhow::Result<()> {
@@ -287,6 +293,7 @@ fn accumulate_rollup(rollup: &mut Rollup, entry: &Entry) -> anyhow::Result<()> {
             .unknown_cost_tokens
             .saturating_add(entry.tokens_in.saturating_add(entry.tokens_out));
         rollup.unknown_cost_calls = rollup.unknown_cost_calls.saturating_add(entry.calls);
+        rollup.unknown_cost_rows = rollup.unknown_cost_rows.saturating_add(1);
         return Ok(());
     }
     add_cost(&mut rollup.cost_usd, entry.cost_usd)?;
