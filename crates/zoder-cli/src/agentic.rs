@@ -5994,14 +5994,12 @@ async fn confirm_reviews(
         let ReviewerSlot::Ok { model, review } = slot else {
             continue;
         };
-        if !verdict_triggers_confirmation(&review.verdict) {
-            continue;
-        }
-        if !review
-            .findings
-            .iter()
-            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
-        {
+        // Confirmation runs for a blocking verdict, AND for any review that
+        // carries a `high`/`critical` finding whatever its verdict: a
+        // `comment` (or `approve`) with a blocking finding must be re-checked
+        // before it can pass, or a critical defect the reviewer itself
+        // reported never gets a second opinion.
+        if !confirmation_applies(review) {
             continue;
         }
         let reviewer_model = model.clone();
@@ -6018,11 +6016,23 @@ async fn confirm_reviews(
         {
             confirm_sections.push(section);
             // The confirmed verdict supersedes the reviewer's own: a review
-            // whose findings all demoted is no longer request_changes.
+            // whose findings all demoted is no longer request_changes, and a
+            // review whose `comment` carried a finding that still blocks
+            // (or was confirmed) is raised to request_changes.
             review.verdict = verdict;
         }
     }
     confirm_sections
+}
+
+/// Whether the confirm layer runs for this review: it blocks on the
+/// reviewer's verdict, or the reviewer reported a `high`/`critical` finding.
+fn confirmation_applies(review: &ReviewOutput) -> bool {
+    verdict_triggers_confirmation(&review.verdict)
+        || review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity))
 }
 
 /// Dispatch one confirmer call and turn the reply into an attempt.
@@ -6090,9 +6100,14 @@ async fn dispatch_confirmer(
 /// Confirm-on-reject for a single reviewer's output.
 ///
 /// Returns the confirm section (record shape v1) and the verdict the review
-/// should carry. When the verdict does NOT trigger confirmation (an
-/// `approve`) or no finding is a `high`/`critical` candidate, the output is
-/// returned unchanged except for a `not_run`-only record.
+/// should carry. Confirmation runs when the verdict is blocking OR the review
+/// carries a `high`/`critical` finding; when there is no such finding the
+/// reviewer's own verdict is returned unchanged.
+///
+/// The returned verdict is the merged one, except that a `comment` (or
+/// `approve`) whose blocking finding was NOT demoted is raised to
+/// `request_changes`: the reviewer reported a blocker and no independent
+/// confirmer rejected it, so it must not pass as a non-blocking verdict.
 ///
 /// The confirmer is dispatched through the same reviewer call path as a
 /// reviewer (`dispatch_reviewer_for_model`), so every configured gate applies:
@@ -6134,8 +6149,16 @@ async fn confirm_review(
         return None;
     }
 
-    // Confirm only on a blocking verdict; an approve stays advisory.
-    let confirm_this = verdict_triggers_confirmation(&review.verdict);
+    // Confirmation runs for a blocking verdict, and for any review carrying a
+    // `high`/`critical` finding: a `comment` that reports a critical defect
+    // must be re-checked, and raised to request_changes when the finding
+    // stands. An `approve` carrying a blocking finding is re-checked too — the
+    // raise rule is what stops it passing.
+    let confirm_this = verdict_triggers_confirmation(&review.verdict)
+        || review
+            .findings
+            .iter()
+            .any(|f| crate::review_confirm::is_blocking_severity(&f.severity));
 
     let (blocking, non_blocking): (Vec<_>, Vec<_>) = all
         .into_iter()
@@ -6159,29 +6182,15 @@ async fn confirm_review(
     }
 
     if !confirm_this {
-        // An approve (or comment): no confirmation runs. Blocking findings, if
-        // any, are recorded not_run and non-blocking because the verdict never
-        // blocked in the first place.
-        for f in &blocking {
-            decisions.push(FindingDecision {
-                finding_id: f.id.clone(),
-                severity: f.severity.clone(),
-                location: f.location.clone(),
-                quote: f.quote.clone(),
-                quote_found: f.quote_found,
-                disposition: Disposition::NotRun,
-                blocking: false,
-                reason: "verdict is not request_changes; confirmation never runs".to_string(),
-                attempts: Vec::new(),
-            });
-        }
+        // No blocking-severity finding at all: there is nothing to confirm,
+        // so the reviewer's verdict stands unchanged.
         let merged = crate::review_confirm::ConfirmedReview {
             decisions,
             demoted: Vec::new(),
             effective_blocking: false,
             reviewer_family_recall: None,
         };
-        let verdict = "approve".to_string();
+        let verdict = review.verdict.clone();
         let payload = crate::review_confirm::record(
             &merged,
             reviewer_model,
@@ -6267,7 +6276,14 @@ async fn confirm_review(
         effective_blocking: confirmed.effective_blocking,
         reviewer_family_recall: confirmed.reviewer_family_recall,
     };
-    let verdict = merged.effective_verdict().to_string();
+    // A verdict of `comment` (or `approve`) with a blocking finding that was
+    // not demoted is raised to request_changes: the reviewer reported a
+    // blocker in its own output, and no independent confirmer rejected it.
+    let verdict = if crate::review_confirm::raised_by_confirmed_finding(&merged, &review.verdict) {
+        "request_changes".to_string()
+    } else {
+        merged.effective_verdict().to_string()
+    };
     let payload = crate::review_confirm::record(
         &merged,
         reviewer_model,
@@ -13857,6 +13873,320 @@ not run to max_iters"
             !review_would_bail(&[ok_slot("real", "comment")], 1, 0),
             "a neutral comment (no blocker) must exit 0"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D4.1 + D4.2: two paths that used to let a blocked PR exit 0. Both are
+    // golden tests: they drive the PRODUCTION bridge (grounding -> pre-check
+    // -> aggregate -> the aggregate verdict `cmd_review` gates on) and then
+    // assert the exit-code decision `cmd_review` applies, `verdict_rank >= 2`.
+    // -----------------------------------------------------------------------
+
+    /// The reviewed head for the two golden tests: one readable file.
+    fn read_src_test(path: &str) -> Option<String> {
+        (path == "src/a.rs").then(|| "fn a() { let x = 1; }\n".to_string())
+    }
+
+    /// A reviewer's confirmed finding, as the confirm bridge sees it.
+    fn finding_at(severity: &str, location: &str, claim: &str) -> Finding {
+        Finding {
+            severity: severity.into(),
+            title: claim.into(),
+            body: claim.into(),
+            location: Some(location.into()),
+            disposition: None,
+        }
+    }
+
+    /// The verdict `cmd_review` gates on for one reviewer's review after the
+    /// confirm bridge ran over it. This is `aggregate_review`'s worst-rank
+    /// walk, the same one `emit_reviews` -> `cmd_review` uses.
+    fn gated_verdict(review: &ReviewOutput) -> (String, bool) {
+        let slot = ReviewerSlot::Ok {
+            model: "real".into(),
+            review: review.clone(),
+        };
+        let (agg, _, _) = aggregate_review(std::slice::from_ref(&slot), 0.0, 1, 1, 0);
+        let bail = verdict_rank(&agg) >= 2;
+        (agg, bail)
+    }
+
+    /// A confirmer attempt that CONFIRMED the finding: it quotes the context
+    /// verbatim and speaks only about `finding_id`.
+    fn confirming_attempt(
+        finding_id: &str,
+        context: &str,
+    ) -> crate::review_confirm::ConfirmerAttempt {
+        crate::review_confirm::confirmer_attempt_from_reply(
+            "confirmer-model".into(),
+            "other".into(),
+            5,
+            &json!({
+                "finding_id": finding_id,
+                "disposition": "confirm",
+                "quote": context.lines().next().unwrap_or(""),
+                "reason": "the defect is real",
+            })
+            .to_string(),
+            finding_id,
+            context,
+        )
+    }
+
+    /// D4.1 golden: a reviewer blocks on a `critical` finding that cites a
+    /// file the review cannot read (`a/src/x.rs`, not in the tree — a deleted
+    /// file, or an IO error). The unreadable file must not disprove the
+    /// finding: it is kept, reaches a confirmer, is confirmed, and the review
+    /// still blocks -> `cmd_review` exits NONZERO.
+    ///
+    /// The regression: the grounding check read `None` from the cited path as
+    /// "the location does not exist", the pre-check dropped the finding as
+    /// `filtered_z3` with no model call, the only blocker was gone, the verdict
+    /// became `comment`, and `cmd_review` exited 0.
+    #[tokio::test]
+    async fn cmd_review_exits_nonzero_for_unreadable_cited_path() {
+        use crate::review_confirm::{build_context, precheck, ConfirmLimits, Disposition};
+
+        let cited = "a/src/x.rs";
+        let location = format!("{cited}:4");
+        let claim = "the `let guard = value.unwrap()` is dropped";
+        // The reader the review uses: the cited path is unreadable, and the
+        // diff touches exactly that file.
+        let read = |path: &str| -> Option<String> { (path != cited).then(|| "fn f() {}\n".into()) };
+        let touched = vec![cited.to_string()];
+        let all = pending_findings_for_confirm(
+            &ReviewOutput {
+                verdict: "request_changes".into(),
+                summary: "the guard is dropped".into(),
+                findings: vec![finding_at("critical", &location, claim)],
+                next_steps: vec![],
+                ..Default::default()
+            },
+            "fam",
+            &touched,
+            &read,
+        );
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].grounded,
+            "an unreadable cited path neither grounds nor disproves the finding; \
+             it must stay ungroundable (kept), not be dropped"
+        );
+        assert!(
+            all[0].ungrounded_reason.is_empty(),
+            "an unreadable path is not a reason to drop: {}",
+            all[0].ungrounded_reason
+        );
+
+        // Pre-check: NOT dropped, so it reaches a confirmer.
+        let (checks, pending) = precheck(&all);
+        assert!(!checks[0].dropped, "the blocking finding must be kept");
+        assert_eq!(pending.len(), 1, "the finding must reach a confirmer");
+
+        // The confirmer re-checks it from the same unreadable state.
+        let context = build_context(&pending[0], "", &read, 40, &touched);
+        let limits = ConfirmLimits::default();
+        let jobs: Vec<crate::review_confirm::ConfirmationJob> = pending
+            .iter()
+            .map(|f| crate::review_confirm::ConfirmationJob {
+                plan: crate::review_confirm::FindingPlan {
+                    finding: f.clone(),
+                    reviewer_model: "real".into(),
+                    reviewer_family: "fam".into(),
+                    confirmer_chain: vec!["confirmer-model".into()],
+                    context: context.clone(),
+                },
+                confirmers: vec!["confirmer-model".into()],
+            })
+            .collect();
+        let merged = crate::review_confirm::aggregate(&jobs, &limits, &mut |plan| {
+            vec![confirming_attempt(&plan.finding.id, &plan.context)]
+        });
+        assert_eq!(merged.decisions.len(), 1);
+        assert_eq!(merged.decisions[0].disposition, Disposition::Confirmed);
+        assert!(merged.effective_blocking);
+        assert_eq!(merged.effective_verdict(), "request_changes");
+
+        // And `cmd_review`'s gate: the review still blocks.
+        let mut review = rro("request_changes");
+        review.findings = vec![finding_at("critical", &location, claim)];
+        review.verdict = merged.effective_verdict().into();
+        let (agg, bail) = gated_verdict(&review);
+        assert!(
+            bail,
+            "an unreadable cited path must not unblock the review (aggregate {agg})"
+        );
+    }
+
+    /// D4.2 golden: a reviewer answers `comment` but carries a `critical`
+    /// finding, and the confirmer CONFIRMS it. A verdict of `comment` with a
+    /// confirmed critical finding must be raised to `request_changes`, and
+    /// `cmd_review` must exit NONZERO.
+    ///
+    /// The regression: confirmation ran only for blocking verdicts, so a
+    /// `comment` carrying a `critical` finding was never re-checked, and
+    /// `strict_review` forbids only `approve` with a critical/high finding, so
+    /// the review passed.
+    #[tokio::test]
+    async fn cmd_review_exits_nonzero_for_comment_with_critical_finding() {
+        use crate::review_confirm::{
+            is_blocking_severity, raised_by_confirmed_finding, ConfirmLimits, Disposition,
+        };
+
+        let review = ReviewOutput {
+            verdict: "comment".into(),
+            summary: "one serious concern".into(),
+            findings: vec![finding_at(
+                "critical",
+                "src/a.rs:1",
+                "the `let x = 1` is wrong",
+            )],
+            next_steps: vec![],
+            ..Default::default()
+        };
+        assert!(is_blocking_severity(&review.findings[0].severity));
+        // The production trigger: a comment with a blocking-severity finding
+        // must reach confirmation instead of being skipped.
+        assert!(
+            verdict_triggers_confirmation(&review.verdict)
+                || review
+                    .findings
+                    .iter()
+                    .any(|f| is_blocking_severity(&f.severity)),
+            "a comment carrying a critical finding must reach confirmation"
+        );
+
+        let all = pending_findings_for_confirm(&review, "fam", &[], &read_src_test);
+        assert_eq!(all.len(), 1);
+        let context = "the `let x = 1` is wrong";
+        let limits = ConfirmLimits::default();
+        let jobs: Vec<crate::review_confirm::ConfirmationJob> = all
+            .iter()
+            .map(|f| crate::review_confirm::ConfirmationJob {
+                plan: crate::review_confirm::FindingPlan {
+                    finding: f.clone(),
+                    reviewer_model: "real".into(),
+                    reviewer_family: "fam".into(),
+                    confirmer_chain: vec!["confirmer-model".into()],
+                    context: context.into(),
+                },
+                confirmers: vec!["confirmer-model".into()],
+            })
+            .collect();
+        let merged = crate::review_confirm::aggregate(&jobs, &limits, &mut |plan| {
+            vec![confirming_attempt(&plan.finding.id, &plan.context)]
+        });
+        assert_eq!(merged.decisions[0].disposition, Disposition::Confirmed);
+        assert!(merged.effective_blocking);
+
+        // The raise rule: a confirmed critical/high finding blocks even the
+        // reviewer's own `comment`.
+        assert!(raised_by_confirmed_finding(&merged, &review.verdict));
+        let mut corrected = review.clone();
+        corrected.verdict = merged.effective_verdict().into();
+        assert_eq!(corrected.verdict, "request_changes");
+        let (agg, bail) = gated_verdict(&corrected);
+        assert!(
+            bail,
+            "comment with a confirmed critical finding must block (aggregate {agg})"
+        );
+    }
+
+    /// The raises rule pinned for every blocking disposition, and NOT for a
+    /// demoted finding: a `comment` whose critical finding the confirmer
+    /// REJECTED (with two independent rejects) stays `comment` and exits 0.
+    #[test]
+    fn comment_with_critical_finding_blocks() {
+        use crate::review_confirm::{
+            raised_by_confirmed_finding, ConfirmLimits, Disposition, FindingDecision, FindingPlan,
+            PendingFinding,
+        };
+
+        let f = PendingFinding {
+            id: "id".into(),
+            severity: "critical".into(),
+            location: "src/a.rs:1".into(),
+            quote: None,
+            claim: "the `let x = 1` is wrong".into(),
+            quote_found: false,
+            grounded: true,
+            ungrounded_reason: String::new(),
+        };
+        let j = crate::review_confirm::ConfirmationJob {
+            plan: FindingPlan {
+                finding: f,
+                reviewer_model: "real".into(),
+                reviewer_family: "fam".into(),
+                confirmer_chain: vec!["c1".into()],
+                context: "ctx the `let x = 1` is wrong".into(),
+            },
+            confirmers: vec!["c1".into()],
+        };
+        let limits = ConfirmLimits::default();
+
+        // Confirmed -> raised.
+        let confirmed =
+            crate::review_confirm::aggregate(std::slice::from_ref(&j), &limits, &mut |plan| {
+                vec![confirming_attempt(&plan.finding.id, &plan.context)]
+            });
+        assert!(raised_by_confirmed_finding(&confirmed, "comment"));
+        // An `approve` with a confirmed critical finding is raised too: the
+        // verdict the reviewer wrote never survives its own confirmed blocker.
+        assert!(raised_by_confirmed_finding(&confirmed, "approve"));
+
+        // No confirmer could be resolved (`not_run`): still blocking, so still
+        // raised. An unconfirmed finding is never a rejection either.
+        let not_run =
+            crate::review_confirm::aggregate(std::slice::from_ref(&j), &limits, &mut |_| {
+                Vec::new()
+            });
+        assert_eq!(not_run.decisions[0].disposition, Disposition::NotRun);
+        assert!(raised_by_confirmed_finding(&not_run, "comment"));
+
+        // Two independent rejects demote a critical: no confirmed finding
+        // remains, so the `comment` stands and must NOT be raised.
+        let demoted = crate::review_confirm::aggregate(&[j], &limits, &mut |plan| {
+            let id = plan.finding.id.clone();
+            ["c1", "c2"]
+                .iter()
+                .map(|m| {
+                    crate::review_confirm::confirmer_attempt_from_reply(
+                        m.to_string(),
+                        format!("fam-{m}"),
+                        3,
+                        &json!({
+                            "finding_id": id,
+                            "disposition": "reject",
+                            "quote": plan.context.trim(),
+                            "reason": "the guard exists",
+                        })
+                        .to_string(),
+                        &id,
+                        &plan.context,
+                    )
+                })
+                .collect()
+        });
+        assert_eq!(demoted.decisions[0].disposition, Disposition::Rejected);
+        assert!(!raised_by_confirmed_finding(&demoted, "comment"));
+
+        // A `request_changes` with a confirmed finding keeps blocking: the
+        // rule only ever raises, so it leaves an already-blocking verdict
+        // alone (never lowers it).
+        assert!(!raised_by_confirmed_finding(
+            &crate::review_confirm::ConfirmedReview {
+                decisions: vec![FindingDecision {
+                    finding_id: "x".into(),
+                    ..confirmed.decisions[0].clone()
+                }],
+                demoted: vec![],
+                effective_blocking: true,
+                reviewer_family_recall: None,
+            },
+            "request_changes"
+        ));
+        assert!(confirmed.effective_blocking);
+        assert_eq!(confirmed.effective_verdict(), "request_changes");
     }
 }
 
