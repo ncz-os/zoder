@@ -2715,8 +2715,7 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 loop_timeout_secs,
                 agent_timeout_secs,
-                run_budget.deadline_secs,
-                run_budget.shared_daemon,
+                run_budget,
                 *allow_dangerous_check,
                 *require_approval,
             )

@@ -6730,17 +6730,26 @@ pub(crate) fn loop_deadline_headroom_secs(worker_timeout_secs: u64) -> u64 {
 }
 
 /// The default whole-run deadline for `zoder loop`: derived from, and strictly
-/// below, the worker's timeout. Falls back to the built-in worker budget when
-/// the derived value would be degenerate (a worker budget too small to leave
-/// any run time at all).
+/// below, the worker's timeout.
+///
+/// The headroom is always at least one second and at most `worker_timeout - 1`,
+/// so the result is strictly less than `worker_timeout_secs` for EVERY input,
+/// including budgets too small for the normal headroom (`worker_timeout_secs <=
+/// 300`). Returning the worker's own timeout there would put the loop's
+/// deadline exactly on the worker's kill: the run would be killed blind before
+/// it could emit its result, which is the one thing this deadline exists to
+/// prevent.
 pub(crate) fn default_loop_deadline_secs(worker_timeout_secs: u64) -> u64 {
-    let headroom = loop_deadline_headroom_secs(worker_timeout_secs);
-    let derived = worker_timeout_secs.saturating_sub(headroom);
-    if derived == 0 {
-        worker_timeout_secs
-    } else {
-        derived
+    if worker_timeout_secs <= 1 {
+        // No positive whole-second deadline exists below this. A 1 s (or 0 s)
+        // worker budget cannot leave a run any time at all; return the input
+        // rather than underflow, and let the caller's own validation reject
+        // the configuration.
+        return worker_timeout_secs;
     }
+    let headroom = loop_deadline_headroom_secs(worker_timeout_secs)
+        .clamp(1, worker_timeout_secs.saturating_sub(1));
+    worker_timeout_secs - headroom
 }
 
 /// Everything `zoder loop` needs to know about its whole-run budget, resolved
@@ -8494,8 +8503,7 @@ pub(crate) async fn cmd_loop(
     background: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
-    deadline_secs: u64,
-    shared_daemon: bool,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
 ) -> anyhow::Result<()> {
@@ -8530,8 +8538,7 @@ pub(crate) async fn cmd_loop(
         accept_on_green,
         loop_timeout_secs,
         agent_timeout_secs,
-        deadline_secs,
-        shared_daemon,
+        run_budget,
         allow_dangerous_check,
         require_approval,
         &cwd,
@@ -8720,6 +8727,7 @@ pub(crate) fn spawn_run_heartbeat(
 /// true by construction instead of by remembering to call it.
 struct RunHeartbeatGuard {
     live: Option<std::sync::Arc<std::sync::Mutex<RunHeartbeat>>>,
+    progress: LoopProgress,
 }
 
 impl RunHeartbeatGuard {
@@ -8728,7 +8736,19 @@ impl RunHeartbeatGuard {
         ticker: tokio::task::JoinHandle<()>,
     ) -> Self {
         ticker.abort();
-        Self { live: Some(live) }
+        Self {
+            live: Some(live),
+            progress: LoopProgress::default(),
+        }
+    }
+
+    /// Record how far the run got, so the `Drop`-time finalisation (used on an
+    /// error exit) reports the real iteration instead of zero.
+    fn note_progress(&mut self, iteration: usize, at_deadline: bool) {
+        self.progress = LoopProgress {
+            iteration,
+            at_deadline,
+        };
     }
 
     /// Record why the run stopped, in the final document.
@@ -8744,10 +8764,21 @@ impl RunHeartbeatGuard {
     }
 }
 
+/// The last iteration this guard saw, so a `Drop`-time finalisation reports
+/// the real progress instead of resetting it to zero.
+#[derive(Clone, Copy, Default)]
+struct LoopProgress {
+    iteration: usize,
+    at_deadline: bool,
+}
+
 impl Drop for RunHeartbeatGuard {
     fn drop(&mut self) {
         if self.live.is_some() {
-            self.finalize(LOOP_PHASE_DONE, 0, false);
+            // Only reachable when the normal-path `finalize` did NOT run, i.e.
+            // an early return or a `?`/`bail!` out of the iteration body.
+            let progress = self.progress;
+            self.finalize(LOOP_PHASE_DONE, progress.iteration, progress.at_deadline);
         }
     }
 }
@@ -8772,6 +8803,9 @@ impl Drop for LoopEventGuard {
     }
 }
 
+// The parameter count is the loop's explicit, named configuration — the same
+// shape as `cmd_loop`, which already carries this allowance.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_loop_run(
     cli: &crate::Cli,
     task: &[String],
@@ -8784,8 +8818,7 @@ async fn cmd_loop_run(
     accept_on_green: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
-    deadline_secs: u64,
-    shared_daemon: bool,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
     cwd: &Path,
@@ -8840,6 +8873,8 @@ async fn cmd_loop_run(
     // iteration boundary (and around the review phase), and when it fires the
     // loop leaves by a normal terminal path: the iteration record is pushed,
     // the worktree is committed, and the final JSON result is still emitted.
+    let deadline_secs = run_budget.deadline_secs;
+    let shared_daemon = run_budget.shared_daemon;
     let deadline = LoopDeadline::from_cli(deadline_secs);
     let cancel_abort_threshold = unconfirmed_cancel_abort_threshold(shared_daemon);
     let mut deadline_hit = false;
@@ -9011,6 +9046,8 @@ async fn cmd_loop_run(
             let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
             state.set_phase(LOOP_PHASE_AUTHOR, i);
         }
+        // So an error exit mid-iteration reports the iteration it reached.
+        heartbeat.note_progress(i, deadline_hit);
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
@@ -9281,13 +9318,32 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = loop_task_diff(
+        //    A capture failure is a terminal iteration, not an early return:
+        //    the run still commits the worktree and emits its JSON result, so
+        //    the caller learns WHY it stopped. `?` here would skip both.
+        let (label, diff) = match loop_task_diff(
             cwd,
             scope,
             base.as_deref(),
             Some(&loop_start),
             &task_journal,
-        )?;
+        ) {
+            Ok(captured) => captured,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}/{max_iters}: diff capture failed: {detail}");
+                }
+                iterations.push(json!({
+                    "iteration": i,
+                    "resolved": false,
+                    "error": "diff_capture_failed",
+                    "diff_capture_error": detail,
+                }));
+                final_verdict = String::from("comment");
+                break;
+            }
+        };
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -11067,6 +11123,28 @@ mod tests {
         let at = started + Duration::from_secs(deadline);
         assert!(dl.expired_at(at), "the run must stop at the deadline");
         assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// The "strictly below the worker's timeout" invariant is a property of the
+    /// FUNCTION, not of one favourable input: a small worker budget used to
+    /// make the headroom saturate the subtraction, and the degenerate branch
+    /// then returned the worker timeout itself — a deadline equal to the kill,
+    /// which is precisely the blind cut-off the deadline exists to prevent.
+    #[test]
+    fn loop_deadline_is_strictly_below_the_worker_timeout_for_every_budget() {
+        for worker in [2u64, 3, 10, 299, 300, 301, 600, 3600, 7200, 86400] {
+            let deadline = default_loop_deadline_secs(worker);
+            assert!(
+                deadline < worker,
+                "worker budget {worker} s produced deadline {deadline} s, which is not \
+                 strictly below the kill"
+            );
+            assert!(deadline > 0, "worker budget {worker} s left no run time");
+        }
+        // The fleet value: 7,200 s less the larger of a tenth of the budget
+        // and the five-minute floor — 7,200 / 10 = 720 s here, so 6,480 s.
+        assert_eq!(default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS), 6480);
+        assert_eq!(loop_deadline_headroom_secs(WORKER_RUN_TIMEOUT_SECS), 720);
     }
 
     /// On a SHARED daemon the FIRST unconfirmed author cancel stops the loop.
@@ -20354,8 +20432,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
-            super::WORKER_RUN_TIMEOUT_SECS,
-            false,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &cwd,
@@ -20433,8 +20513,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
-            super::WORKER_RUN_TIMEOUT_SECS,
-            false,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -20500,8 +20582,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
-            super::WORKER_RUN_TIMEOUT_SECS,
-            false,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,

@@ -190,6 +190,18 @@ const TASK_COMM_LEN: usize = 16;
 const MAX_TEARDOWN_ROUNDS: usize = 4;
 /// How many drain passes the cancel phase may make before giving up.
 const MAX_CANCEL_PASSES: usize = 8;
+/// Ceiling on the cancel phase's whole-phase wall clock, as a multiple of the
+/// per-session window.
+///
+/// The budget is per SESSION so that every recorded session is asked, but an
+/// unbounded N x budget teardown is its own fleet hazard: a host that recorded
+/// twenty sessions from one wedged engine would hold teardown for minutes.
+/// The cap therefore bounds the phase without ever costing a session its first
+/// ask: passes stop early only once the ceiling is passed, and a pass always
+/// finishes asking everyone it snapshotted. Twenty windows is generous for any
+/// real fleet host (one engine session per job, plus fallbacks) and still keeps
+/// teardown in the low minutes.
+const CANCEL_PHASE_CAP_WINDOWS: u32 = 20;
 /// Read timeout for the blocking cancel used on the `Drop` path.
 const BLOCKING_ACK_WAIT: Duration = Duration::from_millis(200);
 /// How many scan/signall passes one reap may make before giving up. Each pass
@@ -944,7 +956,19 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
     // one still editing the tree. One snapshot would leave it uncancelled.
     // Bounded as well as time-bounded: a floor alone does not stop a loop whose
     // cancels all fail instantly while the engine keeps minting.
+    //
+    // Two independent bounds, and they answer different questions:
+    // `MAX_CANCEL_PASSES` bounds how many times we re-snapshot, and
+    // `CANCEL_PHASE_CAP_WINDOWS` bounds the phase's total wall clock so a host
+    // with many sessions cannot hold teardown for minutes. The cap is checked
+    // only BETWEEN passes, so a pass that has started asks every session it
+    // snapshotted — the ceiling never costs a session its first ask.
+    let phase_started = Instant::now();
+    let phase_cap = budget.saturating_mul(CANCEL_PHASE_CAP_WINDOWS);
     for _ in 0..MAX_CANCEL_PASSES {
+        if phase_started.elapsed() >= phase_cap {
+            break;
+        }
         // One lock per pass; a pass covers every session that appeared since
         // the last one.
         let pending: Vec<String> = {
@@ -3287,6 +3311,44 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(40),
             "the phase must give the second session its own window, not stop after the first"
+        );
+        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|s| !ids.contains(&s.as_str()));
+    }
+
+    /// The phase ceiling is checked BETWEEN passes, so it can never cost a
+    /// session its first ask: one pass over three silent sessions asks all
+    /// three even when the whole cap is far shorter than three windows.
+    #[tokio::test]
+    async fn cancel_phase_cap_does_not_truncate_the_first_pass() {
+        let ids = ["capped-a", "capped-b", "capped-c"];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = silent_daemon(dir.path());
+        {
+            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+            for id in ids {
+                note_session(id);
+            }
+        }
+        cancel_recorded_sessions(&socket, Duration::from_millis(10)).await;
+        let attempts = ATTEMPT_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            attempts >= ids.len(),
+            "the first pass must ask all {} sessions before any phase ceiling applies; \
+             only {attempts} attempt(s) were made",
+            ids.len()
         );
         let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SESSIONS
