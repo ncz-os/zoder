@@ -123,16 +123,8 @@ impl FailureClass {
         }
     }
 
-    /// Whether a caller MAY usefully retry the same invocation as-is.
-    ///
-    /// Only [`FailureClass::Transient`] is retryable unconditionally; a
-    /// `budget` failure becomes retryable once its window resets, which the
-    /// envelope says with `retry_after_s`.
-    pub(crate) const fn retryable(self) -> bool {
-        matches!(self, FailureClass::Transient)
-    }
-
     /// All classes, in the canonical order used by docs and tests.
+    #[cfg(test)]
     pub(crate) const ALL: &'static [FailureClass] = &[
         FailureClass::Transient,
         FailureClass::Permanent,
@@ -142,6 +134,7 @@ impl FailureClass {
     ];
 
     /// Parse a class string back into a class (inverse of [`Self::as_str`]).
+    #[cfg(test)]
     pub(crate) fn from_str_exact(s: &str) -> Option<Self> {
         FailureClass::ALL.iter().copied().find(|c| c.as_str() == s)
     }
@@ -166,6 +159,10 @@ pub(crate) const EXIT_CONFIG: i32 = 40;
 /// Internal: a bug, or a failure the contract does not classify yet.
 pub(crate) const EXIT_INTERNAL: i32 = 50;
 /// Reserved: the oneshot refusal band. Never assigned to a review/loop code.
+///
+/// Test-only: the constant exists so the invariant "no failure code ever exits
+/// in the reserved band" is asserted rather than assumed.
+#[cfg(test)]
 pub(crate) const EXIT_RESERVED_ONESHOT: i32 = 75;
 
 /// The exit code the process uses when the failure was never classified.
@@ -291,11 +288,6 @@ impl FailureCode {
         self.class().exit_code()
     }
 
-    /// Whether the same invocation may usefully be retried as-is.
-    pub(crate) const fn retryable(self) -> bool {
-        self.class().retryable()
-    }
-
     /// All codes, in the canonical (documented) order.
     pub(crate) const ALL: &'static [FailureCode] = &[
         FailureCode::ReviewBlocked,
@@ -331,15 +323,11 @@ impl fmt::Display for FailureCode {
     }
 }
 
-/// The stable code of every failure code, in the canonical order.
-pub(crate) fn all_class_codes() -> Vec<&'static str> {
-    FailureCode::ALL.iter().map(|c| c.code()).collect()
-}
-
 /// `(code, class, exit code)` for every failure code.
 ///
 /// Exposed so the documentation test can assert that `docs/EXIT_CODES.md`
 /// matches the implementation — the doc and the code cannot drift.
+#[cfg(test)]
 pub(crate) fn class_exit_codes() -> Vec<(&'static str, &'static str, i32)> {
     FailureCode::ALL
         .iter()
@@ -386,6 +374,7 @@ pub(crate) struct ReviewerOutcome {
 }
 
 impl ReviewerOutcome {
+    #[cfg(test)]
     pub(crate) fn new(model: impl Into<String>, err_kind: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -422,14 +411,9 @@ impl ClassifiedFailure {
     }
 
     /// Attach the per-model reviewer outcomes (builder style).
+    #[cfg(test)]
     pub(crate) fn with_reviewers(mut self, reviewers: Vec<ReviewerOutcome>) -> Self {
         self.reviewers = reviewers;
-        self
-    }
-
-    /// Attach one extra `detail` member (builder style).
-    pub(crate) fn with_detail(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        self.extra.insert(key.into(), value);
         self
     }
 
@@ -441,11 +425,6 @@ impl ClassifiedFailure {
     /// The process exit code for this failure.
     pub(crate) const fn exit_code(&self) -> i32 {
         self.code.exit_code()
-    }
-
-    /// Whether the same invocation may usefully be retried as-is.
-    pub(crate) const fn retryable(&self) -> bool {
-        self.code.retryable()
     }
 
     /// Seconds a caller should wait before retrying, derived from
@@ -573,11 +552,6 @@ pub(crate) fn classify_error(error: &anyhow::Error) -> Option<ClassifiedFailure>
 /// The common shape: `return Err(classified_err(FailureCode::EmptyDiff, msg))`.
 pub(crate) fn classified_err(code: FailureCode, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ClassifiedFailureError::new(code, message))
-}
-
-/// Build a `diff_too_large` error.
-pub(crate) fn diff_too_large_err(message: impl Into<String>) -> anyhow::Error {
-    classified_err(FailureCode::DiffTooLarge, message)
 }
 
 /// Build an `engine_budget_exceeded` error that carries the engine's reset
@@ -942,9 +916,29 @@ mod tests {
 
     #[test]
     fn only_transient_is_retryable() {
+        // `retryable` is `class == Transient` by construction. Assert that
+        // partition directly so the property survives without a dead method:
+        // `Transient` is the only class a caller may retry as-is.
         for c in FailureClass::ALL {
-            assert_eq!(c.retryable(), *c == FailureClass::Transient, "{c}");
+            assert_eq!(
+                *c == FailureClass::Transient,
+                !matches!(
+                    c,
+                    FailureClass::Permanent
+                        | FailureClass::Config
+                        | FailureClass::Budget
+                        | FailureClass::Blocked
+                ),
+                "{c}"
+            );
         }
+        assert_eq!(
+            FailureClass::ALL
+                .iter()
+                .filter(|c| **c == FailureClass::Transient)
+                .count(),
+            1
+        );
     }
 
     // ---- the named classifications --------------------------------------
@@ -1224,7 +1218,8 @@ mod tests {
             Some("2099-11-01T00:00:00Z")
         );
         assert_eq!(recovered.exit_code(), 30);
-        assert!(!recovered.retryable());
+        // `budget` is not the transient class, so it is not retryable as-is.
+        assert_ne!(recovered.code.class(), FailureClass::Transient);
         assert!(recovered.retry_after_s(chrono::Utc::now()).is_some());
     }
 

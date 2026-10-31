@@ -369,6 +369,15 @@ fn an_unreachable_engine_is_classified_and_never_approves() {
         stdout(&output),
         stderr(&output)
     );
+    // The reserved oneshot band is never a review/loop exit code.
+    assert_ne!(
+        code,
+        exit_code::RESERVED_ONESHOT,
+        "exit {} is reserved for the oneshot refusal band and must never be a review/loop code\nstdout:\n{}\nstderr:\n{}",
+        exit_code::RESERVED_ONESHOT,
+        stdout(&output),
+        stderr(&output)
+    );
     let carrier = json_code(&output).expect("the JSON must carry a code");
     // The class the envelope claims must be the class the published table
     // assigns to that code.
