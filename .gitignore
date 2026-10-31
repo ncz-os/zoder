@@ -1,5 +1,8 @@
 /target
 **/target
+# Local build target dir used by this workspace (CARGO_TARGET_DIR must stay
+# on local disk, never /tmp).
+/.cargo-target
 # Local data, benchmarks, and anything containing tokens/spend/proofs — never commit.
 /data
 *.parquet

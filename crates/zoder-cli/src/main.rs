@@ -12,6 +12,7 @@ mod child_env;
 mod context_opt;
 mod evals;
 mod exec_safety;
+mod failure;
 mod goose;
 mod jobs;
 mod mnemos;
