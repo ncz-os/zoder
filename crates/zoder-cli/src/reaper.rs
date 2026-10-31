@@ -147,21 +147,32 @@ pub(crate) const REAP_CANCEL_BUDGET: Duration = zoder_core::CANCEL_SETTLE_BUDGET
 /// The cancel budget for a deployment profile — per session.
 ///
 /// Fleet takes the settled per-session window ([`REAP_CANCEL_BUDGET`], 5 s).
-/// A standalone host has no shared-daemon contention to clear and may afford a
-/// longer window; its profile value is therefore a FLOOR applied on top of the
-/// fleet window rather than a replacement, which keeps the documented profile
-/// ordering (`standalone >= fleet`) true now that the fleet value is the 5 s
-/// settle budget rather than the old 750 ms.
+/// A standalone host has no shared-daemon contention to clear and keeps the
+/// longer window its profile already specifies.
+///
+/// The numeric profile values (1500 ms standalone, 750 ms fleet) were tuned
+/// for the old 750 ms phase budget, so neither can be applied as written now
+/// that the window is per session: 750 ms IS the value that starved every
+/// session after the first. Both are therefore treated as what they actually
+/// express — how much LONGER than the base settle window a profile wants to
+/// wait — and that surplus is added to [`REAP_CANCEL_BUDGET`]. Standalone
+/// (1500 ms) is 750 ms above the old fleet value, so it settles for 5.75 s;
+/// fleet takes the 5 s window unchanged.
 ///
 /// Either way the value applies per SESSION, never to the whole phase.
 pub(crate) fn cancel_budget_for(mode: zoder_core::config::DeploymentMode) -> Duration {
     match mode {
         zoder_core::config::DeploymentMode::Fleet => REAP_CANCEL_BUDGET,
         zoder_core::config::DeploymentMode::Standalone => {
-            let profile = Duration::from_millis(
-                zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms(),
-            );
-            REAP_CANCEL_BUDGET.max(profile)
+            // The profile numbers are relative to the old fleet phase budget;
+            // carry the surplus over that baseline onto the new window. Taking
+            // max(fleet, profile) instead would silently give standalone the
+            // fleet window, since 1500 ms < 5 s.
+            const LEGACY_FLEET_BUDGET_MS: u64 = 750;
+            let profile_ms =
+                zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms();
+            REAP_CANCEL_BUDGET
+                + Duration::from_millis(profile_ms.saturating_sub(LEGACY_FLEET_BUDGET_MS))
         }
     }
 }
@@ -2549,6 +2560,25 @@ mod tests {
         );
     }
 
+    /// The profile numbers are expressed against the old 750 ms phase budget,
+    /// so the standalone window is the settled per-session window PLUS the
+    /// profile's surplus (1500 - 750 = 750 ms) = 5.75 s. Pinned exactly: a
+    /// `max()` of the two would collapse standalone onto the fleet window and
+    /// lose the documented "standalone can afford longer" ordering.
+    #[test]
+    fn standalone_cancel_budget_is_the_fleet_window_plus_the_profile_surplus() {
+        use zoder_core::config::DeploymentMode;
+        assert_eq!(
+            cancel_budget_for(DeploymentMode::Standalone),
+            zoder_core::CANCEL_SETTLE_BUDGET + Duration::from_millis(750)
+        );
+        assert_eq!(
+            cancel_budget_for(DeploymentMode::Fleet),
+            zoder_core::CANCEL_SETTLE_BUDGET,
+            "the fleet window is the settle budget itself, not a derived value"
+        );
+    }
+
     struct Workspace {
         _dir: tempfile::TempDir,
         cd: PathBuf,
@@ -3161,10 +3191,6 @@ mod tests {
 
         kill_exact(bystander);
     }
-
-    /// Counts cancel attempts so a test can assert that a session was ASKED,
-    /// not merely recorded. Incremented in `cancel_session_with_retries` for
-    /// every attempt that actually reaches the transport.
 
     /// A daemon socket that accepts connections and never answers. Every
     /// cancel attempt against it therefore burns its whole window, which is

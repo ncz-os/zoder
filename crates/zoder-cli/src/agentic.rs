@@ -8710,6 +8710,48 @@ pub(crate) fn spawn_run_heartbeat(
     })
 }
 
+/// Stops the heartbeat ticker and writes the FINAL `run.json` on every way out
+/// of the loop, including the `?`/`bail!` paths inside the iteration body.
+///
+/// The final write used to sit on the normal path only: a mid-iteration
+/// `bail!` (a free-policy violation, an engine-kind resolution failure) left
+/// `run.json` frozen at the last 10 s tick, and the ticker itself kept running
+/// until the process exited. A guard makes "always emit the final heartbeat"
+/// true by construction instead of by remembering to call it.
+struct RunHeartbeatGuard {
+    live: Option<std::sync::Arc<std::sync::Mutex<RunHeartbeat>>>,
+}
+
+impl RunHeartbeatGuard {
+    fn new(
+        live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+        ticker: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        ticker.abort();
+        Self { live: Some(live) }
+    }
+
+    /// Record why the run stopped, in the final document.
+    fn finalize(&mut self, phase: &str, iteration: usize, at_deadline: bool) {
+        if let Some(live) = self.live.take() {
+            let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(phase, iteration);
+            if at_deadline {
+                state.at_deadline();
+            }
+            state.write();
+        }
+    }
+}
+
+impl Drop for RunHeartbeatGuard {
+    fn drop(&mut self) {
+        if self.live.is_some() {
+            self.finalize(LOOP_PHASE_DONE, 0, false);
+        }
+    }
+}
+
 /// Writes a `teardown` event with reason `crash` if the loop function exits
 /// without disarming (early `?`/bail/panic), so a dying loop still leaves a
 /// trail in MNEMOS. Disarmed on every normal teardown.
@@ -8801,6 +8843,11 @@ async fn cmd_loop_run(
     let deadline = LoopDeadline::from_cli(deadline_secs);
     let cancel_abort_threshold = unconfirmed_cancel_abort_threshold(shared_daemon);
     let mut deadline_hit = false;
+    // A free-policy violation ends the loop AFTER the iteration is recorded,
+    // so the final result and `run.json` are still emitted. The run then exits
+    // nonzero with the `--allow-paid` hint, exactly as the previous mid-loop
+    // `bail!` did.
+    let mut policy_violation: Option<String> = None;
     // `run.json` heartbeat: phase + session states + last provider error, every
     // 10 s, so callers poll a document instead of waiting out the worker's
     // 7,200 s timeout blind. Only a job run has a directory to write into.
@@ -8815,7 +8862,12 @@ async fn cmd_loop_run(
     if heartbeat_enabled {
         run_state.lock().unwrap_or_else(|e| e.into_inner()).write();
     }
-    let heartbeat = spawn_run_heartbeat(run_state.clone(), RUN_HEARTBEAT_INTERVAL);
+    // Final `run.json` and ticker shutdown are guaranteed on EVERY exit path
+    // from here on, including the `?`/`bail!` ones inside the iteration body.
+    let mut heartbeat = RunHeartbeatGuard::new(
+        run_state.clone(),
+        spawn_run_heartbeat(run_state.clone(), RUN_HEARTBEAT_INTERVAL),
+    );
     crate::mnemos::event(
         event_job_id.as_deref(),
         "loop_start",
@@ -9108,10 +9160,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // incrementing `total_cost` — a violating turn does
                 // not extend the loop's bookkeeping as if it were a
                 // legitimate iteration.
-                if let Some(v) = &t.policy_violation {
-                    anyhow::bail!(
-                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
-                    );
+                //
+                // Recorded as a terminal iteration rather than a `bail!`:
+                // the loop must still emit its final JSON result and its
+                // final `run.json` here, so the exit code and the hint are
+                // carried by the result and applied once, after the loop.
+                if t.policy_violation.is_some() {
+                    policy_violation = t.policy_violation.clone();
+                    break;
                 }
                 // `t.alias` is the alias of the candidate that actually
                 // produced this turn (the head or a fallback), so the next
@@ -10208,15 +10264,7 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
     // stopped because the whole-run deadline fired says so in `run.json`
     // before the result below, so a caller polling the heartbeat learns the
     // reason even if it never reads the result document.
-    heartbeat.abort();
-    {
-        let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
-        state.set_phase(LOOP_PHASE_DONE, iterations.len());
-        if deadline_hit {
-            state.at_deadline();
-        }
-        state.write();
-    }
+    heartbeat.finalize(LOOP_PHASE_DONE, iterations.len(), deadline_hit);
 
     let payload = json!({
         "kind": "loop",
@@ -10237,6 +10285,10 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         // budget fact, not a verdict about the work.
         "deadline_secs": deadline_secs,
         "deadline_reached": deadline_hit,
+        // Present only for a run stopped by the free-policy gate: the reason
+        // the loop stopped, carried in the document instead of being lost
+        // with a mid-loop `bail!`.
+        "policy_violation": policy_violation,
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
@@ -10253,6 +10305,8 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
 
     let teardown_reason = if resolved {
         "approved"
+    } else if policy_violation.is_some() {
+        "policy_violation"
     } else if deadline_hit {
         "deadline"
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
@@ -10349,6 +10403,13 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         }
     }
 
+    // A free-policy violation is still a hard failure with the actionable
+    // hint the previous mid-loop `bail!` carried -- but it is applied only
+    // now, after the final result document, the result line and the final
+    // `run.json` have been written, so none of them is lost.
+    if let Some(v) = policy_violation {
+        anyhow::bail!("loop author turn violated free policy (use --allow-paid to permit): {v}");
+    }
     if !resolved {
         anyhow::bail!(
             "loop ended unresolved after {} iteration(s)",
@@ -11068,6 +11129,75 @@ mod tests {
         let mut fleet = Config::default_provider(dir.path());
         fleet.deployment.mode = zoder_core::config::DeploymentMode::Fleet;
         assert!(resolve_loop_run_budget(None, Some(&fleet)).shared_daemon);
+    }
+
+    /// `run.json` must carry what a caller polling it instead of waiting out
+    /// the worker's 7,200 s actually needs: which PHASE the run is stuck in,
+    /// what each session is doing, why the last provider call failed, and
+    /// whether the whole-run deadline is what stopped the run. A heartbeat
+    /// that omits any of these is a liveness ping, not a status document.
+    #[test]
+    fn run_heartbeat_carries_phase_sessions_provider_error_and_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("job").join("run.json");
+        let started = Instant::now();
+        let mut hb = RunHeartbeat::new(Some(path.clone()), 6300, started, 5);
+        hb.set_phase(LOOP_PHASE_AUTHOR, 2);
+        hb.note_session("session-a", "running");
+        hb.note_provider_error("429 rate limited: provider overloaded");
+
+        // Written eagerly at loop entry and again on every tick, so the file
+        // exists before the first iteration finishes.
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json written"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+        assert_eq!(doc["iteration"], 2);
+        assert_eq!(doc["max_iters"], 5);
+        assert_eq!(doc["sessions"]["session-a"], "running");
+        assert_eq!(
+            doc["last_provider_error"],
+            "429 rate limited: provider overloaded"
+        );
+        assert_eq!(doc["deadline_secs"], 6300);
+        assert_eq!(doc["deadline_reached"], false);
+
+        // Re-recording the same session updates it in place: a caller must
+        // never see one session twice and have to guess which line is current.
+        hb.note_session("session-a", "cancel_unconfirmed");
+        hb.note_session("session-b", "completed:completed");
+        let doc = hb.to_json();
+        let sessions = doc["sessions"].as_object().expect("sessions object");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions["session-a"], "cancel_unconfirmed");
+        assert_eq!(sessions["session-b"], "completed:completed");
+
+        // The final document written at the deadline says so, so a caller
+        // polling the heartbeat learns the run ended without reading the
+        // result document at all.
+        hb.at_deadline();
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json rewritten"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["deadline_reached"], true);
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+    }
+
+    /// A heartbeat write is observability, never a failure mode: a job
+    /// directory that cannot be created must not take the loop down.
+    #[test]
+    fn run_heartbeat_write_is_best_effort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path whose parent is a regular FILE: create_dir_all must fail.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let mut hb = RunHeartbeat::new(Some(blocker.join("run.json")), 6300, Instant::now(), 1);
+        hb.set_phase(LOOP_PHASE_CHECK, 1);
+        hb.write(); // must not panic
+                    // With no path at all (a foreground run) it is a no-op.
+        RunHeartbeat::new(None, 6300, Instant::now(), 1).write();
     }
 
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
