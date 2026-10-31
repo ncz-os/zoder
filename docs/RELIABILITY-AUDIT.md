@@ -22,22 +22,22 @@ Two surfaces were audited:
 |---|-----|---------|--------|
 | 1 | BLOCKER | Streaming EOF before any terminal marker (`[DONE]`/`finish_reason`/usage) returned `Ok` — a proxy dropping the SSE connection mid-answer was booked as a successful partial, poisoning health and suppressing fallback. | **Fixed** — terminal-marker tracking + truncation error (`provider.rs`); regression tests added. |
 | 2 | BLOCKER | `agentic_cost` swallowed engine `cost/query` failures and returned `$0` on the primary, so a paid alias/fallback escaped the free gate. | **Fixed** — returns `Option`; `None` (after retry) → policy violation under the free guard (`main.rs`). |
-| 3 | HIGH | Mid-turn socket disconnect `bail!`ed, discarding streamed text/tool-count/session-id and skipping health. | **Fixed** — returns a partial `AgentRun` (`disconnected`); caller records a health failure (`engine_rpc.rs`). |
+| 3 | HIGH | Mid-turn socket disconnect `bail!`ed, discarding streamed text/tool-count/session-id and skipping health. | **Fixed** — returns a partial `AgentRun` (`disconnected`); caller records a health failure (`acp-client`, re-exported as `zoder_core::engine_rpc`). |
 | 4 | HIGH | Agentic path built a fallback chain but only ever ran `chain.first()`. | **Fixed** — pre-side-effect fallback loop: falls back only on `run_agent` `Err` (before any streamed output/tool), never after side effects (`main.rs`). |
-| 5 | HIGH | Timeout-cancel sent `session/cancel` then read one line and returned — a ghost agent could keep editing; a completed-at-deadline turn was mislabeled. | **Fixed** — bounded drain that parses final frames and waits for engine wind-down (`engine_rpc.rs`). |
-| 6 | HIGH | Only a `prompt`-id JSON-RPC error was fatal; a failed `session/approve` was ignored and stalled the turn to the wall-clock budget. | **Fixed** — every error response handled; approval failure ends the turn with preserved partial (`engine_rpc.rs`). |
+| 5 | HIGH | Timeout-cancel sent `session/cancel` then read one line and returned — a ghost agent could keep editing; a completed-at-deadline turn was mislabeled. | **Fixed** — bounded drain that parses final frames and waits for engine wind-down (`acp-client`/`engine_rpc_impl.rs`). |
+| 6 | HIGH | Only a `prompt`-id JSON-RPC error was fatal; a failed `session/approve` was ignored and stalled the turn to the wall-clock budget. | **Fixed** — every error response handled; approval failure ends the turn with preserved partial (`acp-client`). |
 | 7 | HIGH | Agentic setup/prompt failures returned early via `?` without feeding the breaker — a broken alias stayed "healthy". | **Fixed** — health failure recorded before propagating (`main.rs`). |
-| 8 | HIGH | Daemon readiness was connect-only; a socket that accepts but never answers `initialize` was treated as ready; daemon stderr discarded; early child exit waited the full budget. | **Fixed** — `probe_ready` initialize handshake, stderr→`daemon.log`, retained `Child` + `try_wait`, stale-socket unlink (`main.rs`/`engine_rpc.rs`). |
-| 9 | HIGH | Reviewer/panel completions bypassed health and returned `Ok` after an unverified paid fallback. | **Fixed** — health recorded; free-policy violation now fails the call unless `--allow-paid` (`codex.rs`). |
+| 8 | HIGH | Daemon readiness was connect-only; a socket that accepts but never answers `initialize` was treated as ready; daemon stderr discarded; early child exit waited the full budget. | **Fixed** — `probe_ready` initialize handshake, stderr→`daemon.log`, retained `Child` + `try_wait`, stale-socket unlink (`main.rs`/`acp-client`). |
+| 9 | HIGH | Reviewer/panel completions bypassed health and returned `Ok` after an unverified paid fallback. | **Fixed** — health recorded; free-policy violation now fails the call unless `--allow-paid` (`main.rs`/`reviewer_pool.rs`). |
 | 10 | HIGH | `health --probe` sent through a possibly-metered provider with no gate, no post-call free verification, and no ledger — spending untracked money and marking paid models healthy. | **Fixed** — paid-provider opt-in gate, per-probe `verify_free`, ledger of any nonzero-cost/violating probe (`main.rs`). |
-| 11 | MED | `read_result` / `new_session` had no deadline — a daemon that accepts the socket but never answers could hang the loop (only the 900s+ turn guard, or nothing). | **Fixed** — 30s setup-RPC budget; `new_session` bounded (`engine_rpc.rs`). |
+| 11 | MED | `read_result` / `new_session` had no deadline — a daemon that accepts the socket but never answers could hang the loop (only the 900s+ turn guard, or nothing). | **Fixed** — 30s setup-RPC budget; `new_session` bounded (`acp-client`). |
 | 12 | MED | Agentic health recorded success even on a policy violation. | **Fixed** — violation recorded as a health failure (`main.rs`). |
 | 13 | MED | HTTP error-body read (chat) and `list_models` body read were unbounded — a stalled body pinned the call. | **Fixed** — both timeout-bounded (`provider.rs`). |
 | 14 | LOW | FinOps `--since`/`--until` silently defaulted a typo'd date to *now*. | **Fixed** — invalid date is now a hard CLI error (`finops.rs`). |
 
 ### Tracked for follow-up (zoder)
 
-- **Engine JSON-RPC frame reads are line-unbounded** (`engine_rpc.rs`): a daemon
+- **Engine JSON-RPC frame reads are line-unbounded** (`acp-client`): a daemon
   streaming bytes without a newline grows the line buffer until the deadline. A
   truly bounded framed reader (cap ~4 MiB, error on exceed) is the proper fix.
 - **Health/session/ledger writes are not concurrent-safe** (fixed temp paths,

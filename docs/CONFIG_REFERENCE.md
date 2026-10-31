@@ -157,6 +157,13 @@ no fleet addresses, no keys.
 - `ZODER_PRICING_SOURCE=file`: installed pricing files are
   authoritative, never re-pulled (`config.rs:Config::pricing`,
   `PricingConfig`).
+- `ZODER_UPDATE_CHECK_RETRY_S`: seconds before a FAILED release-update
+  check is retried (default 900). The failure is cached under
+  `$ZODER_HOME`, so an offline or air-gapped host keeps one early,
+  short-budgeted attempt per interval instead of re-attempting the
+  network on every command (`update.rs:failure_retry_interval`,
+  `DEFAULT_FAILURE_RETRY`). `ZODER_NO_UPDATE_CHECK=1` opts out
+  entirely.
 
 ## CLI route flags
 
