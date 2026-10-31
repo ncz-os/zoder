@@ -5,7 +5,8 @@
 > degradation reporting, and the managed tool bundle + `zoder gate`
 > CLI wiring). The `zoder gate` subcommand is operational: `zoder gate
 > [--root DIR] [--strict|--local-iterate] [--tools-only|--plan-only]
-> [--json]` runs the gate end-to-end against the current repo. Next
+> [--step-timeout SECS] [--json]` runs the gate end-to-end against the
+> current repo. Next
 > is CI YAML adapters (Actions / GitLab / Woodpecker → `CiJob`) so
 > repo-declared CI is unioned into the plan via `derive_plan`, and
 > then `zoder loop --check` becomes the gate by default. See
@@ -145,10 +146,19 @@ install keeps "fail-closed" from becoming "can't work because a tool is missing.
    `crates/zoder-core/src/gate_bundle.rs`, `PathEnv` real `GateEnv`
    impl, `ToolLookup`/`InstallHint`/`ToolProbe` for the "what's
    installed / what's missing" view, and the `zoder gate [--root DIR]
-   [--strict|--local-iterate] [--tools-only|--plan-only] [--json]`
+   [--strict|--local-iterate] [--tools-only|--plan-only]
+   [--step-timeout SECS] [--json]`
    subcommand that detects ecosystems, derives the plan, runs it
    against the managed bundle, and prints the `GateReport`. Exit codes
    follow the fail-closed posture: Green/Yellow → 0, Red → 1. The
+   report is printed on EVERY verdict, red included — a caller that
+   asked for `--json` always gets the document (with `exit_code` in the
+   payload) and the non-zero status follows, so a blocked gate names
+   its failing steps instead of exiting silently. Steps run with
+   `--root` as their working directory (not the caller's cwd), and each
+   step is bounded by `--step-timeout` (default 1800s): a step that
+   outlives it is killed and reported as failed, so one wedged check
+   cannot hang an unattended gate. The
    report always attaches the runnable / skipped / added-baseline
    breakdown; the renderer never silently passes a missing required
    tool. CI YAML adapters (Actions / GitLab / Woodpecker → `CiJob`)
