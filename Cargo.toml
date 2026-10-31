@@ -17,6 +17,14 @@ authors = ["ncz-os contributors"]
 repository = "https://gitlab.com/ncz-os/zoder"
 rust-version = "1.88"
 
+# Release artifact hygiene for the shipped `zoder` binary. Neither setting
+# changes behaviour: `strip` drops debug/symbol sections (we ship no debugger
+# support for release builds) and thin LTO lets the optimizer see across the
+# workspace's ~6 crates without the link-time cost of fat LTO.
+[profile.release]
+strip = true
+lto = "thin"
+
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"
