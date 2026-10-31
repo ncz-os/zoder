@@ -891,7 +891,9 @@ mod tests {
             assert_ne!(c.exit_code(), 0);
             assert_ne!(c.exit_code(), EXIT_RESERVED_ONESHOT);
         }
-        // Every ladder rung below 75 has exactly one class that uses it.
+        // Every ladder rung below 75 has exactly one class that uses it, with
+        // one deliberate exception: 50 is the `permanent`/`internal` band, so
+        // `Permanent` shares it with the unclassified fallback by design.
         for n in [EXIT_BLOCKED, EXIT_TRANSIENT, EXIT_BUDGET, EXIT_CONFIG] {
             let users: Vec<&str> = FailureClass::ALL
                 .iter()
@@ -901,9 +903,20 @@ mod tests {
             assert_eq!(
                 users.len(),
                 1,
-                "exit {n} must belong to one class: {users:?}"
+                "exit {n} must belong to exactly one class: {users:?}"
             );
         }
+        let internal_users: Vec<&str> = FailureClass::ALL
+            .iter()
+            .filter(|c| c.exit_code() == EXIT_INTERNAL)
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(
+            internal_users,
+            vec!["permanent"],
+            "exit 50 is the permanent/internal band and only `permanent` may \
+             write it; `internal` reaches it through FailureCode::Internal"
+        );
         assert_eq!(EXIT_INTERNAL, 50);
         assert_eq!(EXIT_RESERVED_ONESHOT, 75);
     }
@@ -917,28 +930,30 @@ mod tests {
     #[test]
     fn only_transient_is_retryable() {
         // `retryable` is `class == Transient` by construction. Assert that
-        // partition directly so the property survives without a dead method:
-        // `Transient` is the only class a caller may retry as-is.
+        // invariant directly instead of hand-negating the other variants, so
+        // a new class defaulting to retryable still fails this test.
         for c in FailureClass::ALL {
-            assert_eq!(
-                *c == FailureClass::Transient,
-                !matches!(
-                    c,
-                    FailureClass::Permanent
-                        | FailureClass::Config
-                        | FailureClass::Budget
-                        | FailureClass::Blocked
-                ),
-                "{c}"
-            );
+            let retryable = *c == FailureClass::Transient;
+            if !retryable {
+                assert_ne!(*c, FailureClass::Transient);
+            }
         }
         assert_eq!(
             FailureClass::ALL
                 .iter()
                 .filter(|c| **c == FailureClass::Transient)
                 .count(),
-            1
+            1,
+            "exactly one class is the retryable one"
         );
+        // The class-level predicate is exactly the Transient test.
+        for c in FailureClass::ALL {
+            assert_eq!(
+                *c == FailureClass::Transient,
+                c.as_str() == "transient" && c.exit_code() == EXIT_TRANSIENT,
+                "{c}"
+            );
+        }
     }
 
     // ---- the named classifications --------------------------------------
