@@ -2157,9 +2157,11 @@ mod provider_route_corpus_tests {
 /// [`engine_load_count_for`] reads, and a load of some OTHER home (a
 /// neighbouring test holding [`crate::test_env::ENV_LOCK`]) cannot move it.
 ///
-/// Each write is one relaxed `fetch_add` on the loaded home's counter. Outside
-/// tests the counter is a plain atomic that nothing reads; the per-home map
-/// and both readers are `#[cfg(test)]`.
+/// Each write is one relaxed `fetch_add` on the loaded home's counter. Nothing
+/// in a non-test build reads the counter (the per-home map and the reader are
+/// `#[cfg(test)]`), so a test tally can never drive production behaviour —
+/// `engine_load_counter_for` still returns a counter unconditionally, so the
+/// increment is the same single relaxed instruction in both builds.
 #[cfg(test)]
 static ENGINE_LOADS_BY_HOME: std::sync::OnceLock<
     std::sync::Mutex<
@@ -2200,9 +2202,12 @@ fn engine_load_counter_for(home: &Path) -> std::sync::Arc<std::sync::atomic::Ato
 }
 
 /// Number of whole-engine loads performed so far for `home` in this process.
-/// A home this process has not loaded an engine for reads 0. Read it while
-/// holding [`crate::test_env::ENV_LOCK`] (every test that redirects
-/// `ZODER_HOME` does).
+/// A home this process has not loaded an engine for reads 0.
+///
+/// This read takes only the counter registry's own mutex, never
+/// [`crate::test_env::ENV_LOCK`] and never a database-style lock held across
+/// I/O, so calling it from inside a test that already holds `ENV_LOCK` (every
+/// test that redirects `ZODER_HOME` does) cannot deadlock.
 #[cfg(test)]
 pub(crate) fn engine_load_count_for(home: &Path) -> usize {
     engine_load_counters()
