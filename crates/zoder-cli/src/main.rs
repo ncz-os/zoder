@@ -2506,7 +2506,7 @@ async fn main() {
     reap_ephemeral_daemons();
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
-        std::process::exit(1);
+        std::process::exit(error_exit_code(&e));
     }
 }
 
@@ -6501,7 +6501,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            anyhow::bail!("paid model use declined");
+            return Err(budget_declined(cli.json, "budget_or_policy", &msg));
         }
     }
 
@@ -6544,7 +6544,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                anyhow::bail!("call declined: over budget");
+                return Err(budget_declined(cli.json, "over_budget", &msg));
             }
         }
     }
@@ -12266,7 +12266,7 @@ pub(crate) async fn agentic_turn(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            anyhow::bail!("paid model use declined");
+            return Err(budget_declined(cli.json, "budget_or_policy", &msg));
         }
     }
 
@@ -12291,7 +12291,7 @@ pub(crate) async fn agentic_turn(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                anyhow::bail!("call declined: over budget");
+                return Err(budget_declined(cli.json, "over_budget", &msg));
             }
         }
     }
@@ -13290,6 +13290,79 @@ fn save_health(health: &HealthStore) {
     if let Err(e) = health.save() {
         eprintln!("zoder: warning: failed to persist health store: {e}");
     }
+}
+
+/// The distinct process exit code for "declined because it would exceed a
+/// budget cap".
+///
+/// `78` is `EX_CONFIG` in BSD sysexits.h — "configuration error". A budget cap
+/// (per-call or month-to-date) is exactly that: the operator's configured
+/// ceiling, not a transient failure (75) and not a malformed request (64). A
+/// caller can therefore tell "I was stopped by the budget" from "the request
+/// was bad" or "the provider failed" without parsing stderr.
+const EXIT_BUDGET_EXCEEDED: i32 = 78;
+
+/// Marker carried in a budget-decline error's chain, so [`error_exit_code`] can
+/// find it without depending on the message text.
+#[derive(Debug)]
+struct BudgetExceededTag;
+
+impl std::fmt::Display for BudgetExceededTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("budget cap exceeded")
+    }
+}
+
+impl std::error::Error for BudgetExceededTag {}
+
+/// Build the decline error for a budget-stop, tagging it so `main` exits with
+/// [`EXIT_BUDGET_EXCEEDED`].
+///
+/// `anyhow::bail!` leaves a bare string error, and `main` maps every error to
+/// exit 1. That is why a non-tty run over budget looked identical to a broken
+/// invocation: the command refused (correctly — `confirm_paid` cannot prompt a
+/// pipe) but reported `1`, so a CI job saw "error" with no way to branch on
+/// "the budget stopped me". The tag lives on the error itself, so it survives
+/// whichever gate site produced it.
+fn budget_declined_error(msg: &str) -> anyhow::Error {
+    anyhow::Error::new(BudgetExceededTag).context(msg.to_string())
+}
+
+/// The process exit code for a failed `run()`.
+///
+/// Errors carrying [`BudgetExceededTag`] exit with [`EXIT_BUDGET_EXCEEDED`];
+/// everything else keeps the historical `1`.
+fn error_exit_code(error: &anyhow::Error) -> i32 {
+    if error.chain().any(|c| c.is::<BudgetExceededTag>()) {
+        return EXIT_BUDGET_EXCEEDED;
+    }
+    1
+}
+
+/// Refuse a call that a budget cap stopped, on either surface.
+///
+/// The message is printed as the same human line as before, and under `--json`
+/// also as the standard error envelope on stdout (`outcome: "error"`, plus
+/// `code`/`reason`/`details`) so a JSON consumer gets a parseable object
+/// instead of an empty stdout (the same contract as [`exec_error_json`], B12).
+/// The over-budget case in particular used to emit the confirm PROMPT to
+/// stderr and then exit — a pipe saw a dangling "Type 'yes' to proceed" and no
+/// explanation.
+fn budget_declined(json: bool, reason: &str, msg: &str) -> anyhow::Error {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "outcome": "error",
+                "succeeded": false,
+                "code": EXIT_BUDGET_EXCEEDED,
+                "reason": reason,
+                "error": msg,
+                "details": { "msg": msg },
+            })
+        );
+    }
+    budget_declined_error(msg)
 }
 
 fn confirm_paid(msg: &str) -> anyhow::Result<bool> {
@@ -23348,6 +23421,53 @@ mod exec_error_detail_tests {
 }
 
 #[cfg(test)]
+mod budget_decline_exit_tests {
+    use super::*;
+
+    /// D2/D8 fix (6): an over-budget decline is reported with a DISTINCT exit
+    /// code, not the generic `1`.
+    ///
+    /// Field complaint: a non-tty run (`zoder "..."` under `set -e`, a CI job,
+    /// a pipe) hit the budget gate, could not prompt, and exited `1` — the
+    /// same code as a bad flag or a crash. A caller could not tell "the
+    /// budget stopped me" from "the command is broken".
+    #[test]
+    fn an_over_budget_decline_exits_with_the_budget_code() {
+        let e = budget_declined_error("call declined: over budget");
+        assert_eq!(error_exit_code(&e), EXIT_BUDGET_EXCEEDED);
+        assert_eq!(EXIT_BUDGET_EXCEEDED, 78);
+    }
+
+    /// The budget code survives wrapping (a `.context()` added by a caller
+    /// must not turn it back into a generic failure).
+    #[test]
+    fn the_budget_exit_code_survives_context_wrapping() {
+        let e = budget_declined_error("call declined: over budget").context("dispatching the turn");
+        assert_eq!(error_exit_code(&e), EXIT_BUDGET_EXCEEDED);
+    }
+
+    /// Every OTHER error keeps the historical exit code `1`: the new code is a
+    /// distinct signal, not a reclassification of ordinary failures.
+    #[test]
+    fn ordinary_errors_keep_the_generic_exit_code() {
+        assert_eq!(error_exit_code(&anyhow::anyhow!("boom")), 1);
+        assert_eq!(
+            error_exit_code(&anyhow::anyhow!("bad flag").context("parsing")),
+            1
+        );
+    }
+
+    /// The decline message is preserved for humans and is non-empty, so the
+    /// `zoder: error:` line still says why.
+    #[test]
+    fn the_budget_decline_text_is_preserved() {
+        let e = budget_declined_error("budget cap: month-to-date $12.00 > $10.00");
+        let text = format!("{e:#}");
+        assert!(text.contains("month-to-date"), "got {text:?}");
+    }
+}
+
+#[cfg(test)]
 mod ledger_call_cost_tests {
     use super::*;
     use zoder_core::pricing::{CallTokens, ModelPrice, PricingCatalog};
@@ -23613,6 +23733,52 @@ mod ledger_call_cost_tests {
             None,
         );
         assert!(!unknown);
+    }
+
+    /// A cost-neutral provider is never billed, even when the catalog DOES
+    /// know the model at a positive rate.
+    ///
+    /// D2/D8 fix (4): "never for cost-neutral providers". A flat plan served
+    /// by a model the price list prices (a subscription gateway fronting
+    /// `openai/gpt-5`, say) must record $0 known -- the list rate is what the
+    /// provider would charge a metered caller, not what this call cost. This
+    /// is the posture half of the phantom-$170 incident: the catalog had a
+    /// rate, so the call was billed as if metered.
+    #[test]
+    fn a_cost_neutral_posture_never_bills_a_resolvable_catalog_rate() {
+        let cat = catalog();
+        // Sanity: the catalog prices this model for a METERED caller.
+        let (metered_cost, metered_unknown) = ledger_call_cost(
+            BillingPosture::Metered,
+            None,
+            &cat,
+            "priced/model-alpha",
+            CallTokens {
+                tokens_in: 1_000_000,
+                tokens_out: 0,
+                cache_hit_tokens: 0,
+            },
+            None,
+        );
+        assert!(!metered_unknown);
+        assert!(metered_cost > 0.0, "metered must be billed: {metered_cost}");
+
+        for posture in [BillingPosture::Subscription, BillingPosture::Free] {
+            let (cost, unknown) = ledger_call_cost(
+                posture,
+                None,
+                &cat,
+                "priced/model-alpha",
+                CallTokens {
+                    tokens_in: 1_000_000,
+                    tokens_out: 0,
+                    cache_hit_tokens: 0,
+                },
+                None,
+            );
+            assert_eq!(cost, 0.0, "{posture:?} must not bill the list rate");
+            assert!(!unknown, "{posture:?} is a KNOWN $0, not unknown");
+        }
     }
 
     /// The posture is derived from the provider's billing mode: a flat plan

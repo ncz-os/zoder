@@ -1144,14 +1144,23 @@ impl PricingCatalog {
         }
         // Short-name (leaf/suffix) fallback. It exists for id-vs-display-name
         // drift (`deepseek-flash` for `deepseek/deepseek-flash`), NOT for
-        // re-attributing a call to another publisher.
+        // re-attributing a call to another publisher, and NOT for guessing
+        // that a bare, unqualified CLIENT id "must be" some publisher's model.
         //
-        // Two rules, both from the Z3 field incidents:
+        // Three rules, all from the Z3 field incidents:
         //   * a QUALIFIED id (`foo/bar`) is an explicit statement of which
         //     model served the call; its leaf may not be borrowed from a
         //     different publisher (`foo/deepseek-r1` is not
-        //     `deepseek/deepseek-r1`), so only an unqualified short name may
-        //     resolve one;
+        //     `deepseek/deepseek-r1`);
+        //   * an id with NO vendor prefix (`llama-3.3`, `MiniMax-M3`, a local
+        //     `qwen3-coder-30b`) is what a local server or a renamed custom
+        //     model reports. It may resolve a leaf that the catalog lists under
+        //     a single publisher (that IS the id/display-name drift this
+        //     fallback is for), but it must never borrow a price from a
+        //     catalog key that is itself unqualified -- a bare key is a cloud
+        //     vendor's own listing, and matching an unrelated bare id to it is
+        //     how a $0 local model was billed at a cloud rate (the phantom
+        //     $170);
         //   * an ambiguous leaf (two or more DISTINCT publishers under the
         //     same short name) resolves to no price at all. C6-P3 picked the
         //     MAX-rate match "to never undercharge"; that guess billed local
@@ -1173,6 +1182,13 @@ impl PricingCatalog {
             }
             let key_leaf = kl.rsplit('/').next().unwrap_or(&kl);
             if key_leaf != leaf {
+                continue;
+            }
+            // An UNQUALIFIED query never resolves a BARE catalog key. The bare
+            // key is some cloud vendor's listing and a different bare id that
+            // merely shares its text is not evidence the same model served the
+            // call -- that is the phantom-$170 attribution.
+            if !qualified && !kl.contains('/') {
                 continue;
             }
             // A qualified query never borrows from a different publisher. The
@@ -1789,6 +1805,79 @@ mod tests {
             cat.classify_cost("custom/cheap-gpt-4o", 1_000, 0, None),
             CostVerdict::Unknown
         );
+    }
+
+    /// D2/D8 fix (4): an id with NO vendor prefix must not borrow a price from
+    /// a BARE catalog key.
+    ///
+    /// Phantom-$170 regression. A bare `gpt-4o` key is a cloud vendor's own
+    /// listing. A local server reporting `my-gpt-4o` (no prefix, different
+    /// model) shares only its tail text with that key, and the old leaf
+    /// fallback billed it at the cloud rate -- every local call then looked
+    /// like a paid OpenAI call and drove the engine's month figure to ~$170.
+    /// A bare query resolves a leaf only under a QUALIFIED key, where the
+    /// catalog states which publisher the model belongs to.
+    #[test]
+    fn a_bare_id_never_borrows_a_bare_cloud_key_rate() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "gpt-4o".to_string(),
+            ModelPrice {
+                usd_per_mtok: 0.0,
+                input_usd_per_mtok: 2.50,
+                output_usd_per_mtok: 10.0,
+                ..Default::default()
+            },
+        );
+        // The exact key is still priced; only ANOTHER bare id is refused.
+        assert!(cat.lookup("gpt-4o").is_some());
+        assert!(
+            cat.lookup("my-gpt-4o").is_none(),
+            "an unprefixed id must not borrow a bare cloud key's rate"
+        );
+        assert_eq!(
+            cat.classify_cost("my-gpt-4o", 1_000_000, 0, None),
+            CostVerdict::Unknown,
+            "an unprefixed local id must be unknown, not billed at the cloud rate"
+        );
+
+        // A qualified key DOES serve a bare query: the drift this fallback
+        // exists for (`deepseek-flash` for `deepseek/deepseek-flash`).
+        let mut cat2 = PricingCatalog::default();
+        cat2.models.insert(
+            "deepseek/deepseek-flash".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.15,
+                output_usd_per_mtok: 0.60,
+                ..Default::default()
+            },
+        );
+        assert!(cat2.lookup("deepseek-flash").is_some());
+    }
+
+    /// D2/D8 fix (4): the bundled catalog must not let a bare (unprefixed) id
+    /// borrow a bare cloud rate, which is the shape the phantom-$170 incident
+    /// took once the engine catalog was seeded with vendor-less keys.
+    ///
+    /// This runs against the REAL shipped list, so it fails if a future
+    /// regeneration introduces bare keys that collide with local ids.
+    #[test]
+    fn the_shipped_list_has_no_bare_key_that_shadows_a_local_id() {
+        let cat = bundled_catalog();
+        for key in cat.models.keys() {
+            // A bare key is legal (some vendors publish unprefixed ids), but it
+            // must not be reachable as a LEAF from a different unprefixed id.
+            if key.contains('/') {
+                continue;
+            }
+            let leaf = key.rsplit('/').next().unwrap_or(key);
+            let mut probe = PricingCatalog::default();
+            probe.models.insert(key.clone(), cat.models[key].clone());
+            assert!(
+                probe.lookup(&format!("local-{leaf}")).is_none(),
+                "bare key {key:?} must not price the unrelated local id local-{leaf}"
+            );
+        }
     }
 
     /// Finding #23: `cost_at` honors the configured off-peak window so
