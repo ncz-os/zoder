@@ -7524,6 +7524,17 @@ fn has_located_blocking_finding(r: &ReviewOutput) -> bool {
     })
 }
 
+/// Does any sample carry an UNLOCATED `critical`? D4.3: the three-sample
+/// majority used to ignore it, so two fresh approvals could resolve a loop
+/// while a critical defect the reviewer could not place was still open.
+/// An unlocated `high` keeps its existing (advisory) treatment here; a
+/// critical never depends on a location to veto.
+fn has_unlocated_critical_finding(r: &ReviewOutput) -> bool {
+    r.findings
+        .iter()
+        .any(|f| f.severity.trim().eq_ignore_ascii_case("critical") && !has_concrete_location(f))
+}
+
 /// Downgrade an unlocated `request_changes` to the fail-closed
 /// `comment_no_evidence` state. `loop_review_ok` fails closed on the unknown
 /// verdict so this can NEVER resolve; the loop additionally exempts it from
@@ -7545,13 +7556,17 @@ comment-with-no-evidence, NOT as a blocking defect. Original summary: {}",
 }
 
 /// Majority decision over the loop's three reviewer samples. Approve iff a
-/// strict majority approve AND no sample carries a located blocking finding.
-/// An empty sample set or a tie is never an approval (fail-closed).
+/// strict majority approve AND no sample carries a located blocking finding
+/// or an unlocated `critical` finding (D4.3). An empty sample set or a tie is
+/// never an approval (fail-closed).
 pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
     if samples.is_empty() {
         return false;
     }
-    if samples.iter().any(has_located_blocking_finding) {
+    if samples
+        .iter()
+        .any(|r| has_located_blocking_finding(r) || has_unlocated_critical_finding(r))
+    {
         return false;
     }
     let approvals = samples
@@ -7571,8 +7586,9 @@ pub(crate) fn majority_loop_approval(samples: &[ReviewOutput]) -> bool {
 /// majority can only be reached when two independent reviewers overrule the
 /// one noisy block. The current sample is included in `majority_loop_approval`
 /// so a single fresh approve cannot resolve, and in the located-blocker veto
-/// (see `majority_loop_approval`) so a located `critical`/`high` finding in ANY
-/// sample blocks — on an unchanged diff it is by definition still unaddressed.
+/// (see `majority_loop_approval`) so a located `critical`/`high` finding — or
+/// an unlocated `critical` (D4.3) — in ANY sample blocks; on an unchanged diff
+/// it is by definition still unaddressed.
 ///
 /// The objective gate and the anti-gaming substance gate must both hold.
 /// An unparseable, unavailable, or synthesized-failure sample is not an
@@ -7753,25 +7769,53 @@ fn bounded_located_findings(findings: &[Finding], reviewer_model: Option<&str>) 
     out
 }
 
-/// Count "blocking" findings. Severity that blocks depends on whether the
-/// objective gate is already green: when the build/test check passes we only
-/// block on `critical` (treat `high` as advisory), otherwise `critical|high`.
-/// In both cases a blocking finding must cite a concrete location, which filters
-/// the hallucinated high-severity findings over-strict free reviewers emit on an
-/// already-correct tree.
-fn count_blocking(r: &ReviewOutput, green: bool) -> usize {
+/// Count "blocking" findings: every `critical`, plus every `high` when no
+/// objective check actually passed (`green == false`).
+///
+/// D4.3 (2026-10-31). Two calibration holes let the loop resolve with a real
+/// defect still open:
+///
+///   1. `high` severity was dropped whenever the build/test check passed. A
+///      green check says the code compiles and the tests held — it says
+///      nothing about a missing authorization check or a data loss path a
+///      reviewer reported. Only a passing check downgrades the `high` class.
+///   2. A finding with no concrete location was not counted at all, so an
+///      unlocated `critical` was invisible to the resolution gate. The
+///      location requirement only ever existed to filter over-strict free
+///      reviewers, and it must never satisfy the gate on its own: absence of
+///      a location is missing evidence, not evidence of safety. The
+///      no-evidence case is handled separately by [`is_unlocated_block`],
+///      which re-asks for a located finding and then fails closed.
+///
+/// `green` therefore only ever excuses `high` severity, and never a
+/// `critical`.
+fn count_blocking(r: &ReviewOutput, _green: bool) -> usize {
     r.findings
         .iter()
         .filter(|f| {
-            let s = f.severity.to_lowercase();
-            let sev_blocks = if green {
-                s == "critical"
-            } else {
-                s == "critical" || s == "high"
-            };
-            sev_blocks && has_concrete_location(f)
+            let s = f.severity.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "critical" | "high")
         })
         .count()
+}
+
+/// The model that actually answered this iteration's review, when a verdict
+/// chunk confirms it.
+///
+/// D4.3: the iteration record's `review_unlocated_no_evidence` flag tells a
+/// consumer that a reviewer answered and could not place a blocking defect,
+/// so the record has to name WHICH reviewer. `run_loop_review` already
+/// returns that model as the top-level slot of `reviewer_verdicts`, but the
+/// flag path took the model from the chunk completion, which is `None` on a
+/// reviewer fallback — so the evidence was there and thrown away. Read it
+/// from the record instead of from the dispatch bookkeeping.
+fn reviewer_model_from_verdicts(verdicts: &[serde_json::Value]) -> Option<String> {
+    verdicts
+        .iter()
+        .filter(|v| v.get("verdict").is_some())
+        .filter_map(|v| v.get("model").and_then(serde_json::Value::as_str))
+        .find(|m| !m.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Synthesize the `ReviewOutput` used when the loop's review phase cannot
@@ -8090,6 +8134,9 @@ pub(crate) struct LoopResolutionSignals {
 ///   3. Non-substantive diffs (Empty / WhitespaceOnly / CommentOnly) are
 ///      explicitly rejected by the anti-gaming guard, even when the
 ///      check is green.
+///   4. A blocking finding blocks EVERY resolve path, `--accept-on-green`
+///      included (D4.3). A green check never excuses a `high` finding, and
+///      no path excuses a `critical`.
 pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green: bool) -> bool {
     let substance_ok = substance_accept_eligible(&s.substance);
     let check_explicit_passed = s.check_passed == Some(true);
@@ -8106,7 +8153,12 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
         verdict: s.verdict.clone(),
         ..Default::default()
     };
-    let review_ok = loop_review_ok(&review, s.blocking_findings);
+    // D4.3: an `approve` verdict is only a review-ok verdict when the
+    // heuristic found nothing blocking. `loop_review_ok`'s
+    // `v == "approve" || blocking == 0` used to let a reviewer that said
+    // "approve" while still reporting a `high` (or an unlocated `critical`)
+    // finding satisfy the gate on its own.
+    let review_ok = s.blocking_findings == 0 && loop_review_ok(&review, s.blocking_findings);
     // Anti-gaming guard: never accept a non-substantive diff on a green /
     // check-satisfied iteration. Mirrors the in-loop guard exactly.
     if (check_explicit_passed || check_satisfied) && !substance_ok {
@@ -8117,10 +8169,13 @@ pub(crate) fn decide_loop_resolution(s: &LoopResolutionSignals, accept_on_green:
     if !review_ok {
         return false;
     }
-    // `--accept-on-green` is an opt-in: requires a REAL passing check
-    // AND no reviewer block. Even under --accept-on-green, an explicit
-    // request_changes / reject / block verdict cannot be overridden.
-    if accept_on_green && check_explicit_passed && substance_ok {
+    // `--accept-on-green` is an opt-in: a REAL passing check plus a reviewer
+    // that raised no blocking finding. D4.3: the same fail-closed blocker
+    // applies here. `--accept-on-green` used to return `true` on a green
+    // check regardless of the reviewer's findings, so it was the one path
+    // where a check passing silently satisfied the gate for a `high` or an
+    // unlocated `critical` finding.
+    if accept_on_green && check_explicit_passed && substance_ok && review_ok {
         return true;
     }
     // Default resolve path: check satisfied (no negative information)
@@ -9242,11 +9297,17 @@ diff is not a finished turn"
         // finding keeps today's semantics.
         let mut review_unlocated_no_evidence = false;
         if is_unlocated_block(&review) {
+            // D4.3: the re-ask used to end "Otherwise return approve or
+            // comment", which invites an approve for a defect the reviewer
+            // could not place — exactly the verdict the gate must not
+            // harvest. The re-ask now either produces a located blocking
+            // finding or a non-blocking verdict that asserts no blocking
+            // defect; approving is only ever the reviewer's own call.
             let located_preamble = format!(
                 "{review_preamble}\n\nThe reviewer returned request_changes with no located finding. \
 A blocking defect MUST cite a concrete location (path:line). Re-review this diff; if you still \
 request changes, include at least one finding with an exact location. Otherwise return approve \
-or comment.\n"
+or comment together with an explicit statement that no blocking defect exists.\n"
             );
             let (r2, m2, c2, ch2, rv2) = match phase_watchdog(
                 LoopPhase::Review,
@@ -9387,6 +9448,11 @@ or comment.\n"
             // never as complete. Empty `reviewer_verdicts` (review errored or
             // was never run) is absent data, and absent data stays incomplete.
             "review_complete": iteration_review_complete(&reviewer_verdicts),
+            // D4.3: name the reviewer that answered. `reviewer_model` above
+            // is set only from a completion, so a reviewer fallback can leave
+            // it null while the verdict slot still records the serving model;
+            // `review_unlocated_no_evidence` below must stay traceable to it.
+            "reviewer_model": reviewer_model_from_verdicts(&reviewer_verdicts).clone(),
             // `reviewer_verdicts` is an array when a reviewer reported; on
             // the incomplete-Err path it is absent (empty), never a lone
             // `false` that a JSON parser would read as the field's value.
@@ -14789,6 +14855,187 @@ mod loop_resolution_tests {
              verdict field was matched case-sensitively and this iteration \
              leaked through as RESOLVED."
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D4.3: the loop must not resolve while an UNLOCATED CRITICAL or a `high`
+    // finding exists. Both halves were calibrated open: `count_blocking`
+    // ignored `high` whenever `--check` passed and ignored every finding
+    // without a concrete location, `decide_loop_resolution` treated an absent
+    // `--check` as satisfied, and the re-ask prompt for an unlocated block
+    // suggested "approve or comment".
+    // -----------------------------------------------------------------------
+
+    /// The regression. An `approve` (or `comment`) review that still carries
+    /// an unlocated `critical` finding must NOT resolve the loop, with or
+    /// without a passing `--check`, and the recorded `blocking_findings`
+    /// count must say so.
+    #[test]
+    fn loop_does_not_resolve_on_unlocated_critical() {
+        for verdict in ["approve", "comment"] {
+            for (check_configured, check_passed) in
+                [(true, Some(true)), (false, None), (true, Some(false))]
+            {
+                let review = ReviewOutput {
+                    verdict: verdict.into(),
+                    summary: "critical data loss path, could not pin the file".into(),
+                    findings: vec![Finding {
+                        severity: "critical".into(),
+                        title: "unbounded write can corrupt the ledger".into(),
+                        body: "the writer is not atomic and nothing bounds it".into(),
+                        // No location: the reviewer could not cite one.
+                        location: None,
+                        disposition: None,
+                    }],
+                    next_steps: vec![],
+                    ..Default::default()
+                };
+                let signals = loop_signals_from_review(
+                    DiffSubstance::Substantive,
+                    check_configured,
+                    check_passed,
+                    &review,
+                );
+                assert!(
+                    signals.blocking_findings >= 1,
+                    "an unlocated critical finding must count as blocking \
+                     (verdict={verdict}, check_passed={check_passed:?}); pre-fix \
+                     `count_blocking` dropped it for having no location"
+                );
+                assert!(
+                    !decide_loop_resolution(&signals, false),
+                    "an unlocated critical finding must NOT resolve the loop \
+                     (verdict={verdict}, check_passed={check_passed:?}); pre-fix \
+                     the location requirement hid it from `count_blocking` and \
+                     an `approve` verdict resolved"
+                );
+                // `--accept-on-green` is not an escape hatch either.
+                assert!(
+                    !decide_loop_resolution(&signals, true),
+                    "even under --accept-on-green, an unlocated critical must \
+                     NOT resolve (verdict={verdict}, check_passed={check_passed:?})"
+                );
+            }
+        }
+    }
+
+    /// The second half of D4.3: a `high` finding blocks even when the
+    /// objective check passes. A green build/test run says nothing about a
+    /// missing authorization check or a data-loss path, so only `medium` and
+    /// below are advisory on a green iteration.
+    #[test]
+    fn loop_does_not_resolve_on_high_finding_with_a_green_check() {
+        let with_location = |location: Option<&str>| ReviewOutput {
+            verdict: "approve".into(),
+            summary: "one high-severity concern".into(),
+            findings: vec![Finding {
+                severity: "high".into(),
+                title: "authorization check removed from the write path".into(),
+                body: "the handler no longer verifies the caller owns the row".into(),
+                location: location.map(str::to_string),
+                disposition: None,
+            }],
+            next_steps: vec![],
+            ..Default::default()
+        };
+        for location in [Some("crates/zoder-cli/src/agentic.rs:42"), None] {
+            let signals = loop_signals_from_review(
+                DiffSubstance::Substantive,
+                true,
+                Some(true), // --check passed
+                &with_location(location),
+            );
+            assert_eq!(
+                signals.blocking_findings, 1,
+                "a high finding must block even on a green check \
+                 (location={location:?}); pre-fix only `critical` blocked here"
+            );
+            assert!(
+                !decide_loop_resolution(&signals, false),
+                "a high finding on a green check must NOT resolve the loop \
+                 (location={location:?})"
+            );
+        }
+        // Lower severities stay advisory on a green check: the fix must not
+        // turn every finding into a blocker.
+        let mut medium = with_location(Some("crates/zoder-cli/src/agentic.rs:42"));
+        medium.findings[0].severity = "medium".into();
+        let signals =
+            loop_signals_from_review(DiffSubstance::Substantive, true, Some(true), &medium);
+        assert_eq!(signals.blocking_findings, 0);
+        assert!(
+            decide_loop_resolution(&signals, false),
+            "a medium finding on a green check with an approving verdict still resolves"
+        );
+    }
+
+    /// The three-sample majority must not overrule an unlocated critical
+    /// either: two fresh approvals on an unchanged diff used to win because
+    /// the veto only looked at LOCATED blocking findings.
+    #[test]
+    fn unchanged_diff_majority_does_not_overrule_an_unlocated_critical() {
+        let approve = |findings: Vec<Finding>| ReviewOutput {
+            verdict: "approve".into(),
+            summary: "no located defect".into(),
+            findings,
+            next_steps: vec![],
+            ..Default::default()
+        };
+        let unlocated_critical = Finding {
+            severity: "critical".into(),
+            title: "credential is logged".into(),
+            body: "the token reaches the trace sink".into(),
+            location: None,
+            disposition: None,
+        };
+        let current = ReviewOutput {
+            verdict: "request_changes".into(),
+            summary: "blocked".into(),
+            ..Default::default()
+        };
+        assert!(
+            !majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve(vec![unlocated_critical.clone()]), approve(vec![]),],
+                true,
+                true,
+            ),
+            "a fresh `approve` sample that still carries an unlocated critical must veto"
+        );
+        // An `high` finding stays non-vetoing in this path (unchanged
+        // behavior): only a critical is location-independent.
+        let unlocated_high = Finding {
+            severity: "high".into(),
+            ..unlocated_critical.clone()
+        };
+        assert!(
+            majority_resolves_on_unchanged_diff(
+                &current,
+                &[approve(vec![unlocated_high]), approve(vec![])],
+                true,
+                true,
+            ),
+            "an unlocated high finding does not veto the three-sample majority"
+        );
+    }
+
+    /// The iteration record must name the reviewer that answered when the
+    /// completion path could not: `review_unlocated_no_evidence` is only
+    /// actionable if the record says which model produced it.
+    #[test]
+    fn iteration_record_names_the_reviewer_that_answered() {
+        let verdicts = vec![
+            json!({"model": "", "verdict": "comment"}),
+            json!({"model": "cerberus-reviewer", "verdict": "comment"}),
+        ];
+        assert_eq!(
+            reviewer_model_from_verdicts(&verdicts).as_deref(),
+            Some("cerberus-reviewer")
+        );
+        assert_eq!(reviewer_model_from_verdicts(&[]), None);
+        // A slot without a verdict (a skip record) is not evidence of who
+        // answered.
+        assert_eq!(reviewer_model_from_verdicts(&[json!({"model": "x"})]), None);
     }
 }
 
