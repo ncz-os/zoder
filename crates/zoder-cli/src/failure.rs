@@ -170,7 +170,9 @@ impl FailureClass {
             | FailureClass::Internal => false,
             // A different reviewer, a later attempt, a restarted daemon, or a
             // re-driven job can plausibly succeed unchanged.
-            FailureClass::ReviewerUnavailable | FailureClass::Cancelled | FailureClass::EngineUnreachable => true,
+            FailureClass::ReviewerUnavailable
+            | FailureClass::Cancelled
+            | FailureClass::EngineUnreachable => true,
         }
     }
 
@@ -187,6 +189,37 @@ impl FailureClass {
         FailureClass::EngineUnreachable,
         FailureClass::Internal,
     ];
+
+    /// Parse a stable class code back into a class.
+    ///
+    /// This is the inverse of [`FailureClass::code`], so a consumer that
+    /// persisted a class code (a fleet worker recording a job outcome, a
+    /// test fixture) can read it back without a hand-maintained mapping.
+    /// An unknown code is `None`: the vocabulary is closed, so an
+    /// unrecognized string is a contract violation, not a class.
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        FailureClass::ALL.iter().copied().find(|c| c.code() == code)
+    }
+}
+
+/// The stable code of every class, in the canonical order.
+///
+/// This is the machine-readable half of the contract, exposed so a caller
+/// (or the documentation test) can enumerate the vocabulary without
+/// duplicating it.
+pub(crate) fn all_class_codes() -> Vec<&'static str> {
+    FailureClass::ALL.iter().map(|c| c.code()).collect()
+}
+
+/// The exit code of every class, paired with its stable code.
+///
+/// Exposed so the documentation test can assert that `docs/EXIT_CODES.md`
+/// matches the code — the doc and the implementation cannot drift.
+pub(crate) fn class_exit_codes() -> Vec<(&'static str, i32)> {
+    FailureClass::ALL
+        .iter()
+        .map(|c| (c.code(), c.exit_code()))
+        .collect()
 }
 
 impl fmt::Display for FailureClass {
@@ -280,11 +313,6 @@ impl ClassifiedFailure {
 /// `1` is the pre-existing behaviour for every failure, so a caller that
 /// predates this contract keeps seeing exactly what it saw before.
 pub(crate) const UNCLASSIFIED_EXIT_CODE: i32 = 1;
-
-/// The exit code for a failure that carries a class.
-pub(crate) fn exit_code_for(class: FailureClass) -> i32 {
-    class.exit_code()
-}
 
 /// A [`ClassifiedFailure`] carried inside an `anyhow::Error` chain.
 ///
@@ -392,6 +420,22 @@ pub(crate) fn error_envelope(failure: &ClassifiedFailure) -> serde_json::Value {
     serde_json::json!({ "error": failure.to_json() })
 }
 
+/// Did this process already print (or write) a RESULT object?
+///
+/// The `--json` contract is one JSON document on stdout. When the command
+/// produced a result (the review payload, the loop payload), the failure
+/// information is attached to THAT object and nothing else is printed —
+/// printing a second document would break every consumer that parses
+/// stdout as one JSON value. When NO result exists (the command failed
+/// before producing one), the failure is printed as its own `error` object.
+static RESULT_EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a result object was produced (printed to stdout and/or
+/// written to `result.json`).
+pub(crate) fn mark_result_emitted() {
+    RESULT_EMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The class of an arbitrary error message, when one can be inferred.
 ///
 /// This is the RECOGNITION step: it maps the free-text shape of a failure onto
@@ -433,7 +477,8 @@ pub(crate) fn classify_message(message: &str) -> Option<(FailureClass, Option<St
     }
 
     // The diff is larger than the review budget.
-    if lower.contains("above the") && (lower.contains("byte limit") || lower.contains("-byte limit"))
+    if lower.contains("above the")
+        && (lower.contains("byte limit") || lower.contains("-byte limit"))
     {
         return Some((FailureClass::DiffTooLarge, None));
     }
@@ -543,7 +588,15 @@ fn extract_reset_timestamp(line: &str) -> Option<String> {
     let token: String = tail
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == ':' || *c == 'T' || *c == 'Z' || *c == '+' || *c == '.')
+        .take_while(|c| {
+            c.is_ascii_digit()
+                || *c == '-'
+                || *c == ':'
+                || *c == 'T'
+                || *c == 'Z'
+                || *c == '+'
+                || *c == '.'
+        })
         .collect();
     if token.len() < 8 {
         return None;
@@ -605,6 +658,24 @@ mod tests {
                 "internal",
             ]
         );
+    }
+
+    #[test]
+    fn every_code_round_trips_back_to_its_class() {
+        for c in FailureClass::ALL {
+            assert_eq!(
+                FailureClass::from_code(c.code()),
+                Some(*c),
+                "the code {:?} must round-trip",
+                c.code()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_code_is_not_a_class() {
+        assert_eq!(FailureClass::from_code("not_a_class"), None);
+        assert_eq!(FailureClass::from_code(""), None);
     }
 
     // ---- one test per class --------------------------------------------
@@ -817,10 +888,9 @@ mod tests {
 
     #[test]
     fn an_unconfirmed_cancel_message_is_recognized() {
-        let (class, _) = classify_message(
-            "author cancellation unconfirmed: session x not confirmed",
-        )
-        .expect("an unconfirmed cancel must be recognized");
+        let (class, _) =
+            classify_message("author cancellation unconfirmed: session x not confirmed")
+                .expect("an unconfirmed cancel must be recognized");
         assert_eq!(class, FailureClass::Cancelled);
     }
 
@@ -875,8 +945,48 @@ mod tests {
         );
         let recovered = classify_error(&err).expect("the class must survive the chain");
         assert_eq!(recovered.class, FailureClass::BudgetExceeded);
-        assert_eq!(recovered.budget_reset_at.as_deref(), Some("2026-11-01T00:00:00Z"));
+        assert_eq!(
+            recovered.budget_reset_at.as_deref(),
+            Some("2026-11-01T00:00:00Z")
+        );
         assert_eq!(recovered.exit_code(), 67);
         assert!(!recovered.retryable());
+    }
+
+    // ---- the documentation cannot drift from the code -------------------
+
+    /// `docs/EXIT_CODES.md` is the published contract. Every class and every
+    /// exit code it documents MUST match the implementation, and every class
+    /// in the implementation MUST be documented. A change to the vocabulary
+    /// without a documentation update fails here.
+    #[test]
+    fn the_exit_code_document_matches_the_implementation() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/EXIT_CODES.md"),
+        )
+        .expect("docs/EXIT_CODES.md must exist: it is the published contract");
+
+        for (code, exit) in class_exit_codes() {
+            // The class code must appear in the document.
+            assert!(
+                doc.contains(code),
+                "docs/EXIT_CODES.md does not document the failure class {code:?}"
+            );
+            // The exit code must appear on the SAME line as the class code,
+            // so the table cannot pair a class with the wrong code.
+            let line = doc
+                .lines()
+                .find(|l| l.contains(&format!("`{code}`")))
+                .unwrap_or_else(|| panic!("docs/EXIT_CODES.md has no line for {code:?}"));
+            assert!(
+                line.contains(&format!("{exit}")),
+                "docs/EXIT_CODES.md pairs {code:?} with the wrong exit code; expected {exit} in: {line:?}"
+            );
+        }
+        // The unclassified fallback must be documented too.
+        assert!(
+            doc.contains("`1`") && doc.contains("not classified"),
+            "docs/EXIT_CODES.md must document the unclassified exit code 1"
+        );
     }
 }

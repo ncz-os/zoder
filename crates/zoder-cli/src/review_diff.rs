@@ -836,11 +836,16 @@ pub fn review_diff_chunks(
         let path = section_path(section).unwrap_or_default();
         let Some(first_hunk) = section.find("\n@@").map(|i| i + 1) else {
             if section.len() > cap {
-                bail!(
-                    "one diff section is {} bytes with no split point, above the {}-byte review limit; pass --max-hunk-bytes N to raise it",
-                    section.len(),
-                    cap
-                );
+                // A single diff section that cannot be split is a diff that
+                // cannot be reviewed as configured: `diff_too_large`.
+                return Err(crate::failure::classified_err(
+                    crate::failure::FailureClass::DiffTooLarge,
+                    format!(
+                        "one diff section is {} bytes with no split point, above the {}-byte review limit; pass --max-hunk-bytes N to raise it",
+                        section.len(),
+                        cap
+                    ),
+                ));
             }
             units.push((String::new(), section.to_owned()));
             continue;
@@ -861,11 +866,16 @@ pub fn review_diff_chunks(
                     units.push((header.to_owned(), rest));
                 }
             } else {
-                bail!(
-                    "one diff hunk is {} bytes, above the {}-byte review limit; pass --max-hunk-bytes N to raise it, or omit --no-split-hunks to split it automatically",
-                    header.len() + hunk.len(),
-                    cap
-                );
+                // An oversized hunk that was not split: the diff cannot be
+                // reviewed as configured, so the class is `diff_too_large`.
+                return Err(crate::failure::classified_err(
+                    crate::failure::FailureClass::DiffTooLarge,
+                    format!(
+                        "one diff hunk is {} bytes, above the {}-byte review limit; pass --max-hunk-bytes N to raise it, or omit --no-split-hunks to split it automatically",
+                        header.len() + hunk.len(),
+                        cap
+                    ),
+                ));
             }
         }
     }
@@ -1137,11 +1147,17 @@ pub fn prepare_review_diff_with_chunks(
     // condition, not an "approve" one. Record it so the caller can refuse.
     let emptied_by_exclusion = !raw_diff.trim().is_empty() && filtered.trim().is_empty();
     if filtered.len() > max_diff_bytes {
-        bail!(
-            "review diff is {} bytes, above the {}-byte limit; pass --max-diff-bytes N (or set [review].max_diff_bytes) to raise it, or --exclude <glob> to drop generated files",
-            filtered.len(),
-            max_diff_bytes
-        );
+        // The diff is larger than the review budget. The class is
+        // `diff_too_large`: the operator must raise the cap or exclude
+        // files, and an identical retry fails identically.
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::DiffTooLarge,
+            format!(
+                "review diff is {} bytes, above the {}-byte limit; pass --max-diff-bytes N (or set [review].max_diff_bytes) to raise it, or --exclude <glob> to drop generated files",
+                filtered.len(),
+                max_diff_bytes
+            ),
+        ));
     }
     let chunks = review_diff_chunks(&filtered, max_hunk_bytes, split_hunks, max_chunks)?;
     let diff_map = if chunks.len() > 1 {

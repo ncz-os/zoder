@@ -556,11 +556,28 @@ struct ChainFailure {
     message: String,
     skipped: Vec<SkippedReviewCandidate>,
     forced: bool,
+    /// The failure class this chain failure belongs to.
+    ///
+    /// `None` means "not classified at the site": [`ChainFailure::into_anyhow`]
+    /// then infers the class from the message (see
+    /// [`crate::failure::classify_message`]), which keeps the pre-existing
+    /// construction sites working while still landing in a stable class.
+    class: Option<crate::failure::FailureClass>,
 }
 
 impl ChainFailure {
+    /// Convert to an `anyhow::Error` that CARRIES the classification.
+    ///
+    /// The class is what the fleet contract reads, so it must survive the
+    /// trip up the stack: it travels as a typed error in the anyhow chain
+    /// (see [`crate::failure::classify_error`]) rather than as a substring.
     fn into_anyhow(self) -> anyhow::Error {
-        anyhow!(self.message)
+        let class = self.class.unwrap_or_else(|| {
+            crate::failure::classify_message(&self.message)
+                .map(|(c, _)| c)
+                .unwrap_or(crate::failure::FailureClass::ReviewerUnavailable)
+        });
+        crate::failure::classified_err(class, self.message)
     }
 }
 
@@ -777,6 +794,10 @@ async fn complete_once_tracked(
         message: e.to_string(),
         skipped: Vec::new(),
         forced: false,
+        // Resolving the reviewer PLAN failed: the engine config could not
+        // be loaded, or the pinned reviewer is not in the corpus. Either
+        // way the operator must change something before a retry can work.
+        class: Some(crate::failure::FailureClass::Config),
     })?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
@@ -829,10 +850,21 @@ async fn complete_once_tracked(
         } else {
             "no reviewer model resolved (check `--reviewer`, `[agents.X].reviewer_model`, or `Config::reviewer_model`)".to_string()
         };
+        let class = crate::failure::classify_message(&message)
+            .map(|(c, _)| c)
+            .or(Some(crate::failure::FailureClass::ReviewerUnavailable));
         return Err(ChainFailure {
             message,
             skipped,
             forced,
+            // No reviewer candidate could answer. The chain is empty
+            // because nothing was resolvable (config) or because every
+            // candidate was skipped (the reviewer twice returned an
+            // invalid verdict, or the family filter removed them all).
+            // The message carries the exact reason; the class is derived
+            // from it so the config shape and the exhausted-chain shape
+            // land in different classes.
+            class,
         });
     }
 
@@ -996,10 +1028,19 @@ async fn complete_once_tracked(
                 // config, ledger failure, token gating, etc.) where the
                 // next candidate would either reproduce the same failure
                 // or mask a real config error. Surface verbatim.
+                let class = crate::failure::classify_message(&message)
+                    .map(|(c, _)| c)
+                    .or(Some(crate::failure::FailureClass::Config));
                 return Err(ChainFailure {
                     message,
                     skipped,
                     forced,
+                    // A FATAL reviewer error: a policy rejection, a missing
+                    // provider config, a ledger failure, a token gating
+                    // refusal, or an unreadable disk. These are structural:
+                    // the next candidate would reproduce them, and the
+                    // operator has to change the environment first.
+                    class,
                 });
             }
         }
@@ -1017,10 +1058,18 @@ async fn complete_once_tracked(
         "no reviewer model produced a completion (chain exhausted without a candidate answering)"
             .to_string()
     });
+    let class = crate::failure::classify_message(&msg)
+        .map(|(c, _)| c)
+        .or(Some(crate::failure::FailureClass::ReviewerUnavailable));
     Err(ChainFailure {
         message: msg,
         skipped,
         forced,
+        // Every candidate errored. The message names the last provider
+        // error, which is what decides the class: a budget refusal is a
+        // budget failure, an unreachable engine is an engine failure, and
+        // anything else is a reviewer that could not answer (retryable).
+        class,
     })
 }
 
@@ -1075,10 +1124,14 @@ fn plan_loop_review(
     // `run_git_diff` caps acquisition at 1 MiB and marks the tail. Reviewing
     // that marker would still be an approve on a partial view, so refuse it
     // even when `max_diff_bytes` was raised above the acquisition cap.
-    anyhow::ensure!(
-        !diff.contains("[git diff truncated during acquisition"),
-        "review diff was truncated during acquisition; refusing to approve an incomplete view"
-    );
+    // The class is `diff_too_large`: the diff could not be acquired in
+    // full, so it cannot be reviewed as configured.
+    if diff.contains("[git diff truncated during acquisition") {
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::DiffTooLarge,
+            "review diff was truncated during acquisition; refusing to approve an incomplete view",
+        ));
+    }
     // Definition context is paid for inside the per-route chunk budget: the
     // chunk cap is reduced by the context share, and the context builder gets
     // that same share as its hard ceiling.
@@ -4985,20 +5038,32 @@ did not satisfy the review schema."
                         // message that names the model and both budgets,
                         // and stop — no third request, no chain advance
                         // pretending a verdict was attempted.
+                        //
+                        // The class is `budget_exceeded`: the reviewer's
+                        // OUTPUT budget was exhausted twice. The operator
+                        // must raise `max_tokens` or lower the reasoning
+                        // effort, so an identical retry fails identically —
+                        // this is NOT a transient failure.
                         let first = completion.max_tokens;
                         let second = repair.completion.max_tokens;
                         if first == second {
-                            anyhow::bail!(
-                                "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
+                            return Err(crate::failure::classified_err(
+                                crate::failure::FailureClass::BudgetExceeded,
+                                format!(
+                                    "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                                    completion.model
+                                ),
+                            ));
+                        }
+                        return Err(crate::failure::classified_err(
+                            crate::failure::FailureClass::BudgetExceeded,
+                            format!(
+                                "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
 lower its reasoning effort or raise max_tokens",
                                 completion.model
-                            );
-                        }
-                        anyhow::bail!(
-                            "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
-lower its reasoning effort or raise max_tokens",
-                            completion.model
-                        );
+                            ),
+                        ));
                     }
                 }
                 Err(failure) => {
@@ -5295,21 +5360,33 @@ pub(crate) async fn cmd_review(
             model: "(no diff)".into(),
             err: reason.clone(),
         };
-        let agg = emit_reviews(
-            cli,
-            &ReviewAggregate {
-                reviewers: &[failed],
-                cost_usd: 0.0,
-                requested: 1,
-                ok_models: 0,
-                failed_models: 1,
-                receipts: &[],
-                exclusions: None,
-                chunking: None,
-                confirm: &[],
-            },
+        let aggregate = ReviewAggregate {
+            reviewers: &[failed],
+            cost_usd: 0.0,
+            requested: 1,
+            ok_models: 0,
+            failed_models: 1,
+            receipts: &[],
+            exclusions: None,
+            chunking: None,
+            confirm: &[],
+        };
+        // The scope was wrong, not the diff: the operator asked to review a
+        // branch whose diff is empty while their real work sits uncommitted.
+        // Retrying the same invocation yields the same empty diff, so this is
+        // a USAGE failure, not a transient one.
+        let failure = crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureClass::Usage,
+            format!(
+                "review refused (aggregate verdict `{}`): {reason}",
+                aggregate_verdict(&aggregate)
+            ),
         );
-        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
+        emit_reviews(cli, &aggregate, Some(&failure));
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::Usage,
+            failure.message.clone(),
+        ));
     }
     if diff.trim().is_empty() {
         let out = ReviewOutput {
@@ -5335,6 +5412,7 @@ pub(crate) async fn cmd_review(
                 chunking: None,
                 confirm: &[],
             },
+            None,
         );
         return Ok(());
     }
@@ -5632,27 +5710,36 @@ unbound, or missing imports:\n{context}"
                 "exclusions removed every changed file from a non-empty {label} diff; refusing to review an empty diff. {report}"
             ),
         };
-        let agg = emit_reviews(
-            cli,
-            &ReviewAggregate {
-                reviewers: &[failed],
-                cost_usd: 0.0,
-                requested: 1,
-                ok_models: 0,
-                failed_models: 1,
-                receipts: &[],
-                exclusions: Some(&prepared.excluded),
-                chunking: None,
-                confirm: &[],
-            },
+        let aggregate = ReviewAggregate {
+            reviewers: &[failed],
+            cost_usd: 0.0,
+            requested: 1,
+            ok_models: 0,
+            failed_models: 1,
+            receipts: &[],
+            exclusions: Some(&prepared.excluded),
+            chunking: None,
+            confirm: &[],
+        };
+        // The exclusions removed every changed file. The diff was fine; the
+        // EXCLUSION SET emptied it, and the same invocation would empty it
+        // again. That is a configuration problem the operator must fix (or a
+        // diff that is entirely excluded), not a transient one.
+        let failure = crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureClass::Config,
+            format!(
+                "review refused: exclusions left nothing to review while the raw {label} diff was non-empty \
+                 ({} byte(s) raw -> 0; aggregate verdict `{}`); {report}",
+                diff.len(),
+                aggregate_verdict(&aggregate)
+            ),
         );
-        anyhow::bail!(
-            "review refused: exclusions left nothing to review while the raw {label} diff was non-empty \
-             ({} byte(s) raw -> 0; aggregate verdict `{agg}`); {report}",
-            diff.len()
-        );
+        emit_reviews(cli, &aggregate, Some(&failure));
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::Config,
+            failure.message.clone(),
+        ));
     }
-
     // Scenario-routed reviewer chain: resolved once above (before chunking, so
     // per-route caps could use it) and reused here. It is passed to every
     // `complete_once` call so the default reviewer (the "head" of the roster,
@@ -5764,7 +5851,70 @@ unbound, or missing imports:\n{context}"
         confirm: &confirm_sections,
     };
 
-    let agg = emit_reviews(cli, &aggregate);
+    // The failure classification is decided BEFORE the payload is emitted,
+    // so the `--json` result can carry the failure (class, code, retryable,
+    // message) inside the SAME document that carries the review. The
+    // diagnostic trail is unchanged: the payload still shows the verdict,
+    // the per-model status and the cost, exactly as before.
+    let failure: Option<crate::failure::ClassifiedFailure> = if ok_models == 0 {
+        // Critical regression guard (Finding #14): when NO reviewer completed
+        // (e.g. the only configured reviewer 401'd, or every panel model
+        // timed out) the function used to return `Ok(())` with a synthetic
+        // "comment" verdict and CI gates saw "green". That hides a real
+        // failure and erases the very signal the review job exists to
+        // produce. Surface it as a nonzero exit so a CI `zoder review` job
+        // breaks the pipeline when every model fails — the same way every
+        // other Rust-bin in this workspace treat "no successful work
+        // happened" as a hard error.
+        //
+        // No reviewer produced a verdict. The panel may be down, the
+        // provider may be refusing, the reviewer may have run out of budget
+        // twice — a DIFFERENT reviewer or a later attempt plausibly
+        // succeeds, so this is the retryable class.
+        Some(crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureClass::ReviewerUnavailable,
+            format!(
+                "review failed: 0/{requested} reviewers completed (all errors; see diagnostics above). \
+A review that no model produced must not be reported as success."
+            ),
+        ))
+    } else if failed_count > 0 {
+        // A PARTIAL review: some reviewers answered, some did not. The
+        // review is real but incomplete, and the missing reviewers may well
+        // answer on a retry.
+        Some(crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureClass::ReviewerUnavailable,
+            format!("review incomplete: {failed_count}/{requested} reviewers failed"),
+        ))
+    } else {
+        // SC1 [CRITICAL]: a blocking aggregate verdict MUST break the
+        // process exit code. `cmd_review` used to `Ok(())` unconditionally
+        // after emitting the payload, so a `request_changes` / `reject` /
+        // `block` (or an unknown verdict, which `verdict_rank` fails closed
+        // to rank 2) still exited 0. Automation keyed on the exit code (and
+        // the background-job finalizer in main.rs, which stamps status from
+        // res.is_ok()) therefore read a BLOCK as APPROVE.
+        let agg = aggregate_verdict(&aggregate);
+        if verdict_rank(&agg) >= 2 {
+            // The review COMPLETED and said "no". This is not a failure of
+            // the tool: retrying the same diff produces the same verdict, so
+            // it is explicitly NOT retryable.
+            Some(crate::failure::ClassifiedFailure::new(
+                crate::failure::FailureClass::ReviewBlocked,
+                format!(
+                    "review blocked: aggregate verdict `{agg}` requests changes \
+(a blocking review must not exit 0)"
+                ),
+            ))
+        } else {
+            None
+        }
+    };
+
+    // The aggregate verdict is already inside the emitted payload; the
+    // value itself is not needed here (the failure decision above used
+    // `aggregate_verdict`).
+    let _agg = emit_reviews(cli, &aggregate, failure.as_ref());
 
     // The per-call records belong to the RUN: a review that printed prose
     // still made calls, and those calls must land in the telemetry file.
@@ -5772,48 +5922,17 @@ unbound, or missing imports:\n{context}"
         crate::context_opt::flush(&eng.cfg);
     }
 
-    // Critical regression guard (Finding #14): when NO reviewer completed
-    // (e.g. the only configured reviewer 401'd, or every panel model timed
-    // out) the function used to return `Ok(())` with a synthetic "comment"
-    // verdict and CI gates saw "green". That hides a real failure and
-    // erases the very signal the review job exists to produce. Surface it
-    // as a nonzero exit so a CI `zoder review` job breaks the pipeline
-    // when every model fails — the same way every other Rust-bins in this
-    // workspace treat "no successful work happened" as a hard error.
-    //
-    // We do this AFTER emitting the payload (and writing result.json when
-    // running as a background job, via `emit_reviews`) so the operator still
-    // has a complete diagnostic trail — verdict, model-by-model status,
-    // and cost — to triage from.
-    if ok_models == 0 {
-        let requested_n = requested;
-        anyhow::bail!(
-            "review failed: 0/{requested_n} reviewers completed (all errors; see diagnostics above). \
-A review that no model produced must not be reported as success.",
-        );
-    }
     if failed_count > 0 && !cli.quiet {
         eprintln!(
             "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
         );
     }
-    if failed_count > 0 {
-        anyhow::bail!("review incomplete: {failed_count}/{requested} reviewers failed");
-    }
-    // SC1 [CRITICAL]: a blocking aggregate verdict MUST break the process
-    // exit code. `cmd_review` used to `Ok(())` unconditionally after
-    // emitting the payload, so a `request_changes` / `reject` / `block`
-    // (or an unknown verdict, which `verdict_rank` fails closed to rank 2)
-    // still exited 0. Automation keyed on the exit code (and the
-    // background-job finalizer in main.rs, which stamps status from
-    // res.is_ok()) therefore read a BLOCK as APPROVE. Surface it as a
-    // nonzero exit AFTER `emit_reviews` has written result.json / printed
-    // the full diagnostic, so the operator still gets the complete trail.
-    if verdict_rank(&agg) >= 2 {
-        anyhow::bail!(
-            "review blocked: aggregate verdict `{agg}` requests changes \
-(a blocking review must not exit 0)"
-        );
+    // The classified failure is the exit signal. The payload has already
+    // been emitted (and `result.json` written for a background job), so the
+    // operator still has the complete diagnostic trail — verdict,
+    // model-by-model status, and cost — to triage from.
+    if let Some(f) = failure {
+        return Err(crate::failure::classified_err(f.class, f.message));
     }
     Ok(())
 }
@@ -6413,12 +6532,30 @@ fn receipts_show_substitution(receipts: &[serde_json::Value]) -> bool {
     })
 }
 
-/// Render the aggregated review(s) as JSON (machine) or text (human), and write
-/// `result.json` when running as a background job. `aggregate.ok_models == 0`
-/// is reflected in the payload as `complete: false` so downstream consumers
-/// (CI gates, dashboards) can distinguish a real "comment" verdict from a
-/// total-failure no-reviewer-actually-ran episode.
-fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
+/// The aggregate verdict of a review aggregate, WITHOUT emitting anything.
+///
+/// Used by the failure paths that must name the verdict in their message
+/// BEFORE the payload is emitted (so the failure can be attached to that
+/// same payload).
+fn aggregate_verdict(aggregate: &ReviewAggregate<'_>) -> String {
+    aggregate_review(
+        aggregate.reviewers,
+        aggregate.cost_usd,
+        aggregate.requested,
+        aggregate.ok_models,
+        aggregate.failed_models,
+    )
+    .0
+}
+
+/// Build the machine-readable review payload for an aggregate.
+///
+/// Pure: it computes the payload and the aggregate verdict WITHOUT printing
+/// anything, so the caller can attach the failure classification to the
+/// payload BEFORE it is emitted. That ordering matters: the `--json` contract
+/// is ONE JSON document on stdout, and the failure information has to live
+/// inside that same document rather than in a second one.
+fn build_review_payload(aggregate: &ReviewAggregate<'_>) -> (String, bool, serde_json::Value) {
     let (agg, all_failed, mut payload) = aggregate_review(
         aggregate.reviewers,
         aggregate.cost_usd,
@@ -6450,6 +6587,29 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     if !aggregate.confirm.is_empty() {
         payload["confirm"] = json!(aggregate.confirm);
     }
+    (agg, all_failed, payload)
+}
+
+/// Render the aggregated review(s) as JSON (machine) or text (human), and write
+/// `result.json` when running as a background job. `aggregate.ok_models == 0`
+/// is reflected in the payload as `complete: false` so downstream consumers
+/// (CI gates, dashboards) can distinguish a real "comment" verdict from a
+/// total-failure no-reviewer-actually-ran episode.
+///
+/// `failure` is the classified failure this run ended with, when there is
+/// one. It is attached to the payload as a `failure` object (class, code,
+/// retryable, message) so a `--json` consumer reads the failure from the
+/// SAME document that carries the review. The field is absent on a
+/// successful run, and no pre-existing field changes meaning.
+fn emit_reviews(
+    cli: &crate::Cli,
+    aggregate: &ReviewAggregate<'_>,
+    failure: Option<&crate::failure::ClassifiedFailure>,
+) -> String {
+    let (agg, all_failed, mut payload) = build_review_payload(aggregate);
+    if let Some(f) = failure {
+        payload["failure"] = f.to_json();
+    }
 
     if let Some(dir) = active_job_dir() {
         let _ = std::fs::write(
@@ -6457,6 +6617,9 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
             serde_json::to_string_pretty(&payload).unwrap_or_default(),
         );
     }
+    // The result object exists now: a `--json` failure must be attached to
+    // it rather than printed as a second document.
+    crate::failure::mark_result_emitted();
 
     if cli.json {
         println!(
@@ -6516,6 +6679,45 @@ fn emit_reviews(cli: &crate::Cli, aggregate: &ReviewAggregate<'_>) -> String {
     }
 
     agg
+}
+
+/// Attach a classified failure to the result object this process already
+/// produced, when there is one.
+///
+/// Returns `true` when the failure was attached (so the caller must NOT
+/// print a second JSON document), and `false` when there was no result to
+/// attach to — in which case the caller prints the standalone `error`
+/// object.
+///
+/// The attachment is possible only for a result that is still in this
+/// process's hands: the background-job `result.json` file. The stdout
+/// document was already printed, so it cannot be rewritten; that is why the
+/// review and loop paths attach the failure BEFORE emitting.
+pub(crate) fn attach_failure_to_result(failure: &crate::failure::ClassifiedFailure) -> bool {
+    // The class must be one of the closed vocabulary's members. A class
+    // outside it would be a contract violation, and writing it into the
+    // result would publish a code no consumer can interpret.
+    if crate::failure::FailureClass::from_code(failure.class.code()).is_none() {
+        return false;
+    }
+    // A result that was printed to stdout cannot be rewritten, so the
+    // failure must already be inside it. Nothing to do here.
+    let Some(dir) = active_job_dir() else {
+        return false;
+    };
+    let path = dir.join("result.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    payload["failure"] = failure.to_json();
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    );
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -7882,13 +8084,23 @@ fn validate_loop_reviewer_pin(cli: &crate::Cli, reviewer: Option<&str>) -> anyho
     // `reviewer_model`.
     let plan = build_reviewer_plan(cli, Some(raw), &[], &[], None)?;
     let Some(head) = plan.candidates.first() else {
-        anyhow::bail!("no reviewer model resolved for --reviewer {raw}");
+        // The pin names a model that resolves to nothing. The operator must
+        // fix the pin: an identical retry fails identically.
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::Config,
+            format!("no reviewer model resolved for --reviewer {raw}"),
+        ));
     };
     let routing = crate::RoutingContext::load(&eng.cfg)?;
     if routing.real_provider_for_model(&eng.cfg, head).is_none() {
         let msg = no_reviewer_provider_message(cli, &eng, &routing, head);
         record_loop_reviewer_pin_failure(cli, &msg);
-        anyhow::bail!("{msg}");
+        // The pin names a model no configured provider serves: a config
+        // problem the operator must fix.
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::Config,
+            msg,
+        ));
     }
     Ok(())
 }
@@ -8466,8 +8678,16 @@ async fn cmd_loop_run(
     // `Engine::load()` would re-read `config.json` and the overlay TOMLs.
     // A failure to load the engine is treated as a fatal misconfig — the
     // operator's config is broken in a way that already prevents the loop
-    // from running at all.
-    let engine_cfg = Engine::load()?.cfg;
+    // from running at all. The class is `config`: the operator must fix the
+    // configuration before a retry can work.
+    let engine_cfg = Engine::load()
+        .map_err(|e| {
+            crate::failure::classified_err(
+                crate::failure::FailureClass::Config,
+                format!("loading engine config: {e:#}"),
+            )
+        })?
+        .cfg;
     let exec_safety_policy = engine_cfg.exec_safety.clone();
     // Fleet job workspaces publish the job id their runner assigned. A
     // standalone run has no such runner, so it must not invent or forward one.
@@ -8602,7 +8822,13 @@ async fn cmd_loop_run(
         if !cli.quiet {
             eprintln!("[loop] {detail}");
         }
-        return Err(anyhow::anyhow!("[zoder] {detail}"));
+        // The `--reviewer` pin names a model no configured provider serves
+        // (or one outside the allowlist). The operator must fix the pin or
+        // the configuration first: an identical retry fails identically.
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureClass::Config,
+            format!("[zoder] {detail}"),
+        ));
     }
     const STALL_LIMIT: usize = 3;
 
@@ -8732,7 +8958,15 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         // record.
                         let reason = author_cancel_reason(&socket, sid, &first_error).await;
                         if !reason.is_empty() {
-                            return Err(anyhow::Error::msg(reason));
+                            // The daemon never acknowledged the cancellation:
+                            // the turn may still be running. The class is
+                            // `cancelled` (retryable — the job can be
+                            // re-driven), and the reason carries the
+                            // operator-facing detail.
+                            return Err(crate::failure::classified_err(
+                                crate::failure::FailureClass::Cancelled,
+                                reason,
+                            ));
                         }
                     }
                 } else {
@@ -8769,9 +9003,16 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // not extend the loop's bookkeeping as if it were a
                 // legitimate iteration.
                 if let Some(v) = &t.policy_violation {
-                    anyhow::bail!(
-                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
-                    );
+                    // The run was refused by the free policy: the operator
+                    // asked for free-only work and the turn would have cost
+                    // money. `--allow-paid` is the fix, so this is a USAGE
+                    // failure, not a transient one.
+                    return Err(crate::failure::classified_err(
+                        crate::failure::FailureClass::Usage,
+                        format!(
+                            "loop author turn violated free policy (use --allow-paid to permit): {v}"
+                        ),
+                    ));
                 }
                 // `t.alias` is the alias of the candidate that actually
                 // produced this turn (the head or a fallback), so the next
@@ -9774,7 +10015,81 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         feedback = fb;
     }
 
-    let payload = json!({
+    // The failure classification is decided BEFORE the payload is built, so
+    // the `--json` result carries the failure (class, code, retryable,
+    // message) inside the SAME document that carries the loop. No
+    // pre-existing field changes meaning; the `failure` field is absent on
+    // a resolved run.
+    let failure: Option<crate::failure::ClassifiedFailure> = if resolved {
+        None
+    } else {
+        // WHY the loop did not resolve decides the class:
+        //
+        // * a reviewer that never produced a verdict -> `reviewer_unavailable`
+        //   (retryable: a different reviewer or a later attempt may answer);
+        // * a cancellation the engine never confirmed -> `cancelled`
+        //   (retryable: the job can be re-driven);
+        // * a budget refusal -> `budget_exceeded` (not retryable until the
+        //   window resets);
+        // * an author that never produced edits -> `engine_unreachable`
+        //   (retryable: the daemon may come back);
+        // * anything else -> `internal`.
+        //
+        // The recorded `review_error` / `author_error` of the LAST iteration
+        // is the evidence; it is the same text the operator already sees.
+        let last_iter = iterations.last();
+        let evidence = last_iter
+            .and_then(|it| {
+                it.get("review_error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        it.get("author_error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .unwrap_or_default();
+        let class = if let Some((class, reset)) = crate::failure::classify_message(&evidence) {
+            // The engine's own budget refusal carries a reset timestamp; it
+            // must survive into the JSON so the caller knows when to come
+            // back.
+            if class == crate::failure::FailureClass::BudgetExceeded {
+                crate::failure::ClassifiedFailure::with_budget_reset(class, evidence.clone(), reset)
+            } else {
+                crate::failure::ClassifiedFailure::new(class, evidence.clone())
+            }
+        } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
+            crate::failure::ClassifiedFailure::new(
+                crate::failure::FailureClass::ReviewerUnavailable,
+                evidence.clone(),
+            )
+        } else if iterations.is_empty() {
+            crate::failure::ClassifiedFailure::new(
+                crate::failure::FailureClass::EngineUnreachable,
+                evidence.clone(),
+            )
+        } else {
+            crate::failure::ClassifiedFailure::new(
+                crate::failure::FailureClass::Internal,
+                evidence.clone(),
+            )
+        };
+        let mut message = format!(
+            "loop ended unresolved after {} iteration(s)",
+            iterations.len()
+        );
+        if !evidence.is_empty() {
+            message.push_str(&format!("; last recorded reason: {evidence}"));
+        }
+        Some(crate::failure::ClassifiedFailure {
+            class: class.class,
+            message,
+            budget_reset_at: class.budget_reset_at,
+        })
+    };
+
+    let mut payload = json!({
         "kind": "loop",
         "task": task_txt,
         "resolved": resolved,
@@ -9801,6 +10116,12 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
             .and_then(|it| it.get("filtered_findings"))
             .cloned(),
     });
+    // The failure classification travels INSIDE the result document, so a
+    // `--json` consumer reads the class, the retryable flag and the message
+    // from the same object that carries the loop.
+    if let Some(f) = &failure {
+        payload["failure"] = f.to_json();
+    }
 
     let teardown_reason = if resolved {
         "approved"
@@ -9847,6 +10168,9 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
             serde_json::to_string_pretty(&payload).unwrap_or_default(),
         );
     }
+    // The result object exists: a `--json` failure must be attached to it
+    // rather than printed as a second document.
+    crate::failure::mark_result_emitted();
 
     if cli.json {
         println!(
@@ -9897,11 +10221,14 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         }
     }
 
-    if !resolved {
-        anyhow::bail!(
-            "loop ended unresolved after {} iteration(s)",
-            iterations.len()
-        );
+    // The loop did not resolve. The class was decided above (before the
+    // payload was built), so the payload already carries it and the exit
+    // code matches what the JSON says.
+    if let Some(f) = failure {
+        return Err(match f.budget_reset_at.clone() {
+            Some(reset) => crate::failure::classified_budget_err(f.message, Some(reset)),
+            None => crate::failure::classified_err(f.class, f.message),
+        });
     }
     Ok(())
 }

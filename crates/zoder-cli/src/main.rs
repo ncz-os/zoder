@@ -2458,7 +2458,15 @@ async fn main() {
     reap_ephemeral_daemons();
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
-        std::process::exit(1);
+        // The failure contract (see `docs/EXIT_CODES.md`): a CLASSIFIED
+        // failure exits with its own documented code, and an UNCLASSIFIED
+        // failure keeps the historical exit `1` so every pre-existing
+        // caller keeps working unchanged.
+        let exit_code = match failure::classify_error(&e) {
+            Some(classified) => classified.exit_code(),
+            None => failure::UNCLASSIFIED_EXIT_CODE,
+        };
+        std::process::exit(exit_code);
     }
 }
 
@@ -2748,7 +2756,60 @@ async fn run() -> anyhow::Result<()> {
     };
     // Best-effort, throttled "a new release is available" hint (stderr). Never fatal.
     maybe_notify_update(&cli).await;
+    // The machine-readable failure contract (see `docs/EXIT_CODES.md`).
+    //
+    // In `--json` mode the failure class, the retryable flag and the human
+    // message must reach the consumer as JSON. TWO shapes, because the
+    // command may or may not have produced a result object first:
+    //
+    // * the command produced a result -> the failure information is
+    //   attached to THAT object, and nothing more is printed (stdout stays
+    //   exactly one JSON document, which every existing consumer parses);
+    // * the command produced no result -> the failure is printed as its own
+    //   `{"error": {...}}` object.
+    //
+    // A non-JSON run keeps the historical behaviour: the message goes to
+    // stderr (the dispatcher in `main` prints it) and stdout stays empty.
+    if let Err(e) = &result {
+        if cli.json {
+            emit_json_failure(e);
+        }
+    }
     result
+}
+
+/// Emit the machine-readable failure for a `--json` run.
+///
+/// The shape depends on whether the command already produced a result
+/// object:
+///
+/// * result emitted -> the failure is attached to the result as a `failure`
+///   object. The result was already printed, so the attachment happens
+///   through the result writer (see [`agentic::attach_failure_to_result`]),
+///   NOT by printing a second document.
+/// * no result -> the failure is printed as `{"error": {...}}`.
+fn emit_json_failure(error: &anyhow::Error) {
+    let Some(classified) = failure::classify_error(error) else {
+        // Unclassifiable: still emit a parseable object so a JSON consumer
+        // never sees an empty stdout. The class is `internal` and the
+        // exit code stays the historical `1`.
+        let unclassified =
+            failure::ClassifiedFailure::new(failure::FailureClass::Internal, format!("{error:#}"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&failure::error_envelope(&unclassified))
+                .unwrap_or_default()
+        );
+        return;
+    };
+    if agentic::attach_failure_to_result(&classified) {
+        // The result object already carries the failure.
+        return;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&failure::error_envelope(&classified)).unwrap_or_default()
+    );
 }
 
 /// Print a one-line "new release available" hint at most once a day, unless the
@@ -13014,12 +13075,39 @@ pub(crate) async fn cmd_exec_agentic(
                 },
             );
         }
-        return Err(anyhow::Error::new(ReportedTurnError(turn_failure_summary(
+        return Err(turn_failure_error(
             &t.run.outcome,
             t.run.failure_detail.as_deref(),
-        ))));
+        ));
     }
     Ok(())
+}
+
+/// Build the error for a failed agentic turn, recognizing the EXTERNAL
+/// engine's `budget_exceeded:` refusal.
+///
+/// The engine reports a budget refusal on stderr (or in its terminal turn
+/// frame) as text beginning with `budget_exceeded:`, optionally followed by
+/// the moment the budget window resets. That refusal is a DISTINCT failure
+/// from a generic provider error: it is not transient (the window has to
+/// reset), and the reset timestamp tells the caller exactly when to come
+/// back.
+///
+/// When the detail carries the marker, the returned error carries the
+/// `budget_exceeded` class AND the reset timestamp. Otherwise the error is
+/// the ordinary reported turn error and the class is inferred from the
+/// message by the dispatcher.
+fn turn_failure_error(outcome: &str, detail: Option<&str>) -> anyhow::Error {
+    let summary = turn_failure_summary(outcome, detail);
+    // Look at the engine's OWN detail first: it is the text that carries the
+    // `budget_exceeded:` marker. The summary is the fallback.
+    let probe = detail.unwrap_or(&summary);
+    if let Some((class, reset)) = failure::classify_engine_budget_exceeded(probe) {
+        if class == failure::FailureClass::BudgetExceeded {
+            return failure::classified_budget_err(summary, reset);
+        }
+    }
+    anyhow::Error::new(ReportedTurnError(summary))
 }
 
 /// A turn failure whose result (including `--json` output) was already
