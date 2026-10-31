@@ -15719,16 +15719,27 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
 fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
     let mut out = full_priced_catalog(cat);
     for id in configured_free_models(cfg) {
-        // A model the feed prices stays priced: the operator's config cannot
-        // know a cloud rate the feed has, and zeroing it would understate
-        // spend.
-        if cat.models.get(&id).is_some_and(|p| p.is_priced()) {
-            continue;
+        // A `serves` entry may be a full model id (`local/qwen3.8-coder`) or a
+        // bare prefix (`local/`). The engine looks models up by the full id it
+        // routed, so a prefix declaration must also stamp every known feed row
+        // under that prefix -- otherwise the $0 declaration sits under `local/`
+        // where nothing looks it up, and the models under it stay unpriced.
+        let mut targets: Vec<String> = vec![id.clone()];
+        if id.ends_with('/') {
+            targets.extend(cat.models.keys().filter(|k| k.starts_with(&id)).cloned());
         }
-        out.models.entry(id).or_insert_with(|| ModelPrice {
-            source: FREE_ENGINE_ENTRY_SOURCE.to_string(),
-            ..Default::default()
-        });
+        for target in targets {
+            // A model the feed prices stays priced: the operator's config
+            // cannot know a cloud rate the feed has, and zeroing it would
+            // understate spend.
+            if cat.models.get(&target).is_some_and(|p| p.is_priced()) {
+                continue;
+            }
+            out.models.entry(target).or_insert_with(|| ModelPrice {
+                source: FREE_ENGINE_ENTRY_SOURCE.to_string(),
+                ..Default::default()
+            });
+        }
     }
     out
 }
@@ -23391,6 +23402,46 @@ mod engine_cost_accounting_tests {
             }}"#
         ))
         .expect("test config parses")
+    }
+
+    /// A `serves` entry of `local/` declares EVERY model under that prefix free.
+    /// The engine reports routed models by their full id (`local/qwen3.8-coder`),
+    /// so the $0 declaration must reach the full ids the feed knows under that
+    /// prefix — not sit under the bare prefix, which the engine never looks up.
+    /// Models already priced by the feed stay priced.
+    #[test]
+    fn a_prefix_only_free_provider_zeros_the_full_ids_under_that_prefix() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        // The feed lists two local models at $0 and one cloud model it prices.
+        cat.models
+            .insert("local/qwen3.8-coder".to_string(), ModelPrice::default());
+        cat.models
+            .insert("local/llama3".to_string(), ModelPrice::default());
+        let out = engine_catalog(&cat, &cfg);
+
+        for id in ["local/qwen3.8-coder", "local/llama3"] {
+            let p = out
+                .models
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} must be an explicit $0 entry"));
+            assert!(!p.is_priced(), "{id} must be $0, got {p:?}");
+        }
+        assert!(
+            out.models
+                .get("deepseek/deepseek-r1")
+                .is_some_and(|p| p.is_priced()),
+            "a metered feed rate must not be zeroed"
+        );
     }
 
     fn paid_catalog() -> PricingCatalog {
