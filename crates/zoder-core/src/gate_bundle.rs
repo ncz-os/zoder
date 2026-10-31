@@ -516,12 +516,21 @@ fn kill_child_tree(child: &mut std::process::Child) {
         // `pid_t` and this cast cannot truncate. `saturating_neg` is used
         // rather than `-pid` so the negation of `pid_t::MIN` cannot
         // overflow (debug builds would panic; release would wrap).
-        let pid = child.id().min(libc::pid_t::MAX as u32) as libc::pid_t;
-        // `-pid` addresses the group the child leads (process_group(0)).
-        // SAFETY: kill(2) with a negative id signals a process group; it
-        // merely reports ESRCH if the group is already gone.
-        unsafe {
-            libc::kill(pid.saturating_neg(), libc::SIGKILL);
+        let raw_pid = child.id();
+        match libc::pid_t::try_from(raw_pid) {
+            Ok(pid) => {
+                // `-pid` addresses the group the child leads
+                // (process_group(0)).
+                // SAFETY: kill(2) with a negative id signals a process
+                // group; it merely reports ESRCH if the group is gone.
+                unsafe {
+                    libc::kill(pid.saturating_neg(), libc::SIGKILL);
+                }
+            }
+            Err(_) => {
+                // Not reachable on a supported host (see above), but never
+                // signal the wrong group: fall through to the direct kill.
+            }
         }
     }
     let _ = child.kill();
