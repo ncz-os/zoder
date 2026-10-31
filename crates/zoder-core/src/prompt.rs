@@ -469,14 +469,24 @@ mod tests {
     /// Write a synthetic prompt root holding a master prompt whose body is
     /// `body`, and return the root path.
     ///
-    /// The root lives under the crate's own target directory rather than
-    /// the platform temp dir: this host's `/tmp` is a tmpfs, and the
-    /// fleet's job rule is to stay inside the workspace.
+    /// The root lives under a private temp directory rather than the
+    /// platform temp dir root: `/tmp` is a tmpfs on the fleet's hosts and a
+    /// job must stay inside its own workspace. `tempfile` creates under
+    /// `$TMPDIR` when it is set (the fleet runner points it at the job's
+    /// workspace) and falls back to `/tmp` only when it is not.
+    ///
+    /// This used `env!("CARGO_TARGET_DIR")` and did not compile: that is a
+    /// RUSTC-time env var, defined only when the build itself sets it, so
+    /// `cargo test -p zoder-core` failed with "environment variable
+    /// `CARGO_TARGET_DIR` not defined at compile time" before a single test
+    /// ran. The whole `prompt` test module — not just the four byte-budget
+    /// tests — was therefore unbuildable.
     fn synthetic_root(name: &str, body: &str) -> PathBuf {
-        let root = Path::new(env!("CARGO_TARGET_DIR"))
-            .join("prompt-tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&root);
+        let root = tempfile::Builder::new()
+            .prefix(&format!("zoder-prompt-{name}-"))
+            .tempdir()
+            .expect("create synthetic prompt root")
+            .keep();
         std::fs::create_dir_all(root.join("master")).expect("create master dir");
         let asset = format!(
             "documentation outside the block\n\n{PROMPT_BLOCK_START}\n{body}\n{PROMPT_BLOCK_END}\n"
