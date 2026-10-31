@@ -1076,8 +1076,9 @@ fn plan_loop_review(
     // that marker would still be an approve on a partial view, so refuse it
     // even when `max_diff_bytes` was raised above the acquisition cap.
     anyhow::ensure!(
-        !diff.contains("[git diff truncated during acquisition"),
-        "review diff was truncated during acquisition; refusing to approve an incomplete view"
+        !diff_is_truncated(diff),
+        "{}",
+        truncated_diff_refusal(MAX_GIT_DIFF_BYTES)
     );
     // Definition context is paid for inside the per-route chunk budget: the
     // chunk cap is reduced by the context share, and the context builder gets
@@ -2756,6 +2757,15 @@ pub(crate) struct ReviewOutput {
     filtered_findings: Vec<serde_json::Value>,
 }
 
+impl ReviewOutput {
+    /// D4.5: this output is the "nothing to review" result, not a verdict on
+    /// any change. Recognized by the [`EMPTY_DIFF_RESULT`] verdict marker so a
+    /// reviewer model can never produce it by accident.
+    fn is_empty_diff(&self) -> bool {
+        self.verdict.trim().eq_ignore_ascii_case(EMPTY_DIFF_VERDICT)
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -3243,6 +3253,42 @@ fn verdict_rank(v: &str) -> u8 {
 // ---------------------------------------------------------------------------
 
 const MAX_GIT_DIFF_BYTES: usize = 1 << 20; // 1 MiB
+
+/// The marker `render_capped_git_diff` appends when acquisition stopped at
+/// `MAX_GIT_DIFF_BYTES`. A review that is handed this marker is looking at a
+/// PARTIAL diff: the tail of the change was never captured.
+const DIFF_ACQUISITION_TRUNCATION_MARKER: &str = "[git diff truncated during acquisition";
+
+/// `zoder review`'s own result for "nothing to review" (D4.5).
+///
+/// A review with no diff is a distinct outcome, not an approval: before it,
+/// an empty diff was reported with `verdict: "approve"` and exit 0, so a CI
+/// gate keyed on the verdict read "no changes" as "changes reviewed and
+/// clean" — including the case where `--base` was the wrong ref.
+const EMPTY_DIFF_RESULT: &str = "empty_diff";
+
+/// Non-approve verdict paired with [`EMPTY_DIFF_RESULT`].
+///
+/// Not a new rank: `verdict_rank` already fails closed on an unrecognized
+/// verdict, so `zoder review` exits nonzero for it exactly like a block. The
+/// verdict STRING is the stable contract; the exit-code NUMBER stays owned by
+/// the failure-contract job.
+const EMPTY_DIFF_VERDICT: &str = "empty_diff";
+
+/// Fail-closed text for a diff acquisition cut off at the byte cap.
+fn truncated_diff_refusal(max_bytes: usize) -> String {
+    format!(
+        "the review diff was truncated during acquisition at {max_bytes} bytes, so the tail of \
+the change was never captured; refusing to review (or approve) a partial diff. Narrow the \
+scope (--scope working-tree, a nearer --base), exclude generated files (--exclude <glob>), or \
+review the change in pieces"
+    )
+}
+
+/// Does this raw diff carry the acquisition-truncation marker?
+fn diff_is_truncated(diff: &str) -> bool {
+    diff.contains(DIFF_ACQUISITION_TRUNCATION_MARKER)
+}
 const MAX_GIT_STDERR_BYTES: usize = 64 << 10; // 64 KiB
 
 struct CappedRead {
@@ -3551,6 +3597,38 @@ fn review_zoderignore_patterns(
     } else {
         crate::review_diff::load_zoderignore(root)
     }
+}
+
+/// D4.5: say so when a branch review is empty because the base IS HEAD.
+///
+/// An explicit `--base` that resolves to HEAD (a full sha, `HEAD`, or a short
+/// sha reaching it) reviews an empty range by construction — a wrong base
+/// that used to be reported as "no changes to review" with an `approve`
+/// verdict. The label carries the diagnosis into the `empty_diff` result.
+fn empty_branch_label(
+    cwd: &Path,
+    scope: ReviewScope,
+    base: Option<&str>,
+    label: &str,
+    diff: &str,
+) -> String {
+    if !matches!(scope, ReviewScope::Branch | ReviewScope::Auto) || !diff.trim().is_empty() {
+        return label.to_string();
+    }
+    let resolve = |rev: &str| {
+        run_git(cwd, &["rev-parse", rev])
+            .ok()
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+    };
+    let Some(head) = resolve("HEAD") else {
+        return label.to_string();
+    };
+    let base_rev = detect_base(cwd, base);
+    if resolve(&base_rev).as_deref() != Some(head.as_str()) {
+        return label.to_string();
+    }
+    format!("{label}; the base {base_rev} is HEAD, so the range is empty")
 }
 
 /// Baseline state of a repository at the start of a loop iteration.
@@ -5290,6 +5368,32 @@ pub(crate) async fn cmd_review(
     }
 
     let (label, diff) = build_diff(&cwd, scope, base.as_deref())?;
+    let label = empty_branch_label(&cwd, scope, base.as_deref(), &label, &diff);
+    // D4.4: `zoder review` refused nothing about a truncated diff — only the
+    // loop did — so with `--max-diff-bytes` above the 1 MiB acquisition cap
+    // the reviewer was shown a partial change and could approve it.
+    if diff_is_truncated(&diff) {
+        let reason = truncated_diff_refusal(MAX_GIT_DIFF_BYTES);
+        let failed = ReviewerSlot::Failed {
+            model: "(truncated)".into(),
+            err: reason.clone(),
+        };
+        let agg = emit_reviews(
+            cli,
+            &ReviewAggregate {
+                reviewers: &[failed],
+                cost_usd: 0.0,
+                requested: 1,
+                ok_models: 0,
+                failed_models: 1,
+                receipts: &[],
+                exclusions: None,
+                chunking: None,
+                confirm: &[],
+            },
+        );
+        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
+    }
     if let Some(reason) = empty_diff_hides_uncommitted_work(&cwd, scope, &label, &diff) {
         let failed = ReviewerSlot::Failed {
             model: "(no diff)".into(),
@@ -5311,10 +5415,14 @@ pub(crate) async fn cmd_review(
         );
         anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
     }
+    // D4.5: an empty diff is its OWN result (`empty_diff`), never `approve`.
+    // `zoder review` has no validator to pass, so an approve here says
+    // "nothing was wrong" about a change nobody looked at — including a
+    // `--base` typo that reviewed an empty range.
     if diff.trim().is_empty() {
         let out = ReviewOutput {
-            verdict: "approve".into(),
-            summary: format!("No changes to review ({label})."),
+            verdict: EMPTY_DIFF_VERDICT.into(),
+            summary: format!("{EMPTY_DIFF_RESULT}: no changes to review ({label})."),
             findings: vec![],
             next_steps: vec![],
             ..Default::default()
@@ -5336,7 +5444,11 @@ pub(crate) async fn cmd_review(
                 confirm: &[],
             },
         );
-        return Ok(());
+        anyhow::bail!(
+            "{EMPTY_DIFF_RESULT}: no changes to review ({label}); nothing was reviewed, so \
+             this is not an approval. Check the scope and --base (an empty range usually means \
+             the base already contains the change)."
+        );
     }
 
     let system = if adversarial {
@@ -6309,6 +6421,33 @@ fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::Confirm
 /// surface as `complete=false` + a non-`approve` verdict, never a silent
 /// "comment" that lets CI think the review ran).
 fn aggregate_review(
+    reviews: &[ReviewerSlot],
+    cost_usd: f64,
+    requested: usize,
+    ok_models: usize,
+    failed_models: usize,
+) -> (String, bool, serde_json::Value) {
+    let (agg, all_failed, mut payload) =
+        aggregate_review_verdicts(reviews, cost_usd, requested, ok_models, failed_models);
+    // D4.5: "there was nothing to review" is its own machine-readable result,
+    // carried next to (never instead of) the aggregate verdict so a consumer
+    // that reads `verdict` alone still sees the fail-closed non-approve.
+    // Absent for every review that had a diff, so old consumers are
+    // unaffected.
+    if let Some(slot) = reviews
+        .iter()
+        .find(|slot| slot.review().is_some_and(ReviewOutput::is_empty_diff))
+    {
+        payload["result"] = json!(EMPTY_DIFF_RESULT);
+        payload["empty_diff"] = json!(true);
+        payload["error"] = json!(slot.display_summary());
+    }
+    (agg, all_failed, payload)
+}
+
+/// The aggregate verdict walk and the per-reviewer payload, without the
+/// [`EMPTY_DIFF_RESULT`] decoration [`aggregate_review`] adds on top.
+fn aggregate_review_verdicts(
     reviews: &[ReviewerSlot],
     cost_usd: f64,
     requested: usize,
@@ -20094,6 +20233,249 @@ data: [DONE]\n\n";
         );
         // No reviewer was ever dispatched.
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D4.4 / D4.5: `zoder review` refuses a truncated diff, and reports an empty
+// diff as its own `empty_diff` result instead of an approval.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod review_refusal_tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
+
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.invalid"]);
+        run(&["config", "user.name", "review-refusal-test"]);
+        run(&["config", "init.defaultBranch", "main"]);
+        std::fs::write(repo.join("README.md"), "seed\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+        (dir, repo)
+    }
+
+    /// Commit `body` into README.md on the CURRENT branch and return the SHA
+    /// it was committed on top of.
+    fn commit_change(repo: &Path, body: &str) -> String {
+        let parent = run_git(repo, &["rev-parse", "HEAD"])
+            .expect("rev-parse HEAD")
+            .trim()
+            .to_string();
+        std::fs::write(repo.join("README.md"), body).unwrap();
+        for args in [&["add", "README.md"][..], &["commit", "-q", "-m", "change"][..]] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        parent
+    }
+
+    fn caps(hunk: usize, diff: usize) -> crate::review_diff::ReviewCaps {
+        crate::review_diff::ReviewCaps {
+            max_hunk_bytes: hunk,
+            max_diff_bytes: diff,
+            max_chunks: 64,
+            max_tokens_floor: None,
+            from_route: false,
+        }
+    }
+
+    fn review_cli(repo: &Path, base: Option<&str>) -> crate::Cli {
+        let mut argv = vec!["zoder", "review", "-C", repo.to_str().unwrap()];
+        if let Some(b) = base {
+            argv.push("--base");
+            argv.push(b);
+        }
+        crate::Cli::try_parse_from(argv).expect("review cli")
+    }
+
+    /// D4.4 REGRESSION: `zoder review` must REFUSE a diff acquisition that was
+    /// cut off at the 1 MiB cap. Only the loop refused the marker, so a
+    /// `--max-diff-bytes` above the acquisition cap sent the reviewer a
+    /// partial diff and its approve stood.
+    ///
+    /// Fails on the base (the reviewer is dispatched and approves the partial
+    /// diff) and passes with the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_refuses_truncated_diff() {
+        let (_dir, repo) = init_repo();
+        // Isolate from whatever engine corpus/config the host has: the review
+        // is refused before any reviewer is resolved, and a stray config must
+        // not turn the refusal into a different failure.
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home = super::reviewer_chain_dispatch_tests::HomeGuard::new(home_dir.path());
+        // Well over the 1 MiB acquisition cap.
+        let mut body = String::from("seed\n");
+        for i in 0..60_000 {
+            body.push_str(&format!("line-{i:05}-padding-padding-padding\n"));
+        }
+        // The change is committed on `main` itself, so the ONLY base that is
+        // not HEAD is the commit before it.
+        let parent = commit_change(&repo, &body);
+
+        let (_label, diff) =
+            build_diff(&repo, ReviewScope::Branch, Some(&parent)).expect("build_diff");
+        assert!(
+            diff_is_truncated(&diff),
+            "fixture diff must exceed the acquisition cap (len={})",
+            diff.len()
+        );
+
+        // Backstop: even if acquisition produced an untruncated diff, the
+        // planner must refuse the marker rather than chunk a partial view.
+        let err = plan_loop_review(
+            &diff,
+            "branch",
+            "task\n",
+            caps(9_000, 200_000_000),
+            &[],
+            &[],
+            false,
+            &|_, _| String::new(),
+            8192,
+        )
+        .expect_err("a truncated diff must never be planned for review");
+        assert!(
+            err.to_string().contains("truncated during acquisition"),
+            "the refusal must name the truncation: {err}"
+        );
+
+        let cli = review_cli(&repo, Some(&parent));
+        let err = cmd_review(
+            &cli,
+            Some(parent.clone()),
+            ReviewScope::Branch,
+            None,
+            false,
+            false,
+            &[],
+            ReviewSizeOptions {
+                excludes: vec![],
+                // Above the acquisition cap: the configuration the base let
+                // through as an approve of a partial diff.
+                max_diff_bytes: Some(200_000_000),
+                max_hunk_bytes: None,
+                split_hunks: true,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("review must refuse a diff truncated during acquisition");
+        assert!(
+            err.to_string().contains("truncated during acquisition"),
+            "refusal must name the truncation: {err}"
+        );
+        assert!(
+            err.to_string().contains("refused"),
+            "refusal must be an explicit refusal, not a reviewer failure: {err}"
+        );
+    }
+
+    /// D4.5 REGRESSION: an empty diff is its OWN result (`empty_diff`), never
+    /// `approve`, and a `--base` equal to HEAD must not read as approval.
+    ///
+    /// Fails on the base (verdict `approve`, exit 0) and passes with the
+    /// `empty_diff` result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_reports_empty_diff_instead_of_approving() {
+        let (_dir, repo) = init_repo();
+        let head = run_git(&repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        let head = head.trim().to_string();
+
+        let (label, diff) =
+            build_diff(&repo, ReviewScope::Branch, Some(&head)).expect("build_diff");
+        assert!(diff.trim().is_empty(), "base == HEAD reviews nothing");
+        let label = empty_branch_label(&repo, ReviewScope::Branch, Some(&head), &label, &diff);
+        assert!(
+            label.contains("the base") && label.contains("is HEAD"),
+            "an empty range whose base IS HEAD must say so: {label}"
+        );
+
+        // The pure aggregation carries the distinct result, and the verdict
+        // it carries is NOT `approve`.
+        let out = ReviewOutput {
+            verdict: EMPTY_DIFF_VERDICT.into(),
+            summary: format!("{EMPTY_DIFF_RESULT}: no changes to review ({label})."),
+            ..Default::default()
+        };
+        let (agg, _all_failed, payload) = aggregate_review(
+            &[ReviewerSlot::Ok {
+                model: "n/a".into(),
+                review: out,
+            }],
+            0.0,
+            1,
+            1,
+            0,
+        );
+        assert_eq!(payload["result"].as_str(), Some(EMPTY_DIFF_RESULT));
+        assert_eq!(payload["empty_diff"].as_bool(), Some(true));
+        assert_ne!(agg, "approve", "an empty diff must never aggregate as approve");
+        assert_ne!(verdict_rank(&agg), 0, "an empty diff must not rank as approve");
+
+        // A real review has no `result`/`empty_diff` fields.
+        let (_, _, real) = aggregate_review(
+            &[ReviewerSlot::Ok {
+                model: "m".into(),
+                review: ReviewOutput {
+                    verdict: "approve".into(),
+                    summary: "clean".into(),
+                    ..Default::default()
+                },
+            }],
+            0.0,
+            1,
+            1,
+            0,
+        );
+        assert!(real.get("result").is_none());
+        assert!(real.get("empty_diff").is_none());
+
+        let cli = review_cli(&repo, Some(&head));
+        let err = cmd_review(
+            &cli,
+            Some(head.clone()),
+            ReviewScope::Branch,
+            None,
+            false,
+            false,
+            &[],
+            ReviewSizeOptions {
+                excludes: vec![],
+                max_diff_bytes: None,
+                max_hunk_bytes: None,
+                split_hunks: true,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect_err("an empty diff must not exit 0 as an approval");
+        assert!(
+            err.to_string().contains(EMPTY_DIFF_RESULT),
+            "the empty diff must be reported as its own result: {err}"
+        );
     }
 }
 
