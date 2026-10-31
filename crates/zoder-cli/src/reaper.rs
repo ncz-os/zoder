@@ -146,28 +146,22 @@ pub(crate) const REAP_CANCEL_BUDGET: Duration = zoder_core::CANCEL_SETTLE_BUDGET
 
 /// The cancel budget for a deployment profile — per session.
 ///
-/// Fleet keeps the settled per-session window ([`REAP_CANCEL_BUDGET`]). A
-/// standalone host has no shared-daemon contention to clear, so it gets a
-/// LONGER window: the profile's standalone budget is a floor on top of the
-/// fleet settle window, which keeps the documented profile ordering intact
-/// now that the fleet value is the 5 s settle budget rather than 750 ms.
+/// Fleet takes the settled per-session window ([`REAP_CANCEL_BUDGET`], 5 s).
+/// A standalone host has no shared-daemon contention to clear and may afford a
+/// longer window; its profile value is therefore a FLOOR applied on top of the
+/// fleet window rather than a replacement, which keeps the documented profile
+/// ordering (`standalone >= fleet`) true now that the fleet value is the 5 s
+/// settle budget rather than the old 750 ms.
 ///
 /// Either way the value applies per SESSION, never to the whole phase.
 pub(crate) fn cancel_budget_for(mode: zoder_core::config::DeploymentMode) -> Duration {
     match mode {
         zoder_core::config::DeploymentMode::Fleet => REAP_CANCEL_BUDGET,
         zoder_core::config::DeploymentMode::Standalone => {
-            // The profile expresses the standalone budget against the old
-            // 750 ms fleet floor; the delta above that floor is what "a
-            // standalone host can afford a longer settle window" means. Carry
-            // the delta on top of the settled fleet window so the ordering
-            // survives the fleet value moving from 750 ms to
-            // CANCEL_SETTLE_BUDGET.
-            const LEGACY_FLEET_FLOOR_MS: u64 = 750;
-            let profile_ms =
-                zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms();
-            REAP_CANCEL_BUDGET
-                + Duration::from_millis(profile_ms.saturating_sub(LEGACY_FLEET_FLOOR_MS))
+            let profile = Duration::from_millis(
+                zoder_core::config::ProfileDefaults::for_mode(mode).daemon_cancel_budget_ms(),
+            );
+            REAP_CANCEL_BUDGET.max(profile)
         }
     }
 }

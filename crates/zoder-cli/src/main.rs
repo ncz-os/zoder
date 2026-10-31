@@ -2694,26 +2694,14 @@ async fn run() -> anyhow::Result<()> {
             let loop_timeout_secs = cli.loop_timeout.unwrap_or(900);
             // Whole-run deadline: `--deadline` > config `loop_deadline_s` >
             // derived from the worker's 7,200 s timeout and kept below it.
-            let (deadline_secs, shared_daemon) = {
-                let cfg = Engine::load()
-                    .map(|engine| engine.cfg)
-                    // A config that does not load is already fatal inside the
-                    // loop; resolve the deadline from the built-in defaults
-                    // here rather than turning this into a second, differently
-                    // worded error before the loop's own diagnosis.
-                    .unwrap_or_else(|_| {
-                        zoder_core::Config::load_unvalidated_from(std::path::Path::new(
-                            "/nonexistent",
-                        ))
-                        .unwrap_or_else(|_| unreachable!("built-in defaults always parse"))
-                    });
-                (
-                    deadline.or(cfg.loop_deadline_s).unwrap_or_else(|| {
-                        agentic::default_loop_deadline_secs(agentic::WORKER_RUN_TIMEOUT_SECS)
-                    }),
-                    cfg.profile_defaults().shared_daemon(),
-                )
-            };
+            // A config that does not load is already fatal inside the loop,
+            // which reports it with its own diagnosis; resolve the budget from
+            // the built-in defaults here rather than turning a load failure
+            // into a different, earlier error.
+            let run_budget = agentic::resolve_loop_run_budget(
+                *deadline,
+                Engine::load().ok().map(|engine| engine.cfg).as_ref(),
+            );
             agentic::cmd_loop(
                 &cli,
                 task,
@@ -2727,8 +2715,8 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 loop_timeout_secs,
                 agent_timeout_secs,
-                deadline_secs,
-                shared_daemon,
+                run_budget.deadline_secs,
+                run_budget.shared_daemon,
                 *allow_dangerous_check,
                 *require_approval,
             )

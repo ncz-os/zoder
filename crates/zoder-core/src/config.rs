@@ -2430,8 +2430,10 @@ impl ProfileDefaults {
 
     /// Shared-daemon assumption for many concurrent jobs (fleet).
     ///
-    /// Hook only: no production path consults this today. The reaper's
-    /// shared-daemon exemption applies on every profile regardless.
+    /// Consumed by `zoder loop`: on a shared daemon the FIRST unconfirmed
+    /// author cancel stops the loop instead of the second, because the next
+    /// attempt would queue behind other tenants' turns for another full phase
+    /// budget (see `agentic::unconfirmed_cancel_abort_threshold`).
     pub fn shared_daemon(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2450,8 +2452,12 @@ impl ProfileDefaults {
     }
 
     /// Budget for the ACP `session/cancel` handshake before the reaper starts
-    /// killing. Fleet keeps the tuned 750 ms; a standalone host can afford a
-    /// longer settle window.
+    /// killing.
+    ///
+    /// Expressed PER SESSION. This is the profile's starting point only: the
+    /// reaper applies it as a floor on top of the fleet settle window
+    /// (`zoder_core::CANCEL_SETTLE_BUDGET`, 5 s), so a standalone host never
+    /// gets a shorter window than a fleet host.
     pub fn daemon_cancel_budget_ms(self) -> u64 {
         match self.mode {
             DeploymentMode::Standalone => 1500,

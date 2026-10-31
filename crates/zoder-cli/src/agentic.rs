@@ -6743,6 +6743,43 @@ pub(crate) fn default_loop_deadline_secs(worker_timeout_secs: u64) -> u64 {
     }
 }
 
+/// Everything `zoder loop` needs to know about its whole-run budget, resolved
+/// once at dispatch: the deadline in seconds, and whether the daemon serving
+/// this run is shared with other jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopRunBudget {
+    pub deadline_secs: u64,
+    pub shared_daemon: bool,
+}
+
+/// Resolve the loop's whole-run budget with the documented precedence:
+/// the `--deadline` flag > the `loop_deadline_s` config key > a default
+/// derived from, and strictly below, the worker's timeout.
+///
+/// `flag` is the parsed `--deadline`, `config` the loaded config (or `None`
+/// when it could not be loaded, in which case the built-in defaults apply —
+/// the loop itself reports the load failure with its own diagnosis, and this
+/// must not turn into a second, differently worded error first).
+///
+/// Lives here rather than in the dispatcher so the precedence is testable:
+/// the dispatcher can only be exercised end to end, and the three sources
+/// are exactly what went wrong in Incident A.
+pub(crate) fn resolve_loop_run_budget(
+    flag: Option<u64>,
+    config: Option<&zoder_core::Config>,
+) -> LoopRunBudget {
+    let deadline_secs = flag
+        .or_else(|| config.and_then(|cfg| cfg.loop_deadline_s))
+        .unwrap_or_else(|| default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS));
+    let shared_daemon = config
+        .map(|cfg| cfg.profile_defaults().shared_daemon())
+        .unwrap_or(false);
+    LoopRunBudget {
+        deadline_secs,
+        shared_daemon,
+    }
+}
+
 /// The wall-clock deadline for one `zoder loop` run.
 ///
 /// Whole-run, not per-phase: the loop's phase watchdogs bound each author
@@ -10990,6 +11027,47 @@ mod tests {
             "a daemon serving this loop alone keeps the two-strike threshold"
         );
         assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
+    /// The three budget sources must compose in the documented order, and the
+    /// default must never equal or exceed the worker's timeout: a default at
+    /// the timeout is Incident A exactly, and a flag silently ignored is worse
+    /// than no flag.
+    #[test]
+    fn loop_run_budget_prefers_flag_then_config_then_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default_provider(dir.path());
+        // Flag wins over config.
+        cfg.loop_deadline_s = Some(1234);
+        assert_eq!(
+            resolve_loop_run_budget(Some(900), Some(&cfg)).deadline_secs,
+            900
+        );
+        // Config wins over the derived default.
+        assert_eq!(
+            resolve_loop_run_budget(None, Some(&cfg)).deadline_secs,
+            1234
+        );
+        // Unset everywhere: the derived default, which stays under the worker.
+        let bland = Config::default_provider(dir.path());
+        let derived = resolve_loop_run_budget(None, Some(&bland));
+        assert_eq!(
+            derived.deadline_secs,
+            default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS)
+        );
+        assert!(derived.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        // A config that failed to load still yields a usable, safe budget
+        // rather than an error or an unbounded run.
+        let unloaded = resolve_loop_run_budget(None, None);
+        assert!(unloaded.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        assert!(!unloaded.shared_daemon);
+        // The shared-daemon bit follows the deployment profile.
+        assert!(!resolve_loop_run_budget(None, Some(&bland)).shared_daemon);
+        // ...and flips to true for a fleet deployment, which is the only thing
+        // that makes the first unconfirmed cancel fatal.
+        let mut fleet = Config::default_provider(dir.path());
+        fleet.deployment.mode = zoder_core::config::DeploymentMode::Fleet;
+        assert!(resolve_loop_run_budget(None, Some(&fleet)).shared_daemon);
     }
 
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
