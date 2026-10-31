@@ -66,6 +66,20 @@ pub const DEFAULT_MASTER_VERSION: &str = "v1";
 /// overlay both fit with room to spare, and small enough that the author
 /// prompt can never crowd out the repository content a coding turn
 /// actually needs.
+///
+/// THE BUDGET IS MEASURED IN BYTES.
+///
+/// `str::len()` is the BYTE length; the character count is
+/// `str::chars().count()`. They differ for any non-ASCII text, and these
+/// assets do contain non-ASCII characters (em-dashes, arrows), so the
+/// distinction is real rather than theoretical. The checks in this module
+/// use `len()`, which is the byte length, and the tests
+/// `the_size_budget_counts_bytes_not_characters` and
+/// `the_asset_ceiling_counts_bytes_not_characters` pin that down: they
+/// build a payload that is UNDER the budget in characters and OVER it in
+/// bytes, and require it to be rejected. Do not "optimise" those checks
+/// into `chars().count()` — that would silently double the effective
+/// budget for every non-ASCII prompt.
 pub const MAX_ASSEMBLED_BYTES: usize = 16 * 1024;
 
 /// Ceiling for a single asset file (master or overlay), in bytes.
@@ -402,6 +416,14 @@ pub fn assemble(
             text.push_str(ov);
         }
     }
+    // SIZE BUDGET, IN BYTES.
+    //
+    // `text.len()` is the byte length, which is what the budget is
+    // measured in. (`chars().count()` would be the CHARACTER count, and
+    // these assets contain non-ASCII text, so the two are not
+    // interchangeable — see `MAX_ASSEMBLED_BYTES`.) The check is on the
+    // assembled text, so the master body and the overlay are counted
+    // together, including the separator added above.
     if text.len() > MAX_ASSEMBLED_BYTES {
         return Err(PromptError::AssembledTooLarge { bytes: text.len() });
     }
@@ -437,6 +459,129 @@ mod tests {
         ("muse", "aihubmix/muse-spark-1.2"),
         ("qwen", "qwen38"),
     ];
+
+    /// A model id that matches no known family, so the master prompt is
+    /// used with NO overlay.  The synthetic prompt roots below contain no
+    /// overlay files, so this is what lets them exercise the master-prompt
+    /// path on its own.
+    const NO_OVERLAY_MODEL: &str = "grok-4.7";
+
+    /// Write a synthetic prompt root holding a master prompt whose body is
+    /// `body`, and return the root path.
+    ///
+    /// The root lives under the crate's own target directory rather than
+    /// the platform temp dir: this host's `/tmp` is a tmpfs, and the
+    /// fleet's job rule is to stay inside the workspace.
+    fn synthetic_root(name: &str, body: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_TARGET_DIR"))
+            .join("prompt-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("master")).expect("create master dir");
+        let asset = format!(
+            "documentation outside the block\n\n{PROMPT_BLOCK_START}\n{body}\n{PROMPT_BLOCK_END}\n"
+        );
+        std::fs::write(master_path(&root, "v1"), asset).expect("write master asset");
+        root
+    }
+
+    /// The size budget is a limit on BYTES, not on characters.
+    ///
+    /// `String::len()` is the byte length (the character count is
+    /// `chars().count()`), so the budget check in `assemble` is already
+    /// byte-based. This test pins that down, because the distinction is
+    /// invisible in the current assets and a future edit that swapped
+    /// `len()` for `chars().count()` would let a prompt of non-ASCII
+    /// text through at twice its intended size.
+    ///
+    /// The payload is built so that its CHARACTER count is under the
+    /// budget while its BYTE count is over it — exactly the case a
+    /// character-count check would wrongly accept.
+    #[test]
+    fn the_size_budget_counts_bytes_not_characters() {
+        // "é" is 2 UTF-8 bytes, so this is over the byte budget but
+        // under it in characters.
+        let body: String = "é".repeat(MAX_ASSEMBLED_BYTES);
+        assert!(
+            body.chars().count() <= MAX_ASSEMBLED_BYTES,
+            "the payload must be under the budget in CHARACTERS"
+        );
+        assert!(
+            body.len() > MAX_ASSEMBLED_BYTES,
+            "the payload must be over the budget in BYTES"
+        );
+
+        let root = synthetic_root("budget-bytes", &body);
+        let err = assemble(&root, "v1", NO_OVERLAY_MODEL)
+            .expect_err("an over-budget prompt must be rejected");
+        match err {
+            PromptError::AssembledTooLarge { bytes } => {
+                assert!(
+                    bytes > MAX_ASSEMBLED_BYTES,
+                    "the error must report the BYTE count, got {bytes}"
+                );
+            }
+            other => panic!("expected AssembledTooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A prompt that is under the budget in bytes is accepted, even when
+    /// it contains multi-byte characters.
+    #[test]
+    fn a_multi_byte_prompt_under_the_budget_is_accepted() {
+        let body: String = "é".repeat(MAX_ASSEMBLED_BYTES / 2);
+        assert!(body.len() <= MAX_ASSEMBLED_BYTES);
+        let root = synthetic_root("budget-ok", &body);
+        let assembled = assemble(&root, "v1", NO_OVERLAY_MODEL)
+            .expect("a prompt under the byte budget must be accepted");
+        assert_eq!(assembled.bytes(), body.len());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The per-asset ceiling is enforced on the file's byte length.
+    ///
+    /// A multi-byte asset is over the limit by bytes well before it is
+    /// over it by characters, so the check must use the byte length.
+    #[test]
+    fn the_asset_ceiling_counts_bytes_not_characters() {
+        let body: String = "é".repeat(MAX_ASSET_BYTES);
+        assert!(body.chars().count() <= MAX_ASSET_BYTES);
+        assert!(body.len() > MAX_ASSET_BYTES);
+
+        let root = synthetic_root("asset-budget-bytes", &body);
+        let err = assemble(&root, "v1", NO_OVERLAY_MODEL)
+            .expect_err("an over-budget asset must be rejected");
+        match err {
+            PromptError::TooLarge { bytes, .. } => {
+                assert!(
+                    bytes > MAX_ASSET_BYTES,
+                    "the error must report the BYTE count, got {bytes}"
+                );
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reported size of an assembled prompt is its byte length.
+    #[test]
+    fn the_reported_size_is_a_byte_count() {
+        let body = "aé".repeat(10);
+        let root = synthetic_root("reported-size", &body);
+        let assembled = assemble(&root, "v1", NO_OVERLAY_MODEL).expect("assemble");
+        assert_eq!(
+            assembled.bytes(),
+            body.len(),
+            "the reported size must be the byte length"
+        );
+        assert_ne!(
+            assembled.bytes(),
+            body.chars().count(),
+            "the byte and character counts differ here, so the reported size must be bytes"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn family_for_model_matches_the_fleet_routes() {
