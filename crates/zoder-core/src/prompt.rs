@@ -481,12 +481,21 @@ mod tests {
     /// `CARGO_TARGET_DIR` not defined at compile time" before a single test
     /// ran. The whole `prompt` test module — not just the four byte-budget
     /// tests — was therefore unbuildable.
+    /// `tempfile::TempDir::keep()` already returns a `PathBuf`, but the
+    /// path is taken explicitly here so the return type is stated at the
+    /// call site rather than inferred. `keep()` consumes the `TempDir`
+    /// without deleting it, so the directory outlives this helper and the
+    /// caller removes it when the test finishes.
+    ///
+    /// (Note for the next reader: `keep()` is `#[must_use] pub fn
+    /// keep(self) -> PathBuf`, NOT a `Result`; the `Result` comes from
+    /// `tempdir()` above, and the `.expect(...)` on that line handles it.)
     fn synthetic_root(name: &str, body: &str) -> PathBuf {
-        let root = tempfile::Builder::new()
+        let temp_dir: tempfile::TempDir = tempfile::Builder::new()
             .prefix(&format!("zoder-prompt-{name}-"))
             .tempdir()
-            .expect("create synthetic prompt root")
-            .keep();
+            .expect("create synthetic prompt root");
+        let root: PathBuf = temp_dir.keep();
         std::fs::create_dir_all(root.join("master")).expect("create master dir");
         let asset = format!(
             "documentation outside the block\n\n{PROMPT_BLOCK_START}\n{body}\n{PROMPT_BLOCK_END}\n"
