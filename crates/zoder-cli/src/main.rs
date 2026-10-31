@@ -6980,6 +6980,7 @@ raise --max-tokens or lower its reasoning effort",
         violation,
         tags: finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
+        estimated_cost_usd: None,
     };
     reconcile_policy_checked_turn(
         winning_reservation.ok_or_else(|| {
@@ -9193,7 +9194,14 @@ fn agentic_scope_directory(engine_socket: &Path, alias: &str) -> PathBuf {
 /// returned alongside the cost is `false` and the caller (the
 /// agentic-turn path) records a policy violation under the free guard
 /// — the same default-deny path a paid engine model already takes.
-type AgenticCostReport = (f64, u64, u64, Option<String>, bool, u64);
+/// `(cost_usd, tokens_in, tokens_out, model, cost_known, calls,
+/// estimated_cost_usd)`.
+///
+/// `estimated_cost_usd` carries the engine's own figure when it reported a
+/// positive one, even on a posture where that figure is NOT the billed cost
+/// (Z3/Incident B, D8 step 1): the number is preserved and labelled, never
+/// silently promoted to spend and never silently thrown away.
+type AgenticCostReport = (f64, u64, u64, Option<String>, bool, u64, Option<f64>);
 
 #[derive(Debug, Clone, Copy)]
 enum AgenticCostGap {
@@ -9203,7 +9211,7 @@ enum AgenticCostGap {
 }
 
 fn unavailable_agentic_cost(_gap: AgenticCostGap) -> AgenticCostReport {
-    (0.0, 0, 0, None, false, 1)
+    (0.0, 0, 0, None, false, 1, None)
 }
 
 async fn agentic_cost(
@@ -9256,10 +9264,27 @@ async fn agentic_cost(
 /// as `cost_unknown` for any longer.
 const AGENTIC_COST_MAX_ATTEMPTS: u32 = 3;
 
+/// Interpret the engine's `cost/query` window as ledger cost.
+///
+/// Returns `(cost_usd, tokens_in, tokens_out, model, cost_known, calls,
+/// estimated_cost_usd)`.
+///
+/// The engine figure is an ESTIMATE, never a bill (Z3/Incident B, D8 step 1):
+///
+///  * on a cost-neutral posture (a free route or a flat plan) the marginal
+///    cost is $0 by construction, so the engine's list-price figure is
+///    recorded as `estimated_cost_usd` and the row is a KNOWN $0 — a local
+///    model the engine priced from a cloud listing can no longer bill the
+///    host;
+///  * on a metered provider the engine figure IS the recorded cost — it is
+///    the only cost source that route has — and it is still tagged as an
+///    estimate, so a report can tell an engine number from a provider bill;
+///  * an engine that found no rows is not an authoritative price: it stays
+///    unknown, never a known $0.
 fn classify_agentic_cost_summary(
     sum: &zoder_core::EngineCostSummary,
     posture: BillingPosture,
-) -> AgenticCostReport {
+) -> (f64, u64, u64, Option<String>, bool, u64, Option<f64>) {
     let cost = sum.window_cost_usd();
     // Pick the dominant model in the window for attribution.
     let model = sum
@@ -9281,17 +9306,28 @@ fn classify_agentic_cost_summary(
     // rows in the requested slice. It does not authoritatively price
     // the turn, so never turn it into a known $0 ledger entry.
     if sum.request_count > 0 && !sum.by_model.is_empty() {
-        // A positive, finite engine cost is the engine's own ledger for the
-        // window: record it as authoritative, whatever the posture.
+        // A positive, finite engine cost is the engine's ESTIMATE for the
+        // window: it prices from the catalog zoder published, not from a
+        // provider bill.
         if cost.is_finite() && cost > 0.0 {
-            return (cost, tin, tout, model, true, calls);
+            // A cost-neutral route (free or flat plan) is $0 marginal. The
+            // engine can still arrive at a positive figure — a local model
+            // that shares an id (or a leaf) with a cloud listing is priced at
+            // the cloud rate — and booking that as spend is exactly the
+            // phantom $170 that failed every job on one host. Record $0 as
+            // KNOWN (the posture proves it) and keep the figure as an
+            // estimate so nothing is lost.
+            if posture.is_cost_neutral() {
+                return (0.0, tin, tout, model, true, calls, Some(cost));
+            }
+            return (cost, tin, tout, model, true, calls, Some(cost));
         }
         // cost == 0.0 (or a query that came back with no priced row) needs
         // the posture to decide what it means. A cost-neutral provider
         // (subscription or a free route) legitimately costs $0: the engine's
         // $0 — like a failed, overlapped, or empty query — is a known $0.
         if posture.is_cost_neutral() {
-            return (0.0, tin, tout, model, true, calls);
+            return (0.0, tin, tout, model, true, calls, None);
         }
         // A METERED provider with real traffic but a $0 total is the engine
         // saying "I priced this as free" — which it only does for an id it
@@ -9306,9 +9342,9 @@ fn classify_agentic_cost_summary(
                  catalog has no row for it; recorded as cost unknown"
             );
         }
-        return (0.0, tin, tout, model, false, calls);
+        return (0.0, tin, tout, model, false, calls, None);
     }
-    (0.0, tin, tout, model, false, calls)
+    (0.0, tin, tout, model, false, calls, None)
 }
 
 /// The cost a turn records, and whether it is known.
@@ -9457,7 +9493,7 @@ mod agentic_cost_tests {
     #[test]
     fn empty_successful_cost_query_is_unknown_not_known_zero() {
         let summary = zoder_core::EngineCostSummary::default();
-        let (cost, tin, tout, model, known, calls) =
+        let (cost, tin, tout, model, known, calls, _) =
             classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert_eq!((cost, tin, tout), (0.0, 0, 0));
         assert_eq!(
@@ -9543,7 +9579,7 @@ mod agentic_cost_tests {
                 cost_usd: 0.25,
             },
         );
-        let (_, _, _, _, known, calls) =
+        let (_, _, _, _, known, calls, _) =
             classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert!(known);
         assert_eq!(calls, 3);
@@ -9582,7 +9618,7 @@ mod agentic_cost_tests {
     #[test]
     fn a_metered_engine_zero_with_tokens_is_unknown_not_known_zero() {
         let summary = summary_with_model("deepseek-flash", 57_043_226, 211_229, 0.0);
-        let (cost, tin, tout, model, known, calls) =
+        let (cost, tin, tout, model, known, calls, _) =
             classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert_eq!(
             (cost, tin, tout, model.as_deref()),
@@ -9601,14 +9637,63 @@ mod agentic_cost_tests {
     #[test]
     fn a_cost_neutral_engine_zero_is_known_zero() {
         let summary = summary_with_model("MiniMax-M3", 1_000, 500, 0.0);
-        let (cost, _, _, _, known, _) =
+        let (cost, _, _, _, known, _, _) =
             classify_agentic_cost_summary(&summary, BillingPosture::Free);
         assert_eq!(cost, 0.0);
         assert!(known, "a free route's $0 is known");
-        let (cost, _, _, _, known, _) =
+        let (cost, _, _, _, known, _, _) =
             classify_agentic_cost_summary(&summary, BillingPosture::Subscription);
         assert_eq!(cost, 0.0);
         assert!(known, "a flat plan's $0 is known");
+    }
+
+    /// Z3/Incident B, decision D8 step 1: on a cost-neutral posture the
+    /// engine's positive `cost/query` figure is an ESTIMATE, not a bill.
+    ///
+    /// The engine prices cloud models from the `pricing.json` zoder publishes
+    /// into its data dir. A local model whose id (or leaf) matches a cloud
+    /// listing is priced at the cloud rate by the engine even though the host
+    /// serves it for $0; recording that number billed a whole host at $170
+    /// while real billed usage was under $1. A flat plan or a free route
+    /// costs $0 marginal by construction, so the engine's list-price figure
+    /// must not become ledger spend — but it is kept as `estimated_cost_usd`
+    /// so the estimate is still visible and never lost.
+    #[test]
+    fn free_route_engine_estimate_records_zero_known_keeps_estimate() {
+        for posture in [BillingPosture::Free, BillingPosture::Subscription] {
+            let summary = summary_with_model("qwen3-coder-30b", 1_000, 500, 170.1173);
+            let (cost, _tin, _tout, _model, known, _calls, estimate) =
+                classify_agentic_cost_summary(&summary, posture);
+            assert_eq!(
+                cost, 0.0,
+                "{posture:?}: a cost-neutral route cannot be BILLED a list price"
+            );
+            assert!(
+                known,
+                "{posture:?}: the zero is known, so the paid guard never fires on an estimate"
+            );
+            assert!(
+                (estimate.unwrap_or(0.0) - 170.1173).abs() < 1e-9,
+                "{posture:?}: the engine figure must survive as estimated_cost_usd"
+            );
+        }
+        // A metered provider keeps the engine figure as the recorded cost
+        // and tags it too: it is still the engine's own number, but it is
+        // the only cost source that provider has.
+        let summary = summary_with_model("deepseek-flash", 1_000, 500, 0.31);
+        let (cost, _, _, _, known, _, estimate) =
+            classify_agentic_cost_summary(&summary, BillingPosture::Metered);
+        assert!((cost - 0.31).abs() < 1e-9);
+        assert!(known);
+        assert!(
+            (estimate.unwrap_or(0.0) - 0.31).abs() < 1e-9,
+            "a metered engine figure is recorded and tagged as an estimate"
+        );
+        // No engine figure at all -> no estimate tag.
+        let zero = summary_with_model("deepseek-flash", 1_000, 500, 0.0);
+        let (_, _, _, _, _, _, estimate) =
+            classify_agentic_cost_summary(&zero, BillingPosture::Metered);
+        assert_eq!(estimate, None, "a $0 engine figure is not an estimate");
     }
 
     /// A free route whose engine cost query FAILED (or overlapped) is still
@@ -9634,7 +9719,7 @@ mod agentic_cost_tests {
                 unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
             ),
         ] {
-            let (cost, _, _, _, known, _) = report;
+            let (cost, _, _, _, known, _, _) = report;
             assert_eq!(cost, 0.0);
             assert!(!known, "{name}: an unavailable query proves no cost");
             // The production conversion: a cost-neutral posture turns the
@@ -9652,21 +9737,29 @@ mod agentic_cost_tests {
         }
     }
 
-    /// A positive engine cost is recorded as authoritative, whatever the
-    /// posture (an overage past a free tier is a real charge).
+    /// A positive engine cost on a METERED provider is the recorded cost —
+    /// it is that route's only cost source — and it is tagged as an
+    /// estimate. The old rule recorded it on a cost-neutral posture too and
+    /// called it authoritative, which is the phantom-bill path; that case is
+    /// pinned by `free_route_engine_estimate_records_zero_known_keeps_estimate`.
     #[test]
     fn a_positive_engine_cost_is_recorded() {
         let summary = summary_with_model("deepseek-flash", 1_000, 500, 0.31);
-        let (cost, _, _, _, known, _) =
+        let (cost, _, _, _, known, _, estimate) =
             classify_agentic_cost_summary(&summary, BillingPosture::Metered);
         assert!((cost - 0.31).abs() < 1e-9);
         assert!(known);
-        let (cost, _, _, _, known, _) =
+        assert!((estimate.unwrap_or(0.0) - 0.31).abs() < 1e-9);
+        let (cost, _, _, _, known, _, estimate) =
             classify_agentic_cost_summary(&summary, BillingPosture::Free);
-        assert!((cost - 0.31).abs() < 1e-9);
+        assert_eq!(
+            cost, 0.0,
+            "a cost-neutral route is not billed its engine list price"
+        );
+        assert!(known, "the posture proves the $0");
         assert!(
-            known,
-            "a billed free-route overage is recorded, feeding the paid guard"
+            (estimate.unwrap_or(0.0) - 0.31).abs() < 1e-9,
+            "the engine's figure survives as an estimate"
         );
     }
 
@@ -9804,7 +9897,7 @@ mod agentic_cost_tests {
             std::time::Duration::from_secs(25),
             agentic_cost(&socket, from, to, "codex", BillingPosture::Metered),
         );
-        let (cost, tin, tout, model, known, calls) = call.await.expect(
+        let (cost, tin, tout, model, known, calls, _) = call.await.expect(
             "agentic_cost must converge within the retry budget (3 attempts with backoff); \
              25s wall clock budget is the upper bound",
         );
@@ -9870,7 +9963,7 @@ mod agentic_cost_tests {
             std::time::Duration::from_secs(20),
             agentic_cost(&socket, from, to, "codex", BillingPosture::Metered),
         );
-        let (cost, tin, tout, _model, known, _calls) = call
+        let (cost, tin, tout, _model, known, _calls, _) = call
             .await
             .expect("agentic_cost must converge within the retry budget (3 attempts with backoff)");
         drop(listener);
@@ -11765,6 +11858,7 @@ mod ledger_integrity_tests {
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         }
     }
 
@@ -12785,19 +12879,20 @@ pub(crate) async fn agentic_turn(
         .real_provider_for_model(&eng.cfg, &used_primary)
         .map(BillingPosture::from)
         .unwrap_or(BillingPosture::Metered);
-    let (cost, tokens_in, tokens_out, cost_model, cost_known, request_count) = match engine_kind {
-        EngineKind::Zeroclaw => {
-            let socket2 = engine_socket_path();
-            match cost_scope.and_then(|scope| scope.finish().ok()) {
-                Some((from, to, false)) => {
-                    agentic_cost(&socket2, from, to, &used_alias, posture).await
+    let (cost, tokens_in, tokens_out, cost_model, cost_known, request_count, estimated_cost_usd) =
+        match engine_kind {
+            EngineKind::Zeroclaw => {
+                let socket2 = engine_socket_path();
+                match cost_scope.and_then(|scope| scope.finish().ok()) {
+                    Some((from, to, false)) => {
+                        agentic_cost(&socket2, from, to, &used_alias, posture).await
+                    }
+                    Some((_, _, true)) => unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
+                    None => unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
                 }
-                Some((_, _, true)) => unavailable_agentic_cost(AgenticCostGap::ScopeOverlapped),
-                None => unavailable_agentic_cost(AgenticCostGap::ScopeUnavailable),
             }
-        }
-        EngineKind::Goose => (0.0, run.input_tokens, 0, None, false, 1),
-    };
+            EngineKind::Goose => (0.0, run.input_tokens, 0, None, false, 1, None),
+        };
     // A cost-neutral route (free or flat plan) costs $0 even when the engine's
     // cost query failed or overlapped another turn: there is nothing to price.
     let (cost, cost_known) = agentic_cost_verdict(cost, cost_known, posture);
@@ -12896,6 +12991,7 @@ pub(crate) async fn agentic_turn(
         violation,
         tags: finops_tags(cli, tokens_in, None),
         billing: Some(posture.as_str().to_string()),
+        estimated_cost_usd,
     };
     reconcile_policy_checked_turn(
         ledger_reservation,
@@ -14598,6 +14694,7 @@ async fn reconcile_probe_success(
         violation,
         tags: finops_tags(cli, tokens_in, result.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
+        estimated_cost_usd: None,
     };
     // D5.9: the ledger write (flock + fsync) and the health-store update run
     // on a blocking thread; the caller gets the updated store back.
@@ -15819,15 +15916,28 @@ fn is_operator_pinned_zero(source: &str) -> bool {
     )
 }
 
-/// Every row of `cat` except the ones that carry no rate AT ALL and no
-/// explicit statement either: priced entries, and explicit `$0` entries an
-/// operator (or `engine_catalog` below) deliberately wrote.
+/// The engine catalog zoder writes: only models of the providers this host
+/// actually CONFIGURED, each carrying a real statement about its price.
 ///
-/// Used by the zoder build: the public feed is zoder's only cost source, so
-/// it prices every model the feed knows. Keeping an explicit zero here is
-/// what makes a free/local declaration survive the merge -- dropping it
-/// leaves the engine with no row and it prices the model its own way (Z3).
-fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
+/// Field incident (Z3/Incident B, D8 step 2): zoder used to publish its whole
+/// ~3,500-model feed into the daemon's `pricing.json`. The engine then had a
+/// cloud rate for every id it could ever see, including ids that a local or
+/// flat-fee route serves, and priced them from that table — the $170 phantom
+/// cap. A model zoder will never route to has no business in the engine's
+/// price table: it can only ever mis-price something.
+///
+/// So this writes, and nothing else:
+///
+///  * a real rate for each METERED model the config routes to (`serves`
+///    prefixes expanded against the feed), straight from the feed — those are
+///    the ids whose cost the engine must report;
+///  * an EXPLICIT `$0` row for the models a cost-neutral provider serves, so
+///    the engine is told "this costs nothing" instead of pricing the id out of
+///    whatever cloud listing happens to share it.
+///
+/// A declared model the feed has never heard of gets no row: zoder cannot
+/// price it either, and inventing a rate is exactly the failure above.
+fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
     let mut out = PricingCatalog {
         generated: cat.generated.clone(),
         window: cat.window.clone(),
@@ -15835,77 +15945,68 @@ fn full_priced_catalog(cat: &PricingCatalog) -> PricingCatalog {
         baseline_model: cat.baseline_model.clone(),
         ..Default::default()
     };
-    for (id, price) in &cat.models {
-        if is_publishable(price) {
-            out.models.insert(id.clone(), price.clone());
-        }
-    }
-    out
-}
-
-/// The engine catalog zoder writes for the `zoder` build: every priced row of
-/// the feed plus an EXPLICIT $0 entry for each model its own config declares
-/// free or local.
-///
-/// Field incident (Z3): the file only ever carried models with a non-zero
-/// price, so a local model — which the public feed lists at $0, or does not
-/// list at all — was simply absent. The engine then had nothing to read for
-/// that model and priced it its own way; its monthly backstop tripped at $170
-/// while the real billed usage was under $1. An explicit zero row is a
-/// statement ("this model costs nothing"); an absent row is not.
-///
-/// Only cost-neutral providers contribute: a free local host or a flat-fee
-/// subscription is $0 marginal by construction (`BillingPosture`), so the
-/// engine is told exactly what zoder's own ledger already treats as free. A
-/// metered model is never pinned at $0 here.
-fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
-    let mut out = full_priced_catalog(cat);
     for id in configured_free_models(cfg) {
-        // A `serves` entry is usually a PREFIX (`local/`, `mimax-`, `gpt-`):
-        // routing matches it with `str::starts_with`, and the engine looks
-        // models up by the full id it routed. So the only rows worth writing
-        // are the feed ids the prefix claims — a declaration written under
-        // the prefix itself is a key no lookup ever produces.
-        //
-        // A delimiter-bounded id (`local/qwen3.8-coder`) can be BOTH a feed id
-        // and the textual head of another one (`...-max`); there the exact
-        // entry is the model and the neighbour is a different model. A bare
-        // prefix (`llama-`, `local/`) is matched as a prefix only.
-        //
-        // An entry that is neither a feed id nor a prefix of one is still a
-        // model the operator declared free (a local server the feed does not
-        // list), so a delimiter-bounded one is written as written.
-        let is_prefix_shaped = id.ends_with('/') || !id.contains('/');
-        let mut targets: Vec<String> = if cat.models.contains_key(id.as_str()) && !is_prefix_shaped
-        {
-            vec![id.clone()]
-        } else {
-            cat.models
-                .keys()
-                .filter(|k| k.starts_with(id.as_str()) && k.as_str() != id.as_str())
-                .cloned()
-                .collect()
-        };
-        // Never write a declared PREFIX as if it were a model: no lookup
-        // produces `llama-`, so the row is dead weight that hides the fact
-        // that the declaration reached nothing.
-        if targets.is_empty() && !is_prefix_shaped {
-            targets.push(id.clone());
-        }
-        for target in targets {
-            // A model the feed prices stays priced: the operator's config
-            // cannot know a cloud rate the feed has, and zeroing it would
-            // understate spend.
-            if cat.models.get(&target).is_some_and(|p| p.is_priced()) {
-                continue;
-            }
+        for target in catalog_models_for_declaration(cat, &id) {
+            // A cost-neutral provider's model is $0 marginal BY CONSTRUCTION
+            // (`BillingPosture`), whatever the feed lists for the id. That is
+            // the phantom-bill path: a local model that shares a cloud id (or
+            // a leaf) was priced at the cloud rate and drove the engine's
+            // monthly cap to $170 on a host that billed under $1. The
+            // operator's declaration wins; it is never downgraded to a feed
+            // rate.
             out.models.entry(target).or_insert_with(|| ModelPrice {
                 source: FREE_ENGINE_ENTRY_SOURCE.to_string(),
                 ..Default::default()
             });
         }
     }
+    for id in configured_metered_models(cfg) {
+        for target in catalog_models_for_declaration(cat, &id) {
+            let Some(price) = cat.models.get(&target) else {
+                continue;
+            };
+            if is_publishable(price) {
+                out.models.insert(target, price.clone());
+            }
+        }
+    }
     out
+}
+
+/// The feed ids a `serves` declaration claims.
+///
+/// A `serves` entry is usually a PREFIX (`local/`, `mimax-`, `gpt-`): routing
+/// matches it with `str::starts_with`, and the engine looks models up by the
+/// full id it routed. So the only rows worth writing are the feed ids the
+/// prefix claims — a declaration written under the prefix itself is a key no
+/// lookup ever produces.
+///
+/// A delimiter-bounded id (`local/qwen3.8-coder`) can be BOTH a feed id and
+/// the textual head of another one (`...-max`); there the exact entry is the
+/// model and the neighbour is a different model. A bare prefix (`llama-`,
+/// `local/`) is matched as a prefix only.
+///
+/// An entry that is neither a feed id nor a prefix of one is still a model the
+/// operator declared (a local server the feed does not list), so a
+/// delimiter-bounded one is returned as written.
+fn catalog_models_for_declaration(cat: &PricingCatalog, id: &str) -> Vec<String> {
+    let is_prefix_shaped = id.ends_with('/') || !id.contains('/');
+    let mut targets: Vec<String> = if cat.models.contains_key(id) && !is_prefix_shaped {
+        vec![id.to_string()]
+    } else {
+        cat.models
+            .keys()
+            .filter(|k| k.starts_with(id) && k.as_str() != id)
+            .cloned()
+            .collect()
+    };
+    // Never write a declared PREFIX as if it were a model: no lookup produces
+    // `llama-`, so the row is dead weight that hides the fact that the
+    // declaration reached nothing.
+    if targets.is_empty() && !is_prefix_shaped {
+        targets.push(id.to_string());
+    }
+    targets
 }
 
 /// Provenance recorded on an explicit $0 engine entry, so an operator reading
@@ -15939,13 +16040,37 @@ fn configured_free_models(cfg: &Config) -> std::collections::BTreeSet<String> {
     ids
 }
 
+/// Models the config routes to a METERED provider: the `serves` entries of
+/// every provider whose posture is pay-as-you-go.
+///
+/// [`engine_catalog`] expands each entry against the feed and writes the feed's
+/// real rate, because those are the ids the engine must price for zoder's
+/// calls. A cost-neutral provider's models are NOT published as rates here —
+/// they get explicit `$0` rows instead (see [`configured_free_models`]).
+fn configured_metered_models(cfg: &Config) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut ids = BTreeSet::new();
+    for p in &cfg.providers {
+        if BillingPosture::from(p).is_cost_neutral() {
+            continue;
+        }
+        for prefix in p.serves.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            ids.insert(prefix.to_string());
+        }
+    }
+    ids
+}
+
 /// Publish per-token rates into the zeroclaw cost engine
 /// (`<data_dir>/pricing.json`), so models report a real `cost_usd` in the
 /// dashboard and reports.
 ///
 /// Behavior diverges by build:
-///   * **zoder** publishes the full priced feed by default (its only cost
-///     source). `--external` is accepted but redundant.
+///   * **zoder** publishes the models its own config routes to — real rates
+///     for metered providers, explicit `$0` rows for cost-neutral ones. It
+///     no longer writes the whole feed: a row for a model zoder cannot route
+///     lets the engine price a local or flat-fee model from a cloud listing
+///     (Z3/Incident B, D8 step 2). `--external` is accepted but redundant.
 ///   * **zoder** stays your provider's billing-authoritative: it publishes nothing unless
 ///     `--external` is passed *and* a non-free provider is configured, and even
 ///     then only that provider's paid models (free-tier stay $0).
@@ -15964,13 +16089,22 @@ fn publish_engine_catalog(
     let engine_path = zeroclaw_data_dir().join("pricing.json");
 
     let engine_cat = if zoder {
-        // The config decides which of zoder's models are free/local; without
-        // it (a broken config) the engine still gets every priced row, just
-        // no explicit $0 declarations.
+        // The config decides WHICH models reach the engine at all (D8 step 2).
+        // Without a readable config there is no way to know what this host
+        // routes to, and guessing is what put the whole feed — and the local
+        // models' cloud look-alikes — in the engine's price table. Fail
+        // closed: publish nothing rather than a table of prices for models
+        // this host cannot call.
         let cfg = Config::load_unvalidated().ok();
         match cfg.as_ref() {
             Some(cfg) => engine_catalog(cat, cfg),
-            None => full_priced_catalog(cat),
+            None => {
+                eprintln!(
+                    "warning: no readable config; publishing no engine prices \
+                     (models are scoped to the configured providers)"
+                );
+                PricingCatalog::default()
+            }
         }
     } else {
         // zoder --external: require a configured external provider, then scope
@@ -16833,6 +16967,7 @@ mod reconciliation_cost_tests {
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let (known, unknown) = reconciliation_local_cost(
             &[entry],
@@ -16871,6 +17006,7 @@ mod reconciliation_cost_tests {
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
             billing: Some("free".into()),
+            estimated_cost_usd: None,
         };
         let (known, unknown) =
             reconciliation_local_cost(&[entry], "openai", &cat, BillingPosture::Free);
@@ -22597,6 +22733,7 @@ model_provider = "custom.minimax"
             violation: None,
             tags: zoder_core::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let entries = vec![exhausted_entry; 10];
         let rc = RoutingContext {
@@ -23597,7 +23734,13 @@ mod engine_cost_accounting_tests {
             "the bare prefix must not be written as a model: {:?}",
             out.models.keys().collect::<Vec<_>>()
         );
-        assert!(out.models.contains_key("deepseek/deepseek-r1"));
+        // Nothing else is configured on this host (D8 step 2): the catalog
+        // carries no model this config cannot route to.
+        assert!(
+            out.models.is_empty(),
+            "only configured models may be published: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
     }
 
     /// A `serves` entry of `local/` declares EVERY model under that prefix free.
@@ -23632,11 +23775,11 @@ mod engine_cost_accounting_tests {
                 .unwrap_or_else(|| panic!("{id} must be an explicit $0 entry"));
             assert!(!p.is_priced(), "{id} must be $0, got {p:?}");
         }
+        // The feed's cloud rate is NOT published: this host routes nothing to
+        // it (D8 step 2), and a row it cannot bill can only mis-price.
         assert!(
-            out.models
-                .get("deepseek/deepseek-r1")
-                .is_some_and(|p| p.is_priced()),
-            "a metered feed rate must not be zeroed"
+            !out.models.contains_key("deepseek/deepseek-r1"),
+            "an unconfigured model must not be published"
         );
     }
 
@@ -23737,7 +23880,7 @@ mod engine_cost_accounting_tests {
                 "kind": "openai-chat",
                 "auth": { "type": "none" },
                 "billing": "metered",
-                "serves": ["deepseek/"]
+                "serves": ["deepseek/", "vendor/", "internal/"]
             }"#,
         );
         let out = engine_catalog(&with_orphan, &cfg);
@@ -23748,6 +23891,111 @@ mod engine_cost_accounting_tests {
         assert!(
             out.models.contains_key("internal/pinned-free"),
             "a deliberate explicit $0 must still be published"
+        );
+    }
+
+    /// D8 step 2 (Z3/Incident B): the engine catalog carries only the models
+    /// this host's config routes to — a real rate for each metered provider's
+    /// models, an explicit $0 for each cost-neutral provider's models.
+    ///
+    /// The old behavior published the whole ~3,500-model feed, which handed
+    /// the engine a cloud rate for ids a local or flat-fee route serves; the
+    /// engine priced those from that table and its monthly backstop tripped
+    /// at $170 on a host whose real spend was under $1.
+    #[test]
+    fn engine_catalog_publishes_only_configured_metered_models() {
+        let cfg = config(
+            r#"{
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/"]
+            },
+            {
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        // Feed rows this host cannot route to: a cloud model on a provider
+        // that is not configured, and a local id it serves for $0.
+        cat.models.insert(
+            "anthropic/claude-sonnet-5".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 3.0,
+                output_usd_per_mtok: 15.0,
+                ..Default::default()
+            },
+        );
+        cat.models
+            .insert("local/qwen3-coder-30b".to_string(), ModelPrice::default());
+
+        let out = engine_catalog(&cat, &cfg);
+
+        assert!(
+            out.models
+                .get("deepseek/deepseek-r1")
+                .is_some_and(|p| p.is_priced()),
+            "a configured metered model is published at its real rate"
+        );
+        assert!(
+            !out.models.contains_key("anthropic/claude-sonnet-5"),
+            "a model no configured provider serves must not be published: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+        // The local model is published, but as an EXPLICIT $0 — never at the
+        // feed's rate for anything that shares the id.
+        let local = out
+            .models
+            .get("local/qwen3-coder-30b")
+            .expect("a configured cost-neutral model gets an explicit row");
+        assert!(!local.is_priced(), "the local row must be $0: {local:?}");
+        assert_eq!(
+            out.models.len(),
+            2,
+            "only the configured models are published: {:?}",
+            out.models.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A local id that shares its leaf with a paid cloud listing is never
+    /// published at the cloud rate: the cost-neutral route's declaration wins
+    /// and the row is an explicit $0.
+    #[test]
+    fn a_local_model_sharing_a_cloud_leaf_is_published_at_zero() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"]
+            }"#,
+        );
+        let mut cat = paid_catalog();
+        cat.models.insert(
+            "local/qwen3-coder-30b".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.2,
+                output_usd_per_mtok: 6.0,
+                ..Default::default()
+            },
+        );
+        let out = engine_catalog(&cat, &cfg);
+        let row = out
+            .models
+            .get("local/qwen3-coder-30b")
+            .expect("the local model must be published");
+        assert!(
+            !row.is_priced(),
+            "a cost-neutral provider's model is $0 whatever the feed says: {row:?}"
         );
     }
 
@@ -23796,8 +24044,44 @@ mod engine_cost_accounting_tests {
             !free.is_priced(),
             "the local model's entry must be an explicit $0, got {free:?}"
         );
-        // The paid entry still carries its real rate.
-        assert!(out.models.contains_key("deepseek/deepseek-r1"));
+        // A configured METERED provider still gets its real rate beside the
+        // $0 declarations, so both kinds of row coexist in one catalog.
+        let both = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["local/"]
+            },
+            {
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/"]
+            }"#,
+        );
+        // The feed must know the local id for the `local/` prefix to expand
+        // to it; a prefix claims the feed ids under it, nothing else.
+        let mut cat = paid_catalog();
+        cat.models
+            .insert("local/qwen3.8-coder".to_string(), ModelPrice::default());
+        let out = engine_catalog(&cat, &both);
+        assert!(
+            out.models
+                .get("deepseek/deepseek-r1")
+                .is_some_and(|p| p.is_priced()),
+            "a configured metered model keeps its real rate"
+        );
+        assert!(
+            out.models
+                .get("local/qwen3.8-coder")
+                .is_some_and(|p| !p.is_priced()),
+            "a configured free model keeps its explicit $0"
+        );
     }
 
     /// A model that is configured on a metered provider is never pinned at $0
@@ -23812,7 +24096,7 @@ mod engine_cost_accounting_tests {
                 "kind": "openai-chat",
                 "auth": { "type": "none" },
                 "billing": "metered",
-                "serves": ["deepseek/"]
+                "serves": ["deepseek/", "internal/"]
             }"#,
         );
         let mut cat = paid_catalog();

@@ -176,6 +176,17 @@ pub struct Entry {
     /// `billing: None` and is re-serialized without the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<String>,
+    /// The engine's own cost figure for this turn, when it reported a
+    /// positive one. It is an ESTIMATE — the engine prices from the catalog
+    /// zoder published, not from a provider bill — so it is kept beside the
+    /// billed `cost_usd` rather than inside it (Z3/Incident B, D8 step 1).
+    ///
+    /// On a cost-neutral posture (a free route or a flat plan) `cost_usd`
+    /// is a known $0 and this field is the only trace of what the engine
+    /// would have charged: a local model the engine priced from a cloud
+    /// listing shows its estimate without billing the host for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 fn one_call() -> u64 {
@@ -465,6 +476,7 @@ impl BillableReservation {
             violation: None,
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         }
     }
 
@@ -781,6 +793,7 @@ impl Ledger {
             )),
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let json = serde_json::to_vec(&pending)?;
         debug_assert!(json.len() < BILLABLE_RESERVATION_BYTES);
@@ -978,6 +991,7 @@ impl Ledger {
                 violation: None,
                 tags: FinOpsTags::default(),
                 billing: None,
+                estimated_cost_usd: None,
             };
             let json = fit_entry_json(&entry, bytes)?;
             if json.len() + 1 > bytes {
@@ -1461,6 +1475,7 @@ mod tests {
             violation: None,
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         }
     }
 
@@ -1672,6 +1687,7 @@ mod tests {
             violation: None,
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         led.record(&unknown).unwrap();
         assert!(led.month_to_date_usd().is_err());
@@ -2054,6 +2070,7 @@ mod tests {
                 )),
                 tags: FinOpsTags::default(),
                 billing: None,
+                estimated_cost_usd: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
@@ -2125,6 +2142,7 @@ mod tests {
                 )),
                 tags: FinOpsTags::default(),
                 billing: None,
+                estimated_cost_usd: None,
             };
             let json = serde_json::to_vec(&row).unwrap();
             let mut line = vec![b' '; slot];
@@ -2212,6 +2230,7 @@ mod tests {
             )),
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let json = serde_json::to_vec(&pending).unwrap();
         let mut line = vec![b' '; LEGACY_RESERVATION_BYTES];
@@ -2285,6 +2304,7 @@ mod tests {
             ),
             tags: FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         }
     }
 
