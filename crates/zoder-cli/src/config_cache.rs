@@ -195,6 +195,62 @@ pub(crate) fn clear() {
     HEALTH.with(|c| c.borrow_mut().clear());
 }
 
+/// One review's post-change file images, read at most once per path.
+///
+/// The review reads the same files up to three times per chunk today: once
+/// to build the cross-chunk context header (`review_context::chunk_context`
+/// per chunk and per reviewer slot), once to disprove a reviewer's
+/// false-"undefined" finding (`filter_false_undefined_findings`), and once
+/// to ground a blocking finding before confirmation
+/// (`review_confirm::ground_finding`). For a branch review each read is a
+/// `git show HEAD:<path>` subprocess, so a five-file, four-chunk review forked
+/// the same files dozens of times. This cache makes it one read per path per
+/// review.
+///
+/// It is deliberately NOT a global: a review's post-image is fixed for the
+/// review (branch reviews read an immutable HEAD; working-tree reviews are
+/// read once and compared against the same working tree the diff came from),
+/// and a shared cache would serve one review's files to a later one in the
+/// same process — the false-"defined" failure this whole family of filters
+/// exists to avoid. `Ok`/`None` (a missing or unreadable path, e.g. a deleted
+/// file) is cached too: a path that does not exist does not start existing
+/// mid-review, and re-probing it per finding is the same wasted read.
+pub(crate) struct PostImages<F> {
+    read: F,
+    cache: RefCell<HashMap<String, Option<String>>>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl<F: Fn(&str) -> Option<String>> PostImages<F> {
+    pub(crate) fn new(read: F) -> Self {
+        Self {
+            read,
+            cache: RefCell::new(HashMap::new()),
+            reads: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The post-change text of `path`, read at most once per review.
+    pub(crate) fn get(&self, path: &str) -> Option<String> {
+        if let Some(hit) = self.cache.borrow().get(path) {
+            return hit.clone();
+        }
+        self.reads.set(self.reads.get() + 1);
+        let value = (self.read)(path);
+        self.cache
+            .borrow_mut()
+            .insert(path.to_string(), value.clone());
+        value
+    }
+
+    /// How many times the underlying reader ran (once per distinct path).
+    /// Test-only: production only cares that the read happened once.
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
