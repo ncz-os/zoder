@@ -9585,6 +9585,41 @@ mod test_env {
             std::env::set_var("ZODER_HOME", home);
             Self { _lock, prev }
         }
+
+        /// Hold the shared lock for the guard's lifetime and set `key` to
+        /// `value` (`None` unsets it), restoring the previous value on drop.
+        /// Used by tests that need a NON-home environment switch without
+        /// taking a second copy of the lock.
+        pub(crate) fn set_var(key: &'static str, value: Option<&str>) -> VarGuard {
+            VarGuard {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+                key,
+                prev: {
+                    let prev = std::env::var(key).ok();
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                    prev
+                },
+            }
+        }
+    }
+
+    /// Restores one environment variable (see [`EnvGuard::set_var`]).
+    pub(crate) struct VarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     impl Drop for EnvGuard {

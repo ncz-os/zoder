@@ -8,7 +8,10 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use futures_util::stream::StreamExt;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -556,6 +559,24 @@ struct ChainFailure {
     message: String,
     skipped: Vec<SkippedReviewCandidate>,
     forced: bool,
+    /// `true` when the failure is a transient transport-class error (the
+    /// chain's fallback-worthy arm: `ErrKind`/status from the provider). The
+    /// parallel chunk walk may retry such a failure on the SAME model; a
+    /// fatal or no-candidate failure is never retried.
+    retryable: bool,
+}
+
+impl ChainFailure {
+    /// A structural failure (bad plan, policy, ledger, mixed model): retrying
+    /// the same call would reproduce it.
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            skipped: Vec::new(),
+            forced: false,
+            retryable: false,
+        }
+    }
 }
 
 impl ChainFailure {
@@ -723,11 +744,7 @@ async fn complete_once(
     // the alias registry at a fixture WITHOUT racing on the process-global
     // `ZEROCLAW_CONFIG_DIR` (see `crate::child_env`).
     let eng = Engine::load_with_engine_config(engine_config)
-        .map_err(|e| ChainFailure {
-            message: e.to_string(),
-            skipped: Vec::new(),
-            forced: false,
-        })
+        .map_err(|e| ChainFailure::fatal(e.to_string()))
         .map_err(ChainFailure::into_anyhow)?;
     complete_once_tracked(
         cli,
@@ -779,11 +796,7 @@ async fn complete_once_tracked(
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
     let mut plan = build_reviewer_plan(cli, eng, model_override, reviewer_chain, author_models)
-        .map_err(|e| ChainFailure {
-            message: e.to_string(),
-            skipped: Vec::new(),
-            forced: false,
-        })?;
+        .map_err(|e| ChainFailure::fatal(e.to_string()))?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -836,6 +849,7 @@ async fn complete_once_tracked(
             "no reviewer model resolved (check `--reviewer`, `[agents.X].reviewer_model`, or `Config::reviewer_model`)".to_string()
         };
         return Err(ChainFailure {
+            retryable: false,
             message,
             skipped,
             forced,
@@ -850,6 +864,9 @@ async fn complete_once_tracked(
     // message — the same fail-closed surface the existing single-model
     // reviewer path already produced.
     let mut last_err_msg: Option<String> = None;
+    // Set only by the fallback-worthy arm: the chain exhausted on TRANSIENT
+    // provider errors, which is the one class a caller may retry as-is.
+    let mut last_retryable = false;
     for (idx, model) in plan.candidates.iter().enumerate() {
         if idx > 0 && !cli.quiet {
             eprintln!(
@@ -963,6 +980,7 @@ async fn complete_once_tracked(
                 // diagnostic a CI maintainer needs to triage a chain-
                 // wide failure.
                 last_err_msg = Some(format!("reviewer {model}: {message}"));
+                last_retryable = true;
                 skipped.push(SkippedReviewCandidate {
                     model: model.clone(),
                     reason: reviewer_skip_reason(kind, &message).to_string(),
@@ -985,6 +1003,7 @@ async fn complete_once_tracked(
                 // next candidate would either reproduce the same failure
                 // or mask a real config error. Surface verbatim.
                 return Err(ChainFailure {
+                    retryable: false,
                     message,
                     skipped,
                     forced,
@@ -1006,6 +1025,7 @@ async fn complete_once_tracked(
             .to_string()
     });
     Err(ChainFailure {
+        retryable: last_retryable,
         message: msg,
         skipped,
         forced,
@@ -4633,23 +4653,176 @@ Findings MUST be an array of objects, never an array of strings. Each finding ob
 next_steps MUST be a top-level array of strings. Use empty arrays when there are no findings or next steps. Write an actual review of this diff. \
 Never copy these instructions or emit template values. No markdown or prose outside the JSON object.";
 
-fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usize, count: usize) {
+fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, _idx: usize, count: usize) {
     if verdict_rank(&review.verdict) > verdict_rank(&merged.verdict) {
         merged.verdict = review.verdict;
     }
     if count == 1 {
         merged.summary = review.summary;
     } else {
-        merged.summary.push_str(&format!(
-            "Chunk {}/{}: {}\n",
-            idx + 1,
-            count,
-            review.summary
-        ));
+        // The per-chunk line text is UNNUMBERED here and numbered afterwards
+        // by `annotate_chunk_summary`. Chunks 1..N complete in parallel, so
+        // the number must come from the fold in CHUNK order, never from
+        // completion order.
+        merged.summary.push_str(&format!("{}\n", review.summary));
     }
     merged.findings.extend(review.findings);
     merged.next_steps.extend(review.next_steps);
     merged.filtered_findings.extend(review.filtered_findings);
+}
+
+/// Number the per-chunk summary lines of a merged multi-chunk review:
+/// `summary` is the unnumbered block written by [`append_chunk_review`] (one
+/// line per `<count>` chunks, in chunk order), and the result is the historical
+/// sequential text, `Chunk N/<count>: <summary>\n` for each chunk.
+///
+/// Parallel chunks make the numbering a merge-time decision: a chunk's number
+/// comes from its plan index, so the text is byte-identical to what the
+/// sequential walk produced regardless of which call returned first.
+fn annotate_chunk_summary(summary: &str, count: usize) -> String {
+    if count <= 1 || summary.is_empty() {
+        return summary.to_string();
+    }
+    let mut out = String::with_capacity(summary.len() + count * 12);
+    for (idx, line) in summary.lines().enumerate() {
+        out.push_str(&format!("Chunk {}/{}: {}\n", idx + 1, count, line));
+    }
+    out
+}
+
+/// Why a chunk walk must not run later chunks ahead of, or beside, chunk 0.
+type ChunkBlocker = Option<String>;
+
+/// The chunk prompt text. `ZODER_REVIEW_STABLE_PREFIX=1` (the default) keeps
+/// the "part N of M" banner inside the chunk's variable tail — it is emitted
+/// by `crate::review_baton` after the cache-stable head. The legacy layout
+/// (`=0`) prepends it, and it then varies per chunk by design.
+fn chunk_user_text(user: &str, idx: usize, count: usize, preface_parts: bool) -> String {
+    if !preface_parts {
+        return user.to_string();
+    }
+    format!(
+        "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
+Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
+is not evidence of a defect. Report only defects established by the supplied code; do not \
+invent missing integration or compiler failures from omitted context.\n\n{user}",
+        idx + 1,
+        count
+    )
+}
+
+/// Concurrency at which the chunk walk runs later chunks beside chunk 0.
+///
+/// Only ONE blocker exists: the legacy chunk layout
+/// (`ZODER_REVIEW_STABLE_PREFIX=0`), where each chunk's prompt begins with
+/// "This is review part N of M." and chunk N+1's leading bytes therefore
+/// differ from chunk N's. A concurrent walk there re-bills every chunk's
+/// prefix (the very cost chunk 0 is run first to avoid), so that layout keeps
+/// the historical sequential order. Everything else — including the default
+/// layout, whose per-chunk banner sits in the variable tail AFTER the shared
+/// head — replays chunk 0 first and then fans the rest out.
+/// `concurrency` is the resolved [`chunk_concurrency`] (a parameter so the
+/// tests can select a walk without touching the process environment).
+fn chunk_parallelism_blocker_at(preface_parts: bool, concurrency: usize) -> ChunkBlocker {
+    if preface_parts {
+        return Some("legacy chunk layout (ZODER_REVIEW_STABLE_PREFIX=0)".to_string());
+    }
+    if concurrency == 1 {
+        return Some("ZODER_REVIEW_CHUNK_CONCURRENCY=1".to_string());
+    }
+    None
+}
+
+/// How many chunks of one reviewer may be in flight at once: 4 by default,
+/// configurable with `ZODER_REVIEW_CHUNK_CONCURRENCY` (environment-only, like
+/// the provider slot map, so an older binary never trips over a config key).
+/// `1` forces the sequential walk. Provider slots (`ZODER_PROVIDER_CONCURRENCY`
+/// / the configured per-endpoint budget) and the shared rate limiter are taken
+/// by each dispatch, so raising this can never exceed the operator's caps.
+fn chunk_concurrency() -> usize {
+    std::env::var("ZODER_REVIEW_CHUNK_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CHUNK_CONCURRENCY)
+}
+
+/// Default number of review chunks of one reviewer dispatched at once.
+const DEFAULT_CHUNK_CONCURRENCY: usize = 4;
+
+/// The single per-chunk attempt, retried on a transient failure with capped
+/// exponential backoff. All attempts are for the SAME model, so a transport
+/// blip cannot move a late chunk to another candidate (which would be refused
+/// as a mixed-model review).
+async fn complete_chunk_with_retries<'a>(
+    cli: &'a crate::Cli,
+    model: &'a str,
+    author_models: &'a [String],
+    system: &'a str,
+    user: &'a str,
+    max_tokens: u32,
+    eng: &'a Engine,
+) -> anyhow::Result<ChainCompletion> {
+    let attempts = std::env::var("ZODER_REVIEW_CHUNK_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CHUNK_RETRIES);
+    let mut delay = CHUNK_RETRY_BASE;
+    let mut last: Option<ChainFailure> = None;
+    for attempt in 0..=attempts {
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(CHUNK_RETRY_MAX);
+        }
+        match complete_once_tracked(
+            cli,
+            Some(model),
+            &[],
+            author_models,
+            &[],
+            system,
+            user,
+            max_tokens,
+            eng,
+            false,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            // A fatal failure (a bytes-level error such as a provenance
+            // mismatch) is not retried: it would repeat on a second send.
+            Err(failure) if !failure.retryable => return Err(failure.into_anyhow()),
+            Err(failure) => last = Some(failure),
+        }
+    }
+    Err(last
+        .map(ChainFailure::into_anyhow)
+        .unwrap_or_else(|| anyhow!("reviewer {model}: no attempt was made")))
+}
+
+/// Transient retries of a parallel review chunk (default 2: one immediate
+/// attempt plus two retries).
+const DEFAULT_CHUNK_RETRIES: u32 = 2;
+const CHUNK_RETRY_BASE: Duration = Duration::from_millis(200);
+const CHUNK_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// The verdict-merge rule for chunked reviews, as a pure function over the
+/// chunks IN CHUNK ORDER.
+///
+/// This is the deterministic merge the parallel chunk fan-out relies on: the
+/// chunks are collected, ordered by their plan index, and folded here one at a
+/// time, so an approval can never depend on which network call returned first.
+/// The verdict is the worst-ranked chunk verdict (blocking beats approve).
+fn merge_chunk_reviews(reviews: Vec<ReviewOutput>) -> ReviewOutput {
+    let count = reviews.len();
+    let mut merged = ReviewOutput {
+        verdict: "approve".into(),
+        ..ReviewOutput::default()
+    };
+    for (idx, review) in reviews.into_iter().enumerate() {
+        append_chunk_review(&mut merged, review, idx, count);
+    }
+    merged
 }
 
 /// Drop findings that claim a symbol is undefined/missing/unimported when the
@@ -4772,6 +4945,451 @@ fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
     pinned_served != this_served
 }
 
+/// One reviewer's plan for ONE chunk attempt: the chunk's prompt text, the
+/// model it is sent to (pinned by chunk 0 for every later chunk), and the
+/// output budget.
+struct ChunkTask {
+    model: String,
+    user: String,
+    max_tokens: u32,
+}
+
+/// What one completed chunk attempt contributes to the review.
+struct ChunkOutcome {
+    completion: Completion,
+    review: ReviewOutput,
+    structured: bool,
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+}
+
+/// The model the review is pinned to after chunk 0 completed: the requested
+/// and the served identity, captured together from that ONE dispatch.
+#[derive(Clone)]
+struct PinnedModel {
+    requested: String,
+    served: String,
+}
+
+/// One completed later chunk, with the plan index that orders it.
+struct IndexedChunkOutcome {
+    idx: usize,
+    outcome: ChunkOutcome,
+}
+
+/// Run the later chunks of one reviewer: `buffer_unordered(concurrency)` on
+/// spawned tasks, one chunk at a time per task. `buffer_unordered` polls at
+/// most `concurrency` futures at once and yields each as it completes; the
+/// caller puts them back in chunk order. A `blocker` (see
+/// [`chunk_parallelism_blocker`]) runs them strictly in order, one at a time.
+///
+/// The chunks share no mutable state: provider slots, the rate limiter and the
+/// ledger reservation are all taken inside each dispatch, so the fan-out is
+/// bounded by the operator's caps as well as by `concurrency`. A failing chunk
+/// fails the review: the stream is dropped, which CANCELS every chunk still in
+/// flight, and no verdict is fabricated for the chunks that did not answer.
+async fn run_parallel_chunks(
+    cli: &crate::Cli,
+    eng: &Engine,
+    author_models: &[String],
+    system: &str,
+    tasks: Vec<ChunkTask>,
+    blocker: ChunkBlocker,
+    concurrency: usize,
+) -> anyhow::Result<Vec<IndexedChunkOutcome>> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let concurrency = if blocker.is_some() { 1 } else { concurrency };
+    // `tasks` holds the LATER chunks only (1..n); chunk 0 ran on its own
+    // before the fan-out. Chunk numbers are 1-based (`idx = offset +
+    // CHUNK_REPLAY_FRONTIER`), so `idx` is already the chunk's number and the
+    // review has `tasks.len() + 1` chunks in total. Printing `idx + 1` and a
+    // total of `CHUNK_REPLAY_FRONTIER + tasks.len()` shifted both by one:
+    // the second chunk read as "2/6" in a five-chunk review.
+    let total = tasks.len() + CHUNK_REPLAY_FRONTIER;
+    let cli = Arc::new(cli);
+    let eng = Arc::new(eng);
+    let author_models = Arc::new(author_models.to_vec());
+    let system = Arc::new(system.to_string());
+    let futures = tasks.into_iter().enumerate().map(|(offset, task)| {
+        let cli = Arc::clone(&cli);
+        let eng = Arc::clone(&eng);
+        let author_models = Arc::clone(&author_models);
+        let system = Arc::clone(&system);
+        let idx = offset + CHUNK_REPLAY_FRONTIER;
+        async move {
+            let outcome = complete_chunk_attempt(
+                cli.as_ref(),
+                &task.model,
+                author_models.as_ref(),
+                system.as_ref(),
+                &task.user,
+                task.max_tokens,
+                eng.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                // Name the chunk and how many chunks there are, the same
+                // wrapper the sequential walk applied. `idx` is already
+                // the 1-based chunk number, so it is printed as-is.
+                anyhow!("review chunk {}/{}: {e:#}", idx, total)
+            })?;
+            Ok::<IndexedChunkOutcome, anyhow::Error>(IndexedChunkOutcome { idx, outcome })
+        }
+    });
+    // Fail-fast: `.collect()` would keep polling every future to completion
+    // even after one failed, so a 401 on chunk 2 would still wait out chunks
+    // 3..n. Walk the stream by hand and return on the first error — dropping
+    // the stream drops the `buffer_unordered` buffer, which CANCELS every
+    // chunk still in flight instead of awaiting it.
+    let mut stream = futures_util::stream::iter(futures).buffer_unordered(concurrency);
+    let mut results: Vec<IndexedChunkOutcome> = Vec::new();
+    while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
+        results.push(next?);
+    }
+    // Deterministic merge input: the plan's order, not the network's.
+    results.sort_by_key(|r| r.idx);
+    Ok(results)
+}
+
+/// Index of the first parallel chunk. Chunk 0 (the replay frontier) always runs
+/// alone, on the caller's task: it pins the served model and warms the
+/// provider's prompt cache, so every later chunk replays the same cache-stable
+/// prefix. The "part N of M" banner is NOT chunk N's own bytes: the shared
+/// prefix (`crate::review_baton`) puts it in the chunk's variable tail, after
+/// the cache-stable head, so naming a chunk by its plan index costs nothing in
+/// cache reuse.
+const CHUNK_REPLAY_FRONTIER: usize = 1;
+
+/// Run the chunks of ONE reviewer.
+///
+/// Sequential prelude, then bounded fan-out: chunk 0 goes first and alone,
+/// because it pins the served model and warms the prompt cache; chunks
+/// 1..N then run concurrently (`buffer_unordered`, 4 by default) on spawned
+/// tasks. Provider slots and the shared rate limiter are taken by each
+/// dispatch, so the fan-out can never exceed the operator's per-provider
+/// concurrency or rate budget. The merge folds the chunks BACK INTO PLAN ORDER
+/// before it runs, so the verdict (worst chunk verdict wins) and the summary
+/// text do not depend on which call returned first.
+///
+/// Two things force the historical sequential walk
+/// (see [`chunk_parallelism_blocker`]): a reviewer chain with more than one
+/// candidate, where chunk 0 decides which model serves before the rest are
+/// sized and sent; and `ZODER_REVIEW_CHUNK_CONCURRENCY=1`.
+/// Evidence accumulated from every dispatch of the review, in dispatch order.
+#[derive(Default)]
+struct ChunkEvidence {
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+    receipts: Vec<serde_json::Value>,
+    cost_usd: f64,
+}
+
+impl ChunkEvidence {
+    /// Fold one attempt's outcome in. `escalation_reason` keeps the FIRST
+    /// non-empty value in dispatch order, exactly as the sequential walk did.
+    fn absorb(&mut self, outcome: &ChunkOutcome) {
+        self.cost_usd += outcome.completion.cost_usd;
+        self.receipts
+            .extend(outcome.completion.receipts.iter().cloned());
+        self.skipped.extend(outcome.skipped.iter().cloned());
+        if self.escalation_reason.is_none() {
+            self.escalation_reason = outcome.escalation_reason.clone();
+        }
+        self.forced |= outcome.forced;
+    }
+}
+
+/// What a chunk attempt contributed before its verdict was established, so a
+/// later error or a repair still leaves the full audit trail (skip reasons,
+/// escalation, forced family conflict, spend and receipts).
+#[derive(Default)]
+struct AttemptEvidence {
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+    cost_usd: f64,
+    receipts: Vec<serde_json::Value>,
+}
+
+impl AttemptEvidence {
+    fn from_completion(outcome: &ChainCompletion) -> Self {
+        Self {
+            skipped: outcome.skipped.clone(),
+            escalation_reason: outcome.escalation_reason.clone(),
+            forced: outcome.forced,
+            cost_usd: outcome.completion.cost_usd,
+            receipts: outcome.completion.receipts.clone(),
+        }
+    }
+
+    fn absorb(&mut self, outcome: &ChainCompletion) {
+        self.cost_usd += outcome.completion.cost_usd;
+        self.receipts
+            .extend(outcome.completion.receipts.iter().cloned());
+        self.skipped.extend(outcome.skipped.iter().cloned());
+        if self.escalation_reason.is_none() {
+            self.escalation_reason = outcome.escalation_reason.clone();
+        }
+        self.forced |= outcome.forced;
+    }
+}
+
+/// Extract the structured verdict of one chunk attempt, re-asking the SAME
+/// model once (twice its budget, or its exhausted budget doubled) when the
+/// reply was not a structured verdict.
+///
+/// `Ok(Some(..))` is a structured verdict (`structured` is false when only the
+/// repair produced it). `Ok(None)` means "no structured verdict" — the caller
+/// advances the chain, and the returned [`AttemptEvidence`] still carries
+/// everything the attempts proved.
+///
+/// The `Err` paths are fatal for the whole review: a twice-exhausted budget,
+/// and a repair that failed for a reason other than the provider.
+#[allow(clippy::too_many_arguments)]
+async fn chunk_structured_review(
+    cli: &crate::Cli,
+    eng: &Engine,
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    completion: Completion,
+    mut evidence: AttemptEvidence,
+) -> anyhow::Result<(Option<(Completion, ReviewOutput, bool)>, AttemptEvidence)> {
+    if let Some(review) = strict_review(&completion.content) {
+        return Ok((Some((completion, review, true)), evidence));
+    }
+    // A completion that ended at `finish_reason: "length"` with no answer
+    // content is NOT a verdict at all — the model spent the whole budget on
+    // hidden reasoning. Treat it exactly like the truncated-before-verdict
+    // case: one same-model repair with the doubled budget (capped by the same
+    // ceiling and context window). The dispatch loop's transient-retry path
+    // already saw this error and did NOT retry it — `retryable()` is false for
+    // a budget exhaustion, since a blind same-budget retry repeats the
+    // failure — so this repair is the ONLY retry of this model and the two
+    // never stack.
+    let budget_exhausted = completion.length_exhausted;
+    let repair_user = format!(
+        "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
+did not satisfy the review schema."
+    );
+    let repair_max_tokens = if budget_exhausted {
+        // The model burned `completion.max_tokens` (the budget it actually ran
+        // with) and came back empty; give it the doubled budget, capped by the
+        // reviewer ceiling AND by the model's configured context window when
+        // one is stated — never above what the model can hold.
+        let doubled = reviewer_retry_budget(completion.max_tokens);
+        // The review's engine is already in hand (D5.2): re-reading it here
+        // cost a second corpus load per exhausted chunk.
+        let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
+            r.real_provider_for_model(&eng.cfg, &completion.model)
+                .map(|p| p.id.clone())
+        });
+        let window = crate::context_opt::window_for(
+            &eng.cfg,
+            provider_id.as_deref().unwrap_or(""),
+            &completion.model,
+            None,
+        );
+        window
+            .and_then(|w| u32::try_from(w).ok())
+            .map_or(doubled, |w| doubled.min(w))
+    } else {
+        reviewer_retry_budget(max_tokens)
+    };
+    let repaired = complete_once_tracked(
+        cli,
+        Some(&completion.model),
+        &[],
+        author_models,
+        &[],
+        system,
+        &repair_user,
+        repair_max_tokens,
+        eng,
+        true,
+    )
+    .await;
+    match repaired {
+        Ok(repair) => {
+            evidence.absorb(&repair);
+            if let Some(review) = strict_review(&repair.completion.content) {
+                return Ok((Some((repair.completion, review, false)), evidence));
+            }
+            if budget_exhausted && repair.completion.length_exhausted {
+                // Exhausted the budget TWICE: the model cannot produce a
+                // verdict in this budget. Fail with a message that names the
+                // model and both budgets, and stop — no third request, no
+                // chain advance pretending a verdict was attempted.
+                let first = completion.max_tokens;
+                let second = repair.completion.max_tokens;
+                if first == second {
+                    anyhow::bail!(
+                        "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                        completion.model
+                    );
+                }
+                anyhow::bail!(
+                    "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                    completion.model
+                );
+            }
+            Ok((None, evidence))
+        }
+        // A transport failure on the repair is not a verdict at all; keep its
+        // skip trail and let the chain advance. A fatal failure (structural:
+        // policy, ledger, provenance) stops the review, exactly as it stopped
+        // the chain walk before it.
+        Err(failure) if !failure.retryable => {
+            evidence.skipped.extend(failure.skipped);
+            evidence.forced |= failure.forced;
+            anyhow::bail!("{}", failure.message)
+        }
+        Err(failure) => {
+            evidence.skipped.extend(failure.skipped);
+            evidence.forced |= failure.forced;
+            Ok((None, evidence))
+        }
+    }
+}
+
+/// One chunk, dispatched along the reviewer chain: the first candidate that
+/// produces a structured verdict answers for the chunk. `invalid_models`
+/// carries the models an earlier PASS of this same chunk index already
+/// rejected (only the replayed first chunk can have any).
+///
+/// In the parallel walk the chain is exactly one candidate (the pinned model)
+/// and there is no fallback: a transport failure is retried on that model and
+/// then fails the review.
+#[allow(clippy::too_many_arguments)]
+async fn complete_chunk_attempt(
+    cli: &crate::Cli,
+    model: &str,
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    eng: &Engine,
+) -> anyhow::Result<ChunkOutcome> {
+    let outcome =
+        complete_chunk_with_retries(cli, model, author_models, system, user, max_tokens, eng)
+            .await?;
+    let evidence = AttemptEvidence::from_completion(&outcome);
+    let completion = outcome.completion;
+    let (answered, evidence) = chunk_structured_review(
+        cli,
+        eng,
+        author_models,
+        system,
+        user,
+        max_tokens,
+        completion,
+        evidence,
+    )
+    .await?;
+    let Some((completion, review, structured)) = answered else {
+        // The pinned model answered twice without a structured verdict. There
+        // is no other candidate to advance to (a later chunk may never pick a
+        // different model: that would be a mixed-model review), so the review
+        // is refused as incomplete.
+        anyhow::bail!(
+            "reviewer returned invalid JSON twice and no further reviewer candidate remains; \
+             review incomplete (a chunk without a structured verdict cannot be merged)"
+        );
+    };
+    Ok(ChunkOutcome {
+        completion,
+        review,
+        structured,
+        skipped: evidence.skipped,
+        escalation_reason: evidence.escalation_reason,
+        forced: evidence.forced,
+    })
+}
+
+/// The replay frontier: chunk 0, along the WHOLE reviewer chain, on the
+/// caller's task. This is the only chunk that may pick a model, and it is the
+/// only one that can produce `skipped`/escalation evidence (a chain fallback).
+#[allow(clippy::too_many_arguments)]
+async fn complete_chunk_zero(
+    cli: &crate::Cli,
+    eng: &Engine,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<ChunkOutcome, ChainFailure> {
+    let mut invalid_models: Vec<(String, String)> = Vec::new();
+    loop {
+        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
+        // verdict gets one same-model repair; if the repair is still not a
+        // structured verdict, the candidate is recorded as `invalid_verdict`
+        // and the chain ADVANCES instead of failing the whole review (as long
+        // as another candidate remains). Transport failures inside
+        // `complete_once_tracked` already advance the chain and leave their
+        // own skip trail.
+        let outcome = complete_once_tracked(
+            cli,
+            model_override,
+            reviewer_chain,
+            author_models,
+            &invalid_models,
+            system,
+            user,
+            max_tokens,
+            eng,
+            false,
+        )
+        .await?;
+        let evidence = AttemptEvidence::from_completion(&outcome);
+        let rejected_model = outcome.completion.model.clone();
+        let completion = outcome.completion;
+        let (answered, evidence) = chunk_structured_review(
+            cli,
+            eng,
+            author_models,
+            system,
+            user,
+            max_tokens,
+            completion,
+            evidence,
+        )
+        .await
+        .map_err(|e| ChainFailure {
+            message: format!("{e:#}"),
+            skipped: Vec::new(),
+            forced: false,
+            retryable: false,
+        })?;
+        // A chunk whose verdict only appeared on the repair retry keeps
+        // `structured: false`: a repaired verdict is not a first-attempt
+        // structured verdict.
+        if let Some((completion, review, structured)) = answered {
+            return Ok(ChunkOutcome {
+                completion,
+                review,
+                structured,
+                skipped: evidence.skipped,
+                escalation_reason: evidence.escalation_reason,
+                forced: evidence.forced,
+            });
+        }
+        // Invalid twice: advance the chain. `complete_once_tracked` applies
+        // `invalid_models` itself on the NEXT walk, so it also records the
+        // skip and returns the "no candidate remains" failure when none is
+        // left — that error is this loop's termination.
+        invalid_models.push((rejected_model, "invalid_verdict".to_string()));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
@@ -4785,298 +5403,180 @@ async fn complete_review_chunks(
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
 ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+    complete_review_chunks_with_concurrency(
+        cli,
+        eng,
+        model_override,
+        reviewer_chain,
+        author_models,
+        system,
+        users,
+        max_tokens,
+        planned_model,
+        replan,
+        chunk_concurrency(),
+    )
+    .await
+}
+
+/// [`complete_review_chunks`] with the chunk concurrency passed explicitly.
+///
+/// The seam exists so a test can select the sequential and the parallel walk
+/// in one process without mutating `ZODER_REVIEW_CHUNK_CONCURRENCY` (which
+/// would need the process-global env lock held across an async review).
+#[allow(clippy::too_many_arguments)]
+async fn complete_review_chunks_with_concurrency(
+    cli: &crate::Cli,
+    eng: Option<&Engine>,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    users: &[String],
+    max_tokens: u32,
+    planned_model: Option<String>,
+    replan: &ReplanFn<'_>,
+    concurrency: usize,
+) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
     // A review with no engine cannot resolve a reviewer: say so instead of
     // dispatching into an empty chain (the caller that loaded the engine has
     // already reported the load failure).
     let eng: &Engine = eng.ok_or_else(|| {
         anyhow::anyhow!("review incomplete: no engine loaded, so no reviewer can be resolved")
     })?;
+    if users.is_empty() {
+        // A chunk walk always completes at least chunk 0; an empty plan is a
+        // planning bug and is reported, never silently "reviewed".
+        anyhow::bail!("no review chunks were generated");
+    }
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
-    // sized for THAT model; mixing models across chunks is refused below, so
-    // the switch can only happen on the first chunk and happens at most once.
+    // sized for THAT model; mixing models across chunks is refused, so the
+    // switch can only happen on the first chunk and happens at most once.
     let mut users: Vec<String> = users.to_vec();
     let mut max_tokens = max_tokens;
     let mut replanned = false;
-    // The model that served the review so far, pinned by the FIRST
-    // completed chunk — replanned or not. `None` only while no chunk has
-    // completed yet; the capture below (the `else` arm of the single model
-    // check) assigns it on the first success, and every later chunk must
-    // match the pinned value or the review bails as a mixed-model approval.
-    let mut served_model: Option<String> = None;
-    // The requested model is captured in the SAME single capture, so the two
-    // can never disagree about which dispatch established the review: no
-    // replan and a replan both go through it.
-    let mut requested_model: Option<String> = None;
-    // Per-chunk evidence: which model was requested, which served, and whether
-    // the chunk's structured verdict came back BEFORE any repair or fallback.
-    // A re-asked or re-dispatched chunk keeps its first (pre-repair)
-    // structured flag: a first-attempt parse failure is real incompleteness
-    // evidence, and a chunk that only parsed on repair is not "every chunk
-    // returned a structured verdict on its own".
-    let mut chunk_records: Vec<ChunkCompletion> = Vec::new();
-    let mut cost_usd = 0.0;
-    let mut receipts = Vec::new();
-    let mut merged = ReviewOutput {
-        verdict: "approve".into(),
-        ..ReviewOutput::default()
-    };
-    // Reviewer-chain evidence accumulated across chunks. The loop dispatches
-    // one reviewer per review, so this is the record of how that reviewer was
-    // reached: candidates skipped before it answered, why, and whether an
-    // explicit operator pin was kept despite a family conflict.
-    let mut skipped_candidates: Vec<SkippedReviewCandidate> = Vec::new();
-    let mut escalation_reason: Option<String> = None;
-    let mut forced_family_conflict = false;
-    let mut idx = 0usize;
-    while idx < users.len() {
-        // The "this is review part N of M" statement and the partial-diff
-        // notice live INSIDE the chunk prompt: the notice is constant, so it
-        // belongs to the cache-stable head, and the part number varies, so it
-        // belongs to the variable tail. Prepending the whole sentence here
-        // put the varying part number in FRONT of the head, so the leading
-        // bytes of chunk N+1 were never the leading bytes of chunk N and the
-        // cache could not hit at all.
-        //
-        // The historical layout (behind ZODER_REVIEW_STABLE_PREFIX=0) keeps
-        // the notice in front, because that layout has no cache-stable head
-        // to protect.
-        let user = if crate::review_baton::stable_prefix_enabled() {
-            users[idx].clone()
-        } else {
-            format!(
-                "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
-Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
-is not evidence of a defect. Report only defects established by the supplied code; do not \
-invent missing integration or compiler failures from omitted context.\n\n{}",
-                idx + 1, users.len(), users[idx]
-            )
-        };
-        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
-        // verdict gets one same-model repair; if the repair is still not a
-        // structured verdict, the candidate is recorded as `invalid_verdict`
-        // and the chain ADVANCES instead of failing the whole review (as long
-        // as another candidate remains). Transport failures inside
-        // `complete_once_tracked` already advance the chain and leave their
-        // own skip trail.
-        let mut invalid_models: Vec<(String, String)> = Vec::new();
-        let (completion, review, chunk_structured) = loop {
-            let outcome = complete_once_tracked(
-                cli,
-                served_model.as_deref().or(model_override),
-                reviewer_chain,
-                author_models,
-                &invalid_models,
-                system,
-                &user,
-                max_tokens,
-                eng,
-                false,
-            )
-            .await
-            .map_err(|failure: ChainFailure| {
-                anyhow!(
-                    "review chunk {}/{}: {}",
-                    idx + 1,
-                    users.len(),
-                    failure.message
-                )
-            })?;
-            cost_usd += outcome.completion.cost_usd;
-            receipts.extend(outcome.completion.receipts.clone());
-            skipped_candidates.extend(outcome.skipped);
-            if escalation_reason.is_none() {
-                escalation_reason = outcome.escalation_reason;
-            }
-            forced_family_conflict |= outcome.forced;
-            let completion = outcome.completion;
-            if idx == 0 && !replanned && served_model.is_none() {
-                if let Some(planned) = planned_model.as_deref() {
-                    if completion.model != planned {
-                        if let Some((new_users, new_tokens)) = replan(&completion.model) {
-                            if new_users != users || new_tokens != max_tokens {
-                                if !cli.quiet {
-                                    eprintln!(
-                                        "[zoder] reviewer {} served the first chunk instead of {planned}; \
-                                         re-planning chunks for it ({} -> {} chunk(s))",
-                                        completion.model,
-                                        users.len(),
-                                        new_users.len()
-                                    );
-                                }
-                                users = new_users;
-                                max_tokens = new_tokens;
-                                replanned = true;
-                                // Do NOT capture the model here: the
-                                // re-dispatched first chunk goes through the
-                                // loop's single model capture below.
-                                continue;
+    // The shared prefix is disabled behind ZODER_REVIEW_STABLE_PREFIX=0, whose
+    // legacy layout prepends "This is review part N of M." to each chunk.
+    let preface_parts = !crate::review_baton::stable_prefix_enabled();
+
+    // ---- the sequential prelude: chunk 0, alone -------------------------
+    let mut evidence = ChunkEvidence::default();
+    let first: ChunkOutcome;
+    loop {
+        let chunk_user = chunk_user_text(&users[0], 0, users.len(), preface_parts);
+        let outcome = complete_chunk_zero(
+            cli,
+            eng,
+            model_override,
+            reviewer_chain,
+            author_models,
+            system,
+            &chunk_user,
+            max_tokens,
+        )
+        .await
+        .map_err(|failure| anyhow!("review chunk 1/{}: {}", users.len(), failure.message))?;
+        evidence.absorb(&outcome);
+        // A first chunk served by a model the plan was NOT sized for re-plans
+        // the WHOLE review for that model (once), then chunk 0 is replayed at
+        // the same index with the new chunk plan.
+        if !replanned {
+            if let Some(planned) = planned_model.as_deref() {
+                if outcome.completion.model != planned {
+                    if let Some((new_users, new_tokens)) = replan(&outcome.completion.model) {
+                        if new_users != users || new_tokens != max_tokens {
+                            if !cli.quiet {
+                                eprintln!(
+                                    "[zoder] reviewer {} served the first chunk instead of {planned}; \
+                                     re-planning chunks for it ({} -> {} chunk(s))",
+                                    outcome.completion.model,
+                                    users.len(),
+                                    new_users.len()
+                                );
                             }
+                            users = new_users;
+                            max_tokens = new_tokens;
+                            replanned = true;
+                            continue;
                         }
                     }
                 }
             }
-            // A chunk whose verdict only appeared on the repair retry keeps
-            // `structured: false`: a repaired verdict is not a first-attempt
-            // structured verdict.
-            if let Some(review) = strict_review(&completion.content) {
-                break (completion, review, true);
-            }
-            // A completion that ended at `finish_reason: "length"` with no
-            // answer content is NOT a verdict at all — the model spent the
-            // whole budget on hidden reasoning. Treat it exactly like the
-            // truncated-before-verdict case: one same-model repair with the
-            // doubled budget (capped by the same ceiling and context
-            // window). The dispatch loop's transient-retry path already saw
-            // this error and did NOT retry it — `retryable()` is false for a
-            // budget exhaustion, since a blind same-budget retry repeats the
-            // failure — so this repair is the ONLY retry of this model and
-            // the two never stack.
-            let budget_exhausted = completion.length_exhausted;
-            let repair_user = format!(
-                "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
-did not satisfy the review schema."
-            );
-            let repair_max_tokens = if budget_exhausted {
-                // The model burned `completion.max_tokens` (the budget it
-                // actually ran with) and came back empty; give it the
-                // doubled budget, capped by the reviewer ceiling AND by the
-                // model's configured context window when one is stated —
-                // never above what the model can hold.
-                let doubled = reviewer_retry_budget(completion.max_tokens);
-                // The review's engine is already in hand (D5.2): re-reading
-                // it here cost a second corpus load per exhausted chunk.
-                let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
-                    r.real_provider_for_model(&eng.cfg, &completion.model)
-                        .map(|p| p.id.clone())
-                });
-                let window = crate::context_opt::window_for(
-                    &eng.cfg,
-                    provider_id.as_deref().unwrap_or(""),
-                    &completion.model,
-                    None,
-                );
-                window
-                    .and_then(|w| u32::try_from(w).ok())
-                    .map_or(doubled, |w| doubled.min(w))
-            } else {
-                reviewer_retry_budget(max_tokens)
-            };
-            let repaired = complete_once_tracked(
-                cli,
-                Some(&completion.model),
-                &[],
-                author_models,
-                &[],
-                system,
-                &repair_user,
-                repair_max_tokens,
-                eng,
-                true,
-            )
-            .await;
-            match repaired {
-                Ok(repair) => {
-                    cost_usd += repair.completion.cost_usd;
-                    receipts.extend(repair.completion.receipts.clone());
-                    skipped_candidates.extend(repair.skipped);
-                    forced_family_conflict |= repair.forced;
-                    if let Some(review) = strict_review(&repair.completion.content) {
-                        break (repair.completion, review, false);
-                    }
-                    if budget_exhausted && repair.completion.length_exhausted {
-                        // Exhausted the budget TWICE: the model cannot
-                        // produce a verdict in this budget. Fail with a
-                        // message that names the model and both budgets,
-                        // and stop — no third request, no chain advance
-                        // pretending a verdict was attempted.
-                        let first = completion.max_tokens;
-                        let second = repair.completion.max_tokens;
-                        if first == second {
-                            anyhow::bail!(
-                                "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
-lower its reasoning effort or raise max_tokens",
-                                completion.model
-                            );
-                        }
-                        anyhow::bail!(
-                            "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
-lower its reasoning effort or raise max_tokens",
-                            completion.model
-                        );
-                    }
-                }
-                Err(failure) => {
-                    // A transport failure on the repair is not a verdict at
-                    // all; keep its skip trail and let the chain advance.
-                    skipped_candidates.extend(failure.skipped);
-                    forced_family_conflict |= failure.forced;
-                }
-            }
-            // Invalid twice (or the repair could not run): advance the chain.
-            skipped_candidates.push(SkippedReviewCandidate {
-                model: completion.model.clone(),
-                reason: "invalid_verdict".to_string(),
-            });
-            if escalation_reason.is_none() {
-                escalation_reason = Some("invalid_verdict".to_string());
-            }
-            invalid_models.push((completion.model.clone(), "invalid_verdict".to_string()));
-        };
-        let record = ChunkCompletion {
-            requested_model: completion.requested_model.clone(),
-            served_model: completion.model.clone(),
-            structured: chunk_structured,
-        };
-        // No `served != requested` check here: `complete_once` dispatches each
-        // candidate with the same id as both the requested and the dispatched
-        // model, so the two can never differ on a returned `Completion`. A
-        // provider-side substitution is refused earlier, inside
-        // `dispatch_reviewer_for_model`, which compares the provider's reported
-        // response model with the requested one (reviewer provenance
-        // mismatch) before any `Completion` is returned. What remains to
-        // enforce at this level is a mid-review FALLBACK to a different
-        // candidate, which the check below catches against the model that
-        // served the earlier chunks. Either way the bail IS the
-        // incompleteness path: `run_loop_review` maps the error to the
-        // iteration's `reviewer_unavailable` verdict with `review_error` set
-        // and `review_complete: false`.
-        // Single model capture AND the canonical mixed-model enforcement,
-        // shared by the replanned and non-replanned paths: the first
-        // COMPLETED chunk pins the served and requested models; every LATER
-        // chunk is then checked against the pinned `served_model` by the
-        // pure `mixed_model_chunk` predicate below and the review bails if
-        // the provider served it by a different model. A mid-review fallback
-        // to a different model is a mixed-model approval, and a mixed-model
-        // approval is refused — never accepted as a complete review.
-        if let Some(first) = &served_model {
-            if mixed_model_chunk(first, &completion.model) {
-                anyhow::bail!(
-                    "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
-                    idx + 1,
-                    users.len(),
-                    completion.model,
-                    first
-                );
-            }
-        } else {
-            served_model = Some(completion.model.clone());
-            requested_model = Some(completion.requested_model.clone());
         }
-        chunk_records.push(record);
-        append_chunk_review(&mut merged, review, idx, users.len());
-        idx += 1;
+        first = outcome;
+        break;
     }
-    // One report per reviewer: the requested and served models (ABSENT,
-    // never an empty string, when no chunk completed) plus the per-chunk
+    // The first COMPLETED chunk pins the served and requested models.
+    let pin = PinnedModel {
+        requested: first.completion.requested_model.clone(),
+        served: first.completion.model.clone(),
+    };
+
+    // ---- the remaining chunks: bounded fan-out --------------------------
+    let tasks: Vec<ChunkTask> = (CHUNK_REPLAY_FRONTIER..users.len())
+        .map(|idx| ChunkTask {
+            // `complete_once` dispatches each candidate with the same id as
+            // both the requested and the dispatched model, so a chunk
+            // dispatched for the pinned model can only be substituted by the
+            // provider itself, which `dispatch_reviewer_for_model` refuses as
+            // a provenance mismatch before a `Completion` is returned. Every
+            // chunk therefore requests `pin.served`.
+            model: pin.served.clone(),
+            user: chunk_user_text(&users[idx], idx, users.len(), preface_parts),
+            max_tokens,
+        })
+        .collect();
+    // A multi-candidate chain is fine here: chunk 0 already picked the model,
+    // so every later chunk is pinned to it and cannot fall back.
+    let blocker = chunk_parallelism_blocker_at(preface_parts, concurrency);
+    let parallel_outcomes =
+        run_parallel_chunks(cli, eng, author_models, system, tasks, blocker, concurrency).await?;
+
+    // ---- the deterministic merge, in CHUNK order ------------------------
+    let mut ordered: Vec<Option<ChunkOutcome>> =
+        std::iter::repeat_with(|| None).take(users.len()).collect();
+    ordered[0] = Some(first);
+    for outcome in parallel_outcomes {
+        ordered[outcome.idx] = Some(outcome.outcome);
+    }
+    let mut chunk_records: Vec<ChunkCompletion> = Vec::with_capacity(users.len());
+    let mut reviews: Vec<ReviewOutput> = Vec::with_capacity(users.len());
+    for (idx, slot) in ordered.into_iter().enumerate() {
+        let outcome = slot.expect("every completed chunk has its plan slot");
+        if idx > 0 && mixed_model_chunk(&pin.served, &outcome.completion.model) {
+            anyhow::bail!(
+                "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
+                idx + 1,
+                users.len(),
+                outcome.completion.model,
+                pin.served
+            );
+        }
+        if idx > 0 {
+            evidence.absorb(&outcome);
+        }
+        chunk_records.push(ChunkCompletion {
+            requested_model: outcome.completion.requested_model.clone(),
+            served_model: outcome.completion.model.clone(),
+            structured: outcome.structured,
+        });
+        reviews.push(outcome.review);
+    }
+    let count = users.len();
+    let mut merged = merge_chunk_reviews(reviews);
+    merged.summary = annotate_chunk_summary(&merged.summary, count);
+
+    // One report per reviewer: the requested and served models (ABSENT, never
+    // an empty string, when no chunk completed) plus the per-chunk
     // structured-verdict evidence, in chunk order.
     let report = ReviewerChunkReport {
-        requested_model,
-        served_model,
+        requested_model: Some(pin.requested.clone()),
+        served_model: Some(pin.served.clone()),
         chunks: chunk_records,
-        skipped: skipped_candidates,
-        escalation_reason,
-        forced_family_conflict,
+        skipped: evidence.skipped,
+        escalation_reason: evidence.escalation_reason,
+        forced_family_conflict: evidence.forced,
     };
     let completion = Completion {
         requested_model: report.requested_model.clone().unwrap_or_default(),
@@ -5085,19 +5585,21 @@ lower its reasoning effort or raise max_tokens",
             .clone()
             .ok_or_else(|| anyhow!("no review chunks were generated"))?,
         content: serde_json::to_string(&merged)?,
-        cost_usd,
-        receipts,
+        cost_usd: evidence.cost_usd,
+        receipts: evidence.receipts,
         chunks: users.len(),
         // The merged content is zoder's own JSON, never a raw provider
         // completion, so no raw budget-exhaustion flag rides on it.
         length_exhausted: false,
-        // `max_tokens` may have been re-planned for a fallback reviewer;
-        // the final value is the one every chunk ran at.
+        // `max_tokens` may have been re-planned for a fallback reviewer; the
+        // final value is the one every chunk ran at.
         max_tokens,
     };
     Ok((completion, report))
 }
 
+/// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
+/// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
 /// One reviewer's chunk plan: its caps, the prepared diff, and the prompts.
 #[derive(Clone)]
 struct ReviewPlan {
@@ -10911,7 +11413,12 @@ mod tests {
         );
         assert_eq!(merged.verdict, "request_changes");
         assert_eq!(merged.findings.len(), 1);
-        assert!(merged.summary.contains("Chunk 2/2"));
+        // `append_chunk_review` folds UNNUMBERED lines; the plan numbering is
+        // applied once, by `annotate_chunk_summary`, from the fold order.
+        assert_eq!(
+            annotate_chunk_summary(&merged.summary, 2),
+            "Chunk 1/2: authorization removed\nChunk 2/2: second hunk sound\n"
+        );
     }
 
     #[test]
@@ -15883,6 +16390,535 @@ mod review_diff_soundness_tests {
 // inside an `ENV_LOCK` mutex, and never touches the host's real
 // `~/.zoder/`.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod review_chunk_fanout_tests {
+    //! D5.1: the chunks of ONE reviewer run as chunk 0 first (it pins the
+    //! served model and warms the prompt cache) and then with bounded
+    //! concurrency, and the merged review is identical to the sequential walk.
+    //!
+    //! The fake provider is a real HTTP server (wiremock): each chunk body
+    //! carries its own plan index, and the server answers that chunk with a
+    //! verdict that names the index — so the merge, the prompt text and the
+    //! chunk order are all observable end to end, with no prompt change.
+    //!
+    //! Concurrency is selected through the `ZODER_REVIEW_CHUNK_CONCURRENCY`
+    //! parameter of the walk itself, never through the process environment, so
+    //! these tests hold no process-global lock while a review is in flight and
+    //! cannot deadlock against the `ZODER_HOME` tests.
+
+    use super::*;
+    use crate::agentic::reviewer_chain_dispatch_tests::{write_config, write_corpus, HomeGuard};
+    use crate::agentic::tests::test_engine;
+    use crate::Cli;
+    use clap::Parser;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// One request as the fake provider saw it: when it arrived, how many
+    /// requests were in flight when it did, the chunk index in the body, and
+    /// whether the chunk asked to be blocked.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        at: Instant,
+        inflight: usize,
+        idx: usize,
+        blocks: bool,
+    }
+
+    #[derive(Clone)]
+    struct FakeProvider {
+        seen: Arc<Mutex<Vec<Seen>>>,
+        max_inflight: Arc<AtomicUsize>,
+    }
+
+    /// Extract the plan index from a review chunk prompt.
+    ///
+    /// The fixtures are one chunk per file (`+chunk N`), so the chunk's own
+    /// file marker is the authoritative index. The "part N of M" banner is
+    /// checked too, when present: it sits in the chunk's variable tail (the
+    /// default layout) and must agree with the file marker — a mis-numbered
+    /// banner would mean the merge renumbered the wrong chunk.
+    fn chunk_index(body: &str) -> usize {
+        let file_idx = body
+            .rsplit_once("\n+chunk ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .and_then(|n| n.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("no chunk marker in body: {body}"));
+        if let Some(at) = body.rfind("This is review part ") {
+            let banner = body[at + "This is review part ".len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("unparsable chunk banner: {body}"));
+            assert_eq!(
+                banner - 1,
+                file_idx,
+                "the part banner must name the chunk it carries"
+            );
+        }
+        file_idx
+    }
+
+    fn body_text(req: &Request) -> String {
+        let raw: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        raw["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A fake reviewer: every request is logged (with its in-flight count and
+    /// chunk index) and answered after `delay_ms`, so the caller can observe
+    /// concurrency and wall time. A body containing `BLOCK-ME` answers
+    /// `request_changes`; anything else approves. A body containing
+    /// `FAIL-ME` answers 401 (a fatal, non-retried provider error).
+    async fn start_fake(delay_ms: u64) -> (MockServer, FakeProvider) {
+        start_fake_with_zero_delay(delay_ms, delay_ms).await
+    }
+
+    /// Like [`start_fake`], but chunk 0 answers after `zero_delay_ms`. A
+    /// cancellation test must not pay chunk 0's (long) delay before the
+    /// fan-out even starts; the overlap test wants chunk 0 to be slow so it
+    /// can prove the later chunks wait for it.
+    async fn start_fake_with_zero_delay(
+        zero_delay_ms: u64,
+        delay_ms: u64,
+    ) -> (MockServer, FakeProvider) {
+        let server = MockServer::start().await;
+        let fake = FakeProvider {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            max_inflight: Arc::new(AtomicUsize::new(0)),
+        };
+        let (s, m) = (fake.seen.clone(), fake.max_inflight.clone());
+        let inflight = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(current, Ordering::SeqCst);
+                let text = body_text(req);
+                let idx = chunk_index(&text);
+                let blocks = text.contains("BLOCK-ME");
+                s.lock().unwrap().push(Seen {
+                    at: Instant::now(),
+                    inflight: current,
+                    idx,
+                    blocks,
+                });
+                // The delay is applied by the response template (see below),
+                // NOT with a blocking sleep here: `MockServer` serves from a
+                // `new_current_thread` runtime, so a sleep in this handler
+                // would serialise every request and no fan-out could ever
+                // overlap. `set_delay` yields to the runtime instead, so the
+                // fixture measures zoder's concurrency rather than its own.
+                if text.contains("FAIL-ME") {
+                    return ResponseTemplate::new(401).set_body_string("bad key");
+                }
+                // Chunk 0 runs alone and only pins the model.
+                let this_delay = if idx == 0 { zero_delay_ms } else { delay_ms };
+                let review = serde_json::json!({
+                    "verdict": if blocks { "request_changes" } else { "approve" },
+                    "summary": format!("chunk {idx} sound"),
+                    "findings": [{
+                        "severity": "low",
+                        "title": format!("note from chunk {idx}"),
+                        "body": "a note",
+                        "location": format!("src/lib.rs:{}", idx + 1),
+                    }],
+                    "next_steps": [],
+                })
+                .to_string();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(this_delay))
+                    .set_body_string(
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": review},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+                        })
+                        .to_string(),
+                    )
+            })
+            .mount(&server)
+            .await;
+        (server, fake)
+    }
+
+    /// `n` chunk prompts; the ones listed in `markers` carry a marker in the
+    /// DIFF text (never in the instructions, so no prompt changes).
+    fn chunk_users(n: usize, markers: &[(usize, &str)]) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let marker = markers
+                    .iter()
+                    .find(|(at, _)| *at == i)
+                    .map(|(_, m)| *m)
+                    .unwrap_or("");
+                format!("diff --git a/f{i} b/f{i}\n+chunk {i}{marker}\n")
+            })
+            .collect()
+    }
+
+    fn install_fake_home(home: &Path, uri: &str) {
+        write_corpus(home, &["working-model/glm-5.1"]);
+        write_config(home, uri, "working-model/glm-5.1");
+    }
+
+    fn test_cli() -> Cli {
+        Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap()
+    }
+
+    async fn run_walk(
+        cli: &Cli,
+        users: &[String],
+        chunk_concurrency: usize,
+    ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+        complete_review_chunks_with_concurrency(
+            cli,
+            Some(&test_engine()),
+            Some("working-model/glm-5.1"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            users,
+            2048,
+            None,
+            &|_| panic!("no re-plan: the planned model serves"),
+            chunk_concurrency,
+        )
+        .await
+    }
+
+    fn seen_snapshot(fake: &FakeProvider) -> Vec<Seen> {
+        fake.seen.lock().unwrap().clone()
+    }
+
+    /// The parallel walk must produce the SAME merged result as the sequential
+    /// one on the same fixtures: verdict, summary text (chunk order) and the
+    /// full findings list. The chunks are supplied directly (a plan of N
+    /// chunks is exactly what the baton hands the walk), so the walk itself is
+    /// the only variable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_chunks_produce_the_same_merged_result_as_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let users = chunk_users(6, &[(2, " BLOCK-ME")]);
+        let cli = test_cli();
+
+        let (sequential, sequential_report) =
+            run_walk(&cli, &users, 1).await.expect("sequential walk");
+        let (parallel, parallel_report) = run_walk(&cli, &users, 4).await.expect("parallel walk");
+
+        let merged_sequential: ReviewOutput = serde_json::from_str(&sequential.content).unwrap();
+        let merged_parallel: ReviewOutput = serde_json::from_str(&parallel.content).unwrap();
+        assert_eq!(
+            merged_parallel.verdict, merged_sequential.verdict,
+            "the parallel merge must reach the same verdict"
+        );
+        assert_eq!(merged_parallel.verdict, "request_changes");
+        assert_eq!(
+            merged_parallel.summary, merged_sequential.summary,
+            "the summary text (one line per chunk, in chunk order) must be identical"
+        );
+        let summaries: Vec<&str> = merged_parallel.summary.lines().collect();
+        assert_eq!(summaries.len(), 6);
+        for (i, line) in summaries.iter().enumerate() {
+            assert_eq!(
+                *line,
+                format!("Chunk {}/6: chunk {i} sound", i + 1),
+                "{line}"
+            );
+        }
+        let finding_json = |r: &ReviewOutput| serde_json::to_string(&r.findings).unwrap();
+        assert_eq!(
+            finding_json(&merged_parallel),
+            finding_json(&merged_sequential),
+            "the findings must be appended in chunk order, not completion order"
+        );
+        let titles: Vec<&str> = merged_parallel
+            .findings
+            .iter()
+            .map(|f| f.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "note from chunk 0",
+                "note from chunk 1",
+                "note from chunk 2",
+                "note from chunk 3",
+                "note from chunk 4",
+                "note from chunk 5",
+            ],
+            "findings must be stable-ordered by chunk"
+        );
+        let structured = |r: &ReviewerChunkReport| -> Vec<bool> {
+            r.chunks.iter().map(|c| c.structured).collect()
+        };
+        assert_eq!(structured(&parallel_report), structured(&sequential_report));
+        assert_eq!(structured(&parallel_report).len(), 6);
+        assert_eq!(parallel.chunks, 6);
+        assert_eq!(parallel.model, "working-model/glm-5.1");
+    }
+
+    /// The worst verdict wins even when the blocking chunk answers LAST, and
+    /// the chunk numbering still follows the plan (not completion order).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worst_verdict_wins_and_order_is_plan_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let users = chunk_users(5, &[(4, " BLOCK-ME")]);
+        let cli = test_cli();
+        let (completion, report) = run_walk(&cli, &users, 4).await.expect("parallel walk");
+        let merged: ReviewOutput = serde_json::from_str(&completion.content).unwrap();
+        assert_eq!(
+            merged.verdict, "request_changes",
+            "the blocking verdict of one chunk must win the merge"
+        );
+        assert!(
+            merged.summary.contains("Chunk 5/5: chunk 4 sound"),
+            "the blocking chunk keeps its plan number: {}",
+            merged.summary
+        );
+        let seen = seen_snapshot(&fake);
+        assert_eq!(seen.len(), 5, "one request per chunk");
+        assert!(
+            seen.iter().any(|s| s.blocks && s.idx == 4),
+            "the marked chunk was sent"
+        );
+        assert_eq!(report.chunks.len(), 5);
+    }
+
+    /// `merge_chunk_reviews` is the deterministic rule the fan-out relies on:
+    /// the worst verdict wins and the fold is over the caller's order.
+    #[test]
+    fn merge_chunk_reviews_worst_verdict_wins() {
+        let chunk = |verdict: &str, summary: &str, title: &str| ReviewOutput {
+            verdict: verdict.into(),
+            summary: summary.into(),
+            findings: vec![Finding {
+                severity: "high".into(),
+                title: title.into(),
+                ..Finding::default()
+            }],
+            ..ReviewOutput::default()
+        };
+        let forward = merge_chunk_reviews(vec![
+            chunk("approve", "first sound", "a"),
+            chunk("comment", "second noted", "b"),
+            chunk("request_changes", "third broken", "c"),
+        ]);
+        let blocking_first = merge_chunk_reviews(vec![
+            chunk("request_changes", "third broken", "c"),
+            chunk("approve", "first sound", "a"),
+            chunk("comment", "second noted", "b"),
+        ]);
+        assert_eq!(forward.verdict, "request_changes");
+        assert_eq!(blocking_first.verdict, "request_changes");
+        assert_eq!(forward.summary, "first sound\nsecond noted\nthird broken\n");
+        assert_eq!(
+            blocking_first.summary,
+            "third broken\nfirst sound\nsecond noted\n"
+        );
+        assert_eq!(
+            annotate_chunk_summary(&forward.summary, 3),
+            "Chunk 1/3: first sound\nChunk 2/3: second noted\nChunk 3/3: third broken\n"
+        );
+    }
+
+    /// Chunk 0 runs ALONE before any later chunk is sent, and the later
+    /// chunks then overlap, bounded by the concurrency.
+    ///
+    /// Overlap is read from the fake's ARRIVAL timestamps against the delay
+    /// each response carries: a later chunk that arrives more than one delay
+    /// after its predecessor cannot have been overlapped with it. (The
+    /// fixture cannot count "in flight" in its handler — `wiremock` applies
+    /// the template delay after the handler returns — so arrival spacing is
+    /// the honest signal.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_zero_runs_first_and_later_chunks_overlap() {
+        let delay = Duration::from_millis(150);
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, fake) = start_fake(delay.as_millis() as u64).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        run_walk(&cli, &chunk_users(5, &[]), 4)
+            .await
+            .expect("parallel walk");
+        let mut seen = seen_snapshot(&fake);
+        assert_eq!(seen.len(), 5, "one request per chunk");
+        seen.sort_by_key(|s| s.at);
+        let first = &seen[0];
+        assert_eq!(
+            first.idx, 0,
+            "chunk 0 (the model-pinning, cache-warming chunk) must be sent first"
+        );
+        // Chunk 0 alone: the next arrival may not come until chunk 0's
+        // response is (nearly) delivered, i.e. about one delay later.
+        let gap_after_zero = seen[1].at - first.at;
+        assert!(
+            gap_after_zero >= delay.mul_f64(0.9),
+            "chunk 0 must finish alone before the fan-out starts; next chunk \
+             arrived after {gap_after_zero:?} (delay {delay:?})"
+        );
+        // The four later chunks fan out: they all arrive within one delay of
+        // each other, not one-per-delay as a serial walk would produce.
+        let later = &seen[1..];
+        let span = later
+            .iter()
+            .map(|s| s.at)
+            .max()
+            .unwrap()
+            .duration_since(later.iter().map(|s| s.at).min().unwrap());
+        assert!(
+            span < delay.mul_f64(0.9),
+            "the later chunks must be dispatched together, not one per delay; \
+             they were spread over {span:?} (delay {delay:?})"
+        );
+    }
+
+    /// Cancellation: when one later chunk fails, the walk fails the review
+    /// instead of merging a partial one, and it drops (cancels) the chunks
+    /// still in flight rather than waiting for them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_chunk_fails_the_review_instead_of_merging_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        // Every chunk is slow except the failing one, so a walk that waited
+        // for its siblings would take ~30 s. The marked prompt is the third
+        // chunk, so it is "review chunk 3/6"; the 20 s bound below proves the
+        // chunks still in flight were abandoned, not awaited.
+        let (server, _fake) = start_fake_with_zero_delay(0, 30_000).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        // Six chunks: chunk 0 pins the model (answered immediately), then
+        // chunks 2..5 fan out four wide. The failure is on chunk 3, inside
+        // the first wave, so the 20 s bound proves the rest were abandoned.
+        let users = chunk_users(6, &[(3, " FAIL-ME")]);
+        let started = Instant::now();
+        let err = run_walk(&cli, &users, 4)
+            .await
+            .expect_err("a 401 chunk must fail the review");
+        let elapsed = started.elapsed();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("review chunk 3/6"),
+            "the error must name the failed chunk: {text}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "in-flight chunks must be cancelled, not awaited: {elapsed:?}"
+        );
+    }
+
+    /// Wall time scales with the fan-out: six chunks at 170 ms. The sequential
+    /// walk is one chunk 0 plus five serialized chunks (~1 s); the parallel
+    /// walk is chunk 0 plus two waves of four (~500 ms). The bound is generous
+    /// so a loaded box cannot flake it, but a walk that still ran the later
+    /// chunks one at a time cannot pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fake_provider_shows_wall_time_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(170).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(6, &[]);
+
+        let sequential_started = Instant::now();
+        run_walk(&cli, &users, 1).await.expect("sequential walk");
+        let sequential = sequential_started.elapsed();
+
+        let parallel_started = Instant::now();
+        run_walk(&cli, &users, 4).await.expect("parallel walk");
+        let parallel = parallel_started.elapsed();
+
+        assert!(
+            parallel < sequential.mul_f64(0.75),
+            "the parallel walk must be materially faster: sequential {sequential:?}, parallel {parallel:?}"
+        );
+    }
+
+    /// The legacy chunk layout keeps the sequential walk: its "part N of M"
+    /// banner sits in FRONT of the prompt.
+    #[test]
+    fn legacy_chunk_layout_keeps_the_sequential_walk() {
+        let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_STABLE_PREFIX", Some("0"));
+        let preface = !crate::review_baton::stable_prefix_enabled();
+        assert!(
+            preface,
+            "ZODER_REVIEW_STABLE_PREFIX=0 selects the legacy layout"
+        );
+        assert!(
+            chunk_parallelism_blocker_at(preface, 4).is_some(),
+            "the legacy layout must keep the sequential walk"
+        );
+        assert!(
+            chunk_parallelism_blocker_at(false, 4).is_none(),
+            "the default layout fans out"
+        );
+    }
+
+    /// The default layout names the chunk inside the variable tail (after the
+    /// cache-stable head) — the text the baton itself emits.
+    #[test]
+    fn default_chunk_layout_does_not_preface_the_prompt() {
+        let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_STABLE_PREFIX", None);
+        assert!(crate::review_baton::stable_prefix_enabled());
+        assert_eq!(chunk_user_text("BODY", 1, 3, false), "BODY");
+        let legacy = chunk_user_text("BODY", 1, 3, true);
+        assert!(
+            legacy.starts_with("This is review part 2 of 3."),
+            "{legacy}"
+        );
+        assert!(legacy.ends_with("BODY"), "{legacy}");
+    }
+
+    /// Every test above selects its walk through the parameter; this one pins
+    /// that the PRODUCTION path reads the same choice from the environment and
+    /// defaults to the bounded fan-out.
+    #[test]
+    fn chunk_concurrency_defaults_to_four_and_is_env_configurable() {
+        {
+            let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", None);
+            assert_eq!(chunk_concurrency(), DEFAULT_CHUNK_CONCURRENCY);
+            assert!(chunk_parallelism_blocker_at(false, 4).is_none());
+        }
+        {
+            let _v =
+                crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", Some("1"));
+            assert_eq!(chunk_concurrency(), 1);
+            assert!(chunk_parallelism_blocker_at(false, 1).is_some());
+        }
+        {
+            let _v =
+                crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", Some("bogus"));
+            assert_eq!(
+                chunk_concurrency(),
+                DEFAULT_CHUNK_CONCURRENCY,
+                "an unparsable value falls back to the default"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod reviewer_chain_dispatch_tests {
