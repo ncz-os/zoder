@@ -1582,7 +1582,7 @@ pub(crate) fn build_reviewer_plan(
     // model id (never an alias), so — like `reviewer_chain` — it is not
     // run through alias resolution.
     if out.is_empty() {
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let routes = crate::resolve_chain(cli, &eng, &health)?;
         let author = routes.primary.first().cloned().unwrap_or_default();
         let default = crate::default_cross_family_reviewer(&author).to_string();
@@ -1658,7 +1658,7 @@ pub(crate) fn build_reviewer_plan(
         }
         let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
         let routing = crate::RoutingContext::load(&eng.cfg)?;
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let author_routes = crate::resolve_chain(cli, &eng, &health)?;
         let primary = out.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
@@ -2517,7 +2517,7 @@ async fn dispatch_reviewer_for_model(
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    let health = HealthStore::load(&eng.cfg.health_path);
+    let health = crate::config_cache::health_store(&eng.cfg.health_path);
     // The reservation's reconcile is a flock + write + fsync: keep it off the
     // dispatch task (D5.9) and hand the updated store back.
     let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
@@ -5348,7 +5348,9 @@ pub(crate) async fn cmd_review(
     // the configured reviewer pin, then the head of the scenario reviewer
     // chain. When none is resolvable (no engine, or a fully dynamic route) the
     // per-route lookup is skipped and the general caps/default apply.
-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let health = eng
+        .as_ref()
+        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
             .map(|r| r.reviewer)
@@ -9193,7 +9195,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         let eng = Engine::load();
         let (reviewer_chain, review_cfg, caps_model) = match eng.as_ref() {
             Ok(eng) => {
-                let health = HealthStore::load(&eng.cfg.health_path);
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
                 let chain = crate::resolve_chain(cli, eng, &health)
                     .map(|r| r.reviewer)
                     .unwrap_or_default();
@@ -9221,7 +9223,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                         models.push(primary);
                     }
                 }
-                let health = HealthStore::load(&eng.cfg.health_path);
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
                 if let Ok(routes) = crate::resolve_chain(cli, eng, &health) {
                     for model in routes.primary {
                         if !models.contains(&model) {

@@ -48,3 +48,8 @@ bench/raw/
 
 # Local build target for this job workspace (kept on local disk, never /tmp).
 /.build-target/
+
+# Job-local scratch (never repo content): the fleet-ops plan clone read for
+# file:line leads, and the test TMPDIR (see /t above).
+/.fleetops-tmp/
+/.test-*.log

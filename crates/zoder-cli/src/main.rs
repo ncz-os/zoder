@@ -9,6 +9,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
 mod child_env;
+mod config_cache;
 mod context_opt;
 mod evals;
 mod exec_safety;
@@ -3791,7 +3792,7 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
     // goes to stderr, before the exec, so the operator sees it even though
     // the TUI takes over the terminal.
     if let Ok(cfg) = Config::load_unvalidated() {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         warn_installed_data_age(&cfg, &pricing);
     }
     let bin = locate_sibling("zerocode").ok_or_else(|| {
@@ -4095,7 +4096,7 @@ async fn cmd_models(
     }
 
     let p = Pal::new();
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     // Live health/latency from the on-disk health store (updated as models are
     // called). Drives the "health" and "resp" columns so the operator sees which
     // models are ready and how fast they have been responding.
@@ -6732,7 +6733,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // month-to-date spend is treated as "could not read spend, ask the
     // user" rather than silently reporting $0 — Finding #10.
     if !cli.allow_paid && !provider_cost_neutral {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
         let verdict = eng.cfg.budget.evaluate_call(
             &pricing,
@@ -7128,7 +7129,7 @@ raise --max-tokens or lower its reasoning effort",
         .provider(&used_provider_id)
         .map(BillingPosture::from)
         .unwrap_or(BillingPosture::Metered);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
     let (cost, unknown_cost) = ledger_call_cost(
         posture,
@@ -10432,8 +10433,7 @@ mod oneshot_ledger_billing_tests {
                     let row = &rows[0];
                     // Reproduce the dispatch math directly in the test so a
                     // regression is visible in the assertion itself.
-                    let pricing =
-                        zoder_core::pricing::PricingCatalog::load(&home.join("pricing.json"));
+                    let pricing = crate::config_cache::pricing_catalog(&home.join("pricing.json"));
                     let (cost, unknown) = ledger_call_cost(
                         BillingPosture::Metered,
                         None,
@@ -12391,7 +12391,7 @@ pub(crate) async fn agentic_turn(
     // classification as --oneshot. Agent dispatch must not bypass unknown
     // pricing, per-call caps, or month-to-date caps.
     if !cli.allow_paid {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let verdict = evaluate_default_exec_budget(
             &eng.cfg,
             &pricing,
@@ -13743,7 +13743,7 @@ async fn cmd_report(
     maybe_spawn_daily_refresh();
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     // The data-age warning for the installed files. In `file` pricing-source
     // mode `maybe_spawn_daily_refresh` skipped the spawn, so this line is
     // the only signal the operator gets that the installed data has gone
@@ -14279,7 +14279,7 @@ async fn cmd_finops(
 ) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let led = Ledger::new(&eng.cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let argv: Vec<String> = std::iter::empty()
         .chain(std::iter::once("zoder".to_string()))
         .chain(std::iter::once(sub.to_string()))
@@ -14695,7 +14695,7 @@ async fn reconcile_probe_success(
         .provider(provider_id)
         .map(BillingPosture::from)
         .unwrap_or(BillingPosture::Metered);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let ts_utc = Utc::now();
     let (cost, cost_unknown) = ledger_call_cost(
         posture,
@@ -16421,7 +16421,7 @@ fn maybe_spawn_daily_refresh() {
     // daily refresh wrote it; fall back to the report copy's date for the
     // warning so an operator sees the age of the data they installed.
     let report_path = Config::home().join("pricing.json");
-    let cat = PricingCatalog::load(&report_path);
+    let cat = crate::config_cache::pricing_catalog(&report_path);
     let data_date_age_days =
         zoder_core::pricing::data_date(&cat.generated, cat.generated_at.as_deref().unwrap_or(""))
             .map(|d| (chrono::Utc::now().date_naive() - d).num_days());
@@ -16520,7 +16520,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             // (a public repull would relabel it and unmanage the file).
             // Carry the installed values into the refreshed catalog.
             if switch.is_file() {
-                let installed = PricingCatalog::load(&path);
+                let installed = crate::config_cache::pricing_catalog(&path);
                 carry_installed_provenance(&mut cat, &installed);
             }
             cat.save(&path)?;
@@ -16585,7 +16585,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         PricingCmd::Show { model } => {
-            let cat = PricingCatalog::load(&path);
+            let cat = crate::config_cache::pricing_catalog(&path);
             // Data-age warning for the installed files (once per process,
             // stderr only): the pricing catalog AND the model corpus, one
             // line per file.
@@ -16649,7 +16649,7 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // same provider id -- the figure the provider's cost API is trued up against.
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let since = chrono::Utc::now() - chrono::Duration::days(days.max(1));
     // Re-price each ledger entry off its recorded timestamp so the
     // off-peak window is honored on the reconciliation path as well
