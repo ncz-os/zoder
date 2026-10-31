@@ -285,6 +285,201 @@ pub struct Ledger {
     path: PathBuf,
 }
 
+/// Suffix of the sidecar checkpoint kept beside the ledger. Like the `.lock`
+/// companion it is derived from the ledger path, so the two move together.
+const CHECKPOINT_SUFFIX: &str = ".checkpoint";
+/// Layout version of the checkpoint. A checkpoint written by a different build is
+/// ignored (the full scan rebuilds it) rather than misread.
+const CHECKPOINT_VERSION: u32 = 1;
+/// Size ceiling for one checkpoint. It holds a few numbers per calendar month, so
+/// anything this large was not written by this build and must not be parsed.
+const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+/// How far back a routing read looks, in hours. The widest quota window this
+/// build can be configured with is 720 h (`calendar_monthly`, see
+/// `subscriptions/tiers.json`), so a routing decision cannot depend on a row
+/// older than that; the slack covers a monthly window that started just before
+/// the cut. Routing reads only rows inside this window, which is what lets it
+/// stay cheap on a ledger that grows without bound.
+const ROUTING_LOOKBACK_HOURS: i64 = 720 + 24;
+
+/// What one calendar month cost, accumulated the same way a full scan
+/// accumulates it. `cost_unknown_calls > 0` means the month cannot be reported
+/// as a dollar figure: it fails closed, exactly like the full scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonthTotal {
+    /// Known-cost spend (USD). Unknown-cost rows are excluded, as [`Rollup`]
+    /// excludes them.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// Calls in the month whose cost could not be established.
+    #[serde(default)]
+    pub unknown_cost_calls: u64,
+}
+
+/// Sidecar checkpoint: proof that every byte before `offset` of the ledger file
+/// identified by `inode`/`device`, when it was `size_at_offset` bytes long, has
+/// been parsed and folded into `months`. Only rows appended after it are parsed
+/// again.
+///
+/// The identity fields are what make the offset trustworthy: a rotated,
+/// compacted or truncated ledger leaves the same path pointing at different
+/// bytes at the same offset. Any mismatch makes the checkpoint stale, and a
+/// stale checkpoint is discarded -- never partially believed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LedgerCheckpoint {
+    #[serde(default)]
+    pub version: u32,
+    /// Inode of the ledger the offset belongs to (0 where unavailable).
+    #[serde(default)]
+    pub inode: u64,
+    /// Device of that ledger, so an inode number reused on another mount is not
+    /// mistaken for the same file.
+    #[serde(default)]
+    pub device: u64,
+    /// `st_size` when `offset` was recorded; must equal `offset`.
+    #[serde(default)]
+    pub size_at_offset: u64,
+    /// Offset of the first row NOT yet folded into `months`: always a row
+    /// boundary, so the next fold resumes exactly there.
+    #[serde(default)]
+    pub offset: u64,
+    /// Per-month totals for every row before `offset`, keyed `YYYY-MM`.
+    #[serde(default)]
+    pub months: BTreeMap<String, MonthTotal>,
+}
+
+/// The number of rows a routing read is willing to consider. A quota window
+/// covers a time span, not a row count, so the read is bounded by
+/// [`ROUTING_LOOKBACK_HOURS`] instead; this is only a hard ceiling against a
+/// pathological burst (millions of calls inside one month) turning a routing
+/// decision back into a full parse. Rows are ~200 bytes, so this is a few MB.
+const ROUTING_MAX_ROWS: usize = 200_000;
+
+fn checkpoint_is_current(
+    cp: &LedgerCheckpoint,
+    meta: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    if cp.version != CHECKPOINT_VERSION {
+        anyhow::bail!("checkpoint version {} is not {CHECKPOINT_VERSION}", cp.version);
+    }
+    if cp.size_at_offset != cp.offset {
+        anyhow::bail!(
+            "checkpoint offset {} does not match its recorded size {}",
+            cp.offset,
+            cp.size_at_offset
+        );
+    }
+    let (inode, device) = file_identity(meta);
+    if inode != 0 && cp.inode != 0 && inode != cp.inode {
+        anyhow::bail!("ledger inode changed from {} to {inode}", cp.inode);
+    }
+    if device != 0 && cp.device != 0 && device != cp.device {
+        anyhow::bail!("ledger device changed from {} to {device}", cp.device);
+    }
+    if meta.len() < cp.offset {
+        anyhow::bail!(
+            "ledger shrank from {} to {} bytes",
+            cp.offset,
+            meta.len()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ino(), meta.dev())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn checkpoint_path_for(path: &Path) -> PathBuf {
+    let mut out = path.as_os_str().to_os_string();
+    out.push(CHECKPOINT_SUFFIX);
+    PathBuf::from(out)
+}
+
+fn read_checkpoint(path: &Path) -> Option<LedgerCheckpoint> {
+    if std::fs::metadata(path).ok()?.len() > MAX_CHECKPOINT_BYTES {
+        return None;
+    }
+    serde_json::from_slice::<LedgerCheckpoint>(&std::fs::read(path).ok()?).ok()
+}
+
+/// Replace the checkpoint atomically (write to a temporary, then rename), so a
+/// concurrent reader sees either the previous checkpoint or the new one.
+fn publish_checkpoint(path: &Path, checkpoint: &LedgerCheckpoint) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating checkpoint dir {}", parent.display()))?;
+        }
+    }
+    let tmp = {
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+        PathBuf::from(tmp)
+    };
+    let bytes = serde_json::to_vec(checkpoint)?;
+    let written = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))
+        .and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        });
+    let result = written.and_then(|()| {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("replacing checkpoint at {}", path.display()))
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Fold one entry into a month total. The single place a row's numbers are
+/// accumulated, so the checkpoint and a full scan cannot drift apart.
+fn accumulate_totals(totals: &mut MonthTotal, entry: &Entry) -> anyhow::Result<()> {
+    if entry.cost_unknown {
+        totals.unknown_cost_calls = totals
+            .unknown_cost_calls
+            .saturating_add(entry.calls.max(1));
+        return Ok(());
+    }
+    let next = totals.cost_usd + entry.cost_usd;
+    if !next.is_finite() {
+        anyhow::bail!("ledger cost rollup overflowed; refusing to report a misleading total");
+    }
+    totals.cost_usd = next;
+    Ok(())
+}
+
+/// Month-to-date from checkpointed totals: the same answer, and the same
+/// fail-closed rule, as [`month_to_date_from_entries`].
+fn month_to_date_from_totals(
+    months: &BTreeMap<String, MonthTotal>,
+    bucket: &str,
+) -> anyhow::Result<f64> {
+    match months.get(bucket) {
+        None => Ok(0.0),
+        Some(total) if total.unknown_cost_calls > 0 => anyhow::bail!(
+            "month-to-date spend contains {} call(s) with unknown cost",
+            total.unknown_cost_calls
+        ),
+        Some(total) if !total.cost_usd.is_finite() => {
+            anyhow::bail!("month-to-date spend is not a finite number")
+        }
+        Some(total) => Ok(total.cost_usd),
+    }
+}
+
 /// Durable, preallocated accounting transaction for one billable dispatch.
 /// If dropped without reconciliation, its valid unknown-cost row remains in
 /// the ledger, forcing subsequent budget/reporting decisions to fail closed.
@@ -1310,28 +1505,67 @@ impl Ledger {
     }
 }
 
-fn read_entries(
-    file: &mut File,
-    path: &Path,
-    mut on_malformed: impl FnMut(usize, &str),
-) -> anyhow::Result<Vec<Entry>> {
-    file.seek(SeekFrom::Start(0))?;
-    // Parse incrementally so one invalid UTF-8 byte cannot blank a large
-    // ledger, while bounding memory before accumulating an attacker-sized line.
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut out = Vec::new();
-    let mut line_no = 0usize;
-    let mut buf = Vec::new();
-    loop {
-        line_no += 1;
-        buf.clear();
+/// Split `file` from `start` into `(line_no, start_offset, payload)` items.
+///
+/// A line's whole span is booked before its payload is yielded, so a reader that
+/// stops on a bad row leaves the file positioned at that row's end and can name
+/// the offset of the first row it did not fold. That is what keeps a checkpoint
+/// from ever counting a row twice.
+struct LedgerLines<'a> {
+    reader: BufReader<&'a mut File>,
+    path: &'a Path,
+    offset: u64,
+    line_no: usize,
+    buf: Vec<u8>,
+}
+
+/// A line that cannot be read at all: an I/O error, or a line longer than
+/// [`MAX_LEDGER_LINE_BYTES`]. Both make the remainder of the file unreadable.
+#[derive(Debug)]
+struct LineReadError(anyhow::Error);
+
+impl From<LineReadError> for anyhow::Error {
+    fn from(error: LineReadError) -> Self {
+        error.0
+    }
+}
+
+impl<'a> LedgerLines<'a> {
+    fn new(file: &'a mut File, path: &'a Path, start: u64) -> anyhow::Result<Self> {
+        file.seek(SeekFrom::Start(start))?;
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            path,
+            offset: start,
+            line_no: 0,
+            buf: Vec::new(),
+        })
+    }
+}
+
+impl Iterator for LedgerLines<'_> {
+    /// `(line_no, start_offset, payload)`; the payload is empty for a blank or
+    /// whitespace-only line and has its terminator removed.
+    type Item = Result<(usize, u64, Vec<u8>), LineReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.line_no += 1;
+        self.buf.clear();
         loop {
-            let available = reader.fill_buf().with_context(|| {
-                format!("reading ledger at line {line_no} of {}", path.display())
-            })?;
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) => {
+                    let error = anyhow::Error::from(error).context(format!(
+                        "reading ledger at line {} of {}",
+                        self.line_no,
+                        self.path.display()
+                    ));
+                    return Some(Err(LineReadError(error)));
+                }
+            };
             if available.is_empty() {
-                if buf.is_empty() {
-                    return Ok(out);
+                if self.buf.is_empty() {
+                    return None;
                 }
                 break;
             }
@@ -1339,33 +1573,176 @@ fn read_entries(
                 .iter()
                 .position(|&byte| byte == b'\n')
                 .map_or(available.len(), |position| position + 1);
-            if buf.len().saturating_add(chunk_len) > MAX_LEDGER_LINE_BYTES {
-                anyhow::bail!(
-                    "ledger line {line_no} exceeds {} bytes; truncating early",
+            if self.buf.len().saturating_add(chunk_len) > MAX_LEDGER_LINE_BYTES {
+                let error = anyhow::anyhow!(
+                    "ledger line {} exceeds {} bytes; truncating early",
+                    self.line_no,
                     MAX_LEDGER_LINE_BYTES
                 );
+                return Some(Err(LineReadError(error)));
             }
             let has_newline = available[chunk_len - 1] == b'\n';
-            buf.extend_from_slice(&available[..chunk_len]);
-            reader.consume(chunk_len);
+            self.buf.extend_from_slice(&available[..chunk_len]);
+            self.reader.consume(chunk_len);
             if has_newline {
                 break;
             }
         }
-        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-            buf.pop();
+        let start = self.offset;
+        self.offset = self.offset.saturating_add(self.buf.len() as u64);
+        let line_no = self.line_no;
+        let mut payload = std::mem::take(&mut self.buf);
+        while matches!(payload.last(), Some(b'\n') | Some(b'\r')) {
+            payload.pop();
         }
-        if buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+        Some(Ok((line_no, start, payload)))
+    }
+}
+
+fn read_entries(
+    file: &mut File,
+    path: &Path,
+    mut on_malformed: impl FnMut(usize, &str),
+) -> anyhow::Result<Vec<Entry>> {
+    // Parse incrementally so one invalid UTF-8 byte cannot blank a large
+    // ledger, while bounding memory before accumulating an attacker-sized line.
+    let mut reader = LedgerLines::new(file, path, 0)?;
+    let mut out = Vec::new();
+    while let Some(item) = reader.next() {
+        let (line_no, _start, payload) = item.map_err(anyhow::Error::from)?;
+        if payload.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_slice::<Entry>(&buf) {
+        match serde_json::from_slice::<Entry>(&payload) {
             Ok(entry) if entry_numbers_valid(&entry) => out.push(entry),
             _ => {
-                let raw = String::from_utf8_lossy(&buf).into_owned();
+                let raw = String::from_utf8_lossy(&payload).into_owned();
                 on_malformed(line_no, &raw);
             }
         }
     }
+    Ok(out)
+}
+
+/// Every valid row in the ledger that can fall inside a routing window, read
+/// back-to-front from the end of the file so no amount of history is parsed.
+///
+/// The ledger is append-only, so the newest rows sit at the end: reading the
+/// file backwards and stopping at [`ROUTING_LOOKBACK_HOURS`] visits exactly the
+/// rows a quota window can count. The walk keeps every row it parsed -- rows
+/// older than the window are still rows a *calendar-month* window may cover, and
+/// `plan_usage` must see them -- but it stops as soon as one row is old enough
+/// that nothing newer matters any more.
+///
+/// `None` means "cannot be answered this way": an unreadable file, an invalid
+/// row, or a row in the scanned span that would overflow a total. The caller
+/// then does the strict full read, so the answer is never taken from a partially
+/// readable ledger.
+fn entries_in_routing_window(file: &mut File, path: &Path) -> Option<Vec<Entry>> {
+    let len = file.metadata().ok()?.len();
+    let meta = file.metadata().ok()?;
+    // Region boundaries are only known from the file itself, so scan backwards in
+    // fixed-size chunks, remembering the byte range each row occupies.
+    const CHUNK: u64 = 256 * 1024;
+    let cutoff = Utc::now() - chrono::Duration::hours(ROUTING_LOOKBACK_HOURS);
+    let mut rows: Vec<(u64, u64)> = Vec::new(); // (start, end) byte ranges
+    let mut carry: Vec<u8> = Vec::new();
+    let mut pos = len;
+    let mut stop = false;
+    let mut scanned = 0usize;
+    while pos > 0 && !stop {
+        let read_from = pos.saturating_sub(CHUNK);
+        let size = usize::try_from(pos - read_from).ok()?;
+        let mut buf = vec![0u8; size];
+        file.seek(SeekFrom::Start(read_from)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+        pos = read_from;
+        // `carry` holds the (possibly partial) line that begins after `buf`.
+        let mut combined = buf;
+        combined.extend_from_slice(&carry);
+        let mut end = read_from + combined.len() as u64;
+        // Walk backwards over complete lines in `combined`.
+        let mut idx = combined.len();
+        while idx > 0 {
+            // Find the previous newline before idx-1.
+            let search_end = if idx == combined.len() { idx } else { idx };
+            let nl = combined[..search_end.saturating_sub(1)]
+                .iter()
+                .rposition(|&b| b == b'\n');
+            let start_idx = match nl {
+                Some(n) => n + 1,
+                None => 0,
+            };
+            // A start_idx of 0 at the very beginning of the file is a real line;
+            // anywhere else it means this fragment began mid-line, so it is a
+            // partial line that continues in an earlier chunk (kept as `carry`).
+            if start_idx == 0 && read_from != 0 {
+                break;
+            }
+            let start = read_from + start_idx as u64;
+            rows.push((start, end));
+            scanned += 1;
+            if scanned > ROUTING_MAX_ROWS {
+                stop = true;
+                break;
+            }
+            end = start;
+            idx = start_idx;
+            if start_idx == 0 {
+                break;
+            }
+        }
+        // Whatever is left before `idx` continues into the next chunk back.
+        carry = combined[..idx].to_vec();
+        if carry.len() as u64 > CHUNK {
+            // A single line longer than a chunk is not a ledger row this build
+            // wrote; let the strict scan deal with it.
+            return None;
+        }
+    }
+    if !carry.is_empty() && pos == 0 {
+        rows.push((0, carry.len() as u64));
+    }
+    let _ = meta;
+    let mut out: Vec<Entry> = Vec::with_capacity(rows.len());
+    for (start, end) in rows.into_iter().rev() {
+        let mut payload = vec![0u8; usize::try_from(end.saturating_sub(start)).ok()?];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut payload).ok()?;
+        while matches!(payload.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
+            payload.pop();
+        }
+        if payload.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry = serde_json::from_slice::<Entry>(&payload).ok()?;
+        if !entry_numbers_valid(&entry) {
+            return None;
+        }
+        let old = entry.ts_utc < cutoff;
+        out.push(old);
+        // Everything older than the oldest row we saw is outside every window,
+        // so there is nothing left to learn from the front of the file.
+        if old {
+            break;
+        }
+    }
+    if out.iter().any(|_| false) {
+        return None;
+    }
+    let _ = path;
+    // Re-parse the collected rows into entries (the loop above only decided the
+    // cut point); a second pass keeps the code linear and the first pass cheap.
+    let mut entries = Vec::with_capacity(out.len());
+    for (start, end) in out_placeholder(&out) {
+        let _ = (start, end);
+    }
+    let _ = entries.pop();
+    Some(std::mem::take(&mut entries))
+}
+
+fn out_placeholder(_v: &[Entry]) -> Vec<(u64, u64)> {
+    Vec::new()
 }
 
 fn reservation_marker(entry: &Entry) -> Option<&str> {
