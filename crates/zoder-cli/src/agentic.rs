@@ -717,6 +717,18 @@ async fn complete_once(
     max_tokens: u32,
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Completion> {
+    // One engine read for the whole completed call (D5 item 2): the plan and
+    // every dispatch below borrow the engine loaded here. The explicit
+    // `engine_config` seam is preserved — it is the only way a test can point
+    // the alias registry at a fixture WITHOUT racing on the process-global
+    // `ZEROCLAW_CONFIG_DIR` (see `crate::child_env`).
+    let eng = Engine::load_with_engine_config(engine_config)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+        })
+        .map_err(ChainFailure::into_anyhow)?;
     complete_once_tracked(
         cli,
         model_override,
@@ -726,7 +738,7 @@ async fn complete_once(
         system,
         user,
         max_tokens,
-        engine_config,
+        &eng,
         false,
     )
     .await
@@ -756,7 +768,7 @@ async fn complete_once_tracked(
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
+    eng: &Engine,
     exact_pin: bool,
 ) -> Result<ChainCompletion, ChainFailure> {
     // Build the ordered candidate list the dispatch loop walks. The shape
@@ -766,18 +778,12 @@ async fn complete_once_tracked(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut plan = build_reviewer_plan(
-        cli,
-        model_override,
-        reviewer_chain,
-        author_models,
-        engine_config,
-    )
-    .map_err(|e| ChainFailure {
-        message: e.to_string(),
-        skipped: Vec::new(),
-        forced: false,
-    })?;
+    let mut plan = build_reviewer_plan(cli, eng, model_override, reviewer_chain, author_models)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+        })?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -851,17 +857,8 @@ async fn complete_once_tracked(
                 prev = plan.candidates[idx - 1]
             );
         }
-        match dispatch_reviewer_for_model(
-            cli,
-            model,
-            model,
-            system,
-            user,
-            max_tokens,
-            engine_config,
-            None,
-        )
-        .await
+        match dispatch_reviewer_for_model(cli, eng, model, model, system, user, max_tokens, None)
+            .await
         {
             Ok(c) => {
                 let escalation_reason = skipped.first().map(|s| s.reason.clone());
@@ -890,76 +887,67 @@ async fn complete_once_tracked(
                 // id is resolved from routing if available (consistent
                 // with author path / agentic turn) so the on-disk store
                 // sees the same stamp as the author's pre-gate entry.
-                if let Ok(eng) = Engine::load_with_engine_config(engine_config) {
-                    // Resolve the provider id BEFORE taking the health lock --
-                    // this is read-only routing config I/O and touches no
-                    // health state, so it must not extend the locked critical
-                    // section.
-                    let provider_id = crate::RoutingContext::load(&eng.cfg)
-                        .ok()
-                        .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
-                        .map(|p| p.id.clone())
-                        .or_else(|| {
-                            eng.cfg
-                                .provider(model)
-                                .filter(|p| {
-                                    !p.base_url
-                                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-                                })
-                                .map(|p| p.id.clone())
-                        })
-                        .unwrap_or_default();
-                    // When a status is present we route through
-                    // `Classification::from_status` so 401/403/429/503/529
-                    // land on the right bucket. The `FallbackWorthy` arm
-                    // only carries `kind + status`, so the typed body
-                    // fallback for the Anthropic branch (Y-14) does not
-                    // apply on this path -- the reviewer dispatcher
-                    // surfaces errors out of `stream_chat`, which
-                    // already populated `anthropic_error_body` upstream
-                    // if the wire carried it.
-                    let cls = status
-                        .map(zoder_core::Classification::from_status)
-                        .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
-                    // C4-MH1: record + persist under an exclusive lock. This
-                    // reviewer fallback runs inside a `join_all` fan-out and
-                    // races the daemon/CLI, so a bare load -> record -> save
-                    // would drop a concurrently-recorded failure (lost
-                    // update). `mutate_locked` reloads the freshest on-disk
-                    // store under an advisory lockfile (create_new on
-                    // `<stem>.lock`, not a File::lock/flock), applies this
-                    // delta, and writes atomically before releasing -- so
-                    // every panel model's failure survives.
-                    // The provider layer (`zoder_core::provider`) is the
-                    // single source of truth for a MiniMax M Plan wall:
-                    // `observe_token_plan_limit` does the best-effort live
-                    // `token_plan/remains` refresh and persists a
-                    // machine-observed reset when the endpoint answers,
-                    // else a grace-bound one. Here we read that persisted
-                    // reset rather than hardcoding our own 5h estimate —
-                    // `observed_reset_at` is the reset of the full window
-                    // the API itself reported (the 5h reset when the
-                    // refresh shows no full window). `None` means no wall is persisted for
-                    // this provider (either not a MiniMax wall, or the
-                    // state was pruned), in which case the generic
-                    // `record_classified_failure` path below is enough.
-                    let wall = status
-                        .and_then(|st| {
-                            (st == 429)
-                                .then(|| zoder_core::minimax::observed_reset_at(&provider_id))
-                        })
-                        .flatten()
-                        .map(|t| t.timestamp());
-                    let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
-                        h.record_classified_failure_with_wall(
-                            model,
-                            &message,
-                            &provider_id,
-                            cls,
-                            wall,
-                        );
-                    });
-                }
+                // Resolve the provider id BEFORE taking the health lock --
+                // this is read-only routing config I/O and touches no
+                // health state, so it must not extend the locked critical
+                // section.
+                let provider_id = crate::RoutingContext::load(&eng.cfg)
+                    .ok()
+                    .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
+                    .map(|p| p.id.clone())
+                    .or_else(|| {
+                        eng.cfg
+                            .provider(model)
+                            .filter(|p| {
+                                !p.base_url
+                                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                            })
+                            .map(|p| p.id.clone())
+                    })
+                    .unwrap_or_default();
+                // When a status is present we route through
+                // `Classification::from_status` so 401/403/429/503/529
+                // land on the right bucket. The `FallbackWorthy` arm
+                // only carries `kind + status`, so the typed body
+                // fallback for the Anthropic branch (Y-14) does not
+                // apply on this path -- the reviewer dispatcher
+                // surfaces errors out of `stream_chat`, which
+                // already populated `anthropic_error_body` upstream
+                // if the wire carried it.
+                let cls = status
+                    .map(zoder_core::Classification::from_status)
+                    .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
+                // C4-MH1: record + persist under an exclusive lock. This
+                // reviewer fallback runs inside a `join_all` fan-out and
+                // races the daemon/CLI, so a bare load -> record -> save
+                // would drop a concurrently-recorded failure (lost
+                // update). `mutate_locked` reloads the freshest on-disk
+                // store under an advisory lockfile (create_new on
+                // `<stem>.lock`, not a File::lock/flock), applies this
+                // delta, and writes atomically before releasing -- so
+                // every panel model's failure survives.
+                // The provider layer (`zoder_core::provider`) is the
+                // single source of truth for a MiniMax M Plan wall:
+                // `observe_token_plan_limit` does the best-effort live
+                // `token_plan/remains` refresh and persists a
+                // machine-observed reset when the endpoint answers,
+                // else a grace-bound one. Here we read that persisted
+                // reset rather than hardcoding our own 5h estimate —
+                // `observed_reset_at` is the reset of the full window
+                // the API itself reported (the 5h reset when the
+                // refresh shows no full window). `None` means no wall is persisted for
+                // this provider (either not a MiniMax wall, or the
+                // state was pruned), in which case the generic
+                // `record_classified_failure` path below is enough.
+                let wall = status
+                    .and_then(|st| {
+                        (st == 429).then(|| zoder_core::minimax::observed_reset_at(&provider_id))
+                    })
+                    .flatten()
+                    .map(|t| t.timestamp());
+                let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+                    h.record_classified_failure_with_wall(model, &message, &provider_id, cls, wall);
+                });
                 tracing::debug!(
                     model = %model,
                     ?kind,
@@ -1135,6 +1123,7 @@ fn plan_loop_review(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review_once(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1154,18 +1143,71 @@ async fn run_loop_review_once(
     usize,
     Vec<serde_json::Value>,
 )> {
+    // Loop work lives in the working tree. One image cache per review.
+    let read_disk = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    let post_image = crate::config_cache::PostImages::new(read_disk);
+    run_loop_review_once_with_reader(
+        cli,
+        eng,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        &post_image,
+    )
+    .await
+}
+
+/// [`run_loop_review_once`] with the post-image reader injected.
+///
+/// Production passes `<root>/<path>` on disk. The seam exists so a test can
+/// observe how many times one review reads a file: `context_for`,
+/// `filter_false_undefined_findings` and the confirmation path all read the
+/// SAME post-image, and reading a branch file is a `git show` subprocess, so
+/// each must share one per-review cache (D10.7).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review_once_with_reader(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    post_image: &crate::config_cache::PostImages<impl Fn(&str) -> Option<String>>,
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
     let caps_for =
         |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
     // Chunked reviews have the same cross-chunk blindness as `zoder review`;
     // feed the post-change file context so a name defined in another chunk is
-    // not reported as missing. Loop work lives in the working tree.
+    // not reported as missing. Every read below goes through the ONE
+    // per-review image cache, so a file is read at most once per review.
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
-        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+        let read = |path: &str| post_image.get(path);
         let context = crate::review_context::chunk_context(chunk, &read, budget);
         if context.is_empty() {
             context
@@ -1208,6 +1250,7 @@ unbound, or missing imports:\n{context}"
     };
     let (completion, reviewer_report) = complete_review_chunks(
         cli,
+        Some(eng),
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1233,8 +1276,9 @@ unbound, or missing imports:\n{context}"
     // Deterministic false-positive filter: a finding that calls a symbol
     // undefined is dropped when the reviewed working tree defines or imports
     // it. The evidence is kept in `filtered_findings` for the loop record.
-    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
-    filter_false_undefined_findings(&mut review, &read_worktree);
+    // The read is served from the SAME per-review image cache the context
+    // header used: these files were already read for this review.
+    filter_false_undefined_findings(&mut review, &|p: &str| post_image.get(p));
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -1288,6 +1332,7 @@ unbound, or missing imports:\n{context}"
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1309,6 +1354,7 @@ async fn run_loop_review(
 )> {
     let first = run_loop_review_once(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1326,6 +1372,7 @@ async fn run_loop_review(
 
     let Some(second_model) = high_risk_second_reviewer(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1339,6 +1386,7 @@ async fn run_loop_review(
 
     let second = run_loop_review_once(
         cli,
+        eng,
         Some(&second_model),
         reviewer_chain,
         author_models,
@@ -1394,6 +1442,7 @@ async fn run_loop_review(
 /// and silently skipping it would leave the escalation claim false.
 fn high_risk_second_reviewer(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1416,9 +1465,8 @@ fn high_risk_second_reviewer(
     }) {
         return Ok(None);
     }
-    let eng = Engine::load()?;
     let routing = crate::RoutingContext::load(&eng.cfg)?;
-    let plan = build_reviewer_plan(cli, reviewer_override, reviewer_chain, author_models, None)?;
+    let plan = build_reviewer_plan(cli, eng, reviewer_override, reviewer_chain, author_models)?;
     for model in plan.candidates {
         if first_model.is_some_and(|first| first == model) {
             continue;
@@ -1494,7 +1542,8 @@ pub(crate) fn build_reviewer_candidates(
     reviewer_chain: &[String],
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(build_reviewer_plan(cli, model_override, reviewer_chain, &[], engine_config)?.candidates)
+    let eng = Engine::load_with_engine_config(engine_config)?;
+    Ok(build_reviewer_plan(cli, &eng, model_override, reviewer_chain, &[])?.candidates)
 }
 
 /// Build the ordered reviewer plan for an AUTHOR-AWARE review.
@@ -1508,13 +1557,11 @@ pub(crate) fn build_reviewer_candidates(
 /// families; it never silently falls back to a same-family review.
 pub(crate) fn build_reviewer_plan(
     cli: &crate::Cli,
+    eng: &Engine,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
-    engine_config: Option<&Path>,
 ) -> anyhow::Result<ReviewerPlan> {
-    let eng = Engine::load_with_engine_config(engine_config)?;
-
     // Resolve the reviewer-model-side channel: any per-agent or profile-
     // level `reviewer_model` override, treated as an ordered chain. Note
     // `reviewer_models_for` already places the per-agent
@@ -1589,7 +1636,7 @@ pub(crate) fn build_reviewer_plan(
     // model id (never an alias), so — like `reviewer_chain` — it is not
     // run through alias resolution.
     if out.is_empty() {
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let routes = crate::resolve_chain(cli, &eng, &health)?;
         let author = routes.primary.first().cloned().unwrap_or_default();
         let default = crate::default_cross_family_reviewer(&author).to_string();
@@ -1665,7 +1712,7 @@ pub(crate) fn build_reviewer_plan(
         }
         let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
         let routing = crate::RoutingContext::load(&eng.cfg)?;
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let author_routes = crate::resolve_chain(cli, &eng, &health)?;
         let primary = out.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
@@ -2007,19 +2054,15 @@ fn routing_context_load_message(e: &anyhow::Error) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_reviewer_for_model(
     cli: &crate::Cli,
+    eng: &Engine,
     requested: &str,
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
     reasoning_override: Option<&str>,
 ) -> Result<Completion, ReviewerError> {
     let started = std::time::Instant::now();
-    let eng = match Engine::load_with_engine_config(engine_config) {
-        Ok(eng) => eng,
-        Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
-    };
 
     // `model` here is already a resolved, real served-model-name —
     // `build_reviewer_candidates` translates any ENGINE AGENT ALIAS
@@ -2045,7 +2088,7 @@ async fn dispatch_reviewer_for_model(
             // reviewing with a different model. The message names the
             // configured reviewer routes and suggests the closest id.
             return Err(ReviewerError::fatal(no_reviewer_provider_message(
-                cli, &eng, &routing, model,
+                cli, eng, &routing, model,
             )));
         }
     };
@@ -2530,7 +2573,7 @@ async fn dispatch_reviewer_for_model(
         billing: Some(posture.as_str().to_string()),
         estimated_cost_usd: None,
     };
-    let health = HealthStore::load(&eng.cfg.health_path);
+    let health = crate::config_cache::health_store(&eng.cfg.health_path);
     // The reservation's reconcile is a flock + write + fsync: keep it off the
     // dispatch task (D5.9) and hand the updated store back.
     let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
@@ -4735,6 +4778,7 @@ fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
+    eng: Option<&Engine>,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -4744,6 +4788,12 @@ async fn complete_review_chunks(
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
 ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+    // A review with no engine cannot resolve a reviewer: say so instead of
+    // dispatching into an empty chain (the caller that loaded the engine has
+    // already reported the load failure).
+    let eng: &Engine = eng.ok_or_else(|| {
+        anyhow::anyhow!("review incomplete: no engine loaded, so no reviewer can be resolved")
+    })?;
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
     // sized for THAT model; mixing models across chunks is refused below, so
@@ -4823,7 +4873,7 @@ invent missing integration or compiler failures from omitted context.\n\n{}",
                 system,
                 &user,
                 max_tokens,
-                None,
+                eng,
                 false,
             )
             .await
@@ -4897,24 +4947,21 @@ did not satisfy the review schema."
                 // model's configured context window when one is stated —
                 // never above what the model can hold.
                 let doubled = reviewer_retry_budget(completion.max_tokens);
-                let capped = if let Ok(eng) = crate::Engine::load() {
-                    let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
-                        r.real_provider_for_model(&eng.cfg, &completion.model)
-                            .map(|p| p.id.clone())
-                    });
-                    let window = crate::context_opt::window_for(
-                        &eng.cfg,
-                        provider_id.as_deref().unwrap_or(""),
-                        &completion.model,
-                        None,
-                    );
-                    window
-                        .and_then(|w| u32::try_from(w).ok())
-                        .map_or(doubled, |w| doubled.min(w))
-                } else {
-                    doubled
-                };
-                capped
+                // The review's engine is already in hand (D5.2): re-reading
+                // it here cost a second corpus load per exhausted chunk.
+                let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
+                    r.real_provider_for_model(&eng.cfg, &completion.model)
+                        .map(|p| p.id.clone())
+                });
+                let window = crate::context_opt::window_for(
+                    &eng.cfg,
+                    provider_id.as_deref().unwrap_or(""),
+                    &completion.model,
+                    None,
+                );
+                window
+                    .and_then(|w| u32::try_from(w).ok())
+                    .map_or(doubled, |w| doubled.min(w))
             } else {
                 reviewer_retry_budget(max_tokens)
             };
@@ -4927,7 +4974,7 @@ did not satisfy the review schema."
                 system,
                 &repair_user,
                 repair_max_tokens,
-                None,
+                eng,
                 true,
             )
             .await;
@@ -5344,6 +5391,11 @@ pub(crate) async fn cmd_review(
     // just below for the reviewer chain) lets `[review]` config participate;
     // a config problem degrades to the built-in defaults rather than blocking
     // a review.
+    // ONE engine load for the whole review (D5.2): the panel fan-out, the
+    // chunk writers, the repair path and the confirmer all borrow this
+    // instance instead of re-reading the config, the engine TOML and the
+    // model corpus per dispatch. A failed load still degrades to the
+    // built-in defaults (as before), but it is now loaded ONCE.
     let eng = Engine::load().ok();
     let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
 
@@ -5353,7 +5405,9 @@ pub(crate) async fn cmd_review(
     // the configured reviewer pin, then the head of the scenario reviewer
     // chain. When none is resolvable (no engine, or a fully dynamic route) the
     // per-route lookup is skipped and the general caps/default apply.
-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let health = eng
+        .as_ref()
+        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
             .map(|r| r.reviewer)
@@ -5407,13 +5461,19 @@ pub(crate) async fn cmd_review(
     // outside the chunk (bindings earlier in the enclosing function, imports,
     // top-level definitions). Working-tree reviews read the files on disk;
     // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
-    let read_post_image = |path: &str| -> Option<String> {
+    //
+    // One image cache per review: `context_for`, the false-"undefined" filter
+    // and `confirm_reviews`' grounding all read the same post-image, and a
+    // branch read is a `git show` subprocess (D10.7).
+    let read_post_image_source = |path: &str| -> Option<String> {
         if label.starts_with("working-tree") {
             std::fs::read_to_string(root.join(path)).ok()
         } else {
             run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
         }
     };
+    let post_image = crate::config_cache::PostImages::new(read_post_image_source);
+    let read_post_image = |path: &str| -> Option<String> { post_image.get(path) };
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
@@ -5681,6 +5741,7 @@ unbound, or missing imports:\n{context}"
         let planned = m.clone().or_else(|| reviewer_for_caps.clone());
         complete_review_chunks(
             cli,
+            eng.as_ref(),
             m.as_deref(),
             &reviewer_chain,
             &[],
@@ -6050,17 +6111,26 @@ async fn dispatch_confirmer(
     let system = "You are a second-opinion confirmer for a code review finding.";
     let instruction = crate::review_confirm::confirmer_instruction(finding_id);
     let user = format!("{context}\n\n{instruction}");
-    let result = dispatch_reviewer_for_model(
-        cli,
-        model,
-        model,
-        system,
-        &user,
-        REVIEW_MIN_MAX_TOKENS,
-        None,
-        Some(reasoning_effort),
-    )
-    .await;
+    let result = match eng {
+        Some(eng) => {
+            dispatch_reviewer_for_model(
+                cli,
+                eng,
+                model,
+                model,
+                system,
+                &user,
+                REVIEW_MIN_MAX_TOKENS,
+                Some(reasoning_effort),
+            )
+            .await
+        }
+        // Without an engine there is no reviewer to dispatch: the confirmer
+        // attempt is reported as unavailable rather than silently dropped.
+        None => Err(ReviewerError::fatal(
+            "confirming a finding needs a loaded engine",
+        )),
+    };
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
         // A successful provider reply is recorded through the one shared
@@ -6746,6 +6816,132 @@ pub(crate) fn validate_loop_timeouts(
     }
 }
 
+/// How the loop derives its whole-run deadline when the operator set none.
+///
+/// The fleet worker gives one job 7,200 s and then kills it blind: no result
+/// document, no teardown, and the worktree's fate decided by whoever notices.
+/// Two compounding iterations of the loop's own per-phase budgets (author
+/// 900 s + check/review 900 s each, twice — see `validate_loop_timeouts`) add
+/// up to EXACTLY that number, so the incident's "2 h wait" was the loop
+/// spending the worker's whole allowance and the worker timing it out. The
+/// deadline is therefore derived from the worker's budget and kept strictly
+/// below it, so the loop always reaches its own teardown (commit, report,
+/// JSON result) before the worker's kill.
+pub(crate) const WORKER_RUN_TIMEOUT_SECS: u64 = 7200;
+
+/// Headroom kept between the loop's deadline and the worker's timeout: a
+/// tenth of the budget or five minutes, whichever is larger. The loop still
+/// has to commit the worktree, emit the final JSON result and cancel/reap the
+/// daemon inside this window — none of which is a per-iteration phase.
+pub(crate) fn loop_deadline_headroom_secs(worker_timeout_secs: u64) -> u64 {
+    (worker_timeout_secs / 10).max(300)
+}
+
+/// The default whole-run deadline for `zoder loop`: derived from, and strictly
+/// below, the worker's timeout.
+///
+/// The headroom is always at least one second and at most `worker_timeout - 1`,
+/// so the result is strictly less than `worker_timeout_secs` for EVERY input,
+/// including budgets too small for the normal headroom (`worker_timeout_secs <=
+/// 300`). Returning the worker's own timeout there would put the loop's
+/// deadline exactly on the worker's kill: the run would be killed blind before
+/// it could emit its result, which is the one thing this deadline exists to
+/// prevent.
+pub(crate) fn default_loop_deadline_secs(worker_timeout_secs: u64) -> u64 {
+    if worker_timeout_secs <= 1 {
+        // No positive whole-second deadline exists below this. A 1 s (or 0 s)
+        // worker budget cannot leave a run any time at all; return the input
+        // rather than underflow, and let the caller's own validation reject
+        // the configuration.
+        return worker_timeout_secs;
+    }
+    let headroom = loop_deadline_headroom_secs(worker_timeout_secs)
+        .clamp(1, worker_timeout_secs.saturating_sub(1));
+    worker_timeout_secs - headroom
+}
+
+/// Everything `zoder loop` needs to know about its whole-run budget, resolved
+/// once at dispatch: the deadline in seconds, and whether the daemon serving
+/// this run is shared with other jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopRunBudget {
+    pub deadline_secs: u64,
+    pub shared_daemon: bool,
+}
+
+/// Resolve the loop's whole-run budget with the documented precedence:
+/// the `--deadline` flag > the `loop_deadline_s` config key > a default
+/// derived from, and strictly below, the worker's timeout.
+///
+/// `flag` is the parsed `--deadline`, `config` the loaded config (or `None`
+/// when it could not be loaded, in which case the built-in defaults apply —
+/// the loop itself reports the load failure with its own diagnosis, and this
+/// must not turn into a second, differently worded error first).
+///
+/// Lives here rather than in the dispatcher so the precedence is testable:
+/// the dispatcher can only be exercised end to end, and the three sources
+/// are exactly what went wrong in Incident A.
+pub(crate) fn resolve_loop_run_budget(
+    flag: Option<u64>,
+    config: Option<&zoder_core::Config>,
+) -> LoopRunBudget {
+    let deadline_secs = flag
+        .or_else(|| config.and_then(|cfg| cfg.loop_deadline_s))
+        .unwrap_or_else(|| default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS));
+    let shared_daemon = config
+        .map(|cfg| cfg.profile_defaults().shared_daemon())
+        .unwrap_or(false);
+    LoopRunBudget {
+        deadline_secs,
+        shared_daemon,
+    }
+}
+
+/// The wall-clock deadline for one `zoder loop` run.
+///
+/// Whole-run, not per-phase: the loop's phase watchdogs bound each author
+/// turn, `--check` and review independently, and nothing bounded the run.
+/// This does, and when it fires the loop stops like any other terminal exit —
+/// after the iteration's work has been captured — so the final JSON result and
+/// teardown still happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopDeadline {
+    pub secs: u64,
+    /// The instant taken at process start, not at loop entry: the connect and
+    /// setup work before the first iteration is part of the run too.
+    pub started: Instant,
+}
+
+impl LoopDeadline {
+    pub(crate) fn new(secs: u64, started: Instant) -> Self {
+        Self { secs, started }
+    }
+
+    /// The deadline for a loop that should be bounded by `secs`, from the
+    /// process-start instant if it is available.
+    pub(crate) fn from_cli(secs: u64) -> Self {
+        Self::new(secs, crate::process_start_instant())
+    }
+
+    /// Time left before the deadline; zero once it has passed.
+    pub(crate) fn remaining(&self) -> Duration {
+        self.remaining_at(Instant::now())
+    }
+
+    pub(crate) fn remaining_at(&self, now: Instant) -> Duration {
+        (self.started + Duration::from_secs(self.secs)).saturating_duration_since(now)
+    }
+
+    /// True once the whole-run budget is spent.
+    pub(crate) fn expired(&self) -> bool {
+        self.expired_at(Instant::now())
+    }
+
+    pub(crate) fn expired_at(&self, now: Instant) -> bool {
+        self.remaining_at(now).is_zero()
+    }
+}
+
 /// Settle budget the author-phase watchdog grants the daemon to ACK a
 /// `session/cancel` before the loop captures `build_diff`. See
 /// [`zoder_core::CANCEL_SETTLE_BUDGET`] for the canonical value —
@@ -6767,6 +6963,26 @@ pub(crate) const AUTHOR_CANCEL_RETRY_BACKOFF: std::time::Duration =
 /// answering this loop at all, and continuing would keep reviewing trees
 /// nobody can prove are quiet.
 pub(crate) const UNCONFIRMED_CANCEL_ABORT_THRESHOLD: usize = 2;
+
+/// The number of consecutive unconfirmed author cancels that stops the loop
+/// for `shared_daemon` deployments.
+///
+/// Two in a row is right when the daemon serves this loop alone: the first
+/// miss is a slow daemon and the second proves it. When the daemon is SHARED
+/// (a fleet host runs many jobs through one daemon), the second miss is not
+/// proof of anything — the next iteration would just queue behind other
+/// tenants' turns for another full per-phase budget, which is how one run
+/// spends the worker's 7,200 s and gets killed blind. On a shared daemon the
+/// first unconfirmed cancel stops the loop: that turn's diff is not a finished
+/// turn and cannot be reviewed, and the work already on disk is preserved and
+/// reported either way.
+pub(crate) fn unconfirmed_cancel_abort_threshold(shared_daemon: bool) -> usize {
+    if shared_daemon {
+        1
+    } else {
+        UNCONFIRMED_CANCEL_ABORT_THRESHOLD
+    }
+}
 
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
@@ -7962,7 +8178,7 @@ fn validate_loop_reviewer_pin(cli: &crate::Cli, reviewer: Option<&str>) -> anyho
     // configured provider serves fails here with a named, explicit error
     // instead of surfacing later as `reviewer_unavailable` with a null
     // `reviewer_model`.
-    let plan = build_reviewer_plan(cli, Some(raw), &[], &[], None)?;
+    let plan = build_reviewer_plan(cli, &eng, Some(raw), &[], &[])?;
     let Some(head) = plan.candidates.first() else {
         anyhow::bail!("no reviewer model resolved for --reviewer {raw}");
     };
@@ -8450,6 +8666,7 @@ pub(crate) async fn cmd_loop(
     background: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
 ) -> anyhow::Result<()> {
@@ -8484,6 +8701,7 @@ pub(crate) async fn cmd_loop(
         accept_on_green,
         loop_timeout_secs,
         agent_timeout_secs,
+        run_budget,
         allow_dangerous_check,
         require_approval,
         &cwd,
@@ -8515,6 +8733,219 @@ fn loop_result_line_enabled(job_id: Option<&str>, env: Option<&str>) -> bool {
     }
 }
 
+/// Interval between `run.json` heartbeat writes. Callers poll the heartbeat
+/// instead of waiting out the worker's 7,200 s timeout blind, so it must be
+/// fresh relative to a human's patience and cheap relative to the loop.
+pub(crate) const RUN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The phase names written to `run.json` and to the final result.
+pub(crate) const LOOP_PHASE_STARTING: &str = "starting";
+pub(crate) const LOOP_PHASE_AUTHOR: &str = "author";
+pub(crate) const LOOP_PHASE_CHECK: &str = "check";
+pub(crate) const LOOP_PHASE_REVIEW: &str = "review";
+pub(crate) const LOOP_PHASE_DONE: &str = "done";
+
+/// Path of the run heartbeat: `<job dir>/run.json`, beside the `result.json`
+/// the job already writes. `None` outside a background/job run — a standalone
+/// `zoder loop` writes nothing extra.
+pub(crate) fn run_heartbeat_path() -> Option<PathBuf> {
+    active_job_dir().map(|dir| dir.join("run.json"))
+}
+
+/// The live state of one loop run, written to `run.json` every
+/// [`RUN_HEARTBEAT_INTERVAL`] and once more at the deadline.
+///
+/// This is observability only: a heartbeat write can never fail the run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunHeartbeat {
+    pub path: Option<PathBuf>,
+    pub phase: String,
+    pub iteration: usize,
+    pub max_iters: usize,
+    /// Session ids this run drove, in the order they were minted.
+    pub session_states: Vec<(String, String)>,
+    /// The most recent provider error, verbatim, if any.
+    pub last_provider_error: Option<String>,
+    pub deadline_secs: u64,
+    pub started: Option<Instant>,
+    /// Set by [`RunHeartbeat::at_deadline`] so the last document says why the
+    /// run stopped instead of leaving a caller to infer it.
+    pub deadline_reached: bool,
+}
+
+impl RunHeartbeat {
+    pub(crate) fn new(
+        path: Option<PathBuf>,
+        deadline_secs: u64,
+        started: Instant,
+        max_iters: usize,
+    ) -> Self {
+        Self {
+            path,
+            phase: LOOP_PHASE_STARTING.to_string(),
+            iteration: 0,
+            max_iters,
+            deadline_secs,
+            started: Some(started),
+            ..Default::default()
+        }
+    }
+
+    /// Record the phase the loop is in. Cheap: no I/O.
+    pub(crate) fn set_phase(&mut self, phase: &str, iteration: usize) {
+        self.phase = phase.to_string();
+        self.iteration = iteration;
+    }
+
+    /// Record a session id and its state. Re-recording an id updates it in
+    /// place, so `run.json` never lists a session twice.
+    pub(crate) fn note_session(&mut self, id: &str, state: &str) {
+        if let Some(slot) = self.session_states.iter_mut().find(|(sid, _)| sid == id) {
+            slot.1 = state.to_string();
+        } else {
+            self.session_states
+                .push((id.to_string(), state.to_string()));
+        }
+    }
+
+    pub(crate) fn note_provider_error(&mut self, error: &str) {
+        self.last_provider_error = Some(error.to_string());
+    }
+
+    /// Mark the document that is written when the whole-run deadline fires.
+    pub(crate) fn at_deadline(&mut self) {
+        self.deadline_reached = true;
+    }
+
+    /// The document written to `run.json`. `sessions` is an object keyed by
+    /// session id so a caller can look one up without scanning; the insertion
+    /// order is kept so the file still reads as a log.
+    pub(crate) fn to_json(&self) -> Value {
+        let sessions: serde_json::Map<String, Value> = self
+            .session_states
+            .iter()
+            .map(|(id, state)| (id.clone(), Value::String(state.clone())))
+            .collect();
+        json!({
+            "kind": "loop_run",
+            "phase": self.phase,
+            "iteration": self.iteration,
+            "max_iters": self.max_iters,
+            "sessions": sessions,
+            "last_provider_error": self.last_provider_error,
+            "deadline_secs": self.deadline_secs,
+            "elapsed_ms": self.started.map(|s| s.elapsed().as_millis()),
+            "remaining_ms": self
+                .started
+                .map(|s| LoopDeadline::new(self.deadline_secs, s).remaining().as_millis()),
+            "deadline_reached": self.deadline_reached,
+            "updated_ms": Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Write the heartbeat. Best-effort by contract: a full disk or a removed
+    /// job directory must never take the loop down with it.
+    pub(crate) fn write(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(&self.to_json()).unwrap_or_default(),
+        );
+    }
+}
+
+/// Periodically rewrite `run.json` while the loop runs.
+///
+/// The ticker is its own task so a run stuck inside one long author turn still
+/// looks alive: `phase` then names the phase it is stuck in, which is exactly
+/// the question an operator asks before the worker's timeout.
+///
+/// `live` is shared with the loop body, which fills in the phase and the
+/// session states as it learns them.
+pub(crate) fn spawn_run_heartbeat(
+    live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let snapshot = live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            snapshot.write();
+        }
+    })
+}
+
+/// Stops the heartbeat ticker and writes the FINAL `run.json` on every way out
+/// of the loop, including the `?`/`bail!` paths inside the iteration body.
+///
+/// The final write used to sit on the normal path only: a mid-iteration
+/// `bail!` (a free-policy violation, an engine-kind resolution failure) left
+/// `run.json` frozen at the last 10 s tick, and the ticker itself kept running
+/// until the process exited. A guard makes "always emit the final heartbeat"
+/// true by construction instead of by remembering to call it.
+struct RunHeartbeatGuard {
+    live: Option<std::sync::Arc<std::sync::Mutex<RunHeartbeat>>>,
+    progress: LoopProgress,
+}
+
+impl RunHeartbeatGuard {
+    fn new(
+        live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+        ticker: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        ticker.abort();
+        Self {
+            live: Some(live),
+            progress: LoopProgress::default(),
+        }
+    }
+
+    /// Record how far the run got, so the `Drop`-time finalisation (used on an
+    /// error exit) reports the real iteration instead of zero.
+    fn note_progress(&mut self, iteration: usize, at_deadline: bool) {
+        self.progress = LoopProgress {
+            iteration,
+            at_deadline,
+        };
+    }
+
+    /// Record why the run stopped, in the final document.
+    fn finalize(&mut self, phase: &str, iteration: usize, at_deadline: bool) {
+        if let Some(live) = self.live.take() {
+            let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(phase, iteration);
+            if at_deadline {
+                state.at_deadline();
+            }
+            state.write();
+        }
+    }
+}
+
+/// The last iteration this guard saw, so a `Drop`-time finalisation reports
+/// the real progress instead of resetting it to zero.
+#[derive(Clone, Copy, Default)]
+struct LoopProgress {
+    iteration: usize,
+    at_deadline: bool,
+}
+
+impl Drop for RunHeartbeatGuard {
+    fn drop(&mut self) {
+        if self.live.is_some() {
+            // Only reachable when the normal-path `finalize` did NOT run, i.e.
+            // an early return or a `?`/`bail!` out of the iteration body.
+            let progress = self.progress;
+            self.finalize(LOOP_PHASE_DONE, progress.iteration, progress.at_deadline);
+        }
+    }
+}
+
 /// Writes a `teardown` event with reason `crash` if the loop function exits
 /// without disarming (early `?`/bail/panic), so a dying loop still leaves a
 /// trail in MNEMOS. Disarmed on every normal teardown.
@@ -8535,6 +8966,9 @@ impl Drop for LoopEventGuard {
     }
 }
 
+// The parameter count is the loop's explicit, named configuration — the same
+// shape as `cmd_loop`, which already carries this allowance.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_loop_run(
     cli: &crate::Cli,
     task: &[String],
@@ -8547,6 +8981,7 @@ async fn cmd_loop_run(
     accept_on_green: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
     cwd: &Path,
@@ -8594,11 +9029,49 @@ async fn cmd_loop_run(
     }
 
     let max_iters = max_iters.max(1);
+    // Whole-run wall-clock deadline (decision D7). The per-phase watchdogs
+    // bound one author turn, one `--check` and one review each; nothing bounded
+    // the RUN, so two compounding unconfirmed iterations could spend the whole
+    // worker budget and be killed blind. The deadline is checked at every
+    // iteration boundary (and around the review phase), and when it fires the
+    // loop leaves by a normal terminal path: the iteration record is pushed,
+    // the worktree is committed, and the final JSON result is still emitted.
+    let deadline_secs = run_budget.deadline_secs;
+    let shared_daemon = run_budget.shared_daemon;
+    let deadline = LoopDeadline::from_cli(deadline_secs);
+    let cancel_abort_threshold = unconfirmed_cancel_abort_threshold(shared_daemon);
+    let mut deadline_hit = false;
+    // A free-policy violation ends the loop AFTER the iteration is recorded,
+    // so the final result and `run.json` are still emitted. The run then exits
+    // nonzero with the `--allow-paid` hint, exactly as the previous mid-loop
+    // `bail!` did.
+    let mut policy_violation: Option<String> = None;
+    // `run.json` heartbeat: phase + session states + last provider error, every
+    // 10 s, so callers poll a document instead of waiting out the worker's
+    // 7,200 s timeout blind. Only a job run has a directory to write into.
+    let heartbeat_path = run_heartbeat_path();
+    let heartbeat_enabled = heartbeat_path.is_some();
+    let run_state = std::sync::Arc::new(std::sync::Mutex::new(RunHeartbeat::new(
+        heartbeat_path,
+        deadline_secs,
+        deadline.started,
+        max_iters,
+    )));
+    if heartbeat_enabled {
+        run_state.lock().unwrap_or_else(|e| e.into_inner()).write();
+    }
+    // Final `run.json` and ticker shutdown are guaranteed on EVERY exit path
+    // from here on, including the `?`/`bail!` ones inside the iteration body.
+    let mut heartbeat = RunHeartbeatGuard::new(
+        run_state.clone(),
+        spawn_run_heartbeat(run_state.clone(), RUN_HEARTBEAT_INTERVAL),
+    );
     crate::mnemos::event(
         event_job_id.as_deref(),
         "loop_start",
         json!({"brief_bytes": task_txt.len(), "max_iters": max_iters,
-               "reviewer": reviewer, "workspace": cwd.to_string_lossy()}),
+               "reviewer": reviewer, "workspace": cwd.to_string_lossy(),
+               "deadline_secs": deadline_secs, "shared_daemon": shared_daemon}),
     )
     .await;
     // The author's engine session for the NEXT iteration, together with the
@@ -8715,6 +9188,29 @@ async fn cmd_loop_run(
     // candidates from these models' families are excluded on every review.
     let mut author_models: Vec<String> = Vec::new();
     for i in 1..=max_iters {
+        // Whole-run deadline, checked BEFORE a new iteration starts: an
+        // iteration begun with no time left would spend another full phase
+        // budget past the deadline, which is exactly how the run outlives the
+        // worker. Whatever the previous iterations produced is already on disk
+        // and is committed and reported below like any other terminal exit.
+        if deadline.expired() {
+            deadline_hit = true;
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}/{max_iters}: whole-run deadline of {}s reached; stopping \
+                     with {} iteration(s)' work preserved and reported",
+                    deadline.secs,
+                    iterations.len()
+                );
+            }
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_AUTHOR, i);
+        }
+        // So an error exit mid-iteration reports the iteration it reached.
+        heartbeat.note_progress(i, deadline_hit);
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
@@ -8768,8 +9264,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         // Consecutive author turns whose cancel could not be confirmed. This is
-        // the ONE thing about an unconfirmed cancel that can stop the loop: two
-        // in a row means the daemon is not answering this loop at all. A single
+        // the ONE thing about an unconfirmed cancel that can stop the loop. On
+        // a daemon this loop owns, two in a row means the daemon is not
+        // answering this loop at all; on a SHARED daemon (fleet) the first one
+        // already stops it — see `unconfirmed_cancel_abort_threshold`. A single
         // one is a slow daemon, and cleanup failing must never throw the
         // author's work away (a supervised loop run).
         let mut unconfirmed_cancel_streak = 0usize;
@@ -8781,11 +9279,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
             continuity.as_ref().map(|c| c.session_id.clone()),
         ));
         let session_id_for_cancel = active_session.clone();
+        let session_tracker = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
             zoder_core::engine_rpc::track_session_id(
-                active_session,
+                session_tracker,
                 crate::agentic_turn(
                     cli,
                     engine_kind,
@@ -8861,10 +9360,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // incrementing `total_cost` — a violating turn does
                 // not extend the loop's bookkeeping as if it were a
                 // legitimate iteration.
-                if let Some(v) = &t.policy_violation {
-                    anyhow::bail!(
-                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
-                    );
+                //
+                // Recorded as a terminal iteration rather than a `bail!`:
+                // the loop must still emit its final JSON result and its
+                // final `run.json` here, so the exit code and the hint are
+                // carried by the result and applied once, after the loop.
+                if t.policy_violation.is_some() {
+                    policy_violation = t.policy_violation.clone();
+                    break;
                 }
                 // `t.alias` is the alias of the candidate that actually
                 // produced this turn (the head or a fallback), so the next
@@ -8876,6 +9379,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 if !author_models.iter().any(|known| known == &t.model) {
                     author_models.push(t.model.clone());
                 }
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.note_session(&t.run.session_id, &format!("completed:{}", t.run.outcome));
+                }
                 total_cost += t.cost_usd;
                 Some(t)
             }
@@ -8885,11 +9392,27 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // is carried in `author_error` + the iter record. Only a run
                 // of them (the daemon is not answering this loop at all)
                 // stops it — and only after this iteration's work is counted.
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sid) = active_session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                            "cancel_unconfirmed"
+                        } else {
+                            "failed"
+                        };
+                        state.note_session(&sid, cancel_state);
+                    }
+                    state.note_provider_error(&msg);
+                }
                 if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
                     unconfirmed_cancel_streak += 1;
                     eprintln!(
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
-                         confirmed ({unconfirmed_cancel_streak}/{UNCONFIRMED_CANCEL_ABORT_THRESHOLD}). \
+                         confirmed ({unconfirmed_cancel_streak}/{cancel_abort_threshold}). \
                          The tree is captured and reported as unresolved, and the edits on disk \
                          are preserved"
                     );
@@ -8958,13 +9481,32 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = loop_task_diff(
+        //    A capture failure is a terminal iteration, not an early return:
+        //    the run still commits the worktree and emits its JSON result, so
+        //    the caller learns WHY it stopped. `?` here would skip both.
+        let (label, diff) = match loop_task_diff(
             cwd,
             scope,
             base.as_deref(),
             Some(&loop_start),
             &task_journal,
-        )?;
+        ) {
+            Ok(captured) => captured,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}/{max_iters}: diff capture failed: {detail}");
+                }
+                iterations.push(json!({
+                    "iteration": i,
+                    "resolved": false,
+                    "error": "diff_capture_failed",
+                    "diff_capture_error": detail,
+                }));
+                final_verdict = String::from("comment");
+                break;
+            }
+        };
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -8982,12 +9524,23 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // commit/report whatever is in the worktree. Only a run of unconfirmed
         // cancels (the daemon is not answering at all) stops the loop, and it
         // stops HERE, after the tree has been captured, so no edit is lost.
+        // The run is ONE on a daemon this loop owns and the FIRST one on a
+        // shared daemon (`cancel_abort_threshold`): there, a second attempt
+        // just queues behind other tenants for another full phase budget.
         let cancel_unconfirmed = matches!(
             author_err.as_deref(),
             Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
         );
         let aborted_on_unconfirmed_cancel =
-            cancel_unconfirmed && unconfirmed_cancel_streak >= UNCONFIRMED_CANCEL_ABORT_THRESHOLD;
+            cancel_unconfirmed && unconfirmed_cancel_streak >= cancel_abort_threshold;
+        if aborted_on_unconfirmed_cancel {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_DONE, i);
+            state.note_provider_error(&format!(
+                "author cancel unconfirmed {} time(s) in a row",
+                unconfirmed_cancel_streak
+            ));
+        }
 
         // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
         // headers from the diff output; this is the same set the reviewer sees.
@@ -9021,6 +9574,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: check `{c}`…");
                 }
+                run_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_phase(LOOP_PHASE_CHECK, i);
                 let t0 = std::time::Instant::now();
                 let (ok, tail) = run_check_watched(
                     cwd,
@@ -9077,16 +9634,19 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             break;
         }
         if aborted_on_unconfirmed_cancel {
-            // The daemon has not acknowledged a cancel twice in a row: it is
-            // not answering this loop at all, so every further turn would be
-            // another unprovable tree. Stop — but DO NOT discard this
+            // The daemon has not acknowledged a cancel often enough that this
+            // loop can prove its trees are quiet: on a shared daemon the FIRST
+            // miss already means the next turn would queue behind other
+            // tenants for another full phase budget, and on a daemon this loop
+            // owns the second miss is the proof. Stop — but DO NOT discard this
             // iteration's work: the diff was captured above, this record is
             // pushed, and the loop's own exit paths commit what is on disk.
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: the daemon did not confirm an author cancel \
-                     {unconfirmed_cancel_streak} times in a row; stopping with this iteration's \
-                     work preserved and reported."
+                     {unconfirmed_cancel_streak} time(s) in a row (abort threshold \
+                     {cancel_abort_threshold}); stopping with this iteration's work preserved \
+                     and reported."
                 );
             }
             iterations.push(json!({
@@ -9119,7 +9679,11 @@ diff is not a finished turn",
                 "verdict": "reviewer_unavailable",
                 "findings": [],
                 "resolved": false,
-                "abort_reason": "author cancel unconfirmed twice in a row",
+                "abort_reason": if cancel_abort_threshold == 1 {
+                    "author cancel unconfirmed on a shared daemon"
+                } else {
+                    "author cancel unconfirmed twice in a row"
+                },
             }));
             final_verdict = "reviewer_unavailable".into();
             break;
@@ -9136,6 +9700,54 @@ diff is not a finished turn",
             }
         }
 
+        // Whole-run deadline, checked before the review phase: the review is
+        // the longest optional phase left in the iteration, and starting it
+        // with no time on the clock is what turns "the loop ran long" into
+        // "the worker killed it before it could report". The iteration is
+        // recorded as unresolved with every byte of work preserved.
+        if deadline.expired() {
+            deadline_hit = true;
+            {
+                let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.set_phase(LOOP_PHASE_DONE, i);
+            }
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: whole-run deadline of {}s reached before review; \
+                     recording the iteration as unresolved and stopping",
+                    deadline.secs
+                );
+            }
+            iterations.push(json!({
+                "iter": i,
+                "author_model": turn.as_ref().map(|t| t.model.clone()),
+                "author_error": author_err.clone(),
+                "author_outcome": turn.as_ref().map(|t| t.run.outcome.clone()),
+                "author_cancel_unconfirmed": cancel_unconfirmed,
+                "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                "diff_lines": diff_lines,
+                "substance": format!("{:?}", diff_substance),
+                "check": check.as_deref(),
+                "check_passed": check_passed,
+                "review_base": loop_base,
+                "review_base_tree": loop_start.tree,
+                "start_dirty": loop_start.dirty,
+                "review_chunks": 0,
+                "review_error": "review skipped: the whole-run deadline was reached",
+                "review_complete": false,
+                "reviewer_verdicts": [],
+                "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+                "findings": [],
+                "resolved": false,
+                "abort_reason": "whole-run deadline reached",
+            }));
+            final_verdict = REVIEWER_UNAVAILABLE_VERDICT.into();
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_REVIEW, i);
+        }
         // 5. Adversarial review of the current diff (+ validation output).
         // When the patch journal has turns, use its `agent_diff` so the
         // reviewer sees EXACTLY what the agent changed — not the full
@@ -9180,10 +9792,16 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // (explicit `--reviewer`, then the configured reviewer pin, then the
         // routed chain head). `cli.model` is the AUTHOR pin and must not size
         // the reviewer's chunks.
-        let (reviewer_chain, review_cfg, caps_model) = match Engine::load() {
+        // ONE engine load per review iteration, reused for the reviewer
+        // chain, the author families and the whole review pass (D5.2). Before
+        // this, every iteration read the config, the engine TOML and the
+        // model corpus three times here alone (chain, author families, and
+        // again inside the review), and once more per reviewer dispatch.
+        let eng = Engine::load();
+        let (reviewer_chain, review_cfg, caps_model) = match eng.as_ref() {
             Ok(eng) => {
-                let health = HealthStore::load(&eng.cfg.health_path);
-                let chain = crate::resolve_chain(cli, &eng, &health)
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                let chain = crate::resolve_chain(cli, eng, &health)
                     .map(|r| r.reviewer)
                     .unwrap_or_default();
                 let caps_model = reviewer
@@ -9195,7 +9813,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                             .next()
                     })
                     .or_else(|| chain.first().cloned());
-                (chain, Some(eng.cfg.review), caps_model)
+                (chain, Some(eng.cfg.review.clone()), caps_model)
             }
             Err(_) => (Vec::new(), None, reviewer.clone()),
         };
@@ -9204,14 +9822,14 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // candidates (a fallback author is still an author for this rule).
         let review_author_models = {
             let mut models = author_models.clone();
-            if let Ok(eng) = Engine::load() {
-                if let Some(primary) = crate::resolve_effective_primary(cli, &eng) {
+            if let Ok(eng) = eng.as_ref() {
+                if let Some(primary) = crate::resolve_effective_primary(cli, eng) {
                     if !models.contains(&primary) {
                         models.push(primary);
                     }
                 }
-                let health = HealthStore::load(&eng.cfg.health_path);
-                if let Ok(routes) = crate::resolve_chain(cli, &eng, &health) {
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                if let Ok(routes) = crate::resolve_chain(cli, eng, &health) {
                     for model in routes.primary {
                         if !models.contains(&model) {
                             models.push(model);
@@ -9248,8 +9866,27 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // 2026-10-21 a reviewer that returned `Context size has been
         // exceeded` (and a diff whose middle was silently truncated) still
         // recorded verdict=approve; that is the fail-open this closes.
+        // A failed engine load is a review that cannot run: it is reported
+        // as `reviewer_unavailable` (never a fail-open approve) and the
+        // iteration stays unresolved, exactly as any other incomplete review.
+        // Pre-D5.2 each of the three `Engine::load()` calls in this block
+        // degraded independently to an empty chain / no `[review]` config.
+        let engine_load_error = eng.as_ref().err().map(|e| format!("loading engine: {e}"));
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
-            if review_unconfirmed_cancel {
+            if let Some(detail) = engine_load_error {
+                let detail = format!("review skipped: {detail}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if review_unconfirmed_cancel {
                 let detail = "review skipped: the author cancel was never confirmed, so this \
 diff is not a finished turn"
                     .to_string();
@@ -9271,6 +9908,7 @@ diff is not a finished turn"
                     cli.quiet,
                     run_loop_review(
                         cli,
+                        eng.as_ref().expect("guarded above: engine loaded"),
                         reviewer.as_deref(),
                         &reviewer_chain,
                         &review_author_models,
@@ -9353,6 +9991,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
                 cli.quiet,
                 run_loop_review(
                     cli,
+                    eng.as_ref().expect("loop review requires a loaded engine"),
                     reviewer.as_deref(),
                     &reviewer_chain,
                     &review_author_models,
@@ -9735,6 +10374,7 @@ approve)…"
                         cli.quiet,
                         run_loop_review(
                             cli,
+                            eng.as_ref().expect("guarded above: engine loaded"),
                             reviewer.as_deref(),
                             &reviewer_chain,
                             &review_author_models,
@@ -9878,6 +10518,12 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         feedback = fb;
     }
 
+    // Final heartbeat: the run is over, whatever the reason. A run that
+    // stopped because the whole-run deadline fired says so in `run.json`
+    // before the result below, so a caller polling the heartbeat learns the
+    // reason even if it never reads the result document.
+    heartbeat.finalize(LOOP_PHASE_DONE, iterations.len(), deadline_hit);
+
     let payload = json!({
         "kind": "loop",
         "task": task_txt,
@@ -9892,6 +10538,15 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "final_verdict": final_verdict,
         "check": check,
         "loop_timeout_secs": loop_timeout_secs,
+        // The whole-run budget and whether IT is what ended the run, kept
+        // separate from `max_iters`/`final_verdict`: a deadline stop is a
+        // budget fact, not a verdict about the work.
+        "deadline_secs": deadline_secs,
+        "deadline_reached": deadline_hit,
+        // Present only for a run stopped by the free-policy gate: the reason
+        // the loop stopped, carried in the document instead of being lost
+        // with a mid-loop `bail!`.
+        "policy_violation": policy_violation,
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
@@ -9908,6 +10563,10 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
 
     let teardown_reason = if resolved {
         "approved"
+    } else if policy_violation.is_some() {
+        "policy_violation"
+    } else if deadline_hit {
+        "deadline"
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
         "reviewer_unavailable"
     } else if iterations.is_empty() {
@@ -9920,6 +10579,7 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "iterations": iterations.len(), "max_iters": max_iters,
         "final_verdict": final_verdict, "cost_usd": total_cost,
         "duration_s": started.elapsed().as_secs(),
+        "deadline_secs": deadline_secs, "deadline_reached": deadline_hit,
         "last_good_head_sha": rev_parse_head(cwd),
         "reviewer_model": iterations.last().and_then(|it| it.get("reviewer_model")).cloned(),
     });
@@ -10001,6 +10661,13 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         }
     }
 
+    // A free-policy violation is still a hard failure with the actionable
+    // hint the previous mid-loop `bail!` carried -- but it is applied only
+    // now, after the final result document, the result line and the final
+    // `run.json` have been written, so none of them is lost.
+    if let Some(v) = policy_violation {
+        anyhow::bail!("loop author turn violated free policy (use --allow-paid to permit): {v}");
+    }
     if !resolved {
         anyhow::bail!(
             "loop ended unresolved after {} iteration(s)",
@@ -10624,9 +11291,203 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Load the engine for a test that drives the review path directly.
+    /// `run_loop_review_once`, `complete_review_chunks` and the reviewer
+    /// dispatch all borrow ONE `&Engine` (D5.2); tests point it at the
+    /// fixture home they already installed in the environment.
+    pub(super) fn test_engine() -> Engine {
+        Engine::load().expect("the fixture home loads an engine")
+    }
+
     use clap::Parser;
     use std::path::PathBuf;
     use zoder_core::Config;
+
+    /// The whole-run deadline must land strictly BELOW the worker's timeout,
+    /// so the loop stops itself and can still commit, emit the final JSON
+    /// result and tear down — instead of being killed mid-run with no result
+    /// at all. Before this, nothing bounded the run: two compounding
+    /// unconfirmed-cancel iterations could spend all 7,200 s.
+    #[test]
+    fn loop_run_deadline_ends_run_before_worker_timeout() {
+        let deadline = default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS);
+        assert!(
+            deadline < WORKER_RUN_TIMEOUT_SECS,
+            "the loop deadline ({deadline} s) must land below the worker timeout \
+             ({WORKER_RUN_TIMEOUT_SECS} s), or the worker kills the run before the \
+             loop can emit its final result"
+        );
+        // And not so far below that it throws away usable run time: the
+        // headroom is the cleanup window, not most of the budget.
+        assert!(
+            deadline > WORKER_RUN_TIMEOUT_SECS / 2,
+            "the deadline ({deadline} s) must leave real run time, not just a \
+             cleanup window"
+        );
+        // The bound really is the deadline: just before it the run continues,
+        // at it the run stops.
+        let started = Instant::now();
+        let dl = LoopDeadline::new(deadline, started);
+        let just_before = started + Duration::from_secs(deadline - 1);
+        assert!(!dl.expired_at(just_before), "the run must not stop early");
+        let at = started + Duration::from_secs(deadline);
+        assert!(dl.expired_at(at), "the run must stop at the deadline");
+        assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// The "strictly below the worker's timeout" invariant is a property of the
+    /// FUNCTION, not of one favourable input: a small worker budget used to
+    /// make the headroom saturate the subtraction, and the degenerate branch
+    /// then returned the worker timeout itself — a deadline equal to the kill,
+    /// which is precisely the blind cut-off the deadline exists to prevent.
+    #[test]
+    fn loop_deadline_is_strictly_below_the_worker_timeout_for_every_budget() {
+        for worker in [2u64, 3, 10, 299, 300, 301, 600, 3600, 7200, 86400] {
+            let deadline = default_loop_deadline_secs(worker);
+            assert!(
+                deadline < worker,
+                "worker budget {worker} s produced deadline {deadline} s, which is not \
+                 strictly below the kill"
+            );
+            assert!(deadline > 0, "worker budget {worker} s left no run time");
+        }
+        // The fleet value: 7,200 s less the larger of a tenth of the budget
+        // and the five-minute floor — 7,200 / 10 = 720 s here, so 6,480 s.
+        assert_eq!(default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS), 6480);
+        assert_eq!(loop_deadline_headroom_secs(WORKER_RUN_TIMEOUT_SECS), 720);
+    }
+
+    /// On a SHARED daemon the FIRST unconfirmed author cancel stops the loop.
+    /// Two-in-a-row is only proof when this loop owns the daemon; on a fleet
+    /// host the second miss just queues behind other tenants' turns for
+    /// another full per-phase budget, which is how a run spends the worker's
+    /// whole timeout and gets killed blind.
+    #[test]
+    fn shared_daemon_unconfirmed_cancel_aborts_first_time() {
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(true),
+            1,
+            "a shared daemon must abort on the FIRST unconfirmed cancel"
+        );
+        // The standalone threshold is unchanged: one miss is a slow daemon.
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(false),
+            UNCONFIRMED_CANCEL_ABORT_THRESHOLD,
+            "a daemon serving this loop alone keeps the two-strike threshold"
+        );
+        assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
+    /// The three budget sources must compose in the documented order, and the
+    /// default must never equal or exceed the worker's timeout: a default at
+    /// the timeout is Incident A exactly, and a flag silently ignored is worse
+    /// than no flag.
+    #[test]
+    fn loop_run_budget_prefers_flag_then_config_then_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default_provider(dir.path());
+        // Flag wins over config.
+        cfg.loop_deadline_s = Some(1234);
+        assert_eq!(
+            resolve_loop_run_budget(Some(900), Some(&cfg)).deadline_secs,
+            900
+        );
+        // Config wins over the derived default.
+        assert_eq!(
+            resolve_loop_run_budget(None, Some(&cfg)).deadline_secs,
+            1234
+        );
+        // Unset everywhere: the derived default, which stays under the worker.
+        let bland = Config::default_provider(dir.path());
+        let derived = resolve_loop_run_budget(None, Some(&bland));
+        assert_eq!(
+            derived.deadline_secs,
+            default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS)
+        );
+        assert!(derived.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        // A config that failed to load still yields a usable, safe budget
+        // rather than an error or an unbounded run.
+        let unloaded = resolve_loop_run_budget(None, None);
+        assert!(unloaded.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        assert!(!unloaded.shared_daemon);
+        // The shared-daemon bit follows the deployment profile.
+        assert!(!resolve_loop_run_budget(None, Some(&bland)).shared_daemon);
+        // ...and flips to true for a fleet deployment, which is the only thing
+        // that makes the first unconfirmed cancel fatal.
+        let mut fleet = Config::default_provider(dir.path());
+        fleet.deployment.mode = zoder_core::config::DeploymentMode::Fleet;
+        assert!(resolve_loop_run_budget(None, Some(&fleet)).shared_daemon);
+    }
+
+    /// `run.json` must carry what a caller polling it instead of waiting out
+    /// the worker's 7,200 s actually needs: which PHASE the run is stuck in,
+    /// what each session is doing, why the last provider call failed, and
+    /// whether the whole-run deadline is what stopped the run. A heartbeat
+    /// that omits any of these is a liveness ping, not a status document.
+    #[test]
+    fn run_heartbeat_carries_phase_sessions_provider_error_and_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("job").join("run.json");
+        let started = Instant::now();
+        let mut hb = RunHeartbeat::new(Some(path.clone()), 6300, started, 5);
+        hb.set_phase(LOOP_PHASE_AUTHOR, 2);
+        hb.note_session("session-a", "running");
+        hb.note_provider_error("429 rate limited: provider overloaded");
+
+        // Written eagerly at loop entry and again on every tick, so the file
+        // exists before the first iteration finishes.
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json written"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+        assert_eq!(doc["iteration"], 2);
+        assert_eq!(doc["max_iters"], 5);
+        assert_eq!(doc["sessions"]["session-a"], "running");
+        assert_eq!(
+            doc["last_provider_error"],
+            "429 rate limited: provider overloaded"
+        );
+        assert_eq!(doc["deadline_secs"], 6300);
+        assert_eq!(doc["deadline_reached"], false);
+
+        // Re-recording the same session updates it in place: a caller must
+        // never see one session twice and have to guess which line is current.
+        hb.note_session("session-a", "cancel_unconfirmed");
+        hb.note_session("session-b", "completed:completed");
+        let doc = hb.to_json();
+        let sessions = doc["sessions"].as_object().expect("sessions object");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions["session-a"], "cancel_unconfirmed");
+        assert_eq!(sessions["session-b"], "completed:completed");
+
+        // The final document written at the deadline says so, so a caller
+        // polling the heartbeat learns the run ended without reading the
+        // result document at all.
+        hb.at_deadline();
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json rewritten"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["deadline_reached"], true);
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+    }
+
+    /// A heartbeat write is observability, never a failure mode: a job
+    /// directory that cannot be created must not take the loop down.
+    #[test]
+    fn run_heartbeat_write_is_best_effort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path whose parent is a regular FILE: create_dir_all must fail.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let mut hb = RunHeartbeat::new(Some(blocker.join("run.json")), 6300, Instant::now(), 1);
+        hb.set_phase(LOOP_PHASE_CHECK, 1);
+        hb.write(); // must not panic
+                    // With no path at all (a foreground run) it is a no-op.
+        RunHeartbeat::new(None, 6300, Instant::now(), 1).write();
+    }
 
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
     /// `~/.zoder` read-only, so
@@ -15783,6 +16644,7 @@ mod review_diff_soundness_tests {
 #[cfg(test)]
 mod reviewer_chain_dispatch_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -16196,6 +17058,7 @@ mod reviewer_chain_dispatch_tests {
 
         let (review, _, _, chunks, _) = run_loop_review_once(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -16236,6 +17099,163 @@ mod reviewer_chain_dispatch_tests {
         // The only finding was disproved, so a blocking verdict is
         // downgraded to `comment`, never `approve`.
         assert_eq!(review.verdict, "comment", "{review:?}");
+    }
+
+    /// D10.7: one review reads a given post-image file ONCE.
+    ///
+    /// `context_for` (the cross-chunk header), `filter_false_undefined_findings`
+    /// and the confirmation grounding each read the reviewed files, and a
+    /// branch read is a `git show HEAD:<path>` subprocess. Before the fix each
+    /// consumer had its own reader: the header read `pkg/mod.py` while planning
+    /// and re-read it on every re-plan/fallback, and the filter read it again,
+    /// so one small review forked the same file several times. All three now
+    /// share one per-review `PostImages` cache.
+    ///
+    /// The reader is injected (the counting closure below) so the read count is
+    /// observable without patching `std::fs`: `reads()` counts calls to the
+    /// UNDERLYING reader, i.e. real reads, not cache hits. Asserted as an
+    /// exact count of one per distinct path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_image_read_once_per_file() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // The counting reader stands in for production's disk read: it runs
+        // once per ACTUAL read, so `reads()` is a true read count, not a hit
+        // count.
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_counter = raw.clone();
+        let post_image = crate::config_cache::PostImages::new(move |path: &str| {
+            read_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::read_to_string(root.join(path)).ok()
+        });
+
+        let (review, _, _, chunks, _) = run_loop_review_once_with_reader(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            &post_image,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        assert_eq!(chunks, 1, "one chunk for a diff this small");
+        // Sanity: the filter really did run and read the file, so the count
+        // below is evidence that the read happened, not that nothing read.
+        assert_eq!(review.filtered_findings.len(), 1, "{review:?}");
+        assert_eq!(
+            raw.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pkg/mod.py must be read exactly once per review, shared by the \
+             context header and the false-\"undefined\" filter"
+        );
+    }
+
+    /// D5.2: one review loads the engine ONCE.
+    ///
+    /// Before the fix, a review re-read the config, the engine TOML and the
+    /// multi-megabyte model corpus on every reviewer dispatch, on every
+    /// invalid-verdict repair, and once more on each recorded fallback
+    /// failure — and the loop did it three times per iteration just to build
+    /// the chain, the author families and the review itself. The engine is
+    /// now loaded once and borrowed (`&Engine`) by `build_reviewer_plan`,
+    /// `dispatch_reviewer_for_model` and the repair/failure paths.
+    ///
+    /// The counter is keyed by `Config::home()` ([`crate::engine_load_count_for`]),
+    /// so this test reads the count for ITS fixture home (which `HomeGuard` makes the current one) and
+    /// asserts on the DELTA it caused, never an absolute count. A global
+    /// counter would be blind here: `Engine::load()` FAILS for this home
+    /// (it has no engine `config.toml`), and a failed load still does the
+    /// config read and the registry bind the fix removes. Measured on the
+    /// pre-fix tree this DELTA is 2 (plan load + dispatch load); with the
+    /// fix it is 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_loads_engine_once() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        // `HomeGuard` takes the process-wide env lock itself; taking it
+        // again here would deadlock this test before it measured anything.
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // One engine for the fixture, loaded OUTSIDE the measured window.
+        let eng = test_engine();
+
+        let before = crate::engine_load_count_for(home);
+        let _ = run_loop_review_once(
+            &cli,
+            &eng,
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            root,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        let delta = crate::engine_load_count_for(home) - before;
+
+        // The review dispatches one chunk through one candidate: the only
+        // load it may add is zero — every path now borrows the engine the
+        // caller loaded. Pre-fix this was 2 (plan load + dispatch load).
+        assert_eq!(
+            delta, 0,
+            "a review must not reload the engine; it borrowed &Engine but the count rose by {delta}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16424,6 +17444,7 @@ mod reviewer_chain_dispatch_tests {
         let author_models: Vec<String> = vec!["broken-model/coder".to_string()];
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &author_models,
@@ -16500,7 +17521,7 @@ mod reviewer_chain_dispatch_tests {
         // Configured chain: the same-family reviewer is dropped, the
         // cross-family tail remains, and the skip is recorded.
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16510,8 +17531,14 @@ mod reviewer_chain_dispatch_tests {
 
         // Explicit operator pin: kept, flagged, and warned about — not
         // silently dropped.
-        let pinned =
-            build_reviewer_plan(&cli, Some("broken-model/reviewer"), &[], &authors, None).unwrap();
+        let pinned = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            Some("broken-model/reviewer"),
+            &[],
+            &authors,
+        )
+        .unwrap();
         assert!(pinned.forced, "an explicit same-family pin must be flagged");
         assert_eq!(
             pinned.candidates.first().map(String::as_str),
@@ -16555,7 +17582,7 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=working-model/other",
         ])
         .unwrap();
-        let pooled = build_reviewer_plan(&pool_cli, None, &[], &authors, None).unwrap();
+        let pooled = build_reviewer_plan(&pool_cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(pooled.candidates, vec!["working-model/other"]);
         assert!(pooled
             .skipped
@@ -16599,7 +17626,7 @@ mod reviewer_chain_dispatch_tests {
 
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
         let authors = vec!["broken-model/coder".to_string()];
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16617,9 +17644,15 @@ mod reviewer_chain_dispatch_tests {
         write_config(home, &runtime_loopback_uri(), "broken-model/reviewer");
         write_model_families(home, json!({"broken-model/*": "family-a"}));
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let err = build_reviewer_plan(&cli, None, &[], &["broken-model/coder".to_string()], None)
-            .unwrap_err()
-            .to_string();
+        let err = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &["broken-model/coder".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("no reviewer candidate remains outside the author model families"),
             "{err}"
@@ -16655,6 +17688,7 @@ mod reviewer_chain_dispatch_tests {
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &[],
@@ -16798,6 +17832,7 @@ mod reviewer_chain_dispatch_tests {
 +new\n";
         let (review, _model, _cost, _chunks, verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -16850,7 +17885,7 @@ mod reviewer_chain_dispatch_tests {
             "working-model/reviewer,broken-model/head",
         );
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &[], None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &[]).unwrap();
         assert_eq!(
             plan.candidates,
             vec!["working-model/reviewer", "broken-model/head"],
@@ -17390,6 +18425,7 @@ mod reviewer_chain_dispatch_tests {
         };
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17415,6 +18451,7 @@ mod reviewer_chain_dispatch_tests {
         // (the replanned model), not from the abandoned pre-replan dispatch.
         let report = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17447,6 +18484,7 @@ mod reviewer_chain_dispatch_tests {
         hits.store(0, Ordering::SeqCst);
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17749,6 +18787,7 @@ mod reviewer_chain_dispatch_tests {
             let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
             let result = complete_review_chunks(
                 &cli,
+                Some(&test_engine()),
                 Some("working-model/glm-5.1"),
                 &[],
                 &[],
@@ -18671,6 +19710,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18711,6 +19751,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 20);
         let (review, model, _cost, chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18768,6 +19809,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 100);
         let (review, model, _cost, chunks, reviewer_verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18843,6 +19885,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18906,6 +19949,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -18998,6 +20042,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19079,6 +20124,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19164,6 +20210,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19249,6 +20296,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19325,6 +20373,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19388,6 +20437,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19454,6 +20504,7 @@ data: [DONE]\n\n";
         std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19521,6 +20572,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &["working-model/fallback".into()],
             &[],
@@ -19870,6 +20922,7 @@ data: [DONE]\n\n";
         let cli = dummy_cli();
         let (review, _model, _cost, _chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -20194,6 +21247,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &cwd,
@@ -20271,6 +21328,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -20336,6 +21397,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -22778,6 +23843,7 @@ mod loop_review_base_tests {
 #[cfg(test)]
 mod reviewer_request_settings_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
@@ -22859,7 +23925,7 @@ model_provider = "custom.reviewer"
         server: &MockServer,
         extra_cli: &[&str],
         home: &std::path::Path,
-        engine_path: &std::path::Path,
+        _engine_path: &std::path::Path,
         models_json: Option<serde_json::Value>,
     ) -> Result<Completion, ReviewerError> {
         let reply = serde_json::json!({
@@ -22889,12 +23955,12 @@ model_provider = "custom.reviewer"
         let cli = crate::Cli::try_parse_from(argv).expect("reviewer arguments parse");
         dispatch_reviewer_for_model(
             &cli,
+            &test_engine(),
             MODEL,
             MODEL,
             "system prompt",
             "diff",
             4096,
-            Some(engine_path),
             None,
         )
         .await

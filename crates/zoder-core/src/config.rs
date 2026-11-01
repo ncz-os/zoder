@@ -2430,8 +2430,10 @@ impl ProfileDefaults {
 
     /// Shared-daemon assumption for many concurrent jobs (fleet).
     ///
-    /// Hook only: no production path consults this today. The reaper's
-    /// shared-daemon exemption applies on every profile regardless.
+    /// Consumed by `zoder loop`: on a shared daemon the FIRST unconfirmed
+    /// author cancel stops the loop instead of the second, because the next
+    /// attempt would queue behind other tenants' turns for another full phase
+    /// budget (see `agentic::unconfirmed_cancel_abort_threshold`).
     pub fn shared_daemon(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2450,8 +2452,12 @@ impl ProfileDefaults {
     }
 
     /// Budget for the ACP `session/cancel` handshake before the reaper starts
-    /// killing. Fleet keeps the tuned 750 ms; a standalone host can afford a
-    /// longer settle window.
+    /// killing.
+    ///
+    /// Expressed PER SESSION. This is the profile's starting point only: the
+    /// reaper applies it as a floor on top of the fleet settle window
+    /// (`zoder_core::CANCEL_SETTLE_BUDGET`, 5 s), so a standalone host never
+    /// gets a shorter window than a fleet host.
     pub fn daemon_cancel_budget_ms(self) -> u64 {
         match self.mode {
             DeploymentMode::Standalone => 1500,
@@ -2562,6 +2568,20 @@ pub struct Config {
     /// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` > the built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_idle_timeout_between_events_s: Option<u64>,
+    /// Whole-run wall-clock deadline for `zoder loop`, in seconds.
+    ///
+    /// Distinct from the per-phase budgets: this bounds the entire run, not
+    /// one author turn, `--check` or review. When it expires the loop stops at
+    /// the next safe point, preserves the work it already captured, and still
+    /// emits its final JSON result.
+    ///
+    /// Unset derives the deadline from the fleet worker's 7,200 s job timeout
+    /// and keeps it strictly below that (6,300 s), so the loop always reaches
+    /// its own teardown before the worker's kill. `0` disables the deadline
+    /// and restores the pre-deadline behaviour. CLI precedence:
+    /// `zoder loop --deadline` > this key > the derived default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_deadline_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -2683,6 +2703,14 @@ pub struct Config {
     /// were before the 2026-10-25 study. See [`crate::context_opt`].
     #[serde(default, skip_serializing_if = "ContextConfig::is_empty")]
     pub context: ContextConfig,
+    /// `[prompt]` block: the master-prompt switch.
+    ///
+    /// An absent block changes nothing — the author role prompt is exactly
+    /// what it was before the master-prompt work landed (no author system
+    /// prompt outside `zoder loop`). See [`PromptConfig`] and
+    /// [`crate::prompt`].
+    #[serde(default, skip_serializing_if = "PromptConfig::is_empty")]
+    pub prompt: PromptConfig,
     /// Config files that exist on disk but were ignored while loading: an
     /// overlay `config.<vendor>.toml` that failed to parse, or a `review.toml`
     /// that could not be read or parsed. Loading still prints a warning and
@@ -2718,6 +2746,108 @@ impl IgnoredConfigFile {
         )
     }
 }
+
+/// `[prompt]` block from `config.json` / an overlay TOML.
+///
+/// THE MASTER-PROMPT SWITCH.
+///
+/// Before the master-prompt work, zoder had no author system prompt outside
+/// `zoder loop` (see `docs/PROMPTS_INVENTORY.md` §1). The master prompt
+/// (`prompts/master/v1.md`) plus a per-family overlay
+/// (`prompts/overlays/<family>.md`) makes that role prompt a versioned
+/// asset, assembled by one function (`crate::prompt::assemble`).
+///
+/// THE DEFAULT IS THE CURRENT BEHAVIOUR.
+///
+/// `master` defaults to `false`. An operator who has not set it sees
+/// byte-for-byte the prompts zoder sent before this block existed: no
+/// author system prompt on the `exec` / `run` / `rescue` paths, and the
+/// pre-existing literal author prompt inside `zoder loop`. The switch is
+/// opt-in on purpose — a behavioural change to every coding turn is not
+/// something an operator should inherit from a config upgrade.
+///
+/// ```toml
+/// [prompt]
+/// master = true                 # default: false
+/// master_version = "v1"         # default: "v1"
+/// ```
+///
+/// The environment variable `ZODER_PROMPT_MASTER=1` turns the master
+/// prompt on for a single run without editing the config; it takes
+/// precedence over the config key, so an operator can A/B a rollout
+/// without a config change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PromptConfig {
+    /// Whether the master system prompt is used for author turns.
+    ///
+    /// `false` (the default) preserves the pre-master-prompt behaviour
+    /// exactly. `true` makes the author turn carry the assembled master
+    /// prompt plus the model family's overlay.
+    #[serde(default)]
+    pub master: bool,
+    /// Which version of the master prompt to load (`prompts/master/<version>.md`).
+    ///
+    /// An unknown version is an error, not a fallback to the newest file:
+    /// silently loading a different prompt than the operator named is the
+    /// kind of drift this whole change exists to remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_version: Option<String>,
+}
+
+impl Default for PromptConfig {
+    /// The default is [`PromptConfig::DEFAULT_MASTER`], so the documented
+    /// constant and the actual default cannot drift apart.
+    fn default() -> Self {
+        Self {
+            master: PromptConfig::DEFAULT_MASTER,
+            master_version: None,
+        }
+    }
+}
+
+impl PromptConfig {
+    /// The default value of [`Self::master`]: the CURRENT behaviour, i.e.
+    /// the master prompt is off.
+    pub const DEFAULT_MASTER: bool = false;
+
+    /// The default master-prompt version.
+    pub const DEFAULT_MASTER_VERSION: &'static str = crate::prompt::DEFAULT_MASTER_VERSION;
+
+    /// Whether the block is empty enough to be skipped when serializing.
+    pub fn is_empty(&self) -> bool {
+        !self.master && self.master_version.is_none()
+    }
+
+    /// Whether the master prompt is enabled, taking the environment
+    /// override into account.
+    ///
+    /// `ZODER_PROMPT_MASTER` is read first so a single run can flip the
+    /// switch without editing the config. The recognised true values are
+    /// `1`, `true`, `yes`, `on`; the recognised false values are `0`,
+    /// `false`, `no`, `off`. An unrecognised value is IGNORED (the config
+    /// decides), so a typo never silently enables a behavioural change.
+    pub fn master_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var(MASTER_PROMPT_ENV) {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => return true,
+                "0" | "false" | "no" | "off" => return false,
+                _ => {}
+            }
+        }
+        self.master
+    }
+
+    /// The master-prompt version to load.
+    pub fn master_version(&self) -> &str {
+        self.master_version
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_MASTER_VERSION)
+    }
+}
+
+/// The environment variable that turns the master prompt on for one run.
+pub const MASTER_PROMPT_ENV: &str = "ZODER_PROMPT_MASTER";
 
 /// `[context]` block from `config.json` / an overlay TOML.
 ///
@@ -4175,6 +4305,7 @@ impl Config {
             agent_idle_timeout_s: None,
             agent_idle_timeout_first_event_s: None,
             agent_idle_timeout_between_events_s: None,
+            loop_deadline_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,
@@ -4188,6 +4319,7 @@ impl Config {
             review: ReviewConfig::default(),
             model_families: BTreeMap::new(),
             context: ContextConfig::default(),
+            prompt: PromptConfig::default(),
             ignored_config_files: Vec::new(),
         }
     }
@@ -9623,5 +9755,156 @@ model = "bare-model"
         );
         assert_eq!(review.confirm.max_per_review, 3);
         assert_eq!(review.confirm.timeout_s, 90);
+    }
+}
+
+#[cfg(test)]
+mod prompt_config_tests {
+    //! Tests for the `[prompt]` master-prompt switch.
+    //!
+    //! The invariant these tests protect is the one the whole change rests
+    //! on: **with the flag off, zoder behaves exactly as it did before.**
+    //! A config that accidentally turns the master prompt on by default
+    //! would change every coding turn on every fleet host, so the default
+    //! is pinned here.
+
+    use super::*;
+
+    /// The env var is process-global, so the tests that flip it are
+    /// serialized behind one mutex (the same pattern the provider tests
+    /// use for `AZURE_OPENAI_API_VERSION`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `ZODER_PROMPT_MASTER` set to `value`, restoring the
+    /// previous value afterwards.
+    fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(MASTER_PROMPT_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(MASTER_PROMPT_ENV, v),
+            None => std::env::remove_var(MASTER_PROMPT_ENV),
+        }
+        let out = f();
+        match previous {
+            Some(v) => std::env::set_var(MASTER_PROMPT_ENV, v),
+            None => std::env::remove_var(MASTER_PROMPT_ENV),
+        }
+        out
+    }
+
+    #[test]
+    fn the_default_is_the_current_behaviour() {
+        let cfg = PromptConfig::default();
+        assert!(
+            !cfg.master,
+            "the master prompt must be OFF by default: an operator must opt in"
+        );
+        assert_eq!(
+            cfg.master,
+            PromptConfig::DEFAULT_MASTER,
+            "the default must come from the documented constant"
+        );
+    }
+
+    #[test]
+    fn an_absent_block_parses_to_the_off_state() {
+        let value = serde_json::json!({});
+        let prompt: PromptConfig = serde_json::from_value(value).unwrap();
+        assert!(!prompt.master);
+        assert!(prompt.master_version.is_none());
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn the_block_parses_when_set() {
+        let value = serde_json::json!({ "master": true, "master_version": "v1" });
+        let prompt: PromptConfig = serde_json::from_value(value).unwrap();
+        assert!(prompt.master);
+        assert_eq!(prompt.master_version(), "v1");
+        assert!(!prompt.is_empty());
+    }
+
+    #[test]
+    fn the_version_defaults_to_v1() {
+        let prompt = PromptConfig::default();
+        assert_eq!(prompt.master_version(), "v1");
+        assert_eq!(
+            prompt.master_version(),
+            PromptConfig::DEFAULT_MASTER_VERSION
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_rejected() {
+        // `deny_unknown_fields`: a typo in the key must fail loudly rather
+        // than silently leave the master prompt off.
+        let value = serde_json::json!({ "mastr": true });
+        assert!(serde_json::from_value::<PromptConfig>(value).is_err());
+    }
+
+    #[test]
+    fn the_env_var_overrides_the_config_key() {
+        let on = PromptConfig {
+            master: true,
+            master_version: None,
+        };
+        let off = PromptConfig {
+            master: false,
+            master_version: None,
+        };
+        // `ZODER_PROMPT_MASTER=1` forces ON regardless of the config key.
+        with_env(Some("1"), || {
+            assert!(on.master_enabled());
+            assert!(off.master_enabled());
+        });
+        // `ZODER_PROMPT_MASTER=0` forces OFF regardless of the config key:
+        // this is what lets an operator A/B a fleet rollout without
+        // editing every host's config.
+        with_env(Some("0"), || {
+            assert!(!on.master_enabled());
+            assert!(!off.master_enabled());
+        });
+        // With the env unset, the config key decides.
+        with_env(None, || {
+            assert!(on.master_enabled());
+            assert!(!off.master_enabled());
+        });
+    }
+
+    #[test]
+    fn an_unrecognised_env_value_is_ignored() {
+        // A typo must never silently enable a behavioural change.
+        let cfg = PromptConfig {
+            master: false,
+            master_version: None,
+        };
+        with_env(Some("maybe"), || {
+            assert!(!cfg.master_enabled());
+        });
+    }
+
+    #[test]
+    fn the_config_carries_the_prompt_block() {
+        // The block is reachable on the loaded config, so the CLI can ask
+        // "is the master prompt on?" without re-reading the file.
+        let cfg = Config::default_provider(std::path::Path::new("/tmp"));
+        assert!(
+            !cfg.prompt.master,
+            "a default config must leave the master prompt off"
+        );
+        assert_eq!(cfg.prompt.master_version(), "v1");
+    }
+
+    #[test]
+    fn the_config_roundtrips_the_prompt_block() {
+        let mut cfg = Config::default_provider(std::path::Path::new("/tmp"));
+        cfg.prompt = PromptConfig {
+            master: true,
+            master_version: Some("v2".into()),
+        };
+        let text = toml::to_string(&cfg).expect("serialize");
+        let parsed: Config = toml::from_str(&text).expect("deserialize");
+        assert!(parsed.prompt.master);
+        assert_eq!(parsed.prompt.master_version(), "v2");
     }
 }
