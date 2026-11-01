@@ -7273,7 +7273,15 @@ fn attach_failure_to_result_file(
     let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(false);
     };
-    payload["failure"] = failure.to_json();
+    // Only an object can carry a `failure` member: index-assigning into an
+    // array/string/number panics, and into `null` would replace the result.
+    let Some(object) = payload.as_object_mut() else {
+        anyhow::bail!(
+            "{} is not a JSON object, so the failure cannot be attached to it",
+            path.display()
+        );
+    };
+    object.insert("failure".into(), failure.to_json());
     let body = serde_json::to_string_pretty(&payload)
         .context("serializing result.json with the failure attached")?;
     let mut tmp = path.as_os_str().to_os_string();
@@ -26752,5 +26760,32 @@ mod attach_failure_to_result_tests {
             original,
             "a failed attach must leave the result document intact"
         );
+    }
+
+    /// Review (muse-spark-1.3, low): a `result.json` that parses but is not an
+    /// OBJECT cannot carry a `failure` member. It must not be reported as
+    /// attached (and must not panic on the index-assign); the result is left
+    /// untouched and the caller falls back to the standalone envelope.
+    #[test]
+    fn a_non_object_result_is_not_reported_as_attached() {
+        for original in ["[1,2]", "\"done\"", "42", "true", "null"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("result.json");
+            std::fs::write(&path, original).unwrap();
+            let outcome =
+                std::panic::catch_unwind(|| attach_failure_to_result_file(&path, &failure()));
+            let outcome =
+                outcome.unwrap_or_else(|_| panic!("{original}: attaching must not panic"));
+            let err = outcome.expect_err("a non-object result must not report attached=true");
+            assert!(
+                format!("{err:#}").contains("not a JSON object"),
+                "{original}: the error must say why: {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "{original}: a refused attach must leave the result untouched"
+            );
+        }
     }
 }
