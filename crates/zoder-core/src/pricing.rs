@@ -1009,12 +1009,18 @@ impl PricingCatalog {
         Ok(())
     }
 
-    /// The age of this catalog in days, as of `today`, from `generated`
-    /// (`YYYY-MM-DD`). `None` when the date is missing or unparsable — an
-    /// unknown age is never reported as rot.
+    /// The age of this catalog in days, as of `today`, from its data date
+    /// ([`data_date`]: `generated_at` when it parses, else `generated`) — the
+    /// same date the engine refresh decision reads. `None` when neither
+    /// parses — an unknown age is never reported as rot.
     pub fn age_days(&self, today: chrono::NaiveDate) -> Option<i64> {
-        let built = crate::corpus::parse_corpus_date(&self.generated)?;
+        let built = self.data_date()?;
         Some((today - built).num_days())
+    }
+
+    /// The catalog's own data date (see [`data_date`]).
+    fn data_date(&self) -> Option<chrono::NaiveDate> {
+        data_date(&self.generated, self.generated_at.as_deref().unwrap_or(""))
     }
 
     /// A one-line warning when this catalog is older than `max_days`, or
@@ -1033,7 +1039,7 @@ impl PricingCatalog {
         if days <= max_days {
             return None;
         }
-        let built = crate::corpus::parse_corpus_date(&self.generated)?;
+        let built = self.data_date()?;
         Some(format!(
             "warning: pricing catalog is {days} days old (generated {built}). \
              Refresh it with: zoder pricing sync"
@@ -1142,38 +1148,45 @@ impl PricingCatalog {
         {
             return Some(p);
         }
-        // Short-name (leaf/suffix) fallback. It exists for id-vs-display-name
-        // drift (`deepseek-flash` for `deepseek/deepseek-flash`), NOT for
-        // re-attributing a call to another publisher, and NOT for guessing
+        // Short-name (leaf/suffix) fallback. It exists for gateway/host drift
+        // on a QUALIFIED id (`together/meta/llama-4` for `meta/llama-4`), NOT
+        // for re-attributing a call to another publisher, and NOT for guessing
         // that a bare, unqualified CLIENT id "must be" some publisher's model.
         //
-        // Three rules, all from the Z3 field incidents:
+        // Three rules, all from the Z3 field incidents (D2/D8):
+        //   * an id with NO vendor prefix (`llama-3.3`, `MiniMax-M3`, a local
+        //     `qwen3-coder-30b`) gets NO leaf fallback at all: it resolves
+        //     only an exact (case-insensitive) key. That bare id is what a
+        //     local server or a renamed custom model reports, and matching it
+        //     to the hosted `.../qwen3-coder-30b` that shares its text is how a
+        //     $0 local model was priced at a cloud rate (the phantom $170).
+        //     Cost unknown is honest and surfaces as such; a borrowed rate is
+        //     not;
         //   * a QUALIFIED id (`foo/bar`) is an explicit statement of which
         //     model served the call; its leaf may not be borrowed from a
         //     different publisher (`foo/deepseek-r1` is not
         //     `deepseek/deepseek-r1`);
-        //   * an id with NO vendor prefix (`llama-3.3`, `MiniMax-M3`, a local
-        //     `qwen3-coder-30b`) is what a local server or a renamed custom
-        //     model reports. It may resolve a leaf that the catalog lists under
-        //     a single publisher (that IS the id/display-name drift this
-        //     fallback is for), but it must never borrow a price from a
-        //     catalog key that is itself unqualified -- a bare key is a cloud
-        //     vendor's own listing, and matching an unrelated bare id to it is
-        //     how a $0 local model was billed at a cloud rate (the phantom
-        //     $170);
         //   * an ambiguous leaf (two or more DISTINCT publishers under the
         //     same short name) resolves to no price at all. C6-P3 picked the
         //     MAX-rate match "to never undercharge"; that guess billed local
-        //     and third-party ids at the priciest cloud model's rates. Cost
-        //     unknown is honest and surfaces as such; a guessed price is not.
+        //     and third-party ids at the priciest cloud model's rates.
         //
         // The old rule was also order-dependent on a HashMap, so the only
         // deterministic answers here are "the one match" and "none".
-        let qualified = ml.contains('/');
+        if !ml.contains('/') {
+            return None;
+        }
         let leaf = ml.rsplit('/').next().unwrap_or(&ml);
         if leaf.is_empty() {
             return None;
         }
+        let segments = |s: &str| -> Vec<String> {
+            s.rsplit('/')
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let query_segments = segments(&ml);
         let mut found: Option<(&String, &ModelPrice)> = None;
         for (k, v) in self.models.iter() {
             let kl = k.to_ascii_lowercase();
@@ -1184,44 +1197,21 @@ impl PricingCatalog {
             if key_leaf != leaf {
                 continue;
             }
-            // An UNQUALIFIED query never resolves a BARE catalog key. The bare
-            // key is some cloud vendor's listing and a different bare id that
-            // merely shares its text is not evidence the same model served the
-            // call -- that is the phantom-$170 attribution.
-            if !qualified && !kl.contains('/') {
+            // A qualified query never borrows from a different publisher.
+            // The key's vendor chain must be a SUFFIX of the query's (nearest
+            // the leaf) -- never merely a leading prefix:
+            //
+            //   key `meta/llama-4-70b`  vs `together/meta/llama-4-70b`  -> ok
+            //   key `gpt-4o` (no vendor) vs `openai/gpt-4o`            -> ok
+            //   key `meta/llama-4-70b`  vs `together/mistral/llama-4-70b` -> NO
+            //
+            // Only the suffix rule expresses "same publisher, maybe behind a
+            // gateway" without re-attributing a model to another vendor.
+            let key_segments = segments(&kl);
+            if key_segments.len() > query_segments.len()
+                || query_segments[..key_segments.len()] != key_segments[..]
+            {
                 continue;
-            }
-            // A qualified query never borrows from a different publisher. The
-            // vendor segments (everything before the leaf) must match with
-            // equal depth, so `together/meta/llama-4` matches the catalog's
-            // `meta/llama-4` (same vendor, one gateway hop) but neither
-            // `openai/gpt-4o` (another publisher) nor
-            // `together/mistral/llama-4` (another vendor).
-            if qualified {
-                let segments = |s: &str| -> Vec<String> {
-                    s.rsplit('/')
-                        .skip(1)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                };
-                let query_segments = segments(&ml);
-                let key_segments = segments(&kl);
-                // The key's vendor chain must be a SUFFIX of the query's
-                // (nearest the leaf) -- never merely a leading prefix.
-                //
-                //   key `meta/llama-4-70b`  vs `together/meta/llama-4-70b`  -> ok
-                //   key `gpt-4o` (no vendor) vs `openai/gpt-4o`            -> ok
-                //   key `a/b`               vs `a/b/c`                      -> NO
-                //
-                // A `min(len)` prefix bound would accept the last case, and a
-                // strict equal-depth rule would reject the first two. Only the
-                // suffix rule expresses "same publisher, maybe behind a
-                // gateway" without re-attributing a model to another vendor.
-                if key_segments.len() > query_segments.len()
-                    || query_segments[..key_segments.len()] != key_segments[..]
-                {
-                    continue;
-                }
             }
             match found {
                 None => found = Some((k, v)),
@@ -1708,9 +1698,50 @@ mod tests {
             cat.classify_cost("foo/deepseek-r1", 1_000_000, 0, None),
             CostVerdict::Unknown
         );
-        // An UNQUALIFIED short name still resolves the cloud entry (the
-        // engine and older ledgers record bare ids).
-        assert!(cat.lookup("deepseek-r1").is_some());
+        // An UNQUALIFIED short name does not resolve it either (D8 step 2:
+        // no leaf fallback for an id without a vendor prefix).
+        assert!(cat.lookup("deepseek-r1").is_none());
+    }
+
+    /// D8 step 2 / brief fix (4): an id with NO vendor prefix gets no
+    /// leaf fallback. A local `qwen3-coder-30b` is not the hosted
+    /// `alibaba/qwen3-coder-30b` that shares its text, even when that is
+    /// the only listing under the leaf -- the unique-match case is exactly
+    /// the incident shape (one hosted listing, one local model).
+    #[test]
+    fn local_model_leaf_does_not_match_cloud_listing() {
+        let mut cat = PricingCatalog::default();
+        cat.models.insert(
+            "alibaba/qwen3-coder-30b".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 1.2,
+                output_usd_per_mtok: 6.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            cat.lookup("qwen3-coder-30b").is_none(),
+            "a bare local id must not borrow the single hosted listing's rate"
+        );
+        assert!(cat.lookup("QWEN3-CODER-30B").is_none());
+        assert_eq!(
+            cat.classify_cost("qwen3-coder-30b", 1_000_000, 1_000_000, None),
+            CostVerdict::Unknown
+        );
+        // An exact bare key still resolves (any case): that is the catalog
+        // stating the id itself, not a borrowed leaf.
+        cat.models.insert(
+            "MiniMax-M3".to_string(),
+            ModelPrice {
+                input_usd_per_mtok: 0.3,
+                output_usd_per_mtok: 1.2,
+                ..Default::default()
+            },
+        );
+        assert!(cat.lookup("MiniMax-M3").is_some());
+        assert!(cat.lookup("minimax-m3").is_some());
+        // The qualified id keeps its exact match.
+        assert!(cat.lookup("alibaba/qwen3-coder-30b").is_some());
     }
 
     /// Short-name fallback must be exact-or-nothing: an exact match always
@@ -1774,7 +1805,8 @@ mod tests {
             (p.input_usd_per_mtok - 1.0).abs() < 1e-12,
             "the exact match must never be replaced by a pricier leaf match"
         );
-        // A leaf that matches exactly ONE publisher still resolves.
+        // A BARE id never resolves by leaf, even when exactly ONE publisher
+        // lists it (D8 step 2): only a qualified id may.
         cat2.models.insert(
             "meta/llama-4-70b".to_string(),
             ModelPrice {
@@ -1782,7 +1814,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(cat2.lookup("llama-4-70b").is_some());
+        assert!(cat2.lookup("llama-4-70b").is_none());
         // Same publisher, different gateway host: the vendor segment matches.
         assert!(cat2.lookup("together/meta/llama-4-70b").is_some());
         // ...but a DIFFERENT vendor under the same gateway does not borrow it.
@@ -1841,8 +1873,8 @@ mod tests {
             "an unprefixed local id must be unknown, not billed at the cloud rate"
         );
 
-        // A qualified key DOES serve a bare query: the drift this fallback
-        // exists for (`deepseek-flash` for `deepseek/deepseek-flash`).
+        // A qualified key does NOT serve a bare query either (D8 step 2: no
+        // leaf fallback for an id without a vendor prefix).
         let mut cat2 = PricingCatalog::default();
         cat2.models.insert(
             "deepseek/deepseek-flash".to_string(),
@@ -1852,32 +1884,43 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(cat2.lookup("deepseek-flash").is_some());
+        assert!(cat2.lookup("deepseek-flash").is_none());
+        // ...while the qualified id it was written for still resolves.
+        assert!(cat2.lookup("deepseek/deepseek-flash").is_some());
     }
 
-    /// D2/D8 fix (4): the bundled catalog must not let a bare (unprefixed) id
-    /// borrow a bare cloud rate, which is the shape the phantom-$170 incident
-    /// took once the engine catalog was seeded with vendor-less keys.
+    /// D2/D8 fix (4), against the REAL shipped list: no bare (unprefixed) id
+    /// is priced by borrowing the leaf of a qualified listing.
     ///
-    /// This runs against the REAL shipped list, so it fails if a future
-    /// regeneration introduces bare keys that collide with local ids.
+    /// The embedded catalog has hundreds of `vendor/<leaf>` keys whose leaf is
+    /// also what a local server reports (`qwen3-coder-30b`, `gpt-oss-20b`).
+    /// Every such leaf that is not itself a key must be unknown. (The earlier
+    /// version of this test probed `local-<key>` against bare keys, which the
+    /// leaf comparison could never match, so it passed with or without the
+    /// fix.)
     #[test]
-    fn the_shipped_list_has_no_bare_key_that_shadows_a_local_id() {
+    fn the_shipped_list_never_prices_a_bare_id_by_leaf() {
         let cat = bundled_catalog();
+        let exact: std::collections::HashSet<String> =
+            cat.models.keys().map(|k| k.to_ascii_lowercase()).collect();
+        let mut probed = 0usize;
         for key in cat.models.keys() {
-            // A bare key is legal (some vendors publish unprefixed ids), but it
-            // must not be reachable as a LEAF from a different unprefixed id.
-            if key.contains('/') {
+            let Some((_, leaf)) = key.rsplit_once('/') else {
                 continue;
+            };
+            if leaf.is_empty() || exact.contains(&leaf.to_ascii_lowercase()) {
+                continue; // the catalog lists the bare id itself
             }
-            let leaf = key.rsplit('/').next().unwrap_or(key);
-            let mut probe = PricingCatalog::default();
-            probe.models.insert(key.clone(), cat.models[key].clone());
+            probed += 1;
             assert!(
-                probe.lookup(&format!("local-{leaf}")).is_none(),
-                "bare key {key:?} must not price the unrelated local id local-{leaf}"
+                cat.lookup(leaf).is_none(),
+                "bare id {leaf:?} must not borrow the rate of {key:?}"
             );
         }
+        assert!(
+            probed > 100,
+            "the shipped list must exercise the rule: {probed}"
+        );
     }
 
     /// Finding #23: `cost_at` honors the configured off-peak window so
@@ -2300,6 +2343,42 @@ mod pricing_source_metadata_tests {
         assert_eq!(data_date("", ""), None);
         assert_eq!(data_date("", "garbage"), None);
         assert_eq!(data_date("2026-13-99", ""), None);
+    }
+
+    /// D2 decision 3: `age_days` (and the staleness warning built on it)
+    /// measures the same date as the refresh decision, `data_date(generated,
+    /// generated_at)`. Reading `generated` alone made the two age rules
+    /// disagree whenever a writer stamped both fields.
+    #[test]
+    fn age_days_prefers_generated_at() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        let cat = PricingCatalog {
+            generated: "2026-06-01".to_string(),
+            generated_at: Some("2026-10-30T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cat.age_days(today), Some(1), "generated_at wins");
+        assert!(
+            cat.staleness_warning(today, 7).is_none(),
+            "the warning reads the same date: 1 day is fresh"
+        );
+        // `generated_at` alone (no `generated`) still dates the catalog.
+        let only_at = PricingCatalog {
+            generated_at: Some("2026-10-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(only_at.age_days(today), Some(30));
+        let w = only_at
+            .staleness_warning(today, 7)
+            .expect("30 days is stale");
+        assert!(w.contains("2026-10-01"), "{w}");
+        // An unparseable `generated_at` falls back to `generated`.
+        let fallback = PricingCatalog {
+            generated: "2026-10-21".to_string(),
+            generated_at: Some("garbage".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(fallback.age_days(today), Some(10));
     }
 
     /// A pricing file that predates the `generated_at` field must load and

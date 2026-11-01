@@ -6559,7 +6559,7 @@ async fn cmd_exec(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let res = cmd_exec_inner(cli, prompt).await;
     if let Err(e) = &res {
         if cli.json && e.downcast_ref::<ReportedTurnError>().is_none() {
-            println!("{}", exec_error_json(cli.model.as_deref(), e));
+            println!("{}", exec_failure_json(cli.model.as_deref(), e));
         }
     }
     res
@@ -6744,12 +6744,10 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            return Err(budget_declined(
-                cli.json,
-                &primary,
-                "budget_or_policy",
-                &msg,
-            ));
+            // A POLICY refusal (paid model, nothing confirmed), not a budget
+            // stop: it keeps the generic exit code so a budget back-off never
+            // parks a host for a refusal no month reset clears.
+            anyhow::bail!("paid model use declined");
         }
     }
 
@@ -6792,7 +6790,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                return Err(budget_declined(cli.json, &primary, "over_budget", &msg));
+                return Err(budget_declined(&primary, "over_budget", &msg));
             }
         }
     }
@@ -12513,12 +12511,10 @@ pub(crate) async fn agentic_turn(
         gate.check(&primary_entry, provider_paid, provider_cost_neutral)
     {
         if !confirm_paid(&msg)? {
-            return Err(budget_declined(
-                cli.json,
-                &primary,
-                "budget_or_policy",
-                &msg,
-            ));
+            // A POLICY refusal (paid model, nothing confirmed), not a budget
+            // stop: it keeps the generic exit code so a budget back-off never
+            // parks a host for a refusal no month reset clears.
+            anyhow::bail!("paid model use declined");
         }
     }
 
@@ -12543,7 +12539,7 @@ pub(crate) async fn agentic_turn(
         );
         if let BudgetVerdict::Confirm(msg) = verdict {
             if !confirm_paid(&msg)? {
-                return Err(budget_declined(cli.json, &primary, "over_budget", &msg));
+                return Err(budget_declined(&primary, "over_budget", &msg));
             }
         }
     }
@@ -13565,9 +13561,14 @@ fn save_health(health: &HealthStore) {
 const EXIT_BUDGET_EXCEEDED: i32 = 78;
 
 /// Marker carried in a budget-decline error's chain, so [`error_exit_code`] can
-/// find it without depending on the message text.
+/// find it without depending on the message text. It also carries what the
+/// `--json` envelope needs, so the envelope is printed once, at the command
+/// boundary ([`exec_failure_json`]), not at the gate.
 #[derive(Debug)]
-struct BudgetExceededTag;
+struct BudgetExceededTag {
+    model: String,
+    reason: String,
+}
 
 impl std::fmt::Display for BudgetExceededTag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -13586,8 +13587,9 @@ impl std::error::Error for BudgetExceededTag {}
 /// pipe) but reported `1`, so a CI job saw "error" with no way to branch on
 /// "the budget stopped me". The tag lives on the error itself, so it survives
 /// whichever gate site produced it.
+#[cfg(test)]
 fn budget_declined_error(msg: &str) -> anyhow::Error {
-    anyhow::Error::new(BudgetExceededTag).context(msg.to_string())
+    budget_declined("", "over_budget", msg)
 }
 
 /// The process exit code for a failed `run()`.
@@ -13601,23 +13603,42 @@ fn error_exit_code(error: &anyhow::Error) -> i32 {
     1
 }
 
-/// Refuse a call that a budget cap stopped, on either surface.
+/// Refuse a call that a budget cap stopped.
 ///
-/// The message is printed as the same human line as before, and under `--json`
-/// also as the standard error envelope on stdout (`outcome: "error"`, plus
-/// `code`/`reason`/`details`) so a JSON consumer gets a parseable object
-/// instead of an empty stdout (the same contract as [`exec_error_json`], B12).
-/// The over-budget case in particular used to emit the confirm PROMPT to
-/// stderr and then exit — a pipe saw a dangling "Type 'yes' to proceed" and no
-/// explanation.
-fn budget_declined(json: bool, model: &str, reason: &str, msg: &str) -> anyhow::Error {
-    if json {
-        println!("{}", budget_declined_envelope(model, reason, msg));
-    }
-    budget_declined_error(msg)
+/// Prints nothing: under `--json` the command boundary ([`cmd_exec`]) prints
+/// exactly one error object for every failure, and [`exec_failure_json`] turns
+/// this error into the budget envelope there. Printing here as well put two
+/// JSON objects on stdout (and one mid-run inside `zoder loop`).
+fn budget_declined(model: &str, reason: &str, msg: &str) -> anyhow::Error {
+    anyhow::Error::new(BudgetExceededTag {
+        model: model.to_string(),
+        reason: reason.to_string(),
+    })
+    .context(msg.to_string())
 }
 
-/// The `--json` error object for a budget/policy decline.
+/// The single `--json` error object for a failed `exec`: the budget envelope
+/// when a budget cap stopped the call, the generic [`exec_error_json`]
+/// otherwise.
+fn exec_failure_json(cli_model: Option<&str>, error: &anyhow::Error) -> serde_json::Value {
+    let tag = error
+        .chain()
+        .find_map(|c| c.downcast_ref::<BudgetExceededTag>());
+    match tag {
+        Some(tag) => {
+            let model = if tag.model.is_empty() {
+                cli_model.unwrap_or_default()
+            } else {
+                tag.model.as_str()
+            };
+            // The human reason is the outermost message (the gate's text).
+            budget_declined_envelope(model, &tag.reason, &error.to_string())
+        }
+        None => exec_error_json(cli_model, error),
+    }
+}
+
+/// The `--json` error object for a budget decline.
 ///
 /// A SUPERSET of [`exec_error_json`]: it carries every key that envelope has
 /// (`outcome`, `succeeded`, `model`, `error`) so a consumer written against the
@@ -16878,7 +16899,8 @@ fn save_reconciled_corpus(
 /// Verdict for the daily auto-refresh, factored out of
 /// [`maybe_spawn_daily_refresh`] so it is testable without spawning:
 /// `file` mode never spawns; `auto` mode spawns when the engine copy is
-/// missing or its mtime is older than 24h.
+/// missing or its mtime is older than 24h, or its data is older than the
+/// data-age threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshDecision {
     /// No spawn, no warning.
@@ -16897,12 +16919,13 @@ enum RefreshDecision {
 /// and `stale_days` is the configurable threshold
 /// ([`engine_refresh_stale_days`]).
 ///
-/// The data date is what decides, not the mtime. A file rewritten five
-/// minutes ago from week-old data is stale, and a file copied months ago from
-/// today's data is not: the mtime says when a writer touched the file, never
-/// how old the rates are. The mtime is only the fallback for a file whose
-/// data carries no parseable date at all (and for a missing file), so an
-/// undated copy cannot pin the engine to whatever it says forever.
+/// Stale = the file is missing or its mtime is older than 24 h (the daily
+/// cadence, unchanged) OR the DATA is older than `stale_days` (D2 decision
+/// 2). The data-age rule is an extra trigger: a file rewritten five minutes
+/// ago from week-old data is stale even though its mtime is fresh. It never
+/// suppresses the daily refresh — a refresh stamps `generated` with the
+/// current time, so letting a fresh data date veto an old mtime would turn
+/// the daily refresh into a `stale_days` one.
 fn daily_refresh_decision(
     zoder_build: bool,
     switch: FileSwitch,
@@ -16917,20 +16940,11 @@ fn daily_refresh_decision(
     if switch.is_file() {
         return RefreshDecision::Warn;
     }
-    // `0` (or a negative value) disables the data-age trigger entirely: the
-    // operator opted out of age-based refreshing for this host.
-    if stale_days > 0 {
-        if let Some(age_days) = data_date_age_days {
-            return if age_days > stale_days {
-                RefreshDecision::Spawn
-            } else {
-                RefreshDecision::Skip
-            };
-        }
-    }
-    // Data age unknown (or the trigger disabled): fall back to the mtime.
-    let stale = mtime_age_secs.map(|a| a > 24 * 60 * 60).unwrap_or(true);
-    if stale {
+    // `0` (or a negative value) disables the data-age trigger: the operator
+    // opted out of age-based refreshing for this host. The mtime rule stays.
+    let data_stale = stale_days > 0 && data_date_age_days.is_some_and(|age| age > stale_days);
+    let mtime_stale = mtime_age_secs.map(|a| a > 24 * 60 * 60).unwrap_or(true);
+    if mtime_stale || data_stale {
         RefreshDecision::Spawn
     } else {
         RefreshDecision::Skip
@@ -16956,8 +16970,18 @@ fn engine_refresh_stale_days() -> i64 {
     }
 }
 
+/// Whether a skipped refresh must still say the engine data is old: only when
+/// the data-age trigger is disabled (`stale_days <= 0`) and the data is older
+/// than the default threshold. "Old" needs a yardstick even when the trigger
+/// is off; the default one is what an unconfigured host would act on.
+fn engine_data_age_warning_due(stale_days: i64, data_date_age_days: Option<i64>) -> bool {
+    stale_days <= 0
+        && data_date_age_days.is_some_and(|age| age > zoder_core::corpus::DEFAULT_STALE_DAYS)
+}
+
 /// Keep the pricing feed fresh without a daemon-side fetch or an external
-/// scheduler: when the DATA inside the engine catalog is older than
+/// scheduler: when the engine copy is missing or older than 24 h, OR the DATA
+/// inside it is older than
 /// [`engine_refresh_stale_days`] (default 7 days, `$ZODER_PRICING_STALE_DAYS`),
 /// spawn a detached `pricing refresh` so the *next* run (and the ephemeral
 /// daemon it starts) sees current rates. Non-blocking and network-tolerant —
@@ -17010,8 +17034,8 @@ fn maybe_spawn_daily_refresh() {
             // The data is current enough to keep. Say so when it is older
             // than the threshold but the trigger was disabled, so a stalled
             // feed is never silent.
-            if stale_days <= 0 {
-                if let Some(age) = data_date_age_days.filter(|a| *a > 0) {
+            if engine_data_age_warning_due(stale_days, data_date_age_days) {
+                if let Some(age) = data_date_age_days {
                     warn_engine_data_age(&report_path, &cat, age, stale_days);
                 }
             }
@@ -23796,6 +23820,35 @@ mod budget_decline_exit_tests {
         assert_eq!(error_exit_code(&message_only), 1, "message, not cause");
     }
 
+    /// Branch review: the `--json` error object is printed ONCE, at the command
+    /// boundary, and a budget stop becomes the budget envelope there.
+    ///
+    /// The gate used to print its own envelope and `cmd_exec` then printed the
+    /// generic one for the same error: two objects on stdout.
+    #[test]
+    fn the_exec_failure_object_for_a_budget_stop_is_the_budget_envelope() {
+        use anyhow::Context;
+        let e = Err::<(), _>(budget_declined(
+            "deepseek/deepseek-chat",
+            "over_budget",
+            "BUDGET: this call would exceed the cap",
+        ))
+        .context("dispatching")
+        .unwrap_err();
+        let v = exec_failure_json(Some("cli-model"), &e);
+        assert_eq!(v["code"], EXIT_BUDGET_EXCEEDED);
+        assert_eq!(v["reason"], "over_budget");
+        assert_eq!(v["model"], "deepseek/deepseek-chat");
+        assert_eq!(v["outcome"], "error");
+
+        // Any other failure keeps the generic envelope, with no budget keys.
+        let other = anyhow::anyhow!("paid model use declined");
+        let v = exec_failure_json(Some("cli-model"), &other);
+        assert_eq!(v, exec_error_json(Some("cli-model"), &other));
+        assert!(v.get("code").is_none());
+        assert_eq!(error_exit_code(&other), 1);
+    }
+
     /// Review r3: the budget envelope must be a strict SUPERSET of the generic
     /// `exec_error_json` contract, so a `--json` consumer written against the
     /// error envelope sees every key it already relies on -- and gains the
@@ -24778,11 +24831,12 @@ mod engine_cost_accounting_tests {
         );
     }
 
-    /// The refresh decision reads the data's OWN generated-at date, not the
-    /// file mtime: a file written five minutes ago from week-old data is
+    /// The refresh decision ALSO reads the data's own generated-at date (D2
+    /// decision 2: stale = mtime older than 24 h OR data age over the
+    /// threshold): a file written five minutes ago from week-old data is
     /// stale.
     #[test]
-    fn refresh_decision_uses_the_data_date_not_the_mtime() {
+    fn refresh_decision_also_triggers_on_the_data_date() {
         let path = Path::new("/nonexistent/pricing.json");
         // Fresh mtime, 9-day-old data, default 7-day threshold -> spawn.
         assert_eq!(
@@ -24790,7 +24844,16 @@ mod engine_cost_accounting_tests {
             RefreshDecision::Spawn,
             "old data must refresh even though the file was just written"
         );
-        // Week-old mtime, 1-day-old data -> nothing to do.
+        // The ADR's own case: mtime 1 h, data 124 days -> spawn.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(3600), Some(124), 7),
+            RefreshDecision::Spawn,
+            "daily_refresh_spawns_when_data_date_stale_even_if_mtime_fresh"
+        );
+        // Week-old mtime, 1-day-old data -> the DAILY refresh still runs: the
+        // data-age rule is an extra trigger, never a reason to stop the
+        // 24 h cadence (a refresh stamps `generated` = now, so a data-age-only
+        // rule would silently turn the daily refresh into a weekly one).
         assert_eq!(
             daily_refresh_decision(
                 true,
@@ -24800,8 +24863,13 @@ mod engine_cost_accounting_tests {
                 Some(1),
                 7
             ),
-            RefreshDecision::Skip,
-            "current data must not re-sync just because the file is old"
+            RefreshDecision::Spawn,
+            "a file older than 24 h is refreshed whatever its data date says"
+        );
+        // Fresh mtime AND current data -> nothing to do.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, path, Some(3600), Some(1), 7),
+            RefreshDecision::Skip
         );
         // Data age unknown: fall back to the mtime (never silently skip).
         assert_eq!(
@@ -24818,6 +24886,26 @@ mod engine_cost_accounting_tests {
             daily_refresh_decision(true, FileSwitch::None, path, Some(60), Some(400), 0),
             RefreshDecision::Skip
         );
+    }
+
+    /// With the data-age trigger disabled (`$ZODER_PRICING_STALE_DAYS=0`) an
+    /// OLD feed prints one warning (README: "an old feed then prints one
+    /// warning instead of refreshing"). Data that is a day old is not old:
+    /// warning on any age > 0 would print on practically every `report`/`tui`
+    /// run of a host that opted out.
+    #[test]
+    fn disabled_refresh_warns_only_about_old_data() {
+        let default = zoder_core::corpus::DEFAULT_STALE_DAYS;
+        assert!(!engine_data_age_warning_due(0, Some(1)), "1 day is not old");
+        assert!(!engine_data_age_warning_due(0, Some(default)));
+        assert!(engine_data_age_warning_due(0, Some(default + 1)));
+        assert!(engine_data_age_warning_due(-3, Some(400)));
+        assert!(
+            !engine_data_age_warning_due(0, None),
+            "unknown age: no claim"
+        );
+        // An enabled trigger refreshes instead of warning.
+        assert!(!engine_data_age_warning_due(7, Some(400)));
     }
 
     /// The data-age threshold is configurable via the env override and falls
@@ -25106,22 +25194,27 @@ mod pricing_source_file_tests {
     #[test]
     fn daily_refresh_decision_auto_spawns_when_mtime_stale() {
         let p = Path::new("/tmp/none/pricing.json");
-        // Missing file, no data date -> the mtime fallback says stale -> Spawn.
+        // Missing file -> stale -> Spawn (auto mode), with or without a date.
+        assert_eq!(
+            daily_refresh_decision(true, FileSwitch::None, p, None, Some(1), 7),
+            RefreshDecision::Spawn
+        );
         assert_eq!(
             daily_refresh_decision(true, FileSwitch::None, p, None, None, 7),
             RefreshDecision::Spawn
         );
-        // Fresh mtime, one-day-old DATA -> Skip: the data decides.
+        // Fresh mtime (1h old) -> Skip even though data is a day old.
         assert_eq!(
             daily_refresh_decision(true, FileSwitch::None, p, Some(3600), Some(1), 7),
             RefreshDecision::Skip
         );
-        // >24h mtime with current data -> still Skip (the data decides).
+        // >24h mtime -> Spawn (master's rule, unchanged by the data-age
+        // trigger).
         assert_eq!(
             daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), Some(1), 7),
-            RefreshDecision::Skip
+            RefreshDecision::Spawn
         );
-        // >24h mtime and no data date -> the fallback spawns.
+        // >24h mtime and no data date -> spawns.
         assert_eq!(
             daily_refresh_decision(true, FileSwitch::None, p, Some(25 * 3600), None, 7),
             RefreshDecision::Spawn

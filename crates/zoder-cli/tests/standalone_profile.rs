@@ -362,3 +362,57 @@ fn a_fresh_standalone_install_refuses_to_dial_an_unset_endpoint() {
          failed dispatch\nstderr:\n{err}"
     );
 }
+
+/// A non-tty run that declines a PAID model (no `--allow-paid`, nothing to
+/// prompt) is a policy refusal, not a budget stop, and `--json` gets exactly
+/// one error object on stdout.
+///
+/// Review of the r2 budget-exit change: the paid-model confirmation was routed
+/// through the budget decline, so this refusal exited 78 ("budget cap
+/// exceeded") -- a fleet back-off keyed on the budget class would park the
+/// host until the month resets for a refusal that no reset clears -- and the
+/// decline printed its own envelope before `cmd_exec` printed the generic one,
+/// so stdout carried two JSON objects.
+#[test]
+fn a_non_tty_paid_model_decline_is_one_json_error_not_a_budget_stop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_corpus(dir.path());
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .args(["init", "--profile", "standalone"]));
+    assert_ok(&output, "init");
+
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .stdin(std::process::Stdio::null())
+        .args(["--json", "exec", "--oneshot", "smoke"]));
+    let out = stdout(&output);
+    let err = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a policy decline keeps the generic failure code, not the budget code\n\
+         stdout:\n{out}\nstderr:\n{err}"
+    );
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "--json must print exactly one error object\nstdout:\n{out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(lines[0]).expect("stdout is JSON");
+    assert_eq!(v["outcome"], "error");
+    assert_eq!(v["succeeded"], false);
+    assert!(
+        v.get("code").is_none() && !out.contains("budget"),
+        "a paid-model decline must not be labelled a budget stop: {v}"
+    );
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("paid model use declined"),
+        "the envelope must say why: {v}"
+    );
+    assert!(!err.contains("budget cap exceeded"), "stderr:\n{err}");
+}
