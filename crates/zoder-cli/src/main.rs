@@ -6843,16 +6843,10 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // through (paid must still confirm).
     let provider_paid = provider_cfg.paid || provider_cfg.billing == BillingMode::Metered;
     let provider_cost_neutral = is_cost_neutral_provider(provider_cfg);
-    if let Decision::NeedConfirm(msg) =
-        gate.check(&primary_entry, provider_paid, provider_cost_neutral)
-    {
-        if !confirm_paid(&msg)? {
-            // A POLICY refusal (paid model, nothing confirmed), not a budget
-            // stop: it keeps the generic exit code so a budget back-off never
-            // parks a host for a refusal no month reset clears.
-            anyhow::bail!("paid model use declined");
-        }
-    }
+    let policy_confirm = match gate.check(&primary_entry, provider_paid, provider_cost_neutral) {
+        Decision::NeedConfirm(msg) => Some(msg),
+        Decision::Allow => None,
+    };
 
     let prompt = read_prompt(prompt)?;
     validate_task(&prompt)?;
@@ -6870,12 +6864,21 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // month-to-date caps. A `Free` (explicit-zero) or `Unknown` (missing
     // catalog entry) estimate is never gated on its own; the gate's
     // failure mode is `Confirm` (user decides). `--allow-paid` bypasses,
-    // matching the paid-model confirmation above.
+    // matching the paid-model confirmation below.
+    //
+    // The budget verdict is settled BEFORE the paid-model policy prompt
+    // (D8 step 5, Z3). A metered route is a paid route, so the policy gate
+    // asks for confirmation first; on a non-tty that ask can only be
+    // answered "no", and the run then reported the generic `paid model use
+    // declined` with exit 1 even when a cap — not the policy — was the
+    // reason. A caller (the fleet back-off) must be able to tell "the
+    // budget stopped me" from "nobody confirmed a paid model", so a cap
+    // verdict wins: it exits with the budget code and the budget envelope.
     //
     // The ledger read is intentionally fail-closed: any error reading
     // month-to-date spend is treated as "could not read spend, ask the
     // user" rather than silently reporting $0 — Finding #10.
-    if !cli.allow_paid && !provider_cost_neutral {
+    let budget_confirm = if !cli.allow_paid && !provider_cost_neutral {
         let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
         let verdict = eng.cfg.budget.evaluate_call(
@@ -6891,10 +6894,31 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                     .month_to_date_usd()
             },
         );
-        if let BudgetVerdict::Confirm(msg) = verdict {
-            if !confirm_paid(&msg)? {
-                return Err(budget_declined(&primary, "over_budget", &msg));
-            }
+        match verdict {
+            BudgetVerdict::Confirm(msg) => Some(msg),
+            BudgetVerdict::WithinBudget => None,
+        }
+    } else {
+        None
+    };
+
+    // The budget verdict outranks the policy prompt: a budget stop is
+    // reported as one (a cap trip, an unreadable ledger, or an unpriced
+    // model -- every case this gate already answered with the budget code).
+    if let Some(msg) = &budget_confirm {
+        if !confirm_paid(msg)? {
+            return Err(budget_declined(&primary, "over_budget", msg));
+        }
+    }
+
+    // A paid/metered serving provider the budget gate did not stop still
+    // requires confirmation.
+    if let Some(msg) = policy_confirm {
+        if !confirm_paid(&msg)? {
+            // A POLICY refusal (paid model, nothing confirmed), not a budget
+            // stop: it keeps the generic exit code so a budget back-off never
+            // parks a host for a refusal no month reset clears.
+            anyhow::bail!("paid model use declined");
         }
     }
 
@@ -12673,16 +12697,10 @@ pub(crate) async fn agentic_turn(
     // through (paid must still confirm).
     let provider_paid = routed_provider.paid || routed_provider.billing == BillingMode::Metered;
     let provider_cost_neutral = is_cost_neutral_provider(&routed_provider);
-    if let Decision::NeedConfirm(msg) =
-        gate.check(&primary_entry, provider_paid, provider_cost_neutral)
-    {
-        if !confirm_paid(&msg)? {
-            // A POLICY refusal (paid model, nothing confirmed), not a budget
-            // stop: it keeps the generic exit code so a budget back-off never
-            // parks a host for a refusal no month reset clears.
-            anyhow::bail!("paid model use declined");
-        }
-    }
+    let policy_confirm = match gate.check(&primary_entry, provider_paid, provider_cost_neutral) {
+        Decision::NeedConfirm(msg) => Some(msg),
+        Decision::Allow => None,
+    };
 
     // The reservation lock covers the budget decision, engine dispatch, and
     // final reconciliation. A non-appendable ledger stops the call here.
@@ -12693,7 +12711,13 @@ pub(crate) async fn agentic_turn(
     // Default agentic execution uses the same fail-closed pre-call budget
     // classification as --oneshot. Agent dispatch must not bypass unknown
     // pricing, per-call caps, or month-to-date caps.
-    if !cli.allow_paid {
+    //
+    // Settled BEFORE the paid-model policy prompt, for the same reason as the
+    // oneshot path (D8 step 5): a metered route is a paid route, so on a
+    // non-tty the policy prompt can only be refused, and a cap — the reason
+    // the caller actually needed to know — used to be reported as that
+    // generic refusal with exit 1.
+    let budget_confirm = if !cli.allow_paid {
         let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let verdict = evaluate_default_exec_budget(
             &eng.cfg,
@@ -12703,10 +12727,31 @@ pub(crate) async fn agentic_turn(
             provider_cost_neutral,
             || ledger_reservation.month_to_date_usd(),
         );
-        if let BudgetVerdict::Confirm(msg) = verdict {
-            if !confirm_paid(&msg)? {
-                return Err(budget_declined(&primary, "over_budget", &msg));
-            }
+        match verdict {
+            BudgetVerdict::Confirm(msg) => Some(msg),
+            BudgetVerdict::WithinBudget => None,
+        }
+    } else {
+        None
+    };
+
+    // The budget verdict outranks the policy prompt: a budget stop is
+    // reported as one (a cap trip, an unreadable ledger, or an unpriced
+    // model -- every case this gate already answered with the budget code).
+    if let Some(msg) = &budget_confirm {
+        if !confirm_paid(msg)? {
+            return Err(budget_declined(&primary, "over_budget", msg));
+        }
+    }
+
+    // A paid/metered serving provider the budget gate did not stop still
+    // requires confirmation.
+    if let Some(msg) = policy_confirm {
+        if !confirm_paid(&msg)? {
+            // A POLICY refusal (paid model, nothing confirmed), not a budget
+            // stop: it keeps the generic exit code so a budget back-off never
+            // parks a host for a refusal no month reset clears.
+            anyhow::bail!("paid model use declined");
         }
     }
 
