@@ -64,7 +64,7 @@ pub use acp_client::{
     agents_status, cancel_session, fetch_engine_config, fetch_quickstart_diagnostics, list_agents,
     new_session, probe_ready, run_agent, run_agent_dispatch, run_goose_agent, sop_rpc_call,
     wait_for_socket, write_tool_matrix, write_tool_matrix_human, AgentEntry, AgentEvent,
-    AgentIdleWindows, AgentOptions, AgentRun, AgentStatusEntry, AgentsListResult,
+    AgentIdleWindows, AgentOptions, AgentOutcome, AgentRun, AgentStatusEntry, AgentsListResult,
     AgentsStatusResult, ApprovalPolicy, DaemonReadiness, EngineKind, GooseProviderEnv,
     WriteToolMatrixRow, AGENT_IDLE_BETWEEN_EVENTS_ENV, AGENT_IDLE_FIRST_EVENT_ENV,
     AGENT_IDLE_TIMEOUT_ENV, DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S, DEFAULT_AGENT_IDLE_FIRST_EVENT_S,

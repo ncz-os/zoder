@@ -13646,8 +13646,8 @@ pub(crate) async fn cmd_exec_agentic(
         // Partial work is preserved: on-disk edits stay, and the streamed text
         // above is whatever the turn produced. Point the user at a clean resume.
         if !cli.quiet && !cli.json {
-            let timed_out = t.run.outcome == "timeout";
-            let idle = t.run.outcome == zoder_core::IDLE_TIMEOUT_OUTCOME;
+            let timed_out = t.run.outcome == zoder_core::AgentOutcome::Timeout;
+            let idle = t.run.outcome == zoder_core::AgentOutcome::IdleTimeout;
             eprintln!(
                 "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
                 if timed_out {
@@ -13723,7 +13723,7 @@ const TURN_DETAIL_MAX_CHARS: usize = 400;
 /// the first non-empty line of the engine's own explanation (bounded), so the
 /// process error names the model / HTTP status / provider hint instead of only
 /// "agentic turn ended: failed" (B12).
-fn turn_failure_summary(outcome: &str, detail: Option<&str>) -> String {
+fn turn_failure_summary(outcome: &zoder_core::AgentOutcome, detail: Option<&str>) -> String {
     let line = detail
         .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()))
         .map(|l| {
@@ -23923,19 +23923,19 @@ mod exec_error_detail_tests {
     fn turn_failure_summary_names_the_engine_reason() {
         let detail = "\n  turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider provider-a)\nmore";
         assert_eq!(
-            turn_failure_summary("failed", Some(detail)),
+            turn_failure_summary(&zoder_core::AgentOutcome::Failed, Some(detail)),
             "agentic turn ended: failed: turn failed: provider HTTP 404 Not Found: model 'qwen39' does not exist (provider provider-a)"
         );
         assert_eq!(
-            turn_failure_summary("timeout", None),
+            turn_failure_summary(&zoder_core::AgentOutcome::Timeout, None),
             "agentic turn ended: timeout"
         );
         assert_eq!(
-            turn_failure_summary("failed", Some("  \n ")),
+            turn_failure_summary(&zoder_core::AgentOutcome::Failed, Some("  \n ")),
             "agentic turn ended: failed"
         );
         let long = "x".repeat(TURN_DETAIL_MAX_CHARS + 50);
-        let s = turn_failure_summary("failed", Some(&long));
+        let s = turn_failure_summary(&zoder_core::AgentOutcome::Failed, Some(&long));
         assert!(s.ends_with('…'));
         assert!(s.chars().count() < TURN_DETAIL_MAX_CHARS + 40);
     }

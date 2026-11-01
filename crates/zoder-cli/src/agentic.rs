@@ -7387,7 +7387,7 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
     // `reaper::note_session`), which is what lets a SIGTERM mid-turn cancel it.
 
     let ok = t.run.succeeded();
-    let timed_out = t.run.outcome == "timeout";
+    let timed_out = t.run.outcome == zoder_core::AgentOutcome::Timeout;
 
     if cli.json {
         println!(
@@ -10496,7 +10496,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     .and_then(|t| t.run.failure_detail.clone())
                     .or_else(|| author_err.clone()),
                 "author_outcome": match (&turn, &author_err) {
-                    (Some(t), _) => t.run.outcome.clone(),
+                    (Some(t), _) => t.run.outcome.as_str().to_string(),
                     (None, Some(e)) => format!("interrupted: {e}"),
                     (None, None) => "interrupted".to_string(),
                 },
@@ -10912,7 +10912,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
             .or_else(|| author_err.clone());
 
         let author_outcome = match (&turn, &author_err) {
-            (Some(t), _) => t.run.outcome.clone(),
+            (Some(t), _) => t.run.outcome.as_str().to_string(),
             (None, Some(e)) => format!("interrupted: {e}"),
             (None, None) => "interrupted".to_string(),
         };

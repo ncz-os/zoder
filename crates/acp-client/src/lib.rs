@@ -1527,11 +1527,17 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
     headers.into_iter().collect()
 }
 
-/// Outcome of an agentic turn.
+/// How an agentic turn ended.
 ///
-/// The string is the wire-level classification — consumers branch on it
-/// via `AgentRun::succeeded` (which tests `== "completed"`) or by direct
-/// string comparison (the `rescue` / `exec` commands test `== "timeout"`).
+/// This is the TYPED form of the outcome classification the wire already
+/// carries. Before it was a `String`, every consumer compared it against a
+/// literal (`== "completed"`, `== "timeout"`) — so a typo was a silent
+/// behaviour change, and an outcome the engine invented (`"max_tokens"`,
+/// `"cancelled"`) had no way to be named by the code that had to handle it.
+///
+/// The wire values are preserved EXACTLY: [`AgentOutcome::as_str`] returns the
+/// same strings the drivers used to produce, so the JSON payloads the fleet
+/// parses are byte-identical.
 ///
 /// Recognized values:
 ///   * `completed` — engine explicitly signalled a successful
@@ -1540,6 +1546,11 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 ///   * `timeout` — wall-clock budget elapsed. The `content` and
 ///     `tool_calls` reflect whatever had streamed before the deadline
 ///     (partial work preserved).
+///   * `idle_timeout` — the IDLE watchdog fired: the engine produced no
+///     event for the whole idle window. Deliberately distinct from
+///     `timeout` (the total turn budget) because the two need different
+///     operator responses (raise the idle window vs. raise the total
+///     budget).
 ///   * `interrupted` — the connection ended before a terminal marker,
 ///     after any text or tool activity arrived. Partial content, session
 ///     id, and tool state are retained, but cannot prove completion.
@@ -1548,6 +1559,12 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 ///     a critical RPC, surfaced as `Err` by the driver. Reachable only
 ///     when no `tool_call` was streamed; any `tool_call` on a
 ///     closed-socket turn moves the outcome to `interrupted` instead.
+///   * `cancelled` — the engine acknowledged a cancel (`stopReason:
+///     "cancelled"`). The turn did not complete; it was stopped.
+///   * `max_tokens` — the engine stopped on its output-token ceiling.
+///   * `other` — an outcome this build does not know. The engine's own
+///     string is kept verbatim so nothing is lost, and the value is
+///     still "not a success".
 ///
 /// State matrix (verified at the EOF branch of `drive`):
 ///
@@ -1565,11 +1582,109 @@ fn utilization_headers(value: &Value) -> Vec<(String, String)> {
 /// `timeout`, and `failed` all cause `succeeded()` to return `false` so
 /// the orchestrator treats them as a non-clean end (and the operator
 /// sees the partial transcript + a resumable session id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentOutcome {
+    /// The engine reached a clean terminal marker.
+    Completed,
+    /// The total turn budget elapsed.
+    Timeout,
+    /// The idle watchdog fired (no engine event for the idle window).
+    IdleTimeout,
+    /// The connection ended before a terminal marker; partial work kept.
+    Interrupted,
+    /// The turn failed with nothing streamed.
+    Failed,
+    /// The engine acknowledged a cancel.
+    Cancelled,
+    /// The engine stopped on its output-token ceiling.
+    MaxTokens,
+    /// An outcome this build does not know; the wire string is kept.
+    Other(String),
+}
+
+/// Serialized as the WIRE STRING, not as a tagged object.
+///
+/// The JSON payloads the fleet parses carry `"outcome": "completed"`; a
+/// derived `Serialize` would have produced `{"Completed": null}` and broken
+/// every consumer of those payloads. The hand-written impl keeps the bytes
+/// identical to the pre-typed `String`.
+impl serde::Serialize for AgentOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl AgentOutcome {
+    /// The wire string for this outcome — exactly what the drivers used
+    /// to produce, so every JSON payload keeps its shape.
+    pub fn as_str(&self) -> &str {
+        match self {
+            AgentOutcome::Completed => "completed",
+            AgentOutcome::Timeout => "timeout",
+            AgentOutcome::IdleTimeout => IDLE_TIMEOUT_OUTCOME,
+            AgentOutcome::Interrupted => "interrupted",
+            AgentOutcome::Failed => "failed",
+            AgentOutcome::Cancelled => "cancelled",
+            AgentOutcome::MaxTokens => "max_tokens",
+            AgentOutcome::Other(raw) => raw.as_str(),
+        }
+    }
+
+    /// Classify a wire outcome string.
+    ///
+    /// An unrecognized string is kept verbatim in [`AgentOutcome::Other`]
+    /// rather than being flattened into `Failed`: the engine's own wording
+    /// is information, and the pre-typed code passed it through unchanged.
+    pub fn from_wire(raw: &str) -> AgentOutcome {
+        match raw {
+            "completed" => AgentOutcome::Completed,
+            "timeout" => AgentOutcome::Timeout,
+            IDLE_TIMEOUT_OUTCOME => AgentOutcome::IdleTimeout,
+            "interrupted" => AgentOutcome::Interrupted,
+            "failed" => AgentOutcome::Failed,
+            "cancelled" => AgentOutcome::Cancelled,
+            "max_tokens" => AgentOutcome::MaxTokens,
+            other => AgentOutcome::Other(other.to_string()),
+        }
+    }
+
+    /// True when the turn ended in a wall-clock budget expiry — the total
+    /// turn budget or the idle watchdog. Both mean "the engine stopped
+    /// producing", and both answer the same operator question (raise a
+    /// budget), so the CLI groups them.
+    pub fn is_timed_out(&self) -> bool {
+        matches!(self, AgentOutcome::Timeout | AgentOutcome::IdleTimeout)
+    }
+
+    /// True when the turn ended because it was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, AgentOutcome::Cancelled)
+    }
+}
+
+impl std::fmt::Display for AgentOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&str> for AgentOutcome {
+    fn from(raw: &str) -> Self {
+        AgentOutcome::from_wire(raw)
+    }
+}
+
+/// Outcome of an agentic turn.
+///
+/// The outcome is a TYPED value ([`AgentOutcome`]) rather than a bare
+/// string, so every consumer branches on a closed set instead of on a
+/// literal it could typo. The wire strings are unchanged: see
+/// [`AgentOutcome::as_str`].
 #[derive(Debug, Clone)]
 pub struct AgentRun {
     pub session_id: String,
-    /// `completed` | `timeout` | `interrupted` | `failed`.
-    pub outcome: String,
+    /// How the turn ended.
+    pub outcome: AgentOutcome,
     /// Final assistant content (concatenated text chunks; `content` on
     /// `turn_complete` wins if present).
     pub content: String,
@@ -1601,8 +1716,12 @@ pub struct AgentRun {
 ///   * a completed turn's terminal content is ordinary model output;
 ///   * if chunks were streamed, the caller has already printed them and
 ///     re-printing the terminal copy would duplicate the whole turn.
-fn terminal_failure_detail(outcome: &str, streamed: &str, terminal: &str) -> Option<String> {
-    if outcome != "completed" && streamed.is_empty() && !terminal.is_empty() {
+fn terminal_failure_detail(
+    outcome: &AgentOutcome,
+    streamed: &str,
+    terminal: &str,
+) -> Option<String> {
+    if *outcome != AgentOutcome::Completed && streamed.is_empty() && !terminal.is_empty() {
         Some(terminal.to_string())
     } else {
         None
@@ -1611,7 +1730,7 @@ fn terminal_failure_detail(outcome: &str, streamed: &str, terminal: &str) -> Opt
 
 impl AgentRun {
     pub fn succeeded(&self) -> bool {
-        self.outcome == "completed"
+        self.outcome == AgentOutcome::Completed
     }
 }
 
@@ -1622,6 +1741,33 @@ impl AgentRun {
 /// the final `turn_complete` notification, short enough that a hung
 /// daemon cannot stall the loop indefinitely.
 pub(crate) const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Classify a turn that ended inside the post-cancel settle window.
+///
+/// One place for the three arms that share it (settle budget elapsed, read
+/// error, EOF): they were the same expression written three times, and a
+/// divergence between them would have made the same turn classify
+/// differently depending on how the socket closed.
+///
+/// The matrix is the one the EOF branch of `drive()` uses:
+///   * a tool still pending -> `interrupted` (the engine was mid-tool when
+///     it went away);
+///   * nothing streamed at all -> `failed` (the engine produced no output);
+///   * otherwise -> `timeout` (useful work streamed, but the budget ended
+///     before a terminal marker proved completion).
+fn settle_outcome(
+    pending_tool_results: &HashMap<String, u32>,
+    content: &str,
+    tool_calls: u32,
+) -> AgentOutcome {
+    if pending_tool_results.values().any(|n| *n > 0) {
+        AgentOutcome::Interrupted
+    } else if content.is_empty() && tool_calls == 0 {
+        AgentOutcome::Failed
+    } else {
+        AgentOutcome::Timeout
+    }
+}
 
 /// Drain the engine socket after `drive()`'s outer deadline fires,
 /// parsing any final `turn_complete` / text that raced the deadline,
@@ -1653,7 +1799,7 @@ async fn drain_after_cancel<R, F>(
     tool_calls: &mut u32,
     pending_tool_results: &mut HashMap<String, u32>,
     line: &mut String,
-) -> String
+) -> AgentOutcome
 where
     R: tokio::io::AsyncBufReadExt + Unpin,
     F: FnMut(AgentEvent) + ?Sized,
@@ -1667,13 +1813,7 @@ where
             // `drive()` uses, so a deadline-raced turn that emitted
             // useful work before the budget ended as `completed` /
             // `interrupted` consistently.
-            return if pending_tool_results.values().any(|n| *n > 0) {
-                "interrupted".to_string()
-            } else if content.is_empty() && *tool_calls == 0 {
-                "failed".to_string()
-            } else {
-                "timeout".to_string()
-            };
+            return settle_outcome(pending_tool_results, content, *tool_calls);
         }
         let got_line =
             match tokio::time::timeout(remaining, read_frame_line_capped(reader, line)).await {
@@ -1682,25 +1822,13 @@ where
                 // Fall through to the same classification as a zero-budget
                 // settle (above).
                 Ok(Err(_)) | Err(_) => {
-                    return if pending_tool_results.values().any(|n| *n > 0) {
-                        "interrupted".to_string()
-                    } else if content.is_empty() && *tool_calls == 0 {
-                        "failed".to_string()
-                    } else {
-                        "timeout".to_string()
-                    };
+                    return settle_outcome(pending_tool_results, content, *tool_calls);
                 }
             };
         if !got_line {
             // EOF during settle. Same classification as the settle-
             // budget-elapsed arm above.
-            return if pending_tool_results.values().any(|n| *n > 0) {
-                "interrupted".to_string()
-            } else if content.is_empty() && *tool_calls == 0 {
-                "failed".to_string()
-            } else {
-                "timeout".to_string()
-            };
+            return settle_outcome(pending_tool_results, content, *tool_calls);
         }
         let frame: Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
@@ -1773,9 +1901,8 @@ where
                 let oc = params
                     .get("outcome")
                     .and_then(Value::as_str)
-                    .unwrap_or("completed")
-                    .to_string();
-                return oc;
+                    .unwrap_or("completed");
+                return AgentOutcome::from_wire(oc);
             }
             _ => {}
         }
@@ -2726,11 +2853,11 @@ fn classify_partial_outcome(
     _pending_tool_results: &HashMap<String, u32>,
     content: &str,
     tool_call_count: u32,
-) -> String {
+) -> AgentOutcome {
     if content.is_empty() && tool_call_count == 0 {
-        "failed".to_string()
+        AgentOutcome::Failed
     } else {
-        "interrupted".to_string()
+        AgentOutcome::Interrupted
     }
 }
 
@@ -2768,7 +2895,7 @@ fn classify_partial_outcome_flat(
     pending_tools: Option<&HashMap<String, u32>>,
     content: &str,
     tool_call_count: u32,
-) -> String {
+) -> AgentOutcome {
     if let Some(pending) = pending_tools {
         // Delegate to the full classifier so the matrix stays in one
         // place. The audit explicitly requires this delegation when
@@ -2779,9 +2906,9 @@ fn classify_partial_outcome_flat(
     // `drive_goose_io` whose wire shape doesn't carry enough
     // information to track pending tools by name.
     if content.is_empty() && tool_call_count == 0 {
-        "failed".to_string()
+        AgentOutcome::Failed
     } else {
-        "interrupted".to_string()
+        AgentOutcome::Interrupted
     }
 }
 
@@ -3129,7 +3256,7 @@ async fn drive<F: FnMut(AgentEvent)>(
     // window measures the silence of the TURN, not the setup handshake
     // (the handshake RPCs have their own `SETUP_RPC_TIMEOUT`).
     let mut watchdog = IdleWatchdog::new(opts.idle_windows);
-    let outcome: String = loop {
+    let outcome: AgentOutcome = loop {
         // The streaming-loop dispatch on the per-frame read result is
         // exhaustive over [`read_frame_line_capped`]'s
         // `Result<bool, io::Error>`:
@@ -3188,7 +3315,7 @@ async fn drive<F: FnMut(AgentEvent)>(
                     }),
                 )
                 .await;
-                break IDLE_TIMEOUT_OUTCOME.to_string();
+                break AgentOutcome::IdleTimeout;
             }
             // Budget exhausted. CANCEL the turn server-side so the engine stops
             // editing files (otherwise a ghost agent keeps running after we
@@ -3348,7 +3475,7 @@ async fn drive<F: FnMut(AgentEvent)>(
                     eprintln!(
                         "zoder: warning: approval rejected by engine (id={id}): {msg}; ending turn"
                     );
-                    break "failed".to_string();
+                    break AgentOutcome::Failed;
                 }
                 eprintln!(
                     "zoder: warning: ignoring non-fatal engine error response (id={id}): {msg}"
@@ -3557,11 +3684,12 @@ async fn drive<F: FnMut(AgentEvent)>(
                 on_event(AgentEvent::Approval { tool, approved });
             }
             "turn_complete" => {
-                let oc = params
-                    .get("outcome")
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed")
-                    .to_string();
+                let oc = AgentOutcome::from_wire(
+                    params
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed"),
+                );
                 if let Some(c) = params.get("content").and_then(Value::as_str) {
                     if !c.is_empty() {
                         // Y-9: enforce the same cumulative cap on the
@@ -5013,7 +5141,7 @@ where
     let mut pending_tool_calls: u32 = 0;
     // Structured reason for a non-completed turn (idle timeout today).
     let mut failure_detail: Option<String> = None;
-    let outcome: String = loop {
+    let outcome: AgentOutcome = loop {
         // 3. Send `session/prompt` on the first iteration, BEFORE reading.
         //    Doing it here (inside the loop, after the reader is set up
         //    but before the first `read_frame_line_capped`) is the
@@ -5076,7 +5204,7 @@ where
                     }),
                 )
                 .await;
-                break IDLE_TIMEOUT_OUTCOME.to_string();
+                break AgentOutcome::IdleTimeout;
             }
             Err(_) => {
                 // Budget exhausted. Best-effort: ask goose to stop the turn
@@ -5121,7 +5249,7 @@ where
                     )
                     .await;
                 }
-                break "timeout".to_string();
+                break AgentOutcome::Timeout;
             }
             Ok(r) => match r {
                 Ok(got_line) => got_line,
@@ -5218,10 +5346,10 @@ where
                 }
             }
             break match stop_reason {
-                "end_turn" => "completed".to_string(),
-                "cancelled" => "cancelled".to_string(),
-                "max_tokens" | "max_tokens_reached" => "max_tokens".to_string(),
-                other => other.to_string(),
+                "end_turn" => AgentOutcome::Completed,
+                "cancelled" => AgentOutcome::Cancelled,
+                "max_tokens" | "max_tokens_reached" => AgentOutcome::MaxTokens,
+                other => AgentOutcome::Other(other.to_string()),
             };
         }
 
@@ -5806,8 +5934,9 @@ mod tests {
         // "397 chars captured" and no reason. The 404, the offending model id
         // and the provider hint were all present and all discarded, which is
         // what made this look like a credential or model-resolution bug.
-        let detail = terminal_failure_detail("failed", "", ZEROCLAW_FAILED_TURN_CONTENT)
-            .expect("a failed turn with no streamed text must retain its detail");
+        let detail =
+            terminal_failure_detail(&AgentOutcome::Failed, "", ZEROCLAW_FAILED_TURN_CONTENT)
+                .expect("a failed turn with no streamed text must retain its detail");
         assert_eq!(detail, ZEROCLAW_FAILED_TURN_CONTENT);
         assert!(detail.contains("404"), "HTTP status must survive: {detail}");
         assert!(
@@ -5823,7 +5952,10 @@ mod tests {
     #[test]
     fn completed_turn_content_is_not_treated_as_a_failure_detail() {
         // Ordinary model output must never be re-printed as a failure reason.
-        assert_eq!(terminal_failure_detail("completed", "", "OK"), None);
+        assert_eq!(
+            terminal_failure_detail(&AgentOutcome::Completed, "", "OK"),
+            None
+        );
     }
 
     #[test]
@@ -5833,14 +5965,18 @@ mod tests {
         // "just always print content on failure" fix would regress — most
         // visibly on a timeout, where partial work IS streamed.
         assert_eq!(
-            terminal_failure_detail("timeout", "partial work so far", "partial work so far"),
+            terminal_failure_detail(
+                &AgentOutcome::Timeout,
+                "partial work so far",
+                "partial work so far"
+            ),
             None
         );
     }
 
     #[test]
     fn empty_terminal_content_yields_no_detail() {
-        assert_eq!(terminal_failure_detail("failed", "", ""), None);
+        assert_eq!(terminal_failure_detail(&AgentOutcome::Failed, "", ""), None);
     }
 
     #[test]
@@ -6077,7 +6213,7 @@ mod tests {
         let run = run_agent(&opts, |_| {})
             .await
             .expect("an unchanged final config should release the prompt");
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
         server.await.unwrap();
     }
 
@@ -6198,7 +6334,7 @@ mod tests {
         let (bound_model, prompt) = server.await.unwrap();
 
         assert_eq!(bound_model, "paid-model-b");
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
         assert_eq!(prompt["params"]["session_id"], "aba-session");
         assert_eq!(prompt["params"]["prompt"], "ABA-visible prompt");
     }
@@ -6327,7 +6463,7 @@ mod tests {
         );
         assert_eq!(frames[2]["params"]["agent_alias"], "agent-b");
         assert_eq!(run.session_id, "fresh-on-agent-b");
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
         assert_eq!(frames[3]["params"]["session_id"], "fresh-on-agent-b");
     }
 
@@ -8827,7 +8963,7 @@ mod tests {
             run.session_id, "goose-recovered-fresh",
             "AgentRun must record the freshly issued id (not the stale one)"
         );
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
 
         // The next run's load must see the recovered id, not the
         // stale one — this is the persistence invariant the slice
@@ -9108,7 +9244,7 @@ mod tests {
             drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
         assert_eq!(frames.len(), 3, "expected init/new/prompt");
         assert_eq!(run.session_id, "goose-test-session-1");
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
         assert_eq!(run.content, "hello world");
         assert_eq!(run.tool_calls, 1);
         assert_eq!(run.input_tokens, 42);
@@ -9228,7 +9364,8 @@ mod tests {
         let _ = server.await;
         let run = res.expect("a pre-terminal read failure must preserve the partial AgentRun");
         assert_eq!(
-            run.outcome, "failed",
+            run.outcome,
+            AgentOutcome::Failed,
             "no work arrived before the read error"
         );
         assert!(!run.succeeded());
@@ -9444,7 +9581,8 @@ mod tests {
         let (_frames, run, _events) =
             drive_against_mock(outbound, false, ApprovalPolicy::Allowlist).await;
         assert_eq!(
-            run.outcome, "completed",
+            run.outcome,
+            AgentOutcome::Completed,
             "Y-9 (positive): a normal turn well under the cumulative cap must still complete"
         );
         assert_eq!(
@@ -9984,7 +10122,7 @@ mod tests {
             "partial turn must be preserved (res={:?})",
             res
         );
-        assert_eq!(res.unwrap().outcome, "timeout");
+        assert_eq!(res.unwrap().outcome, AgentOutcome::Timeout);
     }
 
     #[tokio::test]
@@ -10280,7 +10418,7 @@ mod tests {
             "Allowlist+shell must decline"
         );
         // And the final turn completed with content from the chunk.
-        assert_eq!(res.outcome, "completed");
+        assert_eq!(res.outcome, AgentOutcome::Completed);
         assert_eq!(res.content, "done.");
         assert!(
             events.iter().any(
@@ -11001,7 +11139,7 @@ mod tests {
         );
         assert_eq!(reply["result"]["outcome"]["optionId"], "opt-allow");
         // The turn still completed via the REAL (method-less) prompt response.
-        assert_eq!(run.outcome, "completed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
         assert!(
             events
                 .iter()
@@ -11083,13 +11221,13 @@ mod tests {
                 .expect("drive_goose_io should succeed")
         }
         let r = run_with_stop_reason("max_tokens".to_string()).await;
-        assert_eq!(r.outcome, "max_tokens");
+        assert_eq!(r.outcome, AgentOutcome::MaxTokens);
         assert!(!r.succeeded());
         let r = run_with_stop_reason("cancelled".to_string()).await;
-        assert_eq!(r.outcome, "cancelled");
+        assert_eq!(r.outcome, AgentOutcome::Cancelled);
         assert!(!r.succeeded());
         let r = run_with_stop_reason("end_turn".to_string()).await;
-        assert_eq!(r.outcome, "completed");
+        assert_eq!(r.outcome, AgentOutcome::Completed);
         assert!(r.succeeded());
     }
 
@@ -11702,7 +11840,7 @@ mod tests {
         .await;
 
         assert_eq!(run.session_id, "goose-test-session-1");
-        assert_eq!(run.outcome, "interrupted");
+        assert_eq!(run.outcome, AgentOutcome::Interrupted);
         assert!(!run.succeeded());
         assert_eq!(run.content, "Hello World");
         assert!(
@@ -11850,7 +11988,8 @@ mod tests {
         // 2. Partial work is reported as `interrupted`: useful output
         //    survives, but EOF cannot stand in for `turn_complete`.
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome,
+            AgentOutcome::Interrupted,
             "non-empty mid-turn disconnect must be classified as `interrupted`; got {:?}",
             run.outcome
         );
@@ -11973,7 +12112,7 @@ mod tests {
             run.tool_calls
         );
         assert_eq!(
-            run.outcome, "failed",
+            run.outcome, AgentOutcome::Failed,
             "empty mid-turn disconnect must be classified as `failed` (NOT `completed`, NOT `timeout`); \
              got {:?}",
             run.outcome
@@ -12139,7 +12278,8 @@ mod tests {
         //    flagged: a tool_call without a matching tool_result
         //    MUST NOT be misreported as a successful turn.
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome,
+            AgentOutcome::Interrupted,
             "EOF after a tool_call frame with no matching tool_result must be classified \
              as `interrupted` (NOT `completed`); got {:?}",
             run.outcome
@@ -12426,7 +12566,8 @@ mod tests {
         //    (flat counter, REJECTED) implementation would fail
         //    this assertion with `"completed"`.
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome,
+            AgentOutcome::Interrupted,
             "stray tool_result for an unrelated tool must NOT cause a false `completed`; \
              v1 flat-counter code would fail here. got {:?}",
             run.outcome
@@ -12612,7 +12753,8 @@ mod tests {
         assert_eq!(run.content, "hi");
         assert_eq!(run.tool_calls, 2);
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome,
+            AgentOutcome::Interrupted,
             "duplicate tool_result must NOT cause a false `completed`; \
              v1 flat-counter code would fail here. got {:?}",
             run.outcome
@@ -12774,7 +12916,8 @@ mod tests {
             "two tool_call frames for edit_file were streamed"
         );
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome,
+            AgentOutcome::Interrupted,
             "two calls to the same tool with only one matching result MUST be `interrupted`; \
              a HashSet-based regression would fail here with `completed`. got {:?}",
             run.outcome
@@ -13227,7 +13370,8 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(
-            run.outcome, "completed",
+            run.outcome,
+            AgentOutcome::Completed,
             "the turn must survive a tool wait longer than the idle window; got {run:?}"
         );
         assert!(
@@ -13264,7 +13408,7 @@ mod tests {
             .expect("the idle watchdog must end the turn");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::IdleTimeout, "got {run:?}");
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13308,10 +13452,15 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(
-            run.outcome, IDLE_TIMEOUT_OUTCOME,
+            run.outcome,
+            AgentOutcome::IdleTimeout,
             "a silent session must end with the distinct idle-timeout outcome; got {run:?}"
         );
-        assert_ne!(run.outcome, "timeout", "the idle outcome must be distinct");
+        assert_ne!(
+            run.outcome,
+            AgentOutcome::Timeout,
+            "the idle outcome must be distinct"
+        );
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13369,7 +13518,7 @@ mod tests {
             .expect("the idle watchdog must end the turn");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::IdleTimeout, "got {run:?}");
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13416,7 +13565,7 @@ mod tests {
             .expect("the idle watchdog must end the turn");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::IdleTimeout, "got {run:?}");
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13462,7 +13611,7 @@ mod tests {
         .expect("a steady stream must complete normally");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, "completed", "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::Completed, "got {run:?}");
         assert!(
             elapsed >= Duration::from_millis(2500),
             "the turn must have run for longer than the idle window; took {elapsed:?}"
@@ -13496,7 +13645,8 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_ne!(
-            run.outcome, IDLE_TIMEOUT_OUTCOME,
+            run.outcome,
+            AgentOutcome::IdleTimeout,
             "a disabled watchdog must never produce the idle outcome; got {run:?}"
         );
         assert!(
@@ -13528,7 +13678,7 @@ mod tests {
             .expect("the idle watchdog must end the turn");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::IdleTimeout, "got {run:?}");
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13589,7 +13739,7 @@ done
             .expect("the idle watchdog must end the goose turn");
         let elapsed = started.elapsed();
 
-        assert_eq!(run.outcome, IDLE_TIMEOUT_OUTCOME, "got {run:?}");
+        assert_eq!(run.outcome, AgentOutcome::IdleTimeout, "got {run:?}");
         let detail = run
             .failure_detail
             .expect("an idle timeout must carry a structured reason");
@@ -13732,7 +13882,8 @@ mod mr1_reliability_regression {
             .expect("drive must end promptly on an approval rejection, not stall to the wall-clock budget")
             .expect("drive returned Err on an approval rejection");
         assert_eq!(
-            run.outcome, "failed",
+            run.outcome,
+            AgentOutcome::Failed,
             "approval rejection must end turn with outcome='failed' (not stall); got: {:?}",
             run.outcome
         );
@@ -14035,7 +14186,8 @@ mod mr1_reliability_regression {
         // The critical MR !1 assertion: a turn whose `turn_complete`
         // raced the deadline ends as `completed`, not `timeout`.
         assert_eq!(
-            run.outcome, "completed",
+            run.outcome,
+            AgentOutcome::Completed,
             "a turn_complete raced the deadline and was drained cleanly; \
              outcome MUST be 'completed', not 'timeout'; got: {:?}",
             run.outcome
@@ -14230,11 +14382,13 @@ mod goose_acp_real_turn {
             run.outcome, run.content, run.tool_calls
         );
         assert_ne!(
-            run.outcome, "failed",
+            run.outcome,
+            AgentOutcome::Failed,
             "real goose+minimax turn failed outright"
         );
         assert_ne!(
-            run.outcome, "timeout",
+            run.outcome,
+            AgentOutcome::Timeout,
             "real goose+minimax turn TIMED OUT (possible prompt-write-before-read deadlock!)"
         );
     }
@@ -14259,7 +14413,8 @@ mod goose_acp_real_turn {
         pending.insert("edit_file".to_string(), 1);
         let out = classify_partial_outcome(&pending, "", 1);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "a pending tool result with zero text MUST classify as `interrupted`; got {out:?}"
         );
     }
@@ -14272,7 +14427,8 @@ mod goose_acp_real_turn {
         pending.insert("bash".to_string(), 1);
         let out = classify_partial_outcome(&pending, "starting bash", 1);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "non-empty text with a pending tool must still classify as `interrupted`; got {out:?}"
         );
     }
@@ -14284,7 +14440,8 @@ mod goose_acp_real_turn {
         let pending = HashMap::new();
         let out = classify_partial_outcome(&pending, "", 0);
         assert_eq!(
-            out, "failed",
+            out,
+            AgentOutcome::Failed,
             "an empty stream with no pending tools MUST classify as `failed`; got {out:?}"
         );
     }
@@ -14296,7 +14453,8 @@ mod goose_acp_real_turn {
         let pending = HashMap::new();
         let out = classify_partial_outcome(&pending, "hello, world", 0);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "text streamed without a terminal event must classify as `interrupted`; got {out:?}"
         );
     }
@@ -14307,7 +14465,8 @@ mod goose_acp_real_turn {
         let pending = HashMap::new(); // every tool has closed
         let out = classify_partial_outcome(&pending, "done editing", 1);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "closed tools without a terminal event must classify as `interrupted`; got {out:?}"
         );
     }
@@ -14319,7 +14478,11 @@ mod goose_acp_real_turn {
     #[test]
     fn classify_partial_outcome_flat_empty_is_failed() {
         let out = classify_partial_outcome_flat(None, "", 0);
-        assert_eq!(out, "failed", "flat (None): empty stream must be `failed`");
+        assert_eq!(
+            out,
+            AgentOutcome::Failed,
+            "flat (None): empty stream must be `failed`"
+        );
     }
 
     /// Pin the flat variant's fallback when `None` is passed and
@@ -14328,7 +14491,8 @@ mod goose_acp_real_turn {
     fn classify_partial_outcome_flat_with_text_is_interrupted() {
         let out = classify_partial_outcome_flat(None, "some text", 0);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "flat (None): text without a terminal event must be `interrupted`"
         );
     }
@@ -14341,7 +14505,8 @@ mod goose_acp_real_turn {
     fn classify_partial_outcome_flat_with_tool_calls_is_interrupted() {
         let out = classify_partial_outcome_flat(None, "", 3);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "flat (None): tool calls without a terminal event must be `interrupted`; got {out:?}"
         );
     }
@@ -14361,7 +14526,8 @@ mod goose_acp_real_turn {
         // empty content). But the per-name map says `interrupted`.
         let out = classify_partial_outcome_flat(Some(&pending), "", 1);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "flat (Some(pending)): pending tool with empty content MUST classify as \
              `interrupted` (delegate to classify_partial_outcome, not the flat matrix); \
              got {out:?}"
@@ -14381,7 +14547,8 @@ mod goose_acp_real_turn {
             "flat (Some(empty pending)) and flat (None) must agree on empty stream"
         );
         assert_eq!(
-            out_some, "failed",
+            out_some,
+            AgentOutcome::Failed,
             "flat (Some(empty pending)): empty stream must be `failed`"
         );
     }
@@ -14395,7 +14562,8 @@ mod goose_acp_real_turn {
         pending.insert("edit_file".to_string(), 0); // closed
         let out = classify_partial_outcome_flat(Some(&pending), "done", 1);
         assert_eq!(
-            out, "interrupted",
+            out,
+            AgentOutcome::Interrupted,
             "flat (Some(zero-count pending)): no terminal event was received; \
              got {out:?}"
         );
@@ -14524,7 +14692,7 @@ mod goose_acp_real_turn {
             "no tool_call frames were streamed; tool_calls must be 0"
         );
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome, AgentOutcome::Interrupted,
             "a non-empty stream with no terminal event must classify as `interrupted` (the read-error path \
              uses the same state matrix as the EOF path); got {:?}",
             run.outcome
@@ -14668,7 +14836,7 @@ mod goose_acp_real_turn {
             "exactly one tool_call was streamed before the read-error"
         );
         assert_eq!(
-            run.outcome, "interrupted",
+            run.outcome, AgentOutcome::Interrupted,
             "read-error with a pending tool_call MUST classify as `interrupted` (the per-name pending map \
              must take precedence over the text-stream check); got {:?}",
             run.outcome
@@ -14934,5 +15102,151 @@ mod goose_acp_real_turn {
             ),
         }
         let _ = server.await;
+    }
+}
+
+/// D12: the typed turn outcome replaces the `AgentRun.outcome: String`.
+///
+/// These tests pin the CONTRACT the typed value has to keep, because the
+/// whole point of the swap is that nothing observable changes: the wire
+/// strings are the same, the JSON payloads are the same, and only the
+/// RUST type is stricter.
+#[cfg(test)]
+mod agent_outcome_tests {
+    use super::*;
+
+    /// The wire strings the pre-typed code produced, verbatim. Every one of
+    /// them is a value some consumer in the fleet compares against, so a
+    /// rename would be a silent behaviour change.
+    #[test]
+    fn every_outcome_keeps_its_wire_string() {
+        let cases: &[(AgentOutcome, &str)] = &[
+            (AgentOutcome::Completed, "completed"),
+            (AgentOutcome::Timeout, "timeout"),
+            (AgentOutcome::IdleTimeout, "idle_timeout"),
+            (AgentOutcome::Interrupted, "interrupted"),
+            (AgentOutcome::Failed, "failed"),
+            (AgentOutcome::Cancelled, "cancelled"),
+            (AgentOutcome::MaxTokens, "max_tokens"),
+        ];
+        for (outcome, wire) in cases {
+            assert_eq!(
+                outcome.as_str(),
+                *wire,
+                "the wire string of {outcome:?} changed"
+            );
+            assert_eq!(
+                outcome.to_string(),
+                *wire,
+                "the Display of {outcome:?} changed"
+            );
+        }
+    }
+
+    /// An outcome this build does not know keeps the ENGINE's own string,
+    /// verbatim. Flattening it into `Failed` would lose information the
+    /// pre-typed code passed through unchanged.
+    #[test]
+    fn an_unknown_wire_outcome_is_kept_verbatim() {
+        let out = AgentOutcome::from_wire("something_new");
+        assert_eq!(out, AgentOutcome::Other("something_new".to_string()));
+        assert_eq!(out.as_str(), "something_new");
+        // An unknown outcome is NOT a success.
+        assert!(!out.is_timed_out());
+    }
+
+    /// The round trip is lossless for every known value, so a value can
+    /// cross the wire boundary and come back unchanged.
+    #[test]
+    fn from_wire_round_trips_every_known_outcome() {
+        for (outcome, wire) in [
+            (AgentOutcome::Completed, "completed"),
+            (AgentOutcome::Timeout, "timeout"),
+            (AgentOutcome::IdleTimeout, "idle_timeout"),
+            (AgentOutcome::Interrupted, "interrupted"),
+            (AgentOutcome::Failed, "failed"),
+            (AgentOutcome::Cancelled, "cancelled"),
+            (AgentOutcome::MaxTokens, "max_tokens"),
+        ] {
+            assert_eq!(AgentOutcome::from_wire(wire), outcome);
+            assert_eq!(AgentOutcome::from(outcome.as_str()), outcome);
+        }
+    }
+
+    /// The JSON shape must not change: `"outcome": "completed"`, NOT
+    /// `{"Completed": null}`. The fleet parses these payloads.
+    #[test]
+    fn the_outcome_serializes_as_the_wire_string() {
+        assert_eq!(
+            serde_json::to_string(&AgentOutcome::Completed).expect("serialize"),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentOutcome::IdleTimeout).expect("serialize"),
+            "\"idle_timeout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentOutcome::Other("weird".to_string())).expect("serialize"),
+            "\"weird\""
+        );
+    }
+
+    /// `succeeded()` is the canonical "did the turn reach a clean end" gate.
+    /// ONLY `completed` counts; every other outcome — including the ones the
+    /// engine names itself — is a non-clean end.
+    #[test]
+    fn only_completed_counts_as_succeeded() {
+        let run = |outcome| AgentRun {
+            session_id: "s".to_string(),
+            outcome,
+            content: String::new(),
+            input_tokens: 0,
+            tool_calls: 0,
+            failure_detail: None,
+        };
+        assert!(run(AgentOutcome::Completed).succeeded());
+        for outcome in [
+            AgentOutcome::Timeout,
+            AgentOutcome::IdleTimeout,
+            AgentOutcome::Interrupted,
+            AgentOutcome::Failed,
+            AgentOutcome::Cancelled,
+            AgentOutcome::MaxTokens,
+            AgentOutcome::Other("anything".to_string()),
+        ] {
+            assert!(
+                !run(outcome.clone()).succeeded(),
+                "{outcome:?} must not count as a clean end"
+            );
+        }
+    }
+
+    /// The two wall-clock endings are grouped: both mean "the engine stopped
+    /// producing", and both answer the same operator question. The total
+    /// budget and the idle window are DIFFERENT facts, so the typed value
+    /// keeps them apart — `is_timed_out` groups them for the hint, and the
+    /// variants stay distinguishable.
+    #[test]
+    fn the_two_wall_clock_endings_are_distinguishable_but_grouped() {
+        assert!(AgentOutcome::Timeout.is_timed_out());
+        assert!(AgentOutcome::IdleTimeout.is_timed_out());
+        assert!(!AgentOutcome::Interrupted.is_timed_out());
+        assert!(!AgentOutcome::Failed.is_timed_out());
+        assert_ne!(AgentOutcome::Timeout, AgentOutcome::IdleTimeout);
+        // The idle watchdog must remain DISTINCT from the total budget: the
+        // operator response is different (raise the idle window vs. raise
+        // the total budget).
+        assert_ne!(
+            AgentOutcome::IdleTimeout.as_str(),
+            AgentOutcome::Timeout.as_str()
+        );
+    }
+
+    /// A cancelled turn is its own fact: the engine acknowledged the cancel.
+    #[test]
+    fn a_cancelled_turn_is_typed_as_cancelled() {
+        assert!(AgentOutcome::Cancelled.is_cancelled());
+        assert!(!AgentOutcome::Completed.is_cancelled());
+        assert!(!AgentOutcome::Timeout.is_cancelled());
     }
 }
