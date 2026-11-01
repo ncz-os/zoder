@@ -2430,8 +2430,10 @@ impl ProfileDefaults {
 
     /// Shared-daemon assumption for many concurrent jobs (fleet).
     ///
-    /// Hook only: no production path consults this today. The reaper's
-    /// shared-daemon exemption applies on every profile regardless.
+    /// Consumed by `zoder loop`: on a shared daemon the FIRST unconfirmed
+    /// author cancel stops the loop instead of the second, because the next
+    /// attempt would queue behind other tenants' turns for another full phase
+    /// budget (see `agentic::unconfirmed_cancel_abort_threshold`).
     pub fn shared_daemon(self) -> bool {
         self.mode.is_fleet()
     }
@@ -2450,8 +2452,12 @@ impl ProfileDefaults {
     }
 
     /// Budget for the ACP `session/cancel` handshake before the reaper starts
-    /// killing. Fleet keeps the tuned 750 ms; a standalone host can afford a
-    /// longer settle window.
+    /// killing.
+    ///
+    /// Expressed PER SESSION. This is the profile's starting point only: the
+    /// reaper applies it as a floor on top of the fleet settle window
+    /// (`zoder_core::CANCEL_SETTLE_BUDGET`, 5 s), so a standalone host never
+    /// gets a shorter window than a fleet host.
     pub fn daemon_cancel_budget_ms(self) -> u64 {
         match self.mode {
             DeploymentMode::Standalone => 1500,
@@ -2562,6 +2568,20 @@ pub struct Config {
     /// `ZODER_AGENT_IDLE_BETWEEN_EVENTS_S` > the built-in default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_idle_timeout_between_events_s: Option<u64>,
+    /// Whole-run wall-clock deadline for `zoder loop`, in seconds.
+    ///
+    /// Distinct from the per-phase budgets: this bounds the entire run, not
+    /// one author turn, `--check` or review. When it expires the loop stops at
+    /// the next safe point, preserves the work it already captured, and still
+    /// emits its final JSON result.
+    ///
+    /// Unset derives the deadline from the fleet worker's 7,200 s job timeout
+    /// and keeps it strictly below that (6,300 s), so the loop always reaches
+    /// its own teardown before the worker's kill. `0` disables the deadline
+    /// and restores the pre-deadline behaviour. CLI precedence:
+    /// `zoder loop --deadline` > this key > the derived default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_deadline_s: Option<u64>,
     /// Vendor provenance for each provider id, populated by `Config::load()`
     /// from `config.<vendor>.toml` overlays. Providers from `config.json` or
     /// the default free-tier config are absent from this map (they're
@@ -4175,6 +4195,7 @@ impl Config {
             agent_idle_timeout_s: None,
             agent_idle_timeout_first_event_s: None,
             agent_idle_timeout_between_events_s: None,
+            loop_deadline_s: None,
             vendor_provenance: BTreeMap::new(),
             theme: Theme::default(),
             primary_model: None,

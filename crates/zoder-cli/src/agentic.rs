@@ -7021,6 +7021,132 @@ pub(crate) fn validate_loop_timeouts(
     }
 }
 
+/// How the loop derives its whole-run deadline when the operator set none.
+///
+/// The fleet worker gives one job 7,200 s and then kills it blind: no result
+/// document, no teardown, and the worktree's fate decided by whoever notices.
+/// Two compounding iterations of the loop's own per-phase budgets (author
+/// 900 s + check/review 900 s each, twice — see `validate_loop_timeouts`) add
+/// up to EXACTLY that number, so the incident's "2 h wait" was the loop
+/// spending the worker's whole allowance and the worker timing it out. The
+/// deadline is therefore derived from the worker's budget and kept strictly
+/// below it, so the loop always reaches its own teardown (commit, report,
+/// JSON result) before the worker's kill.
+pub(crate) const WORKER_RUN_TIMEOUT_SECS: u64 = 7200;
+
+/// Headroom kept between the loop's deadline and the worker's timeout: a
+/// tenth of the budget or five minutes, whichever is larger. The loop still
+/// has to commit the worktree, emit the final JSON result and cancel/reap the
+/// daemon inside this window — none of which is a per-iteration phase.
+pub(crate) fn loop_deadline_headroom_secs(worker_timeout_secs: u64) -> u64 {
+    (worker_timeout_secs / 10).max(300)
+}
+
+/// The default whole-run deadline for `zoder loop`: derived from, and strictly
+/// below, the worker's timeout.
+///
+/// The headroom is always at least one second and at most `worker_timeout - 1`,
+/// so the result is strictly less than `worker_timeout_secs` for EVERY input,
+/// including budgets too small for the normal headroom (`worker_timeout_secs <=
+/// 300`). Returning the worker's own timeout there would put the loop's
+/// deadline exactly on the worker's kill: the run would be killed blind before
+/// it could emit its result, which is the one thing this deadline exists to
+/// prevent.
+pub(crate) fn default_loop_deadline_secs(worker_timeout_secs: u64) -> u64 {
+    if worker_timeout_secs <= 1 {
+        // No positive whole-second deadline exists below this. A 1 s (or 0 s)
+        // worker budget cannot leave a run any time at all; return the input
+        // rather than underflow, and let the caller's own validation reject
+        // the configuration.
+        return worker_timeout_secs;
+    }
+    let headroom = loop_deadline_headroom_secs(worker_timeout_secs)
+        .clamp(1, worker_timeout_secs.saturating_sub(1));
+    worker_timeout_secs - headroom
+}
+
+/// Everything `zoder loop` needs to know about its whole-run budget, resolved
+/// once at dispatch: the deadline in seconds, and whether the daemon serving
+/// this run is shared with other jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopRunBudget {
+    pub deadline_secs: u64,
+    pub shared_daemon: bool,
+}
+
+/// Resolve the loop's whole-run budget with the documented precedence:
+/// the `--deadline` flag > the `loop_deadline_s` config key > a default
+/// derived from, and strictly below, the worker's timeout.
+///
+/// `flag` is the parsed `--deadline`, `config` the loaded config (or `None`
+/// when it could not be loaded, in which case the built-in defaults apply —
+/// the loop itself reports the load failure with its own diagnosis, and this
+/// must not turn into a second, differently worded error first).
+///
+/// Lives here rather than in the dispatcher so the precedence is testable:
+/// the dispatcher can only be exercised end to end, and the three sources
+/// are exactly what went wrong in Incident A.
+pub(crate) fn resolve_loop_run_budget(
+    flag: Option<u64>,
+    config: Option<&zoder_core::Config>,
+) -> LoopRunBudget {
+    let deadline_secs = flag
+        .or_else(|| config.and_then(|cfg| cfg.loop_deadline_s))
+        .unwrap_or_else(|| default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS));
+    let shared_daemon = config
+        .map(|cfg| cfg.profile_defaults().shared_daemon())
+        .unwrap_or(false);
+    LoopRunBudget {
+        deadline_secs,
+        shared_daemon,
+    }
+}
+
+/// The wall-clock deadline for one `zoder loop` run.
+///
+/// Whole-run, not per-phase: the loop's phase watchdogs bound each author
+/// turn, `--check` and review independently, and nothing bounded the run.
+/// This does, and when it fires the loop stops like any other terminal exit —
+/// after the iteration's work has been captured — so the final JSON result and
+/// teardown still happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopDeadline {
+    pub secs: u64,
+    /// The instant taken at process start, not at loop entry: the connect and
+    /// setup work before the first iteration is part of the run too.
+    pub started: Instant,
+}
+
+impl LoopDeadline {
+    pub(crate) fn new(secs: u64, started: Instant) -> Self {
+        Self { secs, started }
+    }
+
+    /// The deadline for a loop that should be bounded by `secs`, from the
+    /// process-start instant if it is available.
+    pub(crate) fn from_cli(secs: u64) -> Self {
+        Self::new(secs, crate::process_start_instant())
+    }
+
+    /// Time left before the deadline; zero once it has passed.
+    pub(crate) fn remaining(&self) -> Duration {
+        self.remaining_at(Instant::now())
+    }
+
+    pub(crate) fn remaining_at(&self, now: Instant) -> Duration {
+        (self.started + Duration::from_secs(self.secs)).saturating_duration_since(now)
+    }
+
+    /// True once the whole-run budget is spent.
+    pub(crate) fn expired(&self) -> bool {
+        self.expired_at(Instant::now())
+    }
+
+    pub(crate) fn expired_at(&self, now: Instant) -> bool {
+        self.remaining_at(now).is_zero()
+    }
+}
+
 /// Settle budget the author-phase watchdog grants the daemon to ACK a
 /// `session/cancel` before the loop captures `build_diff`. See
 /// [`zoder_core::CANCEL_SETTLE_BUDGET`] for the canonical value —
@@ -7042,6 +7168,26 @@ pub(crate) const AUTHOR_CANCEL_RETRY_BACKOFF: std::time::Duration =
 /// answering this loop at all, and continuing would keep reviewing trees
 /// nobody can prove are quiet.
 pub(crate) const UNCONFIRMED_CANCEL_ABORT_THRESHOLD: usize = 2;
+
+/// The number of consecutive unconfirmed author cancels that stops the loop
+/// for `shared_daemon` deployments.
+///
+/// Two in a row is right when the daemon serves this loop alone: the first
+/// miss is a slow daemon and the second proves it. When the daemon is SHARED
+/// (a fleet host runs many jobs through one daemon), the second miss is not
+/// proof of anything — the next iteration would just queue behind other
+/// tenants' turns for another full per-phase budget, which is how one run
+/// spends the worker's 7,200 s and gets killed blind. On a shared daemon the
+/// first unconfirmed cancel stops the loop: that turn's diff is not a finished
+/// turn and cannot be reviewed, and the work already on disk is preserved and
+/// reported either way.
+pub(crate) fn unconfirmed_cancel_abort_threshold(shared_daemon: bool) -> usize {
+    if shared_daemon {
+        1
+    } else {
+        UNCONFIRMED_CANCEL_ABORT_THRESHOLD
+    }
+}
 
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
@@ -8657,6 +8803,97 @@ fn nonsubstantive_stall_step(
     }
 }
 
+/// Classify a loop that did NOT resolve (decision D3: a typed failure
+/// contract, so the exit code and the `failure` object in the `--json`
+/// result always agree).
+///
+/// This is a named seam so the classification can be tested without a live
+/// engine: [`cmd_loop_run`] builds the result document from it and returns
+/// the matching classified error, so the two cannot drift apart.
+///
+/// WHY the loop did not resolve decides the class:
+///
+/// * the free-policy gate fired -> `policy_violation` (config, exit 40).
+///   The loop sets `policy_violation` itself, so it outranks any message
+///   heuristic; the message keeps the actionable `--allow-paid` hint.
+/// * a reviewer that never produced a verdict -> `reviewer_unavailable`
+///   (transient);
+/// * a budget refusal, a truncated/empty diff, a blocked review, ... ->
+///   whatever [`crate::failure::classify_message`] reads from the evidence;
+/// * no iteration at all -> `engine_unreachable` (transient);
+/// * anything else -> `loop_exhausted` (permanent).
+///
+/// The recorded `review_error` / `author_error` of the LAST iteration is
+/// the evidence; it is the same text the operator already sees.
+fn loop_failure(
+    policy_violation: Option<&str>,
+    last_iter: Option<&Value>,
+    final_verdict: &str,
+    iterations: usize,
+) -> Option<crate::failure::ClassifiedFailure> {
+    let evidence = last_iter
+        .and_then(|it| {
+            it.get("review_error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    it.get("author_error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_default();
+    // The free-policy gate is decided by the loop itself, not by a message
+    // heuristic: `policy_violation` is only ever set by the break in
+    // `cmd_loop_run`, so it outranks anything the last iteration recorded.
+    if let Some(v) = policy_violation {
+        let mut message =
+            format!("loop author turn violated free policy (use --allow-paid to permit): {v}");
+        if !evidence.is_empty() {
+            message.push_str(&format!("; last recorded reason: {evidence}"));
+        }
+        return Some(crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureCode::PolicyViolation,
+            message,
+        ));
+    }
+    let class = if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
+        // The engine's own budget refusal carries a reset timestamp; it
+        // must survive into the JSON so the caller knows when to come back.
+        if code == crate::failure::FailureCode::EngineBudgetExceeded {
+            crate::failure::ClassifiedFailure::with_budget_reset(code, evidence.clone(), reset)
+        } else {
+            crate::failure::ClassifiedFailure::new(code, evidence.clone())
+        }
+    } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
+        crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureCode::ReviewersUnavailable,
+            evidence.clone(),
+        )
+    } else if iterations == 0 {
+        crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureCode::EngineUnreachable,
+            evidence.clone(),
+        )
+    } else {
+        crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureCode::LoopExhausted,
+            evidence.clone(),
+        )
+    };
+    let mut message = format!("loop ended unresolved after {iterations} iteration(s)");
+    if !evidence.is_empty() {
+        message.push_str(&format!("; last recorded reason: {evidence}"));
+    }
+    Some(crate::failure::ClassifiedFailure {
+        code: class.code,
+        message,
+        budget_reset_at: class.budget_reset_at,
+        reviewers: Vec::new(),
+        extra: serde_json::Map::new(),
+    })
+}
+
 fn update_loop_streaks(
     turn_failed: bool,
     check_timed_out: bool,
@@ -8735,6 +8972,7 @@ pub(crate) async fn cmd_loop(
     background: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
 ) -> anyhow::Result<()> {
@@ -8769,6 +9007,7 @@ pub(crate) async fn cmd_loop(
         accept_on_green,
         loop_timeout_secs,
         agent_timeout_secs,
+        run_budget,
         allow_dangerous_check,
         require_approval,
         &cwd,
@@ -8800,6 +9039,219 @@ fn loop_result_line_enabled(job_id: Option<&str>, env: Option<&str>) -> bool {
     }
 }
 
+/// Interval between `run.json` heartbeat writes. Callers poll the heartbeat
+/// instead of waiting out the worker's 7,200 s timeout blind, so it must be
+/// fresh relative to a human's patience and cheap relative to the loop.
+pub(crate) const RUN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The phase names written to `run.json` and to the final result.
+pub(crate) const LOOP_PHASE_STARTING: &str = "starting";
+pub(crate) const LOOP_PHASE_AUTHOR: &str = "author";
+pub(crate) const LOOP_PHASE_CHECK: &str = "check";
+pub(crate) const LOOP_PHASE_REVIEW: &str = "review";
+pub(crate) const LOOP_PHASE_DONE: &str = "done";
+
+/// Path of the run heartbeat: `<job dir>/run.json`, beside the `result.json`
+/// the job already writes. `None` outside a background/job run — a standalone
+/// `zoder loop` writes nothing extra.
+pub(crate) fn run_heartbeat_path() -> Option<PathBuf> {
+    active_job_dir().map(|dir| dir.join("run.json"))
+}
+
+/// The live state of one loop run, written to `run.json` every
+/// [`RUN_HEARTBEAT_INTERVAL`] and once more at the deadline.
+///
+/// This is observability only: a heartbeat write can never fail the run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunHeartbeat {
+    pub path: Option<PathBuf>,
+    pub phase: String,
+    pub iteration: usize,
+    pub max_iters: usize,
+    /// Session ids this run drove, in the order they were minted.
+    pub session_states: Vec<(String, String)>,
+    /// The most recent provider error, verbatim, if any.
+    pub last_provider_error: Option<String>,
+    pub deadline_secs: u64,
+    pub started: Option<Instant>,
+    /// Set by [`RunHeartbeat::at_deadline`] so the last document says why the
+    /// run stopped instead of leaving a caller to infer it.
+    pub deadline_reached: bool,
+}
+
+impl RunHeartbeat {
+    pub(crate) fn new(
+        path: Option<PathBuf>,
+        deadline_secs: u64,
+        started: Instant,
+        max_iters: usize,
+    ) -> Self {
+        Self {
+            path,
+            phase: LOOP_PHASE_STARTING.to_string(),
+            iteration: 0,
+            max_iters,
+            deadline_secs,
+            started: Some(started),
+            ..Default::default()
+        }
+    }
+
+    /// Record the phase the loop is in. Cheap: no I/O.
+    pub(crate) fn set_phase(&mut self, phase: &str, iteration: usize) {
+        self.phase = phase.to_string();
+        self.iteration = iteration;
+    }
+
+    /// Record a session id and its state. Re-recording an id updates it in
+    /// place, so `run.json` never lists a session twice.
+    pub(crate) fn note_session(&mut self, id: &str, state: &str) {
+        if let Some(slot) = self.session_states.iter_mut().find(|(sid, _)| sid == id) {
+            slot.1 = state.to_string();
+        } else {
+            self.session_states
+                .push((id.to_string(), state.to_string()));
+        }
+    }
+
+    pub(crate) fn note_provider_error(&mut self, error: &str) {
+        self.last_provider_error = Some(error.to_string());
+    }
+
+    /// Mark the document that is written when the whole-run deadline fires.
+    pub(crate) fn at_deadline(&mut self) {
+        self.deadline_reached = true;
+    }
+
+    /// The document written to `run.json`. `sessions` is an object keyed by
+    /// session id so a caller can look one up without scanning; the insertion
+    /// order is kept so the file still reads as a log.
+    pub(crate) fn to_json(&self) -> Value {
+        let sessions: serde_json::Map<String, Value> = self
+            .session_states
+            .iter()
+            .map(|(id, state)| (id.clone(), Value::String(state.clone())))
+            .collect();
+        json!({
+            "kind": "loop_run",
+            "phase": self.phase,
+            "iteration": self.iteration,
+            "max_iters": self.max_iters,
+            "sessions": sessions,
+            "last_provider_error": self.last_provider_error,
+            "deadline_secs": self.deadline_secs,
+            "elapsed_ms": self.started.map(|s| s.elapsed().as_millis()),
+            "remaining_ms": self
+                .started
+                .map(|s| LoopDeadline::new(self.deadline_secs, s).remaining().as_millis()),
+            "deadline_reached": self.deadline_reached,
+            "updated_ms": Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Write the heartbeat. Best-effort by contract: a full disk or a removed
+    /// job directory must never take the loop down with it.
+    pub(crate) fn write(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(&self.to_json()).unwrap_or_default(),
+        );
+    }
+}
+
+/// Periodically rewrite `run.json` while the loop runs.
+///
+/// The ticker is its own task so a run stuck inside one long author turn still
+/// looks alive: `phase` then names the phase it is stuck in, which is exactly
+/// the question an operator asks before the worker's timeout.
+///
+/// `live` is shared with the loop body, which fills in the phase and the
+/// session states as it learns them.
+pub(crate) fn spawn_run_heartbeat(
+    live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let snapshot = live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            snapshot.write();
+        }
+    })
+}
+
+/// Stops the heartbeat ticker and writes the FINAL `run.json` on every way out
+/// of the loop, including the `?`/`bail!` paths inside the iteration body.
+///
+/// The final write used to sit on the normal path only: a mid-iteration
+/// `bail!` (a free-policy violation, an engine-kind resolution failure) left
+/// `run.json` frozen at the last 10 s tick, and the ticker itself kept running
+/// until the process exited. A guard makes "always emit the final heartbeat"
+/// true by construction instead of by remembering to call it.
+struct RunHeartbeatGuard {
+    live: Option<std::sync::Arc<std::sync::Mutex<RunHeartbeat>>>,
+    progress: LoopProgress,
+}
+
+impl RunHeartbeatGuard {
+    fn new(
+        live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+        ticker: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        ticker.abort();
+        Self {
+            live: Some(live),
+            progress: LoopProgress::default(),
+        }
+    }
+
+    /// Record how far the run got, so the `Drop`-time finalisation (used on an
+    /// error exit) reports the real iteration instead of zero.
+    fn note_progress(&mut self, iteration: usize, at_deadline: bool) {
+        self.progress = LoopProgress {
+            iteration,
+            at_deadline,
+        };
+    }
+
+    /// Record why the run stopped, in the final document.
+    fn finalize(&mut self, phase: &str, iteration: usize, at_deadline: bool) {
+        if let Some(live) = self.live.take() {
+            let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(phase, iteration);
+            if at_deadline {
+                state.at_deadline();
+            }
+            state.write();
+        }
+    }
+}
+
+/// The last iteration this guard saw, so a `Drop`-time finalisation reports
+/// the real progress instead of resetting it to zero.
+#[derive(Clone, Copy, Default)]
+struct LoopProgress {
+    iteration: usize,
+    at_deadline: bool,
+}
+
+impl Drop for RunHeartbeatGuard {
+    fn drop(&mut self) {
+        if self.live.is_some() {
+            // Only reachable when the normal-path `finalize` did NOT run, i.e.
+            // an early return or a `?`/`bail!` out of the iteration body.
+            let progress = self.progress;
+            self.finalize(LOOP_PHASE_DONE, progress.iteration, progress.at_deadline);
+        }
+    }
+}
+
 /// Writes a `teardown` event with reason `crash` if the loop function exits
 /// without disarming (early `?`/bail/panic), so a dying loop still leaves a
 /// trail in MNEMOS. Disarmed on every normal teardown.
@@ -8820,6 +9272,9 @@ impl Drop for LoopEventGuard {
     }
 }
 
+// The parameter count is the loop's explicit, named configuration — the same
+// shape as `cmd_loop`, which already carries this allowance.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_loop_run(
     cli: &crate::Cli,
     task: &[String],
@@ -8832,6 +9287,7 @@ async fn cmd_loop_run(
     accept_on_green: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
     cwd: &Path,
@@ -8887,11 +9343,49 @@ async fn cmd_loop_run(
     }
 
     let max_iters = max_iters.max(1);
+    // Whole-run wall-clock deadline (decision D7). The per-phase watchdogs
+    // bound one author turn, one `--check` and one review each; nothing bounded
+    // the RUN, so two compounding unconfirmed iterations could spend the whole
+    // worker budget and be killed blind. The deadline is checked at every
+    // iteration boundary (and around the review phase), and when it fires the
+    // loop leaves by a normal terminal path: the iteration record is pushed,
+    // the worktree is committed, and the final JSON result is still emitted.
+    let deadline_secs = run_budget.deadline_secs;
+    let shared_daemon = run_budget.shared_daemon;
+    let deadline = LoopDeadline::from_cli(deadline_secs);
+    let cancel_abort_threshold = unconfirmed_cancel_abort_threshold(shared_daemon);
+    let mut deadline_hit = false;
+    // A free-policy violation ends the loop AFTER the iteration is recorded,
+    // so the final result and `run.json` are still emitted. The run then exits
+    // nonzero with the `--allow-paid` hint, exactly as the previous mid-loop
+    // `bail!` did.
+    let mut policy_violation: Option<String> = None;
+    // `run.json` heartbeat: phase + session states + last provider error, every
+    // 10 s, so callers poll a document instead of waiting out the worker's
+    // 7,200 s timeout blind. Only a job run has a directory to write into.
+    let heartbeat_path = run_heartbeat_path();
+    let heartbeat_enabled = heartbeat_path.is_some();
+    let run_state = std::sync::Arc::new(std::sync::Mutex::new(RunHeartbeat::new(
+        heartbeat_path,
+        deadline_secs,
+        deadline.started,
+        max_iters,
+    )));
+    if heartbeat_enabled {
+        run_state.lock().unwrap_or_else(|e| e.into_inner()).write();
+    }
+    // Final `run.json` and ticker shutdown are guaranteed on EVERY exit path
+    // from here on, including the `?`/`bail!` ones inside the iteration body.
+    let mut heartbeat = RunHeartbeatGuard::new(
+        run_state.clone(),
+        spawn_run_heartbeat(run_state.clone(), RUN_HEARTBEAT_INTERVAL),
+    );
     crate::mnemos::event(
         event_job_id.as_deref(),
         "loop_start",
         json!({"brief_bytes": task_txt.len(), "max_iters": max_iters,
-               "reviewer": reviewer, "workspace": cwd.to_string_lossy()}),
+               "reviewer": reviewer, "workspace": cwd.to_string_lossy(),
+               "deadline_secs": deadline_secs, "shared_daemon": shared_daemon}),
     )
     .await;
     // The author's engine session for the NEXT iteration, together with the
@@ -9014,6 +9508,29 @@ async fn cmd_loop_run(
     // candidates from these models' families are excluded on every review.
     let mut author_models: Vec<String> = Vec::new();
     for i in 1..=max_iters {
+        // Whole-run deadline, checked BEFORE a new iteration starts: an
+        // iteration begun with no time left would spend another full phase
+        // budget past the deadline, which is exactly how the run outlives the
+        // worker. Whatever the previous iterations produced is already on disk
+        // and is committed and reported below like any other terminal exit.
+        if deadline.expired() {
+            deadline_hit = true;
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}/{max_iters}: whole-run deadline of {}s reached; stopping \
+                     with {} iteration(s)' work preserved and reported",
+                    deadline.secs,
+                    iterations.len()
+                );
+            }
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_AUTHOR, i);
+        }
+        // So an error exit mid-iteration reports the iteration it reached.
+        heartbeat.note_progress(i, deadline_hit);
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
@@ -9067,8 +9584,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         // Consecutive author turns whose cancel could not be confirmed. This is
-        // the ONE thing about an unconfirmed cancel that can stop the loop: two
-        // in a row means the daemon is not answering this loop at all. A single
+        // the ONE thing about an unconfirmed cancel that can stop the loop. On
+        // a daemon this loop owns, two in a row means the daemon is not
+        // answering this loop at all; on a SHARED daemon (fleet) the first one
+        // already stops it — see `unconfirmed_cancel_abort_threshold`. A single
         // one is a slow daemon, and cleanup failing must never throw the
         // author's work away (a supervised loop run).
         let mut unconfirmed_cancel_streak = 0usize;
@@ -9080,11 +9599,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
             continuity.as_ref().map(|c| c.session_id.clone()),
         ));
         let session_id_for_cancel = active_session.clone();
+        let session_tracker = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
             zoder_core::engine_rpc::track_session_id(
-                active_session,
+                session_tracker,
                 crate::agentic_turn(
                     cli,
                     engine_kind,
@@ -9168,17 +9688,18 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // incrementing `total_cost` — a violating turn does
                 // not extend the loop's bookkeeping as if it were a
                 // legitimate iteration.
+                //
+                // Recorded as a terminal iteration rather than a `bail!`:
+                // the loop must still emit its final JSON result and its
+                // final `run.json`, so the exit code and the hint are
+                // carried by the result and applied once, after the loop.
+                // `--allow-paid` is the fix, so this is a USAGE failure
+                // (`policy_violation`, class config, exit 40), not a
+                // transient one; the typed class is attached where the
+                // result is built so the document and the exit code agree.
                 if let Some(v) = &t.policy_violation {
-                    // The run was refused by the free policy: the operator
-                    // asked for free-only work and the turn would have cost
-                    // money. `--allow-paid` is the fix, so this is a USAGE
-                    // failure, not a transient one.
-                    return Err(crate::failure::classified_err(
-                        crate::failure::FailureCode::PolicyViolation,
-                        format!(
-                            "loop author turn violated free policy (use --allow-paid to permit): {v}"
-                        ),
-                    ));
+                    policy_violation = Some(v.clone());
+                    break;
                 }
                 // `t.alias` is the alias of the candidate that actually
                 // produced this turn (the head or a fallback), so the next
@@ -9190,6 +9711,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 if !author_models.iter().any(|known| known == &t.model) {
                     author_models.push(t.model.clone());
                 }
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.note_session(&t.run.session_id, &format!("completed:{}", t.run.outcome));
+                }
                 total_cost += t.cost_usd;
                 Some(t)
             }
@@ -9199,11 +9724,27 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // is carried in `author_error` + the iter record. Only a run
                 // of them (the daemon is not answering this loop at all)
                 // stops it — and only after this iteration's work is counted.
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sid) = active_session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                            "cancel_unconfirmed"
+                        } else {
+                            "failed"
+                        };
+                        state.note_session(&sid, cancel_state);
+                    }
+                    state.note_provider_error(&msg);
+                }
                 if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
                     unconfirmed_cancel_streak += 1;
                     eprintln!(
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
-                         confirmed ({unconfirmed_cancel_streak}/{UNCONFIRMED_CANCEL_ABORT_THRESHOLD}). \
+                         confirmed ({unconfirmed_cancel_streak}/{cancel_abort_threshold}). \
                          The tree is captured and reported as unresolved, and the edits on disk \
                          are preserved"
                     );
@@ -9272,13 +9813,32 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = loop_task_diff(
+        //    A capture failure is a terminal iteration, not an early return:
+        //    the run still commits the worktree and emits its JSON result, so
+        //    the caller learns WHY it stopped. `?` here would skip both.
+        let (label, diff) = match loop_task_diff(
             cwd,
             scope,
             base.as_deref(),
             Some(&loop_start),
             &task_journal,
-        )?;
+        ) {
+            Ok(captured) => captured,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}/{max_iters}: diff capture failed: {detail}");
+                }
+                iterations.push(json!({
+                    "iteration": i,
+                    "resolved": false,
+                    "error": "diff_capture_failed",
+                    "diff_capture_error": detail,
+                }));
+                final_verdict = String::from("comment");
+                break;
+            }
+        };
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -9296,12 +9856,23 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // commit/report whatever is in the worktree. Only a run of unconfirmed
         // cancels (the daemon is not answering at all) stops the loop, and it
         // stops HERE, after the tree has been captured, so no edit is lost.
+        // The run is ONE on a daemon this loop owns and the FIRST one on a
+        // shared daemon (`cancel_abort_threshold`): there, a second attempt
+        // just queues behind other tenants for another full phase budget.
         let cancel_unconfirmed = matches!(
             author_err.as_deref(),
             Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
         );
         let aborted_on_unconfirmed_cancel =
-            cancel_unconfirmed && unconfirmed_cancel_streak >= UNCONFIRMED_CANCEL_ABORT_THRESHOLD;
+            cancel_unconfirmed && unconfirmed_cancel_streak >= cancel_abort_threshold;
+        if aborted_on_unconfirmed_cancel {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_DONE, i);
+            state.note_provider_error(&format!(
+                "author cancel unconfirmed {} time(s) in a row",
+                unconfirmed_cancel_streak
+            ));
+        }
 
         // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
         // headers from the diff output; this is the same set the reviewer sees.
@@ -9335,6 +9906,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: check `{c}`…");
                 }
+                run_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_phase(LOOP_PHASE_CHECK, i);
                 let t0 = std::time::Instant::now();
                 let (ok, tail) = run_check_watched(
                     cwd,
@@ -9391,16 +9966,19 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             break;
         }
         if aborted_on_unconfirmed_cancel {
-            // The daemon has not acknowledged a cancel twice in a row: it is
-            // not answering this loop at all, so every further turn would be
-            // another unprovable tree. Stop — but DO NOT discard this
+            // The daemon has not acknowledged a cancel often enough that this
+            // loop can prove its trees are quiet: on a shared daemon the FIRST
+            // miss already means the next turn would queue behind other
+            // tenants for another full phase budget, and on a daemon this loop
+            // owns the second miss is the proof. Stop — but DO NOT discard this
             // iteration's work: the diff was captured above, this record is
             // pushed, and the loop's own exit paths commit what is on disk.
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: the daemon did not confirm an author cancel \
-                     {unconfirmed_cancel_streak} times in a row; stopping with this iteration's \
-                     work preserved and reported."
+                     {unconfirmed_cancel_streak} time(s) in a row (abort threshold \
+                     {cancel_abort_threshold}); stopping with this iteration's work preserved \
+                     and reported."
                 );
             }
             iterations.push(json!({
@@ -9433,7 +10011,11 @@ diff is not a finished turn",
                 "verdict": "reviewer_unavailable",
                 "findings": [],
                 "resolved": false,
-                "abort_reason": "author cancel unconfirmed twice in a row",
+                "abort_reason": if cancel_abort_threshold == 1 {
+                    "author cancel unconfirmed on a shared daemon"
+                } else {
+                    "author cancel unconfirmed twice in a row"
+                },
             }));
             final_verdict = "reviewer_unavailable".into();
             break;
@@ -9450,6 +10032,54 @@ diff is not a finished turn",
             }
         }
 
+        // Whole-run deadline, checked before the review phase: the review is
+        // the longest optional phase left in the iteration, and starting it
+        // with no time on the clock is what turns "the loop ran long" into
+        // "the worker killed it before it could report". The iteration is
+        // recorded as unresolved with every byte of work preserved.
+        if deadline.expired() {
+            deadline_hit = true;
+            {
+                let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.set_phase(LOOP_PHASE_DONE, i);
+            }
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: whole-run deadline of {}s reached before review; \
+                     recording the iteration as unresolved and stopping",
+                    deadline.secs
+                );
+            }
+            iterations.push(json!({
+                "iter": i,
+                "author_model": turn.as_ref().map(|t| t.model.clone()),
+                "author_error": author_err.clone(),
+                "author_outcome": turn.as_ref().map(|t| t.run.outcome.clone()),
+                "author_cancel_unconfirmed": cancel_unconfirmed,
+                "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                "diff_lines": diff_lines,
+                "substance": format!("{:?}", diff_substance),
+                "check": check.as_deref(),
+                "check_passed": check_passed,
+                "review_base": loop_base,
+                "review_base_tree": loop_start.tree,
+                "start_dirty": loop_start.dirty,
+                "review_chunks": 0,
+                "review_error": "review skipped: the whole-run deadline was reached",
+                "review_complete": false,
+                "reviewer_verdicts": [],
+                "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+                "findings": [],
+                "resolved": false,
+                "abort_reason": "whole-run deadline reached",
+            }));
+            final_verdict = REVIEWER_UNAVAILABLE_VERDICT.into();
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_REVIEW, i);
+        }
         // 5. Adversarial review of the current diff (+ validation output).
         // When the patch journal has turns, use its `agent_diff` so the
         // reviewer sees EXACTLY what the agent changed — not the full
@@ -10220,80 +10850,27 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         feedback = fb;
     }
 
+    // Final heartbeat: the run is over, whatever the reason. A run that
+    // stopped because the whole-run deadline fired says so in `run.json`
+    // before the result below, so a caller polling the heartbeat learns the
+    // reason even if it never reads the result document.
+    heartbeat.finalize(LOOP_PHASE_DONE, iterations.len(), deadline_hit);
+
     // The failure classification is decided BEFORE the payload is built, so
     // the `--json` result carries the failure (class, code, retryable,
     // message) inside the SAME document that carries the loop. No
     // pre-existing field changes meaning; the `failure` field is absent on
-    // a resolved run.
+    // a resolved run. A free-policy violation resolved by the loop itself
+    // (see `loop_failure`) outranks any message heuristic.
     let failure: Option<crate::failure::ClassifiedFailure> = if resolved {
         None
     } else {
-        // WHY the loop did not resolve decides the class:
-        //
-        // * a reviewer that never produced a verdict -> `reviewer_unavailable`
-        //   (retryable: a different reviewer or a later attempt may answer);
-        // * a cancellation the engine never confirmed -> `cancelled`
-        //   (retryable: the job can be re-driven);
-        // * a budget refusal -> `budget_exceeded` (not retryable until the
-        //   window resets);
-        // * an author that never produced edits -> `engine_unreachable`
-        //   (retryable: the daemon may come back);
-        // * anything else -> `internal`.
-        //
-        // The recorded `review_error` / `author_error` of the LAST iteration
-        // is the evidence; it is the same text the operator already sees.
-        let last_iter = iterations.last();
-        let evidence = last_iter
-            .and_then(|it| {
-                it.get("review_error")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        it.get("author_error")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-            })
-            .unwrap_or_default();
-        let class = if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
-            // The engine's own budget refusal carries a reset timestamp; it
-            // must survive into the JSON so the caller knows when to come
-            // back.
-            if code == crate::failure::FailureCode::EngineBudgetExceeded {
-                crate::failure::ClassifiedFailure::with_budget_reset(code, evidence.clone(), reset)
-            } else {
-                crate::failure::ClassifiedFailure::new(code, evidence.clone())
-            }
-        } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
-            crate::failure::ClassifiedFailure::new(
-                crate::failure::FailureCode::ReviewersUnavailable,
-                evidence.clone(),
-            )
-        } else if iterations.is_empty() {
-            crate::failure::ClassifiedFailure::new(
-                crate::failure::FailureCode::EngineUnreachable,
-                evidence.clone(),
-            )
-        } else {
-            crate::failure::ClassifiedFailure::new(
-                crate::failure::FailureCode::LoopExhausted,
-                evidence.clone(),
-            )
-        };
-        let mut message = format!(
-            "loop ended unresolved after {} iteration(s)",
-            iterations.len()
-        );
-        if !evidence.is_empty() {
-            message.push_str(&format!("; last recorded reason: {evidence}"));
-        }
-        Some(crate::failure::ClassifiedFailure {
-            code: class.code,
-            message,
-            budget_reset_at: class.budget_reset_at,
-            reviewers: Vec::new(),
-            extra: serde_json::Map::new(),
-        })
+        loop_failure(
+            policy_violation.as_deref(),
+            iterations.last(),
+            &final_verdict,
+            iterations.len(),
+        )
     };
 
     let mut payload = json!({
@@ -10310,6 +10887,15 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "final_verdict": final_verdict,
         "check": check,
         "loop_timeout_secs": loop_timeout_secs,
+        // The whole-run budget and whether IT is what ended the run, kept
+        // separate from `max_iters`/`final_verdict`: a deadline stop is a
+        // budget fact, not a verdict about the work.
+        "deadline_secs": deadline_secs,
+        "deadline_reached": deadline_hit,
+        // Present only for a run stopped by the free-policy gate: the reason
+        // the loop stopped, carried in the document instead of being lost
+        // with a mid-loop `bail!`.
+        "policy_violation": policy_violation,
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
@@ -10332,6 +10918,10 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
 
     let teardown_reason = if resolved {
         "approved"
+    } else if policy_violation.is_some() {
+        "policy_violation"
+    } else if deadline_hit {
+        "deadline"
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
         "reviewer_unavailable"
     } else if iterations.is_empty() {
@@ -10344,6 +10934,7 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "iterations": iterations.len(), "max_iters": max_iters,
         "final_verdict": final_verdict, "cost_usd": total_cost,
         "duration_s": started.elapsed().as_secs(),
+        "deadline_secs": deadline_secs, "deadline_reached": deadline_hit,
         "last_good_head_sha": rev_parse_head(cwd),
         "reviewer_model": iterations.last().and_then(|it| it.get("reviewer_model")).cloned(),
     });
@@ -10431,6 +11022,14 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
     // The loop did not resolve. The class was decided above (before the
     // payload was built), so the payload already carries it and the exit
     // code matches what the JSON says.
+    //
+    // A free-policy violation is still a hard failure with the actionable
+    // `--allow-paid` hint the previous mid-loop `bail!` carried -- but it is
+    // applied only now, after the final result document, the result line and
+    // the final `run.json` have been written, so none of them is lost. It is
+    // reported through the typed contract (`policy_violation`, class config,
+    // exit 40) rather than a bare `bail!`, so the exit code still matches the
+    // `failure` object in the document.
     if let Some(f) = failure {
         return Err(match f.budget_reset_at.clone() {
             Some(reset) => crate::failure::classified_budget_err(f.message, Some(reset)),
@@ -11066,6 +11665,191 @@ mod tests {
     use clap::Parser;
     use std::path::PathBuf;
     use zoder_core::Config;
+
+    /// The whole-run deadline must land strictly BELOW the worker's timeout,
+    /// so the loop stops itself and can still commit, emit the final JSON
+    /// result and tear down — instead of being killed mid-run with no result
+    /// at all. Before this, nothing bounded the run: two compounding
+    /// unconfirmed-cancel iterations could spend all 7,200 s.
+    #[test]
+    fn loop_run_deadline_ends_run_before_worker_timeout() {
+        let deadline = default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS);
+        assert!(
+            deadline < WORKER_RUN_TIMEOUT_SECS,
+            "the loop deadline ({deadline} s) must land below the worker timeout \
+             ({WORKER_RUN_TIMEOUT_SECS} s), or the worker kills the run before the \
+             loop can emit its final result"
+        );
+        // And not so far below that it throws away usable run time: the
+        // headroom is the cleanup window, not most of the budget.
+        assert!(
+            deadline > WORKER_RUN_TIMEOUT_SECS / 2,
+            "the deadline ({deadline} s) must leave real run time, not just a \
+             cleanup window"
+        );
+        // The bound really is the deadline: just before it the run continues,
+        // at it the run stops.
+        let started = Instant::now();
+        let dl = LoopDeadline::new(deadline, started);
+        let just_before = started + Duration::from_secs(deadline - 1);
+        assert!(!dl.expired_at(just_before), "the run must not stop early");
+        let at = started + Duration::from_secs(deadline);
+        assert!(dl.expired_at(at), "the run must stop at the deadline");
+        assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// The "strictly below the worker's timeout" invariant is a property of the
+    /// FUNCTION, not of one favourable input: a small worker budget used to
+    /// make the headroom saturate the subtraction, and the degenerate branch
+    /// then returned the worker timeout itself — a deadline equal to the kill,
+    /// which is precisely the blind cut-off the deadline exists to prevent.
+    #[test]
+    fn loop_deadline_is_strictly_below_the_worker_timeout_for_every_budget() {
+        for worker in [2u64, 3, 10, 299, 300, 301, 600, 3600, 7200, 86400] {
+            let deadline = default_loop_deadline_secs(worker);
+            assert!(
+                deadline < worker,
+                "worker budget {worker} s produced deadline {deadline} s, which is not \
+                 strictly below the kill"
+            );
+            assert!(deadline > 0, "worker budget {worker} s left no run time");
+        }
+        // The fleet value: 7,200 s less the larger of a tenth of the budget
+        // and the five-minute floor — 7,200 / 10 = 720 s here, so 6,480 s.
+        assert_eq!(default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS), 6480);
+        assert_eq!(loop_deadline_headroom_secs(WORKER_RUN_TIMEOUT_SECS), 720);
+    }
+
+    /// On a SHARED daemon the FIRST unconfirmed author cancel stops the loop.
+    /// Two-in-a-row is only proof when this loop owns the daemon; on a fleet
+    /// host the second miss just queues behind other tenants' turns for
+    /// another full per-phase budget, which is how a run spends the worker's
+    /// whole timeout and gets killed blind.
+    #[test]
+    fn shared_daemon_unconfirmed_cancel_aborts_first_time() {
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(true),
+            1,
+            "a shared daemon must abort on the FIRST unconfirmed cancel"
+        );
+        // The standalone threshold is unchanged: one miss is a slow daemon.
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(false),
+            UNCONFIRMED_CANCEL_ABORT_THRESHOLD,
+            "a daemon serving this loop alone keeps the two-strike threshold"
+        );
+        assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
+    /// The three budget sources must compose in the documented order, and the
+    /// default must never equal or exceed the worker's timeout: a default at
+    /// the timeout is Incident A exactly, and a flag silently ignored is worse
+    /// than no flag.
+    #[test]
+    fn loop_run_budget_prefers_flag_then_config_then_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default_provider(dir.path());
+        // Flag wins over config.
+        cfg.loop_deadline_s = Some(1234);
+        assert_eq!(
+            resolve_loop_run_budget(Some(900), Some(&cfg)).deadline_secs,
+            900
+        );
+        // Config wins over the derived default.
+        assert_eq!(
+            resolve_loop_run_budget(None, Some(&cfg)).deadline_secs,
+            1234
+        );
+        // Unset everywhere: the derived default, which stays under the worker.
+        let bland = Config::default_provider(dir.path());
+        let derived = resolve_loop_run_budget(None, Some(&bland));
+        assert_eq!(
+            derived.deadline_secs,
+            default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS)
+        );
+        assert!(derived.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        // A config that failed to load still yields a usable, safe budget
+        // rather than an error or an unbounded run.
+        let unloaded = resolve_loop_run_budget(None, None);
+        assert!(unloaded.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        assert!(!unloaded.shared_daemon);
+        // The shared-daemon bit follows the deployment profile.
+        assert!(!resolve_loop_run_budget(None, Some(&bland)).shared_daemon);
+        // ...and flips to true for a fleet deployment, which is the only thing
+        // that makes the first unconfirmed cancel fatal.
+        let mut fleet = Config::default_provider(dir.path());
+        fleet.deployment.mode = zoder_core::config::DeploymentMode::Fleet;
+        assert!(resolve_loop_run_budget(None, Some(&fleet)).shared_daemon);
+    }
+
+    /// `run.json` must carry what a caller polling it instead of waiting out
+    /// the worker's 7,200 s actually needs: which PHASE the run is stuck in,
+    /// what each session is doing, why the last provider call failed, and
+    /// whether the whole-run deadline is what stopped the run. A heartbeat
+    /// that omits any of these is a liveness ping, not a status document.
+    #[test]
+    fn run_heartbeat_carries_phase_sessions_provider_error_and_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("job").join("run.json");
+        let started = Instant::now();
+        let mut hb = RunHeartbeat::new(Some(path.clone()), 6300, started, 5);
+        hb.set_phase(LOOP_PHASE_AUTHOR, 2);
+        hb.note_session("session-a", "running");
+        hb.note_provider_error("429 rate limited: provider overloaded");
+
+        // Written eagerly at loop entry and again on every tick, so the file
+        // exists before the first iteration finishes.
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json written"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+        assert_eq!(doc["iteration"], 2);
+        assert_eq!(doc["max_iters"], 5);
+        assert_eq!(doc["sessions"]["session-a"], "running");
+        assert_eq!(
+            doc["last_provider_error"],
+            "429 rate limited: provider overloaded"
+        );
+        assert_eq!(doc["deadline_secs"], 6300);
+        assert_eq!(doc["deadline_reached"], false);
+
+        // Re-recording the same session updates it in place: a caller must
+        // never see one session twice and have to guess which line is current.
+        hb.note_session("session-a", "cancel_unconfirmed");
+        hb.note_session("session-b", "completed:completed");
+        let doc = hb.to_json();
+        let sessions = doc["sessions"].as_object().expect("sessions object");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions["session-a"], "cancel_unconfirmed");
+        assert_eq!(sessions["session-b"], "completed:completed");
+
+        // The final document written at the deadline says so, so a caller
+        // polling the heartbeat learns the run ended without reading the
+        // result document at all.
+        hb.at_deadline();
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json rewritten"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["deadline_reached"], true);
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+    }
+
+    /// A heartbeat write is observability, never a failure mode: a job
+    /// directory that cannot be created must not take the loop down.
+    #[test]
+    fn run_heartbeat_write_is_best_effort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path whose parent is a regular FILE: create_dir_all must fail.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let mut hb = RunHeartbeat::new(Some(blocker.join("run.json")), 6300, Instant::now(), 1);
+        hb.set_phase(LOOP_PHASE_CHECK, 1);
+        hb.write(); // must not panic
+                    // With no path at all (a foreground run) it is a no-op.
+        RunHeartbeat::new(None, 6300, Instant::now(), 1).write();
+    }
 
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
     /// `~/.zoder` read-only, so
@@ -13898,6 +14682,106 @@ not run to max_iters"
             "a turn with zero tool calls and a non-completed outcome is \
              genuinely dead and must still count toward the streak"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `loop_failure` -- the merge of the D3 typed failure contract with
+    // the D7 "every exit path is reportable" rework.
+    //
+    // On `hv/zf-failure-contract-r3` the free-policy gate returned
+    // `Err(FailureCode::PolicyViolation)` from inside the loop, losing the
+    // final result document / `run.json`. On master (zf-d7-deadline) it
+    // `break`s and re-raises with a bare `anyhow::bail!`, losing the typed
+    // class. The merged behaviour keeps BOTH: the loop breaks and reports,
+    // AND the failure is classified as `policy_violation` so the exit code
+    // still matches the `failure` object in the JSON.
+    // -----------------------------------------------------------------
+
+    /// The free-policy gate outranks every message heuristic. The evidence
+    /// text here (`"loop ended unresolved ..."`) would classify as
+    /// `loop_exhausted` on its own, so only the explicit
+    /// `policy_violation` argument can produce the documented class.
+    #[test]
+    fn loop_failure_classifies_policy_violation_as_config_exit_40() {
+        let last = serde_json::json!({"author_error": "irrelevant evidence"});
+        let f = loop_failure(
+            Some("paid model without --allow-paid"),
+            Some(&last),
+            "comment",
+            3,
+        )
+        .expect("an unresolved loop always carries a failure");
+        assert_eq!(
+            f.code,
+            crate::failure::FailureCode::PolicyViolation,
+            "the free-policy gate must classify as policy_violation"
+        );
+        assert_eq!(f.code.class(), crate::failure::FailureClass::Config);
+        assert_eq!(
+            f.code.exit_code(),
+            40,
+            "D3: policy_violation is a config failure, exit 40"
+        );
+        // The actionable hint the previous mid-loop `bail!` carried must
+        // survive into the result document.
+        assert!(
+            f.message.contains("use --allow-paid to permit"),
+            "the --allow-paid hint must survive: {}",
+            f.message
+        );
+        assert!(
+            f.message.contains("paid model without --allow-paid"),
+            "the violating turn's reason must survive: {}",
+            f.message
+        );
+    }
+
+    /// A resolved run never carries a failure: `cmd_loop_run` passes `None`
+    /// for the policy violation and no evidence, and the caller short-cuts
+    /// to `None`. This pins that an unresolved loop with no evidence at all
+    /// still yields a classified failure rather than `None`.
+    #[test]
+    fn loop_failure_without_evidence_still_classifies() {
+        let f = loop_failure(None, None, "comment", 2).expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::LoopExhausted);
+        assert!(
+            f.message
+                .starts_with("loop ended unresolved after 2 iteration(s)"),
+            "{}",
+            f.message
+        );
+    }
+
+    /// A loop that never ran an iteration is an unreachable engine
+    /// (transient, exit 20), not an exhausted loop. This is the arm the D3
+    /// contract added; it must survive the merge.
+    #[test]
+    fn loop_failure_with_no_iterations_is_engine_unreachable() {
+        let f = loop_failure(None, None, "comment", 0).expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::EngineUnreachable);
+        assert_eq!(f.code.exit_code(), 20);
+    }
+
+    /// A reviewer that never answered is transient, not permanent: the
+    /// verdict decides the class when no more specific evidence matched.
+    #[test]
+    fn loop_failure_reviewer_unavailable_verdict_is_transient() {
+        let f = loop_failure(None, None, REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::ReviewersUnavailable);
+        assert_eq!(f.code.exit_code(), 20);
+    }
+
+    /// The engine's own budget refusal carries a reset timestamp that must
+    /// survive into the JSON so the caller knows when to come back.
+    #[test]
+    fn loop_failure_engine_budget_refusal_keeps_its_reset() {
+        let evidence = crate::failure::BUDGET_EXCEEDED_MARKER.to_string();
+        let last = serde_json::json!({ "author_error": evidence });
+        let f =
+            loop_failure(None, Some(&last), "comment", 1).expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::EngineBudgetExceeded);
+        assert_eq!(f.code.exit_code(), 30);
     }
 
     #[test]
@@ -20825,6 +21709,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &cwd,
@@ -20902,6 +21790,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -20967,6 +21859,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
