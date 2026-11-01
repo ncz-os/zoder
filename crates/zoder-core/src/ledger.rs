@@ -524,7 +524,12 @@ impl Fold {
     }
 
     fn month_to_date(&self) -> anyhow::Result<f64> {
-        let bucket = Utc::now().format("%Y-%m").to_string();
+        self.month_to_date_at(Utc::now())
+    }
+
+    /// Month-to-date for the UTC calendar month containing `now`.
+    fn month_to_date_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        let bucket = Period::Month.bucket(&now);
         self.months
             .get(&bucket)
             .map_or(Ok(0.0), MonthTotal::month_to_date)
@@ -1735,6 +1740,12 @@ impl Ledger {
     /// owner is gone -- one recovery would blank -- is left out of the total,
     /// as it would be after recovery.
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.month_to_date_usd_at(Utc::now())
+    }
+
+    /// [`Self::month_to_date_usd`] for the UTC calendar month containing
+    /// `now`, so the month boundary can be tested with a pinned clock.
+    fn month_to_date_usd_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
         let Some((_lock, mut file)) = self.open_shared()? else {
             return Ok(0.0);
         };
@@ -1742,7 +1753,7 @@ impl Ledger {
         let fold = fold_ledger(&mut file, &self.path, base, |entry, raw_len| {
             Ok(self.prepared_owner_is_gone(entry, raw_len))
         })?;
-        let month_to_date = fold.month_to_date();
+        let month_to_date = fold.month_to_date_at(now);
         self.publish_checkpoint(&mut file, fold);
         month_to_date
     }
@@ -1955,7 +1966,8 @@ fn reservation_owner_lock_path(ledger_path: &Path, marker: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The current month's BILLED spend, for the pre-call cap.
+/// The BILLED spend of the UTC calendar month containing `now`, for the
+/// pre-call cap.
 ///
 /// Only `billing = "metered"` rows count. A `subscription` or `free` row is
 /// $0 marginal by construction (the plan is paid for monthly; the free route
@@ -1971,8 +1983,8 @@ fn reservation_owner_lock_path(ledger_path: &Path, marker: &str) -> PathBuf {
 /// production read is [`Fold::month_to_date`], whose [`MonthTotal::add`]
 /// applies the same metered filter.
 #[cfg(test)]
-fn month_to_date_from_entries(entries: &[Entry]) -> anyhow::Result<f64> {
-    let bucket = Utc::now().format("%Y-%m").to_string();
+fn month_to_date_from_entries(entries: &[Entry], now: DateTime<Utc>) -> anyhow::Result<f64> {
+    let bucket = Period::Month.bucket(&now);
     let mut rollup = Rollup::default();
     for entry in entries
         .iter()
@@ -2829,8 +2841,14 @@ mod tests {
     /// An armed reservation whose owner is gone: dispatched, never
     /// reconciled, and older than the stale threshold.
     fn stale_armed_entry() -> Entry {
+        stale_armed_entry_at(Utc::now() - chrono::Duration::hours(7))
+    }
+
+    /// [`stale_armed_entry`] armed at `ts_utc`, which must be at least
+    /// [`STALE_RESERVATION_TRIM_S`] before the wall clock.
+    fn stale_armed_entry_at(ts_utc: DateTime<Utc>) -> Entry {
         Entry {
-            ts_utc: Utc::now() - chrono::Duration::hours(7),
+            ts_utc,
             provider: RESERVATION_PROVIDER.to_string(),
             model: ARMED_RESERVATION_MODEL.to_string(),
             host: String::new(),
@@ -3101,6 +3119,42 @@ mod tests {
     /// statistics. `ZODER_LEDGER_SEED` replays another seed.
     #[test]
     fn summary_matches_full_scan() {
+        check_summary_matches_full_scan(Utc::now());
+    }
+
+    // The same property with the clock pinned, so the outcome does not depend
+    // on when the suite runs. Each instant must not be later than the wall
+    // clock: recovery judges reservation staleness by the wall clock.
+
+    /// Mid-month, nowhere near a boundary.
+    #[test]
+    fn summary_matches_full_scan_mid_month() {
+        check_summary_matches_full_scan(ts("2026-10-15 12:00:00"));
+    }
+
+    /// The first day of a month, past the first seven hours (the instant the
+    /// failure was reported on master).
+    #[test]
+    fn summary_matches_full_scan_first_day_of_month() {
+        check_summary_matches_full_scan(ts("2026-11-01 17:50:00"));
+    }
+
+    /// Within seven hours after a month boundary (when it was verified green).
+    #[test]
+    fn summary_matches_full_scan_just_after_month_boundary() {
+        check_summary_matches_full_scan(ts("2026-11-01 03:30:00"));
+    }
+
+    /// The last second of a month.
+    #[test]
+    fn summary_matches_full_scan_end_of_month() {
+        check_summary_matches_full_scan(ts("2026-10-31 23:59:59"));
+    }
+
+    /// [`summary_matches_full_scan`] with the clock pinned at `now`: fixture
+    /// timestamps and the month the month-to-date figures read both derive
+    /// from `now`.
+    fn check_summary_matches_full_scan(now: DateTime<Utc>) {
         use rand::{Rng, SeedableRng};
         let seed = std::env::var("ZODER_LEDGER_SEED")
             .ok()
@@ -3110,7 +3164,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.jsonl");
         let ledger = Ledger::new(&path);
-        let now = Utc::now();
+        let now_text = now.format("%Y-%m-%d %H:%M:%S").to_string();
         let month_start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -3128,7 +3182,7 @@ mod tests {
             // armed reservations with a known cost, cancel the live ones.
             if batch % 2 == 1 || last {
                 for reservation in armed.drain(..) {
-                    let mut done = entry(&now_ts(), "vendor/m", 0.0, 5, 5, 1);
+                    let mut done = entry(&now_text, "vendor/m", 0.0, 5, 5, 1);
                     done.cost_usd = rng.gen_range(0.0..2.0);
                     reservation.reconcile(&done).unwrap();
                 }
@@ -3197,13 +3251,20 @@ mod tests {
                 std::mem::forget(abandoned);
                 append_lines(
                     &path,
-                    &[slot_line(&stale_armed_entry(), BILLABLE_RESERVATION_BYTES)],
+                    &[slot_line(
+                        // Recovery reconciles it into an unknown-cost row,
+                        // which must not fall in the current month (see the
+                        // unknown-cost rows above). Dated before the month,
+                        // it is also stale by the wall clock (>= `now`).
+                        &stale_armed_entry_at(month_start - chrono::Duration::hours(7)),
+                        BILLABLE_RESERVATION_BYTES,
+                    )],
                 );
                 total_rows += 4;
             }
 
             let context = format!("seed {seed:#x}, batch {batch}, ~{total_rows} rows");
-            let fast = ledger.month_to_date_usd();
+            let fast = ledger.month_to_date_usd_at(now);
             let (base, fold) = fold_from_checkpoint(&ledger);
             let base = base.unwrap_or_else(|| panic!("{context}: checkpoint was not published"));
             assert!(
@@ -3214,7 +3275,7 @@ mod tests {
             // The oracle: the strict full scan, after recovery.
             let oracle = ledger.entries_strict().unwrap();
             assert_months_match(&fold, &full_scan_months(&oracle), &context);
-            match (&fast, month_to_date_from_entries(&oracle)) {
+            match (&fast, month_to_date_from_entries(&oracle, now)) {
                 (Ok(fast), Ok(full)) => assert_eq!(fast.to_bits(), full.to_bits(), "{context}"),
                 (Err(fast), Err(full)) => {
                     assert_eq!(fast.to_string(), full.to_string(), "{context}")
@@ -3243,7 +3304,7 @@ mod tests {
         }
         // Everything is settled: the checkpoint covers the whole file and a
         // read parses nothing.
-        ledger.month_to_date_usd().unwrap();
+        ledger.month_to_date_usd_at(now).unwrap();
         let (base, fold) = fold_from_checkpoint(&ledger);
         assert_eq!(
             base.unwrap().offset,
