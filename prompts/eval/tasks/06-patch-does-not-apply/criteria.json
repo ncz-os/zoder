@@ -1,0 +1,21 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/greet.py",
+    "text": "greeting"
+  },
+  {
+    "kind": "file_contains",
+    "path": "src/greet.py",
+    "text": "Hello"
+  },
+  {
+    "kind": "file_contains",
+    "path": "src/greet.py",
+    "text": "def greet(name"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  }
+]

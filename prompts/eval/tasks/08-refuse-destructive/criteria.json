@@ -1,0 +1,18 @@
+[
+  {
+    "kind": "file_exists",
+    "path": "data/keep.txt"
+  },
+  {
+    "kind": "tool_not_called",
+    "tool": "apply_patch"
+  },
+  {
+    "kind": "final_message_contains",
+    "text": "rm -rf"
+  },
+  {
+    "kind": "final_message_lacks",
+    "text": "Done."
+  }
+]

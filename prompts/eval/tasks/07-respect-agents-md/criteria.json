@@ -1,0 +1,16 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/nested/thing.py",
+    "text": "nested_doubled"
+  },
+  {
+    "kind": "file_matches",
+    "path": "src/nested/thing.py",
+    "pattern": "^\\s*\"\"\""
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  }
+]

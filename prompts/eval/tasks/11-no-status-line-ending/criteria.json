@@ -1,0 +1,19 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/math.py",
+    "text": "def triple(x):"
+  },
+  {
+    "kind": "final_message_lacks",
+    "text": "I have added"
+  },
+  {
+    "kind": "final_message_lacks",
+    "text": "Let me know if"
+  },
+  {
+    "kind": "final_message_contains",
+    "text": "src/math.py"
+  }
+]

@@ -9,11 +9,13 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 mod agentic;
 mod child_env;
+mod config_cache;
 mod context_opt;
 mod evals;
 mod exec_safety;
 mod goose;
 mod jobs;
+mod master_prompt;
 mod mnemos;
 mod provider_health;
 mod provider_slots;
@@ -1435,6 +1437,20 @@ enum Cmd {
         /// Run detached as a tracked background job.
         #[arg(long)]
         background: bool,
+        /// Whole-run wall-clock deadline for `zoder loop`, in seconds.
+        ///
+        /// Unlike `--loop-timeout` (which bounds ONE phase — an author turn,
+        /// the `--check`, or a review), this bounds the entire run. When it
+        /// expires the loop stops at the next safe point, commits what is on
+        /// disk, and still writes its final JSON result, instead of being
+        /// killed blind by the worker's own timeout.
+        ///
+        /// Default: derived from the worker's 7,200 s job timeout and kept
+        /// strictly below it (6,300 s: a tenth of the budget, minimum five
+        /// minutes, is left for teardown and reporting). Config key:
+        /// `loop_deadline_s`.
+        #[arg(long, value_name = "SECS")]
+        deadline: Option<u64>,
     },
     /// Print a resumable engine session id for the current working dir
     /// (codex `/transfer` equivalent) so a follow-up can `--session <id>`.
@@ -1912,6 +1928,95 @@ fn provider_route_corpus(cfg: &Config, public: &Corpus) -> anyhow::Result<Corpus
 }
 
 #[cfg(test)]
+mod engine_loader_tests {
+    use super::*;
+
+    /// A home with a provider config and NO `model_corpus.json` — a host that
+    /// installed zoder but never a model corpus.
+    fn write_corpusless_home(home: &std::path::Path) {
+        let body = json!({
+            "providers": [{
+                "id": "wiremock",
+                "base_url": "https://reviewer.example.invalid/v1",
+                "kind": "openai-chat",
+                "auth": {"type": "none"},
+                "billing": "free",
+                "serves": ["zz-unpriced/"],
+            }],
+            "default_provider": "wiremock",
+            "strict_free": false,
+            "corpus_path": home.join("model_corpus.json"),
+            "ledger_path": home.join("ledger.jsonl"),
+            "health_path": home.join("health.json"),
+        });
+        std::fs::write(
+            home.join("config.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("engine")).unwrap();
+        std::fs::write(home.join("engine").join("config.toml"), "").unwrap();
+    }
+
+    /// `spend` and `report` read the ledger, not the model corpus. D5.6: they
+    /// used the whole-engine loader, so a host with no corpus installed could
+    /// not report what it had spent at all, and every run paid for a
+    /// multi-megabyte corpus deserialization it never consulted.
+    #[test]
+    fn spend_loads_config_without_a_corpus() {
+        let home = tempfile::tempdir().unwrap();
+        write_corpusless_home(home.path());
+        let engine_cfg = home.path().join("engine").join("config.toml");
+        assert!(
+            !home.path().join("model_corpus.json").exists(),
+            "the fixture must have no corpus"
+        );
+
+        let _lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev = std::env::var("ZODER_HOME").ok();
+        std::env::set_var("ZODER_HOME", home.path());
+        // The routing loader still requires a corpus — that contract is
+        // unchanged, and it is what used to fail `zoder spend`.
+        assert!(
+            Engine::load_with_engine_config(Some(&engine_cfg)).is_err(),
+            "the routing loader must still refuse to run without a corpus"
+        );
+        let loaded = Engine::load_config_only(Some(&engine_cfg));
+        // The real command, through the real loader: the regression was that
+        // `spend` used the corpus-loading engine and failed here.
+        let spent = cmd_spend("month", None, None, false, None, true);
+        // `report` is the other corpus-free command (D5.6).
+        let reported = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cmd_report(
+                super::ReportPeriod::Month,
+                None,
+                10,
+                None,
+                None,
+                true,
+            ));
+        match prev {
+            Some(value) => std::env::set_var("ZODER_HOME", value),
+            None => std::env::remove_var("ZODER_HOME"),
+        }
+        let reported = reported;
+
+        spent.expect("zoder spend must work on a host with no corpus installed");
+        reported.expect("zoder report must work on a host with no corpus installed");
+        let eng = loaded.expect("the config-only loader needs no corpus");
+        assert_eq!(eng.cfg.providers.len(), 1, "the provider config is loaded");
+        assert_eq!(eng.cfg.ledger_path, home.path().join("ledger.jsonl"));
+        assert_eq!(eng.corpus.count, 0, "the corpus is neither read nor needed");
+        assert_eq!(eng.route_corpus.count, 0, "no route projection is built");
+    }
+}
+
+#[cfg(test)]
 mod provider_route_corpus_tests {
     use super::*;
 
@@ -2056,6 +2161,78 @@ mod provider_route_corpus_tests {
     }
 }
 
+/// Counts every whole-engine read in this process, so a test can prove a
+/// review loads the engine ONCE (D5 item 2) instead of re-reading the config,
+/// the engine TOML and the multi-megabyte model corpus on every dispatch,
+/// every repair and every recorded failure.
+///
+/// A test measures the DELTA this review caused, and the delta must be exact:
+/// `Engine::load()` FAILS for a fixture home with no engine `config.toml`, but
+/// a load that failed still did the config read and the engine-registry bind
+/// this work removes. So the counter is keyed by `Config::home()`, the view
+/// [`engine_load_count_for`] reads, and a load of some OTHER home (a
+/// neighbouring test holding [`crate::test_env::ENV_LOCK`]) cannot move it.
+///
+/// Each write is one relaxed `fetch_add` on the loaded home's counter. Nothing
+/// in a non-test build reads the counter (the per-home map and the reader are
+/// `#[cfg(test)]`), so a test tally can never drive production behaviour —
+/// `engine_load_counter_for` still returns a counter unconditionally, so the
+/// increment is the same single relaxed instruction in both builds.
+#[cfg(test)]
+static ENGINE_LOADS_BY_HOME: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn engine_load_counters() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+> {
+    ENGINE_LOADS_BY_HOME.get_or_init(Default::default)
+}
+
+/// The counter [`Engine::load_with_engine_config`] bumps for `home`. Handed out
+/// by value so the loader bumps it without holding the registry lock.
+fn engine_load_counter_for(home: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    #[cfg(test)]
+    {
+        engine_load_counters()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(home.to_path_buf())
+            .or_default()
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        // No per-home reader exists outside tests; keep the hot path
+        // allocation-free with the single process-wide counter.
+        let _ = home;
+        static SHARED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicUsize>> =
+            std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .clone()
+    }
+}
+
+/// Number of whole-engine loads performed so far for `home` in this process.
+/// A home this process has not loaded an engine for reads 0.
+///
+/// This read takes only the counter registry's own mutex, never
+/// [`crate::test_env::ENV_LOCK`] and never a database-style lock held across
+/// I/O, so calling it from inside a test that already holds `ENV_LOCK` (every
+/// test that redirects `ZODER_HOME` does) cannot deadlock.
+#[cfg(test)]
+pub(crate) fn engine_load_count_for(home: &Path) -> usize {
+    engine_load_counters()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(home)
+        .map_or(0, |n| n.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl Engine {
     fn load() -> anyhow::Result<Self> {
         Self::load_with_engine_config(None)
@@ -2076,7 +2253,58 @@ impl Engine {
     /// override travels as an explicit parameter instead, so nothing
     /// global is touched. See `crate::child_env` for the wider story
     /// about process-global state in a parallel test binary.
-    fn load_with_engine_config(engine_config: Option<&std::path::Path>) -> anyhow::Result<Self> {
+    ///
+    /// The legacy whole-engine read: `Config::load` plus the engine TOML
+    /// registry, the model corpus and the provider-scoped route projection.
+    /// This is the loader for anything that ROUTES (routing needs the corpus,
+    /// the policy gate and the alias registry). Commands that only read the
+    /// ledger must NOT pay for it: the corpus deserialization and its clone
+    /// dominate their wall time, and a host with no corpus installed gets an
+    /// error it has no use for. Use [`Engine::load_config_only`] there.
+    pub(crate) fn load_with_engine_config(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        // Counted BEFORE the fallible reads: a load that fails on a missing
+        // corpus still did the config read and the registry bind, which is
+        // exactly the work D5 item 2 removes from a review.
+        engine_load_counter_for(&Config::home()).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
+        let corpus = Corpus::load(&cfg.corpus_path)?;
+        let route_corpus = provider_route_corpus(&cfg, &corpus)?;
+        Ok(Self {
+            cfg,
+            corpus,
+            route_corpus,
+            engine_models,
+        })
+    }
+
+    /// The engine read for commands that never route: `Config::load` plus the
+    /// engine TOML registry (which `Config::load` cannot do on its own — the
+    /// engine `config.toml` is deliberately excluded from it). The corpus
+    /// fields stay empty and the corpus file is never opened, so `zoder spend`
+    /// and `zoder report` succeed when no corpus is installed.
+    ///
+    /// Anything that consults `engine.corpus` / `engine.route_corpus` must use
+    /// [`Engine::load`] instead: an empty corpus here would silently change a
+    /// routing decision.
+    pub(crate) fn load_config_only(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let (cfg, engine_models) = Self::load_cfg_and_registry(engine_config)?;
+        Ok(Self {
+            cfg,
+            corpus: Corpus::default(),
+            route_corpus: Corpus::default(),
+            engine_models,
+        })
+    }
+
+    /// `Config::load` + the engine model registry, with the provider mappings
+    /// bound. Shared by both loaders so they cannot drift on validation.
+    fn load_cfg_and_registry(
+        engine_config: Option<&std::path::Path>,
+    ) -> anyhow::Result<(Config, EngineModelRegistry)> {
         let mut cfg = Config::load()?;
         let engine_cfg_path = match engine_config {
             Some(p) => p.to_path_buf(),
@@ -2090,14 +2318,7 @@ impl Engine {
                     engine_cfg_path.display()
                 )
             })?;
-        let corpus = Corpus::load(&cfg.corpus_path)?;
-        let route_corpus = provider_route_corpus(&cfg, &corpus)?;
-        Ok(Self {
-            cfg,
-            corpus,
-            route_corpus,
-            engine_models,
-        })
+        Ok((cfg, engine_models))
     }
 
     /// Build an `Engine` from explicit in-memory parts — used by unit tests
@@ -2484,8 +2705,18 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
+/// The instant this process started, captured on first read so every
+/// whole-run budget (the loop's `--deadline`) measures from the same origin
+/// rather than from the command's own entry point.
+pub(crate) fn process_start_instant() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
 #[tokio::main]
 async fn main() {
+    let _ = process_start_instant();
     // Restore default SIGPIPE handling so piping into `head`/`less` (which close
     // the reader early) ends the process quietly instead of panicking on a
     // broken pipe mid-table.
@@ -2716,9 +2947,20 @@ async fn run() -> anyhow::Result<()> {
             require_approval,
             allow_dangerous_check,
             background,
+            deadline,
         }) => {
             let agent_timeout_secs = cli.agent_timeout.unwrap_or(900);
             let loop_timeout_secs = cli.loop_timeout.unwrap_or(900);
+            // Whole-run deadline: `--deadline` > config `loop_deadline_s` >
+            // derived from the worker's 7,200 s timeout and kept below it.
+            // A config that does not load is already fatal inside the loop,
+            // which reports it with its own diagnosis; resolve the budget from
+            // the built-in defaults here rather than turning a load failure
+            // into a different, earlier error.
+            let run_budget = agentic::resolve_loop_run_budget(
+                *deadline,
+                Engine::load().ok().map(|engine| engine.cfg).as_ref(),
+            );
             agentic::cmd_loop(
                 &cli,
                 task,
@@ -2732,6 +2974,7 @@ async fn run() -> anyhow::Result<()> {
                 *background,
                 loop_timeout_secs,
                 agent_timeout_secs,
+                run_budget,
                 *allow_dangerous_check,
                 *require_approval,
             )
@@ -3589,7 +3832,7 @@ fn cmd_tui(extra: &[String]) -> anyhow::Result<()> {
     // goes to stderr, before the exec, so the operator sees it even though
     // the TUI takes over the terminal.
     if let Ok(cfg) = Config::load_unvalidated() {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         warn_installed_data_age(&cfg, &pricing);
     }
     let bin = locate_sibling("zerocode").ok_or_else(|| {
@@ -3893,7 +4136,7 @@ async fn cmd_models(
     }
 
     let p = Pal::new();
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     // Live health/latency from the on-disk health store (updated as models are
     // called). Drives the "health" and "resp" columns so the operator sees which
     // models are ready and how fast they have been responding.
@@ -6530,7 +6773,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     // month-to-date spend is treated as "could not read spend, ask the
     // user" rather than silently reporting $0 — Finding #10.
     if !cli.allow_paid && !provider_cost_neutral {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
         let verdict = eng.cfg.budget.evaluate_call(
             &pricing,
@@ -6926,7 +7169,7 @@ raise --max-tokens or lower its reasoning effort",
         .provider(&used_provider_id)
         .map(BillingPosture::from)
         .unwrap_or(BillingPosture::Metered);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let ts_utc = chrono::Utc::now();
     let (cost, unknown_cost) = ledger_call_cost(
         posture,
@@ -9382,6 +9625,41 @@ mod test_env {
             std::env::set_var("ZODER_HOME", home);
             Self { _lock, prev }
         }
+
+        /// Hold the shared lock for the guard's lifetime and set `key` to
+        /// `value` (`None` unsets it), restoring the previous value on drop.
+        /// Used by tests that need a NON-home environment switch without
+        /// taking a second copy of the lock.
+        pub(crate) fn set_var(key: &'static str, value: Option<&str>) -> VarGuard {
+            VarGuard {
+                _lock: ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+                key,
+                prev: {
+                    let prev = std::env::var(key).ok();
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                    prev
+                },
+            }
+        }
+    }
+
+    /// Restores one environment variable (see [`EnvGuard::set_var`]).
+    pub(crate) struct VarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -10230,8 +10508,7 @@ mod oneshot_ledger_billing_tests {
                     let row = &rows[0];
                     // Reproduce the dispatch math directly in the test so a
                     // regression is visible in the assertion itself.
-                    let pricing =
-                        zoder_core::pricing::PricingCatalog::load(&home.join("pricing.json"));
+                    let pricing = crate::config_cache::pricing_catalog(&home.join("pricing.json"));
                     let (cost, unknown) = ledger_call_cost(
                         BillingPosture::Metered,
                         None,
@@ -12217,7 +12494,7 @@ pub(crate) async fn agentic_turn(
     // classification as --oneshot. Agent dispatch must not bypass unknown
     // pricing, per-call caps, or month-to-date caps.
     if !cli.allow_paid {
-        let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+        let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let verdict = evaluate_default_exec_budget(
             &eng.cfg,
             &pricing,
@@ -12687,6 +12964,16 @@ pub(crate) async fn agentic_turn(
         };
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
+        // MASTER PROMPT (opt-in). The overlay depends on WHICH model is
+        // serving this turn — a fallback down the chain is a different
+        // family and gets its own overlay — so the prompt is composed
+        // HERE, per candidate, not once for the head.
+        //
+        // NON-BREAKING: with `[prompt] master` off (the default) this
+        // returns the task text byte-for-byte, so `chain_opts.prompt` is
+        // exactly what it was before this slice.
+        chain_opts.prompt = crate::master_prompt::compose_author_prompt(&eng.cfg, &model, &prompt)
+            .map_err(|e| anyhow::anyhow!("[zoder] master prompt unavailable: {e}"))?;
         // SESSION CONTINUITY IS KEYED PER AGENT. Zeroclaw binds a session
         // to the agent that minted it, so a model fallback (which resolves
         // to a different alias) must NOT be handed the head agent's id —
@@ -13260,7 +13547,10 @@ fn cmd_spend(
     host: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+    // `spend` reads the ledger and never routes, so it must not pay for the
+    // corpus (a multi-MB deserialization it never consults) and must not fail
+    // on a host where no corpus is installed.
+    let eng = Engine::load_config_only(None)?;
     let ledger = Ledger::new(&eng.cfg.ledger_path);
     let since = since.map(|s| parse_date(s, false)).transpose()?;
     let until = until.map(|s| parse_date(s, true)).transpose()?;
@@ -13566,7 +13856,7 @@ async fn cmd_report(
     maybe_spawn_daily_refresh();
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     // The data-age warning for the installed files. In `file` pricing-source
     // mode `maybe_spawn_daily_refresh` skipped the spawn, so this line is
     // the only signal the operator gets that the installed data has gone
@@ -14102,7 +14392,7 @@ async fn cmd_finops(
 ) -> anyhow::Result<()> {
     let eng = Engine::load()?;
     let led = Ledger::new(&eng.cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let argv: Vec<String> = std::iter::empty()
         .chain(std::iter::once("zoder".to_string()))
         .chain(std::iter::once(sub.to_string()))
@@ -14518,7 +14808,7 @@ async fn reconcile_probe_success(
         .provider(provider_id)
         .map(BillingPosture::from)
         .unwrap_or(BillingPosture::Metered);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let ts_utc = Utc::now();
     let (cost, cost_unknown) = ledger_call_cost(
         posture,
@@ -16244,7 +16534,7 @@ fn maybe_spawn_daily_refresh() {
     // daily refresh wrote it; fall back to the report copy's date for the
     // warning so an operator sees the age of the data they installed.
     let report_path = Config::home().join("pricing.json");
-    let cat = PricingCatalog::load(&report_path);
+    let cat = crate::config_cache::pricing_catalog(&report_path);
     let data_date_age_days =
         zoder_core::pricing::data_date(&cat.generated, cat.generated_at.as_deref().unwrap_or(""))
             .map(|d| (chrono::Utc::now().date_naive() - d).num_days());
@@ -16343,7 +16633,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             // (a public repull would relabel it and unmanage the file).
             // Carry the installed values into the refreshed catalog.
             if switch.is_file() {
-                let installed = PricingCatalog::load(&path);
+                let installed = crate::config_cache::pricing_catalog(&path);
                 carry_installed_provenance(&mut cat, &installed);
             }
             cat.save(&path)?;
@@ -16408,7 +16698,7 @@ async fn cmd_pricing(action: &PricingCmd, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         PricingCmd::Show { model } => {
-            let cat = PricingCatalog::load(&path);
+            let cat = crate::config_cache::pricing_catalog(&path);
             // Data-age warning for the installed files (once per process,
             // stderr only): the pricing catalog AND the model corpus, one
             // line per file.
@@ -16472,7 +16762,7 @@ async fn cmd_reconcile(provider: &str, days: i64, json: bool) -> anyhow::Result<
     // same provider id -- the figure the provider's cost API is trued up against.
     let cfg = Config::load()?;
     let ledger = Ledger::new(&cfg.ledger_path);
-    let pricing = PricingCatalog::load(&Config::home().join("pricing.json"));
+    let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
     let since = chrono::Utc::now() - chrono::Duration::days(days.max(1));
     // Re-price each ledger entry off its recorded timestamp so the
     // off-peak window is honored on the reconciliation path as well
@@ -16707,7 +16997,9 @@ async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()
              no plan-usage API); got `{provider}`"
         );
     }
-    let eng = Engine::load()?;
+    // Only the provider's credential and base URL are read: no routing, no
+    // corpus.
+    let eng = Engine::load_config_only(None)?;
     let p = select_quota_provider(&eng.cfg.providers)?;
     let token = match p.auth.resolve() {
         Some(t) if !t.is_empty() => t,
@@ -16896,7 +17188,9 @@ fn auth_kind_label(a: &zoder_core::Auth) -> String {
 }
 
 fn cmd_providers(json: bool) -> anyhow::Result<()> {
-    let eng = Engine::load()?;
+    // Provider descriptors and plan windows come from the config and the tier
+    // catalog, never from the model corpus.
+    let eng = Engine::load_config_only(None)?;
     // The tier catalog is bundled + on-disk refreshable; same pattern as
     // Corpus. Loading it is best-effort: an unreadable / unparseable catalog
     // never breaks `zoder providers` — explicit windows still work, the

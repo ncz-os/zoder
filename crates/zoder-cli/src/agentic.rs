@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use futures_util::stream::StreamExt;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -717,6 +719,18 @@ async fn complete_once(
     max_tokens: u32,
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Completion> {
+    // One engine read for the whole completed call (D5 item 2): the plan and
+    // every dispatch below borrow the engine loaded here. The explicit
+    // `engine_config` seam is preserved — it is the only way a test can point
+    // the alias registry at a fixture WITHOUT racing on the process-global
+    // `ZEROCLAW_CONFIG_DIR` (see `crate::child_env`).
+    let eng = Engine::load_with_engine_config(engine_config)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+        })
+        .map_err(ChainFailure::into_anyhow)?;
     complete_once_tracked(
         cli,
         model_override,
@@ -726,7 +740,7 @@ async fn complete_once(
         system,
         user,
         max_tokens,
-        engine_config,
+        &eng,
         false,
     )
     .await
@@ -756,7 +770,7 @@ async fn complete_once_tracked(
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
+    eng: &Engine,
     exact_pin: bool,
 ) -> Result<ChainCompletion, ChainFailure> {
     // Build the ordered candidate list the dispatch loop walks. The shape
@@ -766,18 +780,12 @@ async fn complete_once_tracked(
     // error. The list is deduped so an operator who lists the same model
     // twice (e.g. via both `[agents.X].reviewer_model` and the scenario
     // chain) doesn't pay for the same call twice.
-    let mut plan = build_reviewer_plan(
-        cli,
-        model_override,
-        reviewer_chain,
-        author_models,
-        engine_config,
-    )
-    .map_err(|e| ChainFailure {
-        message: e.to_string(),
-        skipped: Vec::new(),
-        forced: false,
-    })?;
+    let mut plan = build_reviewer_plan(cli, eng, model_override, reviewer_chain, author_models)
+        .map_err(|e| ChainFailure {
+            message: e.to_string(),
+            skipped: Vec::new(),
+            forced: false,
+        })?;
     // The global `-m` switch is an exact pin. A standalone review may use it
     // as its reviewer override, but must not silently fall back to a different
     // configured reviewer when that pinned endpoint fails.
@@ -851,17 +859,8 @@ async fn complete_once_tracked(
                 prev = plan.candidates[idx - 1]
             );
         }
-        match dispatch_reviewer_for_model(
-            cli,
-            model,
-            model,
-            system,
-            user,
-            max_tokens,
-            engine_config,
-            None,
-        )
-        .await
+        match dispatch_reviewer_for_model(cli, eng, model, model, system, user, max_tokens, None)
+            .await
         {
             Ok(c) => {
                 let escalation_reason = skipped.first().map(|s| s.reason.clone());
@@ -890,76 +889,67 @@ async fn complete_once_tracked(
                 // id is resolved from routing if available (consistent
                 // with author path / agentic turn) so the on-disk store
                 // sees the same stamp as the author's pre-gate entry.
-                if let Ok(eng) = Engine::load_with_engine_config(engine_config) {
-                    // Resolve the provider id BEFORE taking the health lock --
-                    // this is read-only routing config I/O and touches no
-                    // health state, so it must not extend the locked critical
-                    // section.
-                    let provider_id = crate::RoutingContext::load(&eng.cfg)
-                        .ok()
-                        .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
-                        .map(|p| p.id.clone())
-                        .or_else(|| {
-                            eng.cfg
-                                .provider(model)
-                                .filter(|p| {
-                                    !p.base_url
-                                        .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
-                                })
-                                .map(|p| p.id.clone())
-                        })
-                        .unwrap_or_default();
-                    // When a status is present we route through
-                    // `Classification::from_status` so 401/403/429/503/529
-                    // land on the right bucket. The `FallbackWorthy` arm
-                    // only carries `kind + status`, so the typed body
-                    // fallback for the Anthropic branch (Y-14) does not
-                    // apply on this path -- the reviewer dispatcher
-                    // surfaces errors out of `stream_chat`, which
-                    // already populated `anthropic_error_body` upstream
-                    // if the wire carried it.
-                    let cls = status
-                        .map(zoder_core::Classification::from_status)
-                        .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
-                    // C4-MH1: record + persist under an exclusive lock. This
-                    // reviewer fallback runs inside a `join_all` fan-out and
-                    // races the daemon/CLI, so a bare load -> record -> save
-                    // would drop a concurrently-recorded failure (lost
-                    // update). `mutate_locked` reloads the freshest on-disk
-                    // store under an advisory lockfile (create_new on
-                    // `<stem>.lock`, not a File::lock/flock), applies this
-                    // delta, and writes atomically before releasing -- so
-                    // every panel model's failure survives.
-                    // The provider layer (`zoder_core::provider`) is the
-                    // single source of truth for a MiniMax M Plan wall:
-                    // `observe_token_plan_limit` does the best-effort live
-                    // `token_plan/remains` refresh and persists a
-                    // machine-observed reset when the endpoint answers,
-                    // else a grace-bound one. Here we read that persisted
-                    // reset rather than hardcoding our own 5h estimate —
-                    // `observed_reset_at` is the reset of the full window
-                    // the API itself reported (the 5h reset when the
-                    // refresh shows no full window). `None` means no wall is persisted for
-                    // this provider (either not a MiniMax wall, or the
-                    // state was pruned), in which case the generic
-                    // `record_classified_failure` path below is enough.
-                    let wall = status
-                        .and_then(|st| {
-                            (st == 429)
-                                .then(|| zoder_core::minimax::observed_reset_at(&provider_id))
-                        })
-                        .flatten()
-                        .map(|t| t.timestamp());
-                    let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
-                        h.record_classified_failure_with_wall(
-                            model,
-                            &message,
-                            &provider_id,
-                            cls,
-                            wall,
-                        );
-                    });
-                }
+                // Resolve the provider id BEFORE taking the health lock --
+                // this is read-only routing config I/O and touches no
+                // health state, so it must not extend the locked critical
+                // section.
+                let provider_id = crate::RoutingContext::load(&eng.cfg)
+                    .ok()
+                    .and_then(|r| r.real_provider_for_model(&eng.cfg, model).cloned())
+                    .map(|p| p.id.clone())
+                    .or_else(|| {
+                        eng.cfg
+                            .provider(model)
+                            .filter(|p| {
+                                !p.base_url
+                                    .contains(zoder_core::config::PLACEHOLDER_PROVIDER_HOST)
+                            })
+                            .map(|p| p.id.clone())
+                    })
+                    .unwrap_or_default();
+                // When a status is present we route through
+                // `Classification::from_status` so 401/403/429/503/529
+                // land on the right bucket. The `FallbackWorthy` arm
+                // only carries `kind + status`, so the typed body
+                // fallback for the Anthropic branch (Y-14) does not
+                // apply on this path -- the reviewer dispatcher
+                // surfaces errors out of `stream_chat`, which
+                // already populated `anthropic_error_body` upstream
+                // if the wire carried it.
+                let cls = status
+                    .map(zoder_core::Classification::from_status)
+                    .unwrap_or_else(|| zoder_core::classify_err_kind(kind));
+                // C4-MH1: record + persist under an exclusive lock. This
+                // reviewer fallback runs inside a `join_all` fan-out and
+                // races the daemon/CLI, so a bare load -> record -> save
+                // would drop a concurrently-recorded failure (lost
+                // update). `mutate_locked` reloads the freshest on-disk
+                // store under an advisory lockfile (create_new on
+                // `<stem>.lock`, not a File::lock/flock), applies this
+                // delta, and writes atomically before releasing -- so
+                // every panel model's failure survives.
+                // The provider layer (`zoder_core::provider`) is the
+                // single source of truth for a MiniMax M Plan wall:
+                // `observe_token_plan_limit` does the best-effort live
+                // `token_plan/remains` refresh and persists a
+                // machine-observed reset when the endpoint answers,
+                // else a grace-bound one. Here we read that persisted
+                // reset rather than hardcoding our own 5h estimate —
+                // `observed_reset_at` is the reset of the full window
+                // the API itself reported (the 5h reset when the
+                // refresh shows no full window). `None` means no wall is persisted for
+                // this provider (either not a MiniMax wall, or the
+                // state was pruned), in which case the generic
+                // `record_classified_failure` path below is enough.
+                let wall = status
+                    .and_then(|st| {
+                        (st == 429).then(|| zoder_core::minimax::observed_reset_at(&provider_id))
+                    })
+                    .flatten()
+                    .map(|t| t.timestamp());
+                let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
+                    h.record_classified_failure_with_wall(model, &message, &provider_id, cls, wall);
+                });
                 tracing::debug!(
                     model = %model,
                     ?kind,
@@ -1135,6 +1125,7 @@ fn plan_loop_review(
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review_once(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1154,18 +1145,71 @@ async fn run_loop_review_once(
     usize,
     Vec<serde_json::Value>,
 )> {
+    // Loop work lives in the working tree. One image cache per review.
+    let read_disk = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    let post_image = crate::config_cache::PostImages::new(read_disk);
+    run_loop_review_once_with_reader(
+        cli,
+        eng,
+        reviewer_override,
+        reviewer_chain,
+        author_models,
+        system,
+        diff,
+        label,
+        preamble,
+        caps_model,
+        review_cfg,
+        zoderignore,
+        config_excludes,
+        &post_image,
+    )
+    .await
+}
+
+/// [`run_loop_review_once`] with the post-image reader injected.
+///
+/// Production passes `<root>/<path>` on disk. The seam exists so a test can
+/// observe how many times one review reads a file: `context_for`,
+/// `filter_false_undefined_findings` and the confirmation path all read the
+/// SAME post-image, and reading a branch file is a `git show` subprocess, so
+/// each must share one per-review cache (D10.7).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_review_once_with_reader(
+    cli: &crate::Cli,
+    eng: &Engine,
+    reviewer_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    diff: &str,
+    label: &str,
+    preamble: &str,
+    caps_model: Option<&str>,
+    review_cfg: Option<&zoder_core::config::ReviewConfig>,
+    zoderignore: &[String],
+    config_excludes: &[String],
+    post_image: &crate::config_cache::PostImages<impl Fn(&str) -> Option<String>>,
+) -> anyhow::Result<(
+    ReviewOutput,
+    Option<String>,
+    f64,
+    usize,
+    Vec<serde_json::Value>,
+)> {
     let caps_for =
         |m: Option<&str>| crate::review_diff::resolve_review_caps(None, None, review_cfg, m);
     let base_tokens = cli.max_tokens.max(REVIEW_MIN_MAX_TOKENS);
     // Chunked reviews have the same cross-chunk blindness as `zoder review`;
     // feed the post-change file context so a name defined in another chunk is
-    // not reported as missing. Loop work lives in the working tree.
+    // not reported as missing. Every read below goes through the ONE
+    // per-review image cache, so a file is read at most once per review.
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
             return String::new();
         }
-        let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+        let read = |path: &str| post_image.get(path);
         let context = crate::review_context::chunk_context(chunk, &read, budget);
         if context.is_empty() {
             context
@@ -1208,6 +1252,7 @@ unbound, or missing imports:\n{context}"
     };
     let (completion, reviewer_report) = complete_review_chunks(
         cli,
+        Some(eng),
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1233,8 +1278,9 @@ unbound, or missing imports:\n{context}"
     // Deterministic false-positive filter: a finding that calls a symbol
     // undefined is dropped when the reviewed working tree defines or imports
     // it. The evidence is kept in `filtered_findings` for the loop record.
-    let read_worktree = |path: &str| std::fs::read_to_string(root.join(path)).ok();
-    filter_false_undefined_findings(&mut review, &read_worktree);
+    // The read is served from the SAME per-review image cache the context
+    // header used: these files were already read for this review.
+    filter_false_undefined_findings(&mut review, &|p: &str| post_image.get(p));
     // `completion.chunks` is the final plan after a possible fallback re-plan;
     // `plan.chunks` would under-report what the reviewer actually saw.
     let chunks = completion.chunks;
@@ -1288,6 +1334,7 @@ unbound, or missing imports:\n{context}"
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_review(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1309,6 +1356,7 @@ async fn run_loop_review(
 )> {
     let first = run_loop_review_once(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1326,6 +1374,7 @@ async fn run_loop_review(
 
     let Some(second_model) = high_risk_second_reviewer(
         cli,
+        eng,
         reviewer_override,
         reviewer_chain,
         author_models,
@@ -1339,6 +1388,7 @@ async fn run_loop_review(
 
     let second = run_loop_review_once(
         cli,
+        eng,
         Some(&second_model),
         reviewer_chain,
         author_models,
@@ -1394,6 +1444,7 @@ async fn run_loop_review(
 /// and silently skipping it would leave the escalation claim false.
 fn high_risk_second_reviewer(
     cli: &crate::Cli,
+    eng: &Engine,
     reviewer_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -1416,9 +1467,8 @@ fn high_risk_second_reviewer(
     }) {
         return Ok(None);
     }
-    let eng = Engine::load()?;
     let routing = crate::RoutingContext::load(&eng.cfg)?;
-    let plan = build_reviewer_plan(cli, reviewer_override, reviewer_chain, author_models, None)?;
+    let plan = build_reviewer_plan(cli, eng, reviewer_override, reviewer_chain, author_models)?;
     for model in plan.candidates {
         if first_model.is_some_and(|first| first == model) {
             continue;
@@ -1494,7 +1544,8 @@ pub(crate) fn build_reviewer_candidates(
     reviewer_chain: &[String],
     engine_config: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(build_reviewer_plan(cli, model_override, reviewer_chain, &[], engine_config)?.candidates)
+    let eng = Engine::load_with_engine_config(engine_config)?;
+    Ok(build_reviewer_plan(cli, &eng, model_override, reviewer_chain, &[])?.candidates)
 }
 
 /// Build the ordered reviewer plan for an AUTHOR-AWARE review.
@@ -1508,13 +1559,11 @@ pub(crate) fn build_reviewer_candidates(
 /// families; it never silently falls back to a same-family review.
 pub(crate) fn build_reviewer_plan(
     cli: &crate::Cli,
+    eng: &Engine,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
-    engine_config: Option<&Path>,
 ) -> anyhow::Result<ReviewerPlan> {
-    let eng = Engine::load_with_engine_config(engine_config)?;
-
     // Resolve the reviewer-model-side channel: any per-agent or profile-
     // level `reviewer_model` override, treated as an ordered chain. Note
     // `reviewer_models_for` already places the per-agent
@@ -1589,7 +1638,7 @@ pub(crate) fn build_reviewer_plan(
     // model id (never an alias), so — like `reviewer_chain` — it is not
     // run through alias resolution.
     if out.is_empty() {
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let routes = crate::resolve_chain(cli, &eng, &health)?;
         let author = routes.primary.first().cloned().unwrap_or_default();
         let default = crate::default_cross_family_reviewer(&author).to_string();
@@ -1665,7 +1714,7 @@ pub(crate) fn build_reviewer_plan(
         }
         let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
         let routing = crate::RoutingContext::load(&eng.cfg)?;
-        let health = HealthStore::load(&eng.cfg.health_path);
+        let health = crate::config_cache::health_store(&eng.cfg.health_path);
         let author_routes = crate::resolve_chain(cli, &eng, &health)?;
         let primary = out.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
@@ -2007,19 +2056,15 @@ fn routing_context_load_message(e: &anyhow::Error) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_reviewer_for_model(
     cli: &crate::Cli,
+    eng: &Engine,
     requested: &str,
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
-    engine_config: Option<&Path>,
     reasoning_override: Option<&str>,
 ) -> Result<Completion, ReviewerError> {
     let started = std::time::Instant::now();
-    let eng = match Engine::load_with_engine_config(engine_config) {
-        Ok(eng) => eng,
-        Err(e) => return Err(ReviewerError::fatal(format!("loading engine: {e}"))),
-    };
 
     // `model` here is already a resolved, real served-model-name —
     // `build_reviewer_candidates` translates any ENGINE AGENT ALIAS
@@ -2045,7 +2090,7 @@ async fn dispatch_reviewer_for_model(
             // reviewing with a different model. The message names the
             // configured reviewer routes and suggests the closest id.
             return Err(ReviewerError::fatal(no_reviewer_provider_message(
-                cli, &eng, &routing, model,
+                cli, eng, &routing, model,
             )));
         }
     };
@@ -2528,7 +2573,7 @@ async fn dispatch_reviewer_for_model(
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
     };
-    let health = HealthStore::load(&eng.cfg.health_path);
+    let health = crate::config_cache::health_store(&eng.cfg.health_path);
     // The reservation's reconcile is a flock + write + fsync: keep it off the
     // dispatch task (D5.9) and hand the updated store back.
     let (reconciled, _health) = crate::reconcile_policy_checked_turn_async(
@@ -4597,6 +4642,11 @@ fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usi
     if count == 1 {
         merged.summary = review.summary;
     } else {
+        // `idx` is the chunk's PLAN index: the parallel walk puts the chunks
+        // back in plan order before folding (see `merge_chunk_reviews`), so
+        // the number never depends on completion order. One number per
+        // chunk, whatever its summary contains (a multi-line summary is
+        // still one chunk).
         merged.summary.push_str(&format!(
             "Chunk {}/{}: {}\n",
             idx + 1,
@@ -4607,6 +4657,83 @@ fn append_chunk_review(merged: &mut ReviewOutput, review: ReviewOutput, idx: usi
     merged.findings.extend(review.findings);
     merged.next_steps.extend(review.next_steps);
     merged.filtered_findings.extend(review.filtered_findings);
+}
+
+/// Why a chunk walk must not run later chunks ahead of, or beside, chunk 0.
+type ChunkBlocker = Option<String>;
+
+/// The chunk prompt text. `ZODER_REVIEW_STABLE_PREFIX=1` (the default) keeps
+/// the "part N of M" banner inside the chunk's variable tail — it is emitted
+/// by `crate::review_baton` after the cache-stable head. The legacy layout
+/// (`=0`) prepends it, and it then varies per chunk by design.
+fn chunk_user_text(user: &str, idx: usize, count: usize, preface_parts: bool) -> String {
+    if !preface_parts {
+        return user.to_string();
+    }
+    format!(
+        "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
+Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
+is not evidence of a defect. Report only defects established by the supplied code; do not \
+invent missing integration or compiler failures from omitted context.\n\n{user}",
+        idx + 1,
+        count
+    )
+}
+
+/// Whether the later chunks must run one at a time instead of fanning out.
+///
+/// Two things keep the historical sequential walk: the legacy chunk layout
+/// (`ZODER_REVIEW_STABLE_PREFIX=0`), whose prompts begin with the varying
+/// "This is review part N of M." banner and so share no cache-stable head
+/// beyond the system prompt — that opt-out layout is left exactly as it was;
+/// and a resolved concurrency of 1 (`ZODER_REVIEW_CHUNK_CONCURRENCY=1`).
+/// Everything else runs chunk 0 first and then fans the rest out.
+/// `concurrency` is the resolved [`chunk_concurrency`] (a parameter so the
+/// tests can select a walk without touching the process environment).
+fn chunk_parallelism_blocker_at(preface_parts: bool, concurrency: usize) -> ChunkBlocker {
+    if preface_parts {
+        return Some("legacy chunk layout (ZODER_REVIEW_STABLE_PREFIX=0)".to_string());
+    }
+    if concurrency == 1 {
+        return Some("ZODER_REVIEW_CHUNK_CONCURRENCY=1".to_string());
+    }
+    None
+}
+
+/// How many chunks of one reviewer may be in flight at once: 4 by default,
+/// configurable with `ZODER_REVIEW_CHUNK_CONCURRENCY` (environment-only, like
+/// the provider slot map, so an older binary never trips over a config key).
+/// `1` forces the sequential walk. Provider slots (`ZODER_PROVIDER_CONCURRENCY`
+/// / the configured per-endpoint budget) and the shared rate limiter are taken
+/// by each dispatch, so raising this can never exceed the operator's caps.
+fn chunk_concurrency() -> usize {
+    std::env::var("ZODER_REVIEW_CHUNK_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CHUNK_CONCURRENCY)
+}
+
+/// Default number of review chunks of one reviewer dispatched at once.
+const DEFAULT_CHUNK_CONCURRENCY: usize = 4;
+
+/// The verdict-merge rule for chunked reviews, as a pure function over the
+/// chunks IN CHUNK ORDER.
+///
+/// This is the deterministic merge the parallel chunk fan-out relies on: the
+/// chunks are collected, ordered by their plan index, and folded here one at a
+/// time, so an approval can never depend on which network call returned first.
+/// The verdict is the worst-ranked chunk verdict (blocking beats approve).
+fn merge_chunk_reviews(reviews: Vec<ReviewOutput>) -> ReviewOutput {
+    let count = reviews.len();
+    let mut merged = ReviewOutput {
+        verdict: "approve".into(),
+        ..ReviewOutput::default()
+    };
+    for (idx, review) in reviews.into_iter().enumerate() {
+        append_chunk_review(&mut merged, review, idx, count);
+    }
+    merged
 }
 
 /// Drop findings that claim a symbol is undefined/missing/unimported when the
@@ -4729,9 +4856,471 @@ fn mixed_model_chunk(pinned_served: &str, this_served: &str) -> bool {
     pinned_served != this_served
 }
 
+/// One reviewer's plan for ONE chunk attempt: the chunk's prompt text, the
+/// model it is sent to (pinned by chunk 0 for every later chunk), and the
+/// output budget.
+struct ChunkTask {
+    model: String,
+    user: String,
+    max_tokens: u32,
+}
+
+/// What one completed chunk contributes to the review. `cost_usd` and
+/// `receipts` cover EVERY call the chunk made (an invalid first reply, its
+/// repair, a rejected candidate), not only the call whose verdict is used.
+struct ChunkOutcome {
+    completion: Completion,
+    review: ReviewOutput,
+    structured: bool,
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+    cost_usd: f64,
+    receipts: Vec<serde_json::Value>,
+}
+
+/// The model the review is pinned to after chunk 0 completed: the requested
+/// and the served identity, captured together from that ONE dispatch.
+#[derive(Clone)]
+struct PinnedModel {
+    requested: String,
+    served: String,
+}
+
+/// One completed later chunk, with the plan index that orders it.
+struct IndexedChunkOutcome {
+    idx: usize,
+    outcome: ChunkOutcome,
+}
+
+/// Run the later chunks of one reviewer through `buffer_unordered`: at most
+/// `concurrency` chunk futures are polled at once and each is yielded as it
+/// completes; the caller puts them back in chunk order. A `blocker` (see
+/// [`chunk_parallelism_blocker_at`]) runs them strictly in order, one at a
+/// time.
+///
+/// The futures are driven concurrently on the CALLER's task rather than
+/// `tokio::spawn`ed: they borrow the review's `Cli` and `Engine`, which are
+/// not `'static`, and every chunk is network-bound (the only blocking step,
+/// the ledger reservation, already runs on `spawn_blocking`), so polling them
+/// together gives the same overlap without cloning the engine per chunk.
+///
+/// The chunks share no mutable state: provider slots, the rate limiter and the
+/// ledger reservation are all taken inside each dispatch, so the fan-out is
+/// bounded by the operator's caps as well as by `concurrency`. A failing chunk
+/// fails the review: the stream is dropped, which CANCELS every chunk still in
+/// flight (their slot guards are released and an armed ledger reservation
+/// keeps its unknown-cost row on drop), and no verdict is fabricated for the
+/// chunks that did not answer.
+async fn run_parallel_chunks(
+    cli: &crate::Cli,
+    eng: &Engine,
+    author_models: &[String],
+    system: &str,
+    tasks: Vec<ChunkTask>,
+    blocker: ChunkBlocker,
+    concurrency: usize,
+) -> anyhow::Result<Vec<IndexedChunkOutcome>> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let concurrency = if blocker.is_some() { 1 } else { concurrency };
+    // `tasks` holds the LATER chunks only; chunk 0 ran on its own before the
+    // fan-out. `idx` is the chunk's 0-based PLAN index (the slot it is merged
+    // into), so the review has `tasks.len() + 1` chunks and the chunk is
+    // named `idx + 1` of that total — the label the sequential walk printed.
+    let total = tasks.len() + CHUNK_REPLAY_FRONTIER;
+    let futures = tasks.into_iter().enumerate().map(|(offset, task)| {
+        let idx = offset + CHUNK_REPLAY_FRONTIER;
+        async move {
+            let outcome = complete_chunk_attempt(
+                cli,
+                &task.model,
+                author_models,
+                system,
+                &task.user,
+                task.max_tokens,
+                eng,
+            )
+            .await
+            .map_err(|e| anyhow!("review chunk {}/{}: {e:#}", idx + 1, total))?;
+            Ok::<IndexedChunkOutcome, anyhow::Error>(IndexedChunkOutcome { idx, outcome })
+        }
+    });
+    // Fail-fast: `.collect()` would keep polling every future to completion
+    // even after one failed, so a 401 on chunk 2 would still wait out chunks
+    // 3..n. Walk the stream by hand and return on the first error — dropping
+    // the stream drops the `buffer_unordered` buffer, which CANCELS every
+    // chunk still in flight instead of awaiting it.
+    let mut stream = futures_util::stream::iter(futures).buffer_unordered(concurrency);
+    let mut results: Vec<IndexedChunkOutcome> = Vec::new();
+    while let Some(next) = futures_util::StreamExt::next(&mut stream).await {
+        results.push(next?);
+    }
+    // Deterministic merge input: the plan's order, not the network's.
+    results.sort_by_key(|r| r.idx);
+    Ok(results)
+}
+
+/// Index of the first parallel chunk. Chunk 0 (the replay frontier) always runs
+/// alone, on the caller's task: it pins the served model and warms the
+/// provider's prompt cache, so every later chunk replays the same cache-stable
+/// prefix. The "part N of M" banner is NOT chunk N's own bytes: the shared
+/// prefix (`crate::review_baton`) puts it in the chunk's variable tail, after
+/// the cache-stable head, so naming a chunk by its plan index costs nothing in
+/// cache reuse.
+const CHUNK_REPLAY_FRONTIER: usize = 1;
+
+/// Evidence accumulated from every dispatch of the review, in dispatch order.
+#[derive(Default)]
+struct ChunkEvidence {
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+    receipts: Vec<serde_json::Value>,
+    cost_usd: f64,
+}
+
+impl ChunkEvidence {
+    /// Fold one attempt's outcome in. `escalation_reason` keeps the FIRST
+    /// non-empty value in dispatch order, exactly as the sequential walk did.
+    fn absorb(&mut self, outcome: &ChunkOutcome) {
+        self.cost_usd += outcome.cost_usd;
+        self.receipts.extend(outcome.receipts.iter().cloned());
+        self.skipped.extend(outcome.skipped.iter().cloned());
+        if self.escalation_reason.is_none() {
+            self.escalation_reason = outcome.escalation_reason.clone();
+        }
+        self.forced |= outcome.forced;
+    }
+}
+
+/// What a chunk attempt contributed before its verdict was established, so a
+/// later error or a repair still leaves the full audit trail (skip reasons,
+/// escalation, forced family conflict, spend and receipts).
+#[derive(Default)]
+struct AttemptEvidence {
+    skipped: Vec<SkippedReviewCandidate>,
+    escalation_reason: Option<String>,
+    forced: bool,
+    cost_usd: f64,
+    receipts: Vec<serde_json::Value>,
+}
+
+impl AttemptEvidence {
+    fn from_completion(outcome: &ChainCompletion) -> Self {
+        Self {
+            skipped: outcome.skipped.clone(),
+            escalation_reason: outcome.escalation_reason.clone(),
+            forced: outcome.forced,
+            cost_usd: outcome.completion.cost_usd,
+            receipts: outcome.completion.receipts.clone(),
+        }
+    }
+
+    fn absorb(&mut self, outcome: &ChainCompletion) {
+        self.cost_usd += outcome.completion.cost_usd;
+        self.receipts
+            .extend(outcome.completion.receipts.iter().cloned());
+        self.skipped.extend(outcome.skipped.iter().cloned());
+        if self.escalation_reason.is_none() {
+            self.escalation_reason = outcome.escalation_reason.clone();
+        }
+        self.forced |= outcome.forced;
+    }
+
+    /// Append a LATER attempt's evidence (dispatch order is preserved).
+    fn extend(&mut self, later: AttemptEvidence) {
+        self.cost_usd += later.cost_usd;
+        self.receipts.extend(later.receipts);
+        self.skipped.extend(later.skipped);
+        if self.escalation_reason.is_none() {
+            self.escalation_reason = later.escalation_reason;
+        }
+        self.forced |= later.forced;
+    }
+}
+
+/// Extract the structured verdict of one chunk attempt, re-asking the SAME
+/// model once (twice its budget, or its exhausted budget doubled) when the
+/// reply was not a structured verdict.
+///
+/// `Ok(Some(..))` is a structured verdict (`structured` is false when only the
+/// repair produced it). `Ok(None)` means "no structured verdict" — the caller
+/// advances the chain, and the returned [`AttemptEvidence`] still carries
+/// everything the attempts proved.
+///
+/// The only `Err` path is fatal for the whole review: a twice-exhausted
+/// budget. A repair that could not run (any provider or chain failure) is not
+/// a verdict, so it is `Ok(None)` with its skip trail, as on master.
+#[allow(clippy::too_many_arguments)]
+async fn chunk_structured_review(
+    cli: &crate::Cli,
+    eng: &Engine,
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    completion: Completion,
+    mut evidence: AttemptEvidence,
+) -> anyhow::Result<(Option<(Completion, ReviewOutput, bool)>, AttemptEvidence)> {
+    if let Some(review) = strict_review(&completion.content) {
+        return Ok((Some((completion, review, true)), evidence));
+    }
+    // A completion that ended at `finish_reason: "length"` with no answer
+    // content is NOT a verdict at all — the model spent the whole budget on
+    // hidden reasoning. Treat it exactly like the truncated-before-verdict
+    // case: one same-model repair with the doubled budget (capped by the same
+    // ceiling and context window). The dispatch loop's transient-retry path
+    // already saw this error and did NOT retry it — `retryable()` is false for
+    // a budget exhaustion, since a blind same-budget retry repeats the
+    // failure — so this repair is the ONLY retry of this model and the two
+    // never stack.
+    let budget_exhausted = completion.length_exhausted;
+    let repair_user = format!(
+        "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
+did not satisfy the review schema."
+    );
+    let repair_max_tokens = if budget_exhausted {
+        // The model burned `completion.max_tokens` (the budget it actually ran
+        // with) and came back empty; give it the doubled budget, capped by the
+        // reviewer ceiling AND by the model's configured context window when
+        // one is stated — never above what the model can hold.
+        let doubled = reviewer_retry_budget(completion.max_tokens);
+        // The review's engine is already in hand (D5.2): re-reading it here
+        // cost a second corpus load per exhausted chunk.
+        let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
+            r.real_provider_for_model(&eng.cfg, &completion.model)
+                .map(|p| p.id.clone())
+        });
+        let window = crate::context_opt::window_for(
+            &eng.cfg,
+            provider_id.as_deref().unwrap_or(""),
+            &completion.model,
+            None,
+        );
+        window
+            .and_then(|w| u32::try_from(w).ok())
+            .map_or(doubled, |w| doubled.min(w))
+    } else {
+        reviewer_retry_budget(max_tokens)
+    };
+    let repaired = complete_once_tracked(
+        cli,
+        Some(&completion.model),
+        &[],
+        author_models,
+        &[],
+        system,
+        &repair_user,
+        repair_max_tokens,
+        eng,
+        true,
+    )
+    .await;
+    match repaired {
+        Ok(repair) => {
+            evidence.absorb(&repair);
+            if let Some(review) = strict_review(&repair.completion.content) {
+                return Ok((Some((repair.completion, review, false)), evidence));
+            }
+            if budget_exhausted && repair.completion.length_exhausted {
+                // Exhausted the budget TWICE: the model cannot produce a
+                // verdict in this budget. Fail with a message that names the
+                // model and both budgets, and stop — no third request, no
+                // chain advance pretending a verdict was attempted.
+                let first = completion.max_tokens;
+                let second = repair.completion.max_tokens;
+                if first == second {
+                    anyhow::bail!(
+                        "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                        completion.model
+                    );
+                }
+                anyhow::bail!(
+                    "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
+lower its reasoning effort or raise max_tokens",
+                    completion.model
+                );
+            }
+            Ok((None, evidence))
+        }
+        // A failure on the repair is not a verdict at all; keep its skip trail
+        // and let the chain advance.
+        Err(failure) => {
+            evidence.skipped.extend(failure.skipped);
+            evidence.forced |= failure.forced;
+            Ok((None, evidence))
+        }
+    }
+}
+
+/// One LATER chunk, dispatched to the model chunk 0 pinned. Same-model
+/// transport retries are the dispatch's own (`--retries`); there is no chain
+/// fallback here, because a later chunk served by another model would be a
+/// mixed-model review, which is refused anyway.
+#[allow(clippy::too_many_arguments)]
+async fn complete_chunk_attempt(
+    cli: &crate::Cli,
+    model: &str,
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    eng: &Engine,
+) -> anyhow::Result<ChunkOutcome> {
+    let outcome = complete_once_tracked(
+        cli,
+        Some(model),
+        &[],
+        author_models,
+        &[],
+        system,
+        user,
+        max_tokens,
+        eng,
+        false,
+    )
+    .await
+    .map_err(ChainFailure::into_anyhow)?;
+    let evidence = AttemptEvidence::from_completion(&outcome);
+    let completion = outcome.completion;
+    let (answered, evidence) = chunk_structured_review(
+        cli,
+        eng,
+        author_models,
+        system,
+        user,
+        max_tokens,
+        completion,
+        evidence,
+    )
+    .await?;
+    let Some((completion, review, structured)) = answered else {
+        // The pinned model answered twice without a structured verdict. There
+        // is no other candidate to advance to (a later chunk may never pick a
+        // different model: that would be a mixed-model review), so the review
+        // is refused as incomplete.
+        anyhow::bail!(
+            "reviewer returned invalid JSON twice and no further reviewer candidate remains; \
+             review incomplete (a chunk without a structured verdict cannot be merged)"
+        );
+    };
+    Ok(ChunkOutcome {
+        completion,
+        review,
+        structured,
+        skipped: evidence.skipped,
+        escalation_reason: evidence.escalation_reason,
+        forced: evidence.forced,
+        cost_usd: evidence.cost_usd,
+        receipts: evidence.receipts,
+    })
+}
+
+/// The replay frontier: chunk 0, along the WHOLE reviewer chain, on the
+/// caller's task. This is the only chunk that may pick a model, and it is the
+/// only one that can produce `skipped`/escalation evidence (a chain fallback).
+#[allow(clippy::too_many_arguments)]
+async fn complete_chunk_zero(
+    cli: &crate::Cli,
+    eng: &Engine,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<ChunkOutcome, ChainFailure> {
+    let mut invalid_models: Vec<(String, String)> = Vec::new();
+    // Evidence of candidates that answered without a structured verdict: their
+    // calls were made and billed, so their receipts, spend and skip trail stay
+    // in the report even though another candidate answers the chunk.
+    let mut rejected = AttemptEvidence::default();
+    loop {
+        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
+        // verdict gets one same-model repair; if the repair is still not a
+        // structured verdict, the candidate is recorded as `invalid_verdict`
+        // and the chain ADVANCES instead of failing the whole review (as long
+        // as another candidate remains). Transport failures inside
+        // `complete_once_tracked` already advance the chain and leave their
+        // own skip trail.
+        let outcome = complete_once_tracked(
+            cli,
+            model_override,
+            reviewer_chain,
+            author_models,
+            &invalid_models,
+            system,
+            user,
+            max_tokens,
+            eng,
+            false,
+        )
+        .await?;
+        let evidence = AttemptEvidence::from_completion(&outcome);
+        let rejected_model = outcome.completion.model.clone();
+        let completion = outcome.completion;
+        let (answered, evidence) = chunk_structured_review(
+            cli,
+            eng,
+            author_models,
+            system,
+            user,
+            max_tokens,
+            completion,
+            evidence,
+        )
+        .await
+        .map_err(|e| ChainFailure {
+            message: format!("{e:#}"),
+            skipped: Vec::new(),
+            forced: false,
+        })?;
+        // A chunk whose verdict only appeared on the repair retry keeps
+        // `structured: false`: a repaired verdict is not a first-attempt
+        // structured verdict.
+        if let Some((completion, review, structured)) = answered {
+            let mut evidence_all = std::mem::take(&mut rejected);
+            evidence_all.extend(evidence);
+            let evidence = evidence_all;
+            return Ok(ChunkOutcome {
+                completion,
+                review,
+                structured,
+                skipped: evidence.skipped,
+                escalation_reason: evidence.escalation_reason,
+                forced: evidence.forced,
+                cost_usd: evidence.cost_usd,
+                receipts: evidence.receipts,
+            });
+        }
+        // Invalid twice: advance the chain. `complete_once_tracked` applies
+        // `invalid_models` itself on the NEXT walk, so it also records the
+        // skip and returns the "no candidate remains" failure when none is
+        // left — that error is this loop's termination.
+        rejected.extend(evidence);
+        invalid_models.push((rejected_model, "invalid_verdict".to_string()));
+    }
+}
+
+/// Run the chunks of ONE reviewer.
+///
+/// Sequential prelude, then bounded fan-out: chunk 0 goes first and alone,
+/// along the whole reviewer chain, because it pins the served model and warms
+/// the prompt cache; chunks 1..N then run concurrently (`buffer_unordered`,
+/// [`chunk_concurrency`], 4 by default) against that pinned model. Provider
+/// slots and the shared rate limiter are taken by each dispatch, so the
+/// fan-out can never exceed the operator's per-provider concurrency or rate
+/// budget. The merge folds the chunks BACK INTO PLAN ORDER before it runs, so
+/// the verdict (worst chunk verdict wins) and the summary text do not depend
+/// on which call returned first. See [`chunk_parallelism_blocker_at`] for
+/// what keeps the sequential walk.
 #[allow(clippy::too_many_arguments)]
 async fn complete_review_chunks(
     cli: &crate::Cli,
+    eng: Option<&Engine>,
     model_override: Option<&str>,
     reviewer_chain: &[String],
     author_models: &[String],
@@ -4741,295 +5330,178 @@ async fn complete_review_chunks(
     planned_model: Option<String>,
     replan: &ReplanFn<'_>,
 ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+    complete_review_chunks_with_concurrency(
+        cli,
+        eng,
+        model_override,
+        reviewer_chain,
+        author_models,
+        system,
+        users,
+        max_tokens,
+        planned_model,
+        replan,
+        chunk_concurrency(),
+    )
+    .await
+}
+
+/// [`complete_review_chunks`] with the chunk concurrency passed explicitly.
+///
+/// The seam exists so a test can select the sequential and the parallel walk
+/// in one process without mutating `ZODER_REVIEW_CHUNK_CONCURRENCY` (which
+/// would need the process-global env lock held across an async review).
+#[allow(clippy::too_many_arguments)]
+async fn complete_review_chunks_with_concurrency(
+    cli: &crate::Cli,
+    eng: Option<&Engine>,
+    model_override: Option<&str>,
+    reviewer_chain: &[String],
+    author_models: &[String],
+    system: &str,
+    users: &[String],
+    max_tokens: u32,
+    planned_model: Option<String>,
+    replan: &ReplanFn<'_>,
+    concurrency: usize,
+) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+    // A review with no engine cannot resolve a reviewer: say so instead of
+    // dispatching into an empty chain (the caller that loaded the engine has
+    // already reported the load failure).
+    let eng: &Engine = eng.ok_or_else(|| {
+        anyhow::anyhow!("review incomplete: no engine loaded, so no reviewer can be resolved")
+    })?;
+    if users.is_empty() {
+        // A chunk walk always completes at least chunk 0; an empty plan is a
+        // planning bug and is reported, never silently "reviewed".
+        anyhow::bail!("no review chunks were generated");
+    }
     // Chunks are sized for `planned_model`. When the first chunk is served by
     // a different model (the chain fell back), the remaining review must be
-    // sized for THAT model; mixing models across chunks is refused below, so
-    // the switch can only happen on the first chunk and happens at most once.
+    // sized for THAT model; mixing models across chunks is refused, so the
+    // switch can only happen on the first chunk and happens at most once.
     let mut users: Vec<String> = users.to_vec();
     let mut max_tokens = max_tokens;
     let mut replanned = false;
-    // The model that served the review so far, pinned by the FIRST
-    // completed chunk — replanned or not. `None` only while no chunk has
-    // completed yet; the capture below (the `else` arm of the single model
-    // check) assigns it on the first success, and every later chunk must
-    // match the pinned value or the review bails as a mixed-model approval.
-    let mut served_model: Option<String> = None;
-    // The requested model is captured in the SAME single capture, so the two
-    // can never disagree about which dispatch established the review: no
-    // replan and a replan both go through it.
-    let mut requested_model: Option<String> = None;
-    // Per-chunk evidence: which model was requested, which served, and whether
-    // the chunk's structured verdict came back BEFORE any repair or fallback.
-    // A re-asked or re-dispatched chunk keeps its first (pre-repair)
-    // structured flag: a first-attempt parse failure is real incompleteness
-    // evidence, and a chunk that only parsed on repair is not "every chunk
-    // returned a structured verdict on its own".
-    let mut chunk_records: Vec<ChunkCompletion> = Vec::new();
-    let mut cost_usd = 0.0;
-    let mut receipts = Vec::new();
-    let mut merged = ReviewOutput {
-        verdict: "approve".into(),
-        ..ReviewOutput::default()
-    };
-    // Reviewer-chain evidence accumulated across chunks. The loop dispatches
-    // one reviewer per review, so this is the record of how that reviewer was
-    // reached: candidates skipped before it answered, why, and whether an
-    // explicit operator pin was kept despite a family conflict.
-    let mut skipped_candidates: Vec<SkippedReviewCandidate> = Vec::new();
-    let mut escalation_reason: Option<String> = None;
-    let mut forced_family_conflict = false;
-    let mut idx = 0usize;
-    while idx < users.len() {
-        // The "this is review part N of M" statement and the partial-diff
-        // notice live INSIDE the chunk prompt: the notice is constant, so it
-        // belongs to the cache-stable head, and the part number varies, so it
-        // belongs to the variable tail. Prepending the whole sentence here
-        // put the varying part number in FRONT of the head, so the leading
-        // bytes of chunk N+1 were never the leading bytes of chunk N and the
-        // cache could not hit at all.
-        //
-        // The historical layout (behind ZODER_REVIEW_STABLE_PREFIX=0) keeps
-        // the notice in front, because that layout has no cache-stable head
-        // to protect.
-        let user = if crate::review_baton::stable_prefix_enabled() {
-            users[idx].clone()
-        } else {
-            format!(
-                "This is review part {} of {}. Each part is a partial diff, not a complete source file. \
-Definitions, imports and call sites may be unchanged or in other parts. Their absence here \
-is not evidence of a defect. Report only defects established by the supplied code; do not \
-invent missing integration or compiler failures from omitted context.\n\n{}",
-                idx + 1, users.len(), users[idx]
-            )
-        };
-        // Walk the reviewer chain for THIS chunk. An invalid/empty/truncated
-        // verdict gets one same-model repair; if the repair is still not a
-        // structured verdict, the candidate is recorded as `invalid_verdict`
-        // and the chain ADVANCES instead of failing the whole review (as long
-        // as another candidate remains). Transport failures inside
-        // `complete_once_tracked` already advance the chain and leave their
-        // own skip trail.
-        let mut invalid_models: Vec<(String, String)> = Vec::new();
-        let (completion, review, chunk_structured) = loop {
-            let outcome = complete_once_tracked(
-                cli,
-                served_model.as_deref().or(model_override),
-                reviewer_chain,
-                author_models,
-                &invalid_models,
-                system,
-                &user,
-                max_tokens,
-                None,
-                false,
-            )
-            .await
-            .map_err(|failure: ChainFailure| {
-                anyhow!(
-                    "review chunk {}/{}: {}",
-                    idx + 1,
-                    users.len(),
-                    failure.message
-                )
-            })?;
-            cost_usd += outcome.completion.cost_usd;
-            receipts.extend(outcome.completion.receipts.clone());
-            skipped_candidates.extend(outcome.skipped);
-            if escalation_reason.is_none() {
-                escalation_reason = outcome.escalation_reason;
-            }
-            forced_family_conflict |= outcome.forced;
-            let completion = outcome.completion;
-            if idx == 0 && !replanned && served_model.is_none() {
-                if let Some(planned) = planned_model.as_deref() {
-                    if completion.model != planned {
-                        if let Some((new_users, new_tokens)) = replan(&completion.model) {
-                            if new_users != users || new_tokens != max_tokens {
-                                if !cli.quiet {
-                                    eprintln!(
-                                        "[zoder] reviewer {} served the first chunk instead of {planned}; \
-                                         re-planning chunks for it ({} -> {} chunk(s))",
-                                        completion.model,
-                                        users.len(),
-                                        new_users.len()
-                                    );
-                                }
-                                users = new_users;
-                                max_tokens = new_tokens;
-                                replanned = true;
-                                // Do NOT capture the model here: the
-                                // re-dispatched first chunk goes through the
-                                // loop's single model capture below.
-                                continue;
+    // The shared prefix is disabled behind ZODER_REVIEW_STABLE_PREFIX=0, whose
+    // legacy layout prepends "This is review part N of M." to each chunk.
+    let preface_parts = !crate::review_baton::stable_prefix_enabled();
+
+    // ---- the sequential prelude: chunk 0, alone -------------------------
+    let mut evidence = ChunkEvidence::default();
+    let first: ChunkOutcome;
+    loop {
+        let chunk_user = chunk_user_text(&users[0], 0, users.len(), preface_parts);
+        let outcome = complete_chunk_zero(
+            cli,
+            eng,
+            model_override,
+            reviewer_chain,
+            author_models,
+            system,
+            &chunk_user,
+            max_tokens,
+        )
+        .await
+        .map_err(|failure| anyhow!("review chunk 1/{}: {}", users.len(), failure.message))?;
+        evidence.absorb(&outcome);
+        // A first chunk served by a model the plan was NOT sized for re-plans
+        // the WHOLE review for that model (once), then chunk 0 is replayed at
+        // the same index with the new chunk plan.
+        if !replanned {
+            if let Some(planned) = planned_model.as_deref() {
+                if outcome.completion.model != planned {
+                    if let Some((new_users, new_tokens)) = replan(&outcome.completion.model) {
+                        if new_users != users || new_tokens != max_tokens {
+                            if !cli.quiet {
+                                eprintln!(
+                                    "[zoder] reviewer {} served the first chunk instead of {planned}; \
+                                     re-planning chunks for it ({} -> {} chunk(s))",
+                                    outcome.completion.model,
+                                    users.len(),
+                                    new_users.len()
+                                );
                             }
+                            users = new_users;
+                            max_tokens = new_tokens;
+                            replanned = true;
+                            continue;
                         }
                     }
                 }
             }
-            // A chunk whose verdict only appeared on the repair retry keeps
-            // `structured: false`: a repaired verdict is not a first-attempt
-            // structured verdict.
-            if let Some(review) = strict_review(&completion.content) {
-                break (completion, review, true);
-            }
-            // A completion that ended at `finish_reason: "length"` with no
-            // answer content is NOT a verdict at all — the model spent the
-            // whole budget on hidden reasoning. Treat it exactly like the
-            // truncated-before-verdict case: one same-model repair with the
-            // doubled budget (capped by the same ceiling and context
-            // window). The dispatch loop's transient-retry path already saw
-            // this error and did NOT retry it — `retryable()` is false for a
-            // budget exhaustion, since a blind same-budget retry repeats the
-            // failure — so this repair is the ONLY retry of this model and
-            // the two never stack.
-            let budget_exhausted = completion.length_exhausted;
-            let repair_user = format!(
-                "{user}\n\nReturn ONLY the complete JSON verdict object; your previous response \
-did not satisfy the review schema."
-            );
-            let repair_max_tokens = if budget_exhausted {
-                // The model burned `completion.max_tokens` (the budget it
-                // actually ran with) and came back empty; give it the
-                // doubled budget, capped by the reviewer ceiling AND by the
-                // model's configured context window when one is stated —
-                // never above what the model can hold.
-                let doubled = reviewer_retry_budget(completion.max_tokens);
-                let capped = if let Ok(eng) = crate::Engine::load() {
-                    let provider_id = crate::RoutingContext::load(&eng.cfg).ok().and_then(|r| {
-                        r.real_provider_for_model(&eng.cfg, &completion.model)
-                            .map(|p| p.id.clone())
-                    });
-                    let window = crate::context_opt::window_for(
-                        &eng.cfg,
-                        provider_id.as_deref().unwrap_or(""),
-                        &completion.model,
-                        None,
-                    );
-                    window
-                        .and_then(|w| u32::try_from(w).ok())
-                        .map_or(doubled, |w| doubled.min(w))
-                } else {
-                    doubled
-                };
-                capped
-            } else {
-                reviewer_retry_budget(max_tokens)
-            };
-            let repaired = complete_once_tracked(
-                cli,
-                Some(&completion.model),
-                &[],
-                author_models,
-                &[],
-                system,
-                &repair_user,
-                repair_max_tokens,
-                None,
-                true,
-            )
-            .await;
-            match repaired {
-                Ok(repair) => {
-                    cost_usd += repair.completion.cost_usd;
-                    receipts.extend(repair.completion.receipts.clone());
-                    skipped_candidates.extend(repair.skipped);
-                    forced_family_conflict |= repair.forced;
-                    if let Some(review) = strict_review(&repair.completion.content) {
-                        break (repair.completion, review, false);
-                    }
-                    if budget_exhausted && repair.completion.length_exhausted {
-                        // Exhausted the budget TWICE: the model cannot
-                        // produce a verdict in this budget. Fail with a
-                        // message that names the model and both budgets,
-                        // and stop — no third request, no chain advance
-                        // pretending a verdict was attempted.
-                        let first = completion.max_tokens;
-                        let second = repair.completion.max_tokens;
-                        if first == second {
-                            anyhow::bail!(
-                                "reviewer {} spent its whole {first}-token budget reasoning and returned no verdict (twice); \
-lower its reasoning effort or raise max_tokens",
-                                completion.model
-                            );
-                        }
-                        anyhow::bail!(
-                            "reviewer {} spent its whole {first}-token budget and then its doubled {second}-token budget reasoning, and returned no verdict (twice); \
-lower its reasoning effort or raise max_tokens",
-                            completion.model
-                        );
-                    }
-                }
-                Err(failure) => {
-                    // A transport failure on the repair is not a verdict at
-                    // all; keep its skip trail and let the chain advance.
-                    skipped_candidates.extend(failure.skipped);
-                    forced_family_conflict |= failure.forced;
-                }
-            }
-            // Invalid twice (or the repair could not run): advance the chain.
-            skipped_candidates.push(SkippedReviewCandidate {
-                model: completion.model.clone(),
-                reason: "invalid_verdict".to_string(),
-            });
-            if escalation_reason.is_none() {
-                escalation_reason = Some("invalid_verdict".to_string());
-            }
-            invalid_models.push((completion.model.clone(), "invalid_verdict".to_string()));
-        };
-        let record = ChunkCompletion {
-            requested_model: completion.requested_model.clone(),
-            served_model: completion.model.clone(),
-            structured: chunk_structured,
-        };
-        // No `served != requested` check here: `complete_once` dispatches each
-        // candidate with the same id as both the requested and the dispatched
-        // model, so the two can never differ on a returned `Completion`. A
-        // provider-side substitution is refused earlier, inside
-        // `dispatch_reviewer_for_model`, which compares the provider's reported
-        // response model with the requested one (reviewer provenance
-        // mismatch) before any `Completion` is returned. What remains to
-        // enforce at this level is a mid-review FALLBACK to a different
-        // candidate, which the check below catches against the model that
-        // served the earlier chunks. Either way the bail IS the
-        // incompleteness path: `run_loop_review` maps the error to the
-        // iteration's `reviewer_unavailable` verdict with `review_error` set
-        // and `review_complete: false`.
-        // Single model capture AND the canonical mixed-model enforcement,
-        // shared by the replanned and non-replanned paths: the first
-        // COMPLETED chunk pins the served and requested models; every LATER
-        // chunk is then checked against the pinned `served_model` by the
-        // pure `mixed_model_chunk` predicate below and the review bails if
-        // the provider served it by a different model. A mid-review fallback
-        // to a different model is a mixed-model approval, and a mixed-model
-        // approval is refused — never accepted as a complete review.
-        if let Some(first) = &served_model {
-            if mixed_model_chunk(first, &completion.model) {
-                anyhow::bail!(
-                    "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
-                    idx + 1,
-                    users.len(),
-                    completion.model,
-                    first
-                );
-            }
-        } else {
-            served_model = Some(completion.model.clone());
-            requested_model = Some(completion.requested_model.clone());
         }
-        chunk_records.push(record);
-        append_chunk_review(&mut merged, review, idx, users.len());
-        idx += 1;
+        first = outcome;
+        break;
     }
-    // One report per reviewer: the requested and served models (ABSENT,
-    // never an empty string, when no chunk completed) plus the per-chunk
+    // The first COMPLETED chunk pins the served and requested models.
+    let pin = PinnedModel {
+        requested: first.completion.requested_model.clone(),
+        served: first.completion.model.clone(),
+    };
+
+    // ---- the remaining chunks: bounded fan-out --------------------------
+    let tasks: Vec<ChunkTask> = (CHUNK_REPLAY_FRONTIER..users.len())
+        .map(|idx| ChunkTask {
+            // `complete_once` dispatches each candidate with the same id as
+            // both the requested and the dispatched model, so a chunk
+            // dispatched for the pinned model can only be substituted by the
+            // provider itself, which `dispatch_reviewer_for_model` refuses as
+            // a provenance mismatch before a `Completion` is returned. Every
+            // chunk therefore requests `pin.served`.
+            model: pin.served.clone(),
+            user: chunk_user_text(&users[idx], idx, users.len(), preface_parts),
+            max_tokens,
+        })
+        .collect();
+    // A multi-candidate chain is fine here: chunk 0 already picked the model,
+    // so every later chunk is pinned to it and cannot fall back.
+    let blocker = chunk_parallelism_blocker_at(preface_parts, concurrency);
+    let parallel_outcomes =
+        run_parallel_chunks(cli, eng, author_models, system, tasks, blocker, concurrency).await?;
+
+    // ---- the deterministic merge, in CHUNK order ------------------------
+    let mut ordered: Vec<Option<ChunkOutcome>> =
+        std::iter::repeat_with(|| None).take(users.len()).collect();
+    ordered[0] = Some(first);
+    for outcome in parallel_outcomes {
+        ordered[outcome.idx] = Some(outcome.outcome);
+    }
+    let mut chunk_records: Vec<ChunkCompletion> = Vec::with_capacity(users.len());
+    let mut reviews: Vec<ReviewOutput> = Vec::with_capacity(users.len());
+    for (idx, slot) in ordered.into_iter().enumerate() {
+        let outcome = slot.expect("every completed chunk has its plan slot");
+        if idx > 0 && mixed_model_chunk(&pin.served, &outcome.completion.model) {
+            anyhow::bail!(
+                "review chunk {}/{} was served by {}, after earlier chunks were served by {}; refusing a mixed-model approval",
+                idx + 1,
+                users.len(),
+                outcome.completion.model,
+                pin.served
+            );
+        }
+        if idx > 0 {
+            evidence.absorb(&outcome);
+        }
+        chunk_records.push(ChunkCompletion {
+            requested_model: outcome.completion.requested_model.clone(),
+            served_model: outcome.completion.model.clone(),
+            structured: outcome.structured,
+        });
+        reviews.push(outcome.review);
+    }
+    let merged = merge_chunk_reviews(reviews);
+
+    // One report per reviewer: the requested and served models (ABSENT, never
+    // an empty string, when no chunk completed) plus the per-chunk
     // structured-verdict evidence, in chunk order.
     let report = ReviewerChunkReport {
-        requested_model,
-        served_model,
+        requested_model: Some(pin.requested.clone()),
+        served_model: Some(pin.served.clone()),
         chunks: chunk_records,
-        skipped: skipped_candidates,
-        escalation_reason,
-        forced_family_conflict,
+        skipped: evidence.skipped,
+        escalation_reason: evidence.escalation_reason,
+        forced_family_conflict: evidence.forced,
     };
     let completion = Completion {
         requested_model: report.requested_model.clone().unwrap_or_default(),
@@ -5038,14 +5510,14 @@ lower its reasoning effort or raise max_tokens",
             .clone()
             .ok_or_else(|| anyhow!("no review chunks were generated"))?,
         content: serde_json::to_string(&merged)?,
-        cost_usd,
-        receipts,
+        cost_usd: evidence.cost_usd,
+        receipts: evidence.receipts,
         chunks: users.len(),
         // The merged content is zoder's own JSON, never a raw provider
         // completion, so no raw budget-exhaustion flag rides on it.
         length_exhausted: false,
-        // `max_tokens` may have been re-planned for a fallback reviewer;
-        // the final value is the one every chunk ran at.
+        // `max_tokens` may have been re-planned for a fallback reviewer; the
+        // final value is the one every chunk ran at.
         max_tokens,
     };
     Ok((completion, report))
@@ -5341,6 +5813,11 @@ pub(crate) async fn cmd_review(
     // just below for the reviewer chain) lets `[review]` config participate;
     // a config problem degrades to the built-in defaults rather than blocking
     // a review.
+    // ONE engine load for the whole review (D5.2): the panel fan-out, the
+    // chunk writers, the repair path and the confirmer all borrow this
+    // instance instead of re-reading the config, the engine TOML and the
+    // model corpus per dispatch. A failed load still degrades to the
+    // built-in defaults (as before), but it is now loaded ONCE.
     let eng = Engine::load().ok();
     let review_cfg = eng.as_ref().map(|e| e.cfg.review.clone());
 
@@ -5350,7 +5827,9 @@ pub(crate) async fn cmd_review(
     // the configured reviewer pin, then the head of the scenario reviewer
     // chain. When none is resolvable (no engine, or a fully dynamic route) the
     // per-route lookup is skipped and the general caps/default apply.
-    let health = eng.as_ref().map(|e| HealthStore::load(&e.cfg.health_path));
+    let health = eng
+        .as_ref()
+        .map(|e| crate::config_cache::health_store(&e.cfg.health_path));
     let reviewer_chain: Vec<String> = match (&eng, &health) {
         (Some(e), Some(h)) => crate::resolve_chain(cli, e, h)
             .map(|r| r.reviewer)
@@ -5404,13 +5883,19 @@ pub(crate) async fn cmd_review(
     // outside the chunk (bindings earlier in the enclosing function, imports,
     // top-level definitions). Working-tree reviews read the files on disk;
     // branch reviews read them at HEAD. `ZODER_REVIEW_CONTEXT=0` disables.
-    let read_post_image = |path: &str| -> Option<String> {
+    //
+    // One image cache per review: `context_for`, the false-"undefined" filter
+    // and `confirm_reviews`' grounding all read the same post-image, and a
+    // branch read is a `git show` subprocess (D10.7).
+    let read_post_image_source = |path: &str| -> Option<String> {
         if label.starts_with("working-tree") {
             std::fs::read_to_string(root.join(path)).ok()
         } else {
             run_git(&cwd, &["show", &format!("HEAD:{path}")]).ok()
         }
     };
+    let post_image = crate::config_cache::PostImages::new(read_post_image_source);
+    let read_post_image = |path: &str| -> Option<String> { post_image.get(path) };
     let context_on = crate::review_context::enabled();
     let context_for = |chunk: &str, budget: usize| -> String {
         if !context_on {
@@ -5678,6 +6163,7 @@ unbound, or missing imports:\n{context}"
         let planned = m.clone().or_else(|| reviewer_for_caps.clone());
         complete_review_chunks(
             cli,
+            eng.as_ref(),
             m.as_deref(),
             &reviewer_chain,
             &[],
@@ -6047,17 +6533,26 @@ async fn dispatch_confirmer(
     let system = "You are a second-opinion confirmer for a code review finding.";
     let instruction = crate::review_confirm::confirmer_instruction(finding_id);
     let user = format!("{context}\n\n{instruction}");
-    let result = dispatch_reviewer_for_model(
-        cli,
-        model,
-        model,
-        system,
-        &user,
-        REVIEW_MIN_MAX_TOKENS,
-        None,
-        Some(reasoning_effort),
-    )
-    .await;
+    let result = match eng {
+        Some(eng) => {
+            dispatch_reviewer_for_model(
+                cli,
+                eng,
+                model,
+                model,
+                system,
+                &user,
+                REVIEW_MIN_MAX_TOKENS,
+                Some(reasoning_effort),
+            )
+            .await
+        }
+        // Without an engine there is no reviewer to dispatch: the confirmer
+        // attempt is reported as unavailable rather than silently dropped.
+        None => Err(ReviewerError::fatal(
+            "confirming a finding needs a loaded engine",
+        )),
+    };
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
         // A successful provider reply is recorded through the one shared
@@ -6743,6 +7238,132 @@ pub(crate) fn validate_loop_timeouts(
     }
 }
 
+/// How the loop derives its whole-run deadline when the operator set none.
+///
+/// The fleet worker gives one job 7,200 s and then kills it blind: no result
+/// document, no teardown, and the worktree's fate decided by whoever notices.
+/// Two compounding iterations of the loop's own per-phase budgets (author
+/// 900 s + check/review 900 s each, twice — see `validate_loop_timeouts`) add
+/// up to EXACTLY that number, so the incident's "2 h wait" was the loop
+/// spending the worker's whole allowance and the worker timing it out. The
+/// deadline is therefore derived from the worker's budget and kept strictly
+/// below it, so the loop always reaches its own teardown (commit, report,
+/// JSON result) before the worker's kill.
+pub(crate) const WORKER_RUN_TIMEOUT_SECS: u64 = 7200;
+
+/// Headroom kept between the loop's deadline and the worker's timeout: a
+/// tenth of the budget or five minutes, whichever is larger. The loop still
+/// has to commit the worktree, emit the final JSON result and cancel/reap the
+/// daemon inside this window — none of which is a per-iteration phase.
+pub(crate) fn loop_deadline_headroom_secs(worker_timeout_secs: u64) -> u64 {
+    (worker_timeout_secs / 10).max(300)
+}
+
+/// The default whole-run deadline for `zoder loop`: derived from, and strictly
+/// below, the worker's timeout.
+///
+/// The headroom is always at least one second and at most `worker_timeout - 1`,
+/// so the result is strictly less than `worker_timeout_secs` for EVERY input,
+/// including budgets too small for the normal headroom (`worker_timeout_secs <=
+/// 300`). Returning the worker's own timeout there would put the loop's
+/// deadline exactly on the worker's kill: the run would be killed blind before
+/// it could emit its result, which is the one thing this deadline exists to
+/// prevent.
+pub(crate) fn default_loop_deadline_secs(worker_timeout_secs: u64) -> u64 {
+    if worker_timeout_secs <= 1 {
+        // No positive whole-second deadline exists below this. A 1 s (or 0 s)
+        // worker budget cannot leave a run any time at all; return the input
+        // rather than underflow, and let the caller's own validation reject
+        // the configuration.
+        return worker_timeout_secs;
+    }
+    let headroom = loop_deadline_headroom_secs(worker_timeout_secs)
+        .clamp(1, worker_timeout_secs.saturating_sub(1));
+    worker_timeout_secs - headroom
+}
+
+/// Everything `zoder loop` needs to know about its whole-run budget, resolved
+/// once at dispatch: the deadline in seconds, and whether the daemon serving
+/// this run is shared with other jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopRunBudget {
+    pub deadline_secs: u64,
+    pub shared_daemon: bool,
+}
+
+/// Resolve the loop's whole-run budget with the documented precedence:
+/// the `--deadline` flag > the `loop_deadline_s` config key > a default
+/// derived from, and strictly below, the worker's timeout.
+///
+/// `flag` is the parsed `--deadline`, `config` the loaded config (or `None`
+/// when it could not be loaded, in which case the built-in defaults apply —
+/// the loop itself reports the load failure with its own diagnosis, and this
+/// must not turn into a second, differently worded error first).
+///
+/// Lives here rather than in the dispatcher so the precedence is testable:
+/// the dispatcher can only be exercised end to end, and the three sources
+/// are exactly what went wrong in Incident A.
+pub(crate) fn resolve_loop_run_budget(
+    flag: Option<u64>,
+    config: Option<&zoder_core::Config>,
+) -> LoopRunBudget {
+    let deadline_secs = flag
+        .or_else(|| config.and_then(|cfg| cfg.loop_deadline_s))
+        .unwrap_or_else(|| default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS));
+    let shared_daemon = config
+        .map(|cfg| cfg.profile_defaults().shared_daemon())
+        .unwrap_or(false);
+    LoopRunBudget {
+        deadline_secs,
+        shared_daemon,
+    }
+}
+
+/// The wall-clock deadline for one `zoder loop` run.
+///
+/// Whole-run, not per-phase: the loop's phase watchdogs bound each author
+/// turn, `--check` and review independently, and nothing bounded the run.
+/// This does, and when it fires the loop stops like any other terminal exit —
+/// after the iteration's work has been captured — so the final JSON result and
+/// teardown still happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoopDeadline {
+    pub secs: u64,
+    /// The instant taken at process start, not at loop entry: the connect and
+    /// setup work before the first iteration is part of the run too.
+    pub started: Instant,
+}
+
+impl LoopDeadline {
+    pub(crate) fn new(secs: u64, started: Instant) -> Self {
+        Self { secs, started }
+    }
+
+    /// The deadline for a loop that should be bounded by `secs`, from the
+    /// process-start instant if it is available.
+    pub(crate) fn from_cli(secs: u64) -> Self {
+        Self::new(secs, crate::process_start_instant())
+    }
+
+    /// Time left before the deadline; zero once it has passed.
+    pub(crate) fn remaining(&self) -> Duration {
+        self.remaining_at(Instant::now())
+    }
+
+    pub(crate) fn remaining_at(&self, now: Instant) -> Duration {
+        (self.started + Duration::from_secs(self.secs)).saturating_duration_since(now)
+    }
+
+    /// True once the whole-run budget is spent.
+    pub(crate) fn expired(&self) -> bool {
+        self.expired_at(Instant::now())
+    }
+
+    pub(crate) fn expired_at(&self, now: Instant) -> bool {
+        self.remaining_at(now).is_zero()
+    }
+}
+
 /// Settle budget the author-phase watchdog grants the daemon to ACK a
 /// `session/cancel` before the loop captures `build_diff`. See
 /// [`zoder_core::CANCEL_SETTLE_BUDGET`] for the canonical value —
@@ -6764,6 +7385,26 @@ pub(crate) const AUTHOR_CANCEL_RETRY_BACKOFF: std::time::Duration =
 /// answering this loop at all, and continuing would keep reviewing trees
 /// nobody can prove are quiet.
 pub(crate) const UNCONFIRMED_CANCEL_ABORT_THRESHOLD: usize = 2;
+
+/// The number of consecutive unconfirmed author cancels that stops the loop
+/// for `shared_daemon` deployments.
+///
+/// Two in a row is right when the daemon serves this loop alone: the first
+/// miss is a slow daemon and the second proves it. When the daemon is SHARED
+/// (a fleet host runs many jobs through one daemon), the second miss is not
+/// proof of anything — the next iteration would just queue behind other
+/// tenants' turns for another full per-phase budget, which is how one run
+/// spends the worker's 7,200 s and gets killed blind. On a shared daemon the
+/// first unconfirmed cancel stops the loop: that turn's diff is not a finished
+/// turn and cannot be reviewed, and the work already on disk is preserved and
+/// reported either way.
+pub(crate) fn unconfirmed_cancel_abort_threshold(shared_daemon: bool) -> usize {
+    if shared_daemon {
+        1
+    } else {
+        UNCONFIRMED_CANCEL_ABORT_THRESHOLD
+    }
+}
 
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
@@ -7959,7 +8600,7 @@ fn validate_loop_reviewer_pin(cli: &crate::Cli, reviewer: Option<&str>) -> anyho
     // configured provider serves fails here with a named, explicit error
     // instead of surfacing later as `reviewer_unavailable` with a null
     // `reviewer_model`.
-    let plan = build_reviewer_plan(cli, Some(raw), &[], &[], None)?;
+    let plan = build_reviewer_plan(cli, &eng, Some(raw), &[], &[])?;
     let Some(head) = plan.candidates.first() else {
         anyhow::bail!("no reviewer model resolved for --reviewer {raw}");
     };
@@ -8447,6 +9088,7 @@ pub(crate) async fn cmd_loop(
     background: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
 ) -> anyhow::Result<()> {
@@ -8481,6 +9123,7 @@ pub(crate) async fn cmd_loop(
         accept_on_green,
         loop_timeout_secs,
         agent_timeout_secs,
+        run_budget,
         allow_dangerous_check,
         require_approval,
         &cwd,
@@ -8512,6 +9155,219 @@ fn loop_result_line_enabled(job_id: Option<&str>, env: Option<&str>) -> bool {
     }
 }
 
+/// Interval between `run.json` heartbeat writes. Callers poll the heartbeat
+/// instead of waiting out the worker's 7,200 s timeout blind, so it must be
+/// fresh relative to a human's patience and cheap relative to the loop.
+pub(crate) const RUN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The phase names written to `run.json` and to the final result.
+pub(crate) const LOOP_PHASE_STARTING: &str = "starting";
+pub(crate) const LOOP_PHASE_AUTHOR: &str = "author";
+pub(crate) const LOOP_PHASE_CHECK: &str = "check";
+pub(crate) const LOOP_PHASE_REVIEW: &str = "review";
+pub(crate) const LOOP_PHASE_DONE: &str = "done";
+
+/// Path of the run heartbeat: `<job dir>/run.json`, beside the `result.json`
+/// the job already writes. `None` outside a background/job run — a standalone
+/// `zoder loop` writes nothing extra.
+pub(crate) fn run_heartbeat_path() -> Option<PathBuf> {
+    active_job_dir().map(|dir| dir.join("run.json"))
+}
+
+/// The live state of one loop run, written to `run.json` every
+/// [`RUN_HEARTBEAT_INTERVAL`] and once more at the deadline.
+///
+/// This is observability only: a heartbeat write can never fail the run.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunHeartbeat {
+    pub path: Option<PathBuf>,
+    pub phase: String,
+    pub iteration: usize,
+    pub max_iters: usize,
+    /// Session ids this run drove, in the order they were minted.
+    pub session_states: Vec<(String, String)>,
+    /// The most recent provider error, verbatim, if any.
+    pub last_provider_error: Option<String>,
+    pub deadline_secs: u64,
+    pub started: Option<Instant>,
+    /// Set by [`RunHeartbeat::at_deadline`] so the last document says why the
+    /// run stopped instead of leaving a caller to infer it.
+    pub deadline_reached: bool,
+}
+
+impl RunHeartbeat {
+    pub(crate) fn new(
+        path: Option<PathBuf>,
+        deadline_secs: u64,
+        started: Instant,
+        max_iters: usize,
+    ) -> Self {
+        Self {
+            path,
+            phase: LOOP_PHASE_STARTING.to_string(),
+            iteration: 0,
+            max_iters,
+            deadline_secs,
+            started: Some(started),
+            ..Default::default()
+        }
+    }
+
+    /// Record the phase the loop is in. Cheap: no I/O.
+    pub(crate) fn set_phase(&mut self, phase: &str, iteration: usize) {
+        self.phase = phase.to_string();
+        self.iteration = iteration;
+    }
+
+    /// Record a session id and its state. Re-recording an id updates it in
+    /// place, so `run.json` never lists a session twice.
+    pub(crate) fn note_session(&mut self, id: &str, state: &str) {
+        if let Some(slot) = self.session_states.iter_mut().find(|(sid, _)| sid == id) {
+            slot.1 = state.to_string();
+        } else {
+            self.session_states
+                .push((id.to_string(), state.to_string()));
+        }
+    }
+
+    pub(crate) fn note_provider_error(&mut self, error: &str) {
+        self.last_provider_error = Some(error.to_string());
+    }
+
+    /// Mark the document that is written when the whole-run deadline fires.
+    pub(crate) fn at_deadline(&mut self) {
+        self.deadline_reached = true;
+    }
+
+    /// The document written to `run.json`. `sessions` is an object keyed by
+    /// session id so a caller can look one up without scanning; the insertion
+    /// order is kept so the file still reads as a log.
+    pub(crate) fn to_json(&self) -> Value {
+        let sessions: serde_json::Map<String, Value> = self
+            .session_states
+            .iter()
+            .map(|(id, state)| (id.clone(), Value::String(state.clone())))
+            .collect();
+        json!({
+            "kind": "loop_run",
+            "phase": self.phase,
+            "iteration": self.iteration,
+            "max_iters": self.max_iters,
+            "sessions": sessions,
+            "last_provider_error": self.last_provider_error,
+            "deadline_secs": self.deadline_secs,
+            "elapsed_ms": self.started.map(|s| s.elapsed().as_millis()),
+            "remaining_ms": self
+                .started
+                .map(|s| LoopDeadline::new(self.deadline_secs, s).remaining().as_millis()),
+            "deadline_reached": self.deadline_reached,
+            "updated_ms": Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Write the heartbeat. Best-effort by contract: a full disk or a removed
+    /// job directory must never take the loop down with it.
+    pub(crate) fn write(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            path,
+            serde_json::to_string_pretty(&self.to_json()).unwrap_or_default(),
+        );
+    }
+}
+
+/// Periodically rewrite `run.json` while the loop runs.
+///
+/// The ticker is its own task so a run stuck inside one long author turn still
+/// looks alive: `phase` then names the phase it is stuck in, which is exactly
+/// the question an operator asks before the worker's timeout.
+///
+/// `live` is shared with the loop body, which fills in the phase and the
+/// session states as it learns them.
+pub(crate) fn spawn_run_heartbeat(
+    live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let snapshot = live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            snapshot.write();
+        }
+    })
+}
+
+/// Stops the heartbeat ticker and writes the FINAL `run.json` on every way out
+/// of the loop, including the `?`/`bail!` paths inside the iteration body.
+///
+/// The final write used to sit on the normal path only: a mid-iteration
+/// `bail!` (a free-policy violation, an engine-kind resolution failure) left
+/// `run.json` frozen at the last 10 s tick, and the ticker itself kept running
+/// until the process exited. A guard makes "always emit the final heartbeat"
+/// true by construction instead of by remembering to call it.
+struct RunHeartbeatGuard {
+    live: Option<std::sync::Arc<std::sync::Mutex<RunHeartbeat>>>,
+    progress: LoopProgress,
+}
+
+impl RunHeartbeatGuard {
+    fn new(
+        live: std::sync::Arc<std::sync::Mutex<RunHeartbeat>>,
+        ticker: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        ticker.abort();
+        Self {
+            live: Some(live),
+            progress: LoopProgress::default(),
+        }
+    }
+
+    /// Record how far the run got, so the `Drop`-time finalisation (used on an
+    /// error exit) reports the real iteration instead of zero.
+    fn note_progress(&mut self, iteration: usize, at_deadline: bool) {
+        self.progress = LoopProgress {
+            iteration,
+            at_deadline,
+        };
+    }
+
+    /// Record why the run stopped, in the final document.
+    fn finalize(&mut self, phase: &str, iteration: usize, at_deadline: bool) {
+        if let Some(live) = self.live.take() {
+            let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(phase, iteration);
+            if at_deadline {
+                state.at_deadline();
+            }
+            state.write();
+        }
+    }
+}
+
+/// The last iteration this guard saw, so a `Drop`-time finalisation reports
+/// the real progress instead of resetting it to zero.
+#[derive(Clone, Copy, Default)]
+struct LoopProgress {
+    iteration: usize,
+    at_deadline: bool,
+}
+
+impl Drop for RunHeartbeatGuard {
+    fn drop(&mut self) {
+        if self.live.is_some() {
+            // Only reachable when the normal-path `finalize` did NOT run, i.e.
+            // an early return or a `?`/`bail!` out of the iteration body.
+            let progress = self.progress;
+            self.finalize(LOOP_PHASE_DONE, progress.iteration, progress.at_deadline);
+        }
+    }
+}
+
 /// Writes a `teardown` event with reason `crash` if the loop function exits
 /// without disarming (early `?`/bail/panic), so a dying loop still leaves a
 /// trail in MNEMOS. Disarmed on every normal teardown.
@@ -8532,6 +9388,9 @@ impl Drop for LoopEventGuard {
     }
 }
 
+// The parameter count is the loop's explicit, named configuration — the same
+// shape as `cmd_loop`, which already carries this allowance.
+#[allow(clippy::too_many_arguments)]
 async fn cmd_loop_run(
     cli: &crate::Cli,
     task: &[String],
@@ -8544,6 +9403,7 @@ async fn cmd_loop_run(
     accept_on_green: bool,
     loop_timeout_secs: u64,
     agent_timeout_secs: u64,
+    run_budget: LoopRunBudget,
     allow_dangerous_check: bool,
     require_approval: bool,
     cwd: &Path,
@@ -8591,11 +9451,49 @@ async fn cmd_loop_run(
     }
 
     let max_iters = max_iters.max(1);
+    // Whole-run wall-clock deadline (decision D7). The per-phase watchdogs
+    // bound one author turn, one `--check` and one review each; nothing bounded
+    // the RUN, so two compounding unconfirmed iterations could spend the whole
+    // worker budget and be killed blind. The deadline is checked at every
+    // iteration boundary (and around the review phase), and when it fires the
+    // loop leaves by a normal terminal path: the iteration record is pushed,
+    // the worktree is committed, and the final JSON result is still emitted.
+    let deadline_secs = run_budget.deadline_secs;
+    let shared_daemon = run_budget.shared_daemon;
+    let deadline = LoopDeadline::from_cli(deadline_secs);
+    let cancel_abort_threshold = unconfirmed_cancel_abort_threshold(shared_daemon);
+    let mut deadline_hit = false;
+    // A free-policy violation ends the loop AFTER the iteration is recorded,
+    // so the final result and `run.json` are still emitted. The run then exits
+    // nonzero with the `--allow-paid` hint, exactly as the previous mid-loop
+    // `bail!` did.
+    let mut policy_violation: Option<String> = None;
+    // `run.json` heartbeat: phase + session states + last provider error, every
+    // 10 s, so callers poll a document instead of waiting out the worker's
+    // 7,200 s timeout blind. Only a job run has a directory to write into.
+    let heartbeat_path = run_heartbeat_path();
+    let heartbeat_enabled = heartbeat_path.is_some();
+    let run_state = std::sync::Arc::new(std::sync::Mutex::new(RunHeartbeat::new(
+        heartbeat_path,
+        deadline_secs,
+        deadline.started,
+        max_iters,
+    )));
+    if heartbeat_enabled {
+        run_state.lock().unwrap_or_else(|e| e.into_inner()).write();
+    }
+    // Final `run.json` and ticker shutdown are guaranteed on EVERY exit path
+    // from here on, including the `?`/`bail!` ones inside the iteration body.
+    let mut heartbeat = RunHeartbeatGuard::new(
+        run_state.clone(),
+        spawn_run_heartbeat(run_state.clone(), RUN_HEARTBEAT_INTERVAL),
+    );
     crate::mnemos::event(
         event_job_id.as_deref(),
         "loop_start",
         json!({"brief_bytes": task_txt.len(), "max_iters": max_iters,
-               "reviewer": reviewer, "workspace": cwd.to_string_lossy()}),
+               "reviewer": reviewer, "workspace": cwd.to_string_lossy(),
+               "deadline_secs": deadline_secs, "shared_daemon": shared_daemon}),
     )
     .await;
     // The author's engine session for the NEXT iteration, together with the
@@ -8712,6 +9610,29 @@ async fn cmd_loop_run(
     // candidates from these models' families are excluded on every review.
     let mut author_models: Vec<String> = Vec::new();
     for i in 1..=max_iters {
+        // Whole-run deadline, checked BEFORE a new iteration starts: an
+        // iteration begun with no time left would spend another full phase
+        // budget past the deadline, which is exactly how the run outlives the
+        // worker. Whatever the previous iterations produced is already on disk
+        // and is committed and reported below like any other terminal exit.
+        if deadline.expired() {
+            deadline_hit = true;
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}/{max_iters}: whole-run deadline of {}s reached; stopping \
+                     with {} iteration(s)' work preserved and reported",
+                    deadline.secs,
+                    iterations.len()
+                );
+            }
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_AUTHOR, i);
+        }
+        // So an error exit mid-iteration reports the iteration it reached.
+        heartbeat.note_progress(i, deadline_hit);
         // Capture a fresh baseline at the start of each iteration so that
         // user edits made between iterations are included in the baseline
         // and NOT misattributed to the agent in `agent_diff`.
@@ -8765,8 +9686,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
         // Consecutive author turns whose cancel could not be confirmed. This is
-        // the ONE thing about an unconfirmed cancel that can stop the loop: two
-        // in a row means the daemon is not answering this loop at all. A single
+        // the ONE thing about an unconfirmed cancel that can stop the loop. On
+        // a daemon this loop owns, two in a row means the daemon is not
+        // answering this loop at all; on a SHARED daemon (fleet) the first one
+        // already stops it — see `unconfirmed_cancel_abort_threshold`. A single
         // one is a slow daemon, and cleanup failing must never throw the
         // author's work away (a supervised loop run).
         let mut unconfirmed_cancel_streak = 0usize;
@@ -8778,11 +9701,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
             continuity.as_ref().map(|c| c.session_id.clone()),
         ));
         let session_id_for_cancel = active_session.clone();
+        let session_tracker = active_session.clone();
         let turn = match author_phase_with_cancel(
             loop_timeout_secs,
             cli.quiet,
             zoder_core::engine_rpc::track_session_id(
-                active_session,
+                session_tracker,
                 crate::agentic_turn(
                     cli,
                     engine_kind,
@@ -8858,10 +9782,14 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // incrementing `total_cost` — a violating turn does
                 // not extend the loop's bookkeeping as if it were a
                 // legitimate iteration.
-                if let Some(v) = &t.policy_violation {
-                    anyhow::bail!(
-                        "loop author turn violated free policy (use --allow-paid to permit): {v}"
-                    );
+                //
+                // Recorded as a terminal iteration rather than a `bail!`:
+                // the loop must still emit its final JSON result and its
+                // final `run.json` here, so the exit code and the hint are
+                // carried by the result and applied once, after the loop.
+                if t.policy_violation.is_some() {
+                    policy_violation = t.policy_violation.clone();
+                    break;
                 }
                 // `t.alias` is the alias of the candidate that actually
                 // produced this turn (the head or a fallback), so the next
@@ -8873,6 +9801,10 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 if !author_models.iter().any(|known| known == &t.model) {
                     author_models.push(t.model.clone());
                 }
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.note_session(&t.run.session_id, &format!("completed:{}", t.run.outcome));
+                }
                 total_cost += t.cost_usd;
                 Some(t)
             }
@@ -8882,11 +9814,27 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // is carried in `author_error` + the iter record. Only a run
                 // of them (the daemon is not answering this loop at all)
                 // stops it — and only after this iteration's work is counted.
+                {
+                    let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(sid) = active_session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    {
+                        let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                            "cancel_unconfirmed"
+                        } else {
+                            "failed"
+                        };
+                        state.note_session(&sid, cancel_state);
+                    }
+                    state.note_provider_error(&msg);
+                }
                 if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
                     unconfirmed_cancel_streak += 1;
                     eprintln!(
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
-                         confirmed ({unconfirmed_cancel_streak}/{UNCONFIRMED_CANCEL_ABORT_THRESHOLD}). \
+                         confirmed ({unconfirmed_cancel_streak}/{cancel_abort_threshold}). \
                          The tree is captured and reported as unresolved, and the edits on disk \
                          are preserved"
                     );
@@ -8955,13 +9903,32 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             };
 
         // 3. Capture the working-tree diff (whatever edits actually landed).
-        let (label, diff) = loop_task_diff(
+        //    A capture failure is a terminal iteration, not an early return:
+        //    the run still commits the worktree and emits its JSON result, so
+        //    the caller learns WHY it stopped. `?` here would skip both.
+        let (label, diff) = match loop_task_diff(
             cwd,
             scope,
             base.as_deref(),
             Some(&loop_start),
             &task_journal,
-        )?;
+        ) {
+            Ok(captured) => captured,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}/{max_iters}: diff capture failed: {detail}");
+                }
+                iterations.push(json!({
+                    "iteration": i,
+                    "resolved": false,
+                    "error": "diff_capture_failed",
+                    "diff_capture_error": detail,
+                }));
+                final_verdict = String::from("comment");
+                break;
+            }
+        };
         let diff_lines = diff.lines().count();
         // Anti-gaming guard: `diff_lines > 0` is trivially gameable (empty
         // diff-after-headers, whitespace-only churn, comment-only changes,
@@ -8979,12 +9946,23 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // commit/report whatever is in the worktree. Only a run of unconfirmed
         // cancels (the daemon is not answering at all) stops the loop, and it
         // stops HERE, after the tree has been captured, so no edit is lost.
+        // The run is ONE on a daemon this loop owns and the FIRST one on a
+        // shared daemon (`cancel_abort_threshold`): there, a second attempt
+        // just queues behind other tenants for another full phase budget.
         let cancel_unconfirmed = matches!(
             author_err.as_deref(),
             Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
         );
         let aborted_on_unconfirmed_cancel =
-            cancel_unconfirmed && unconfirmed_cancel_streak >= UNCONFIRMED_CANCEL_ABORT_THRESHOLD;
+            cancel_unconfirmed && unconfirmed_cancel_streak >= cancel_abort_threshold;
+        if aborted_on_unconfirmed_cancel {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_DONE, i);
+            state.note_provider_error(&format!(
+                "author cancel unconfirmed {} time(s) in a row",
+                unconfirmed_cancel_streak
+            ));
+        }
 
         // Extract touched files for the patch journal. Parse `diff --git a/X b/X`
         // headers from the diff output; this is the same set the reviewer sees.
@@ -9018,6 +9996,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: check `{c}`…");
                 }
+                run_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_phase(LOOP_PHASE_CHECK, i);
                 let t0 = std::time::Instant::now();
                 let (ok, tail) = run_check_watched(
                     cwd,
@@ -9074,16 +10056,19 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             break;
         }
         if aborted_on_unconfirmed_cancel {
-            // The daemon has not acknowledged a cancel twice in a row: it is
-            // not answering this loop at all, so every further turn would be
-            // another unprovable tree. Stop — but DO NOT discard this
+            // The daemon has not acknowledged a cancel often enough that this
+            // loop can prove its trees are quiet: on a shared daemon the FIRST
+            // miss already means the next turn would queue behind other
+            // tenants for another full phase budget, and on a daemon this loop
+            // owns the second miss is the proof. Stop — but DO NOT discard this
             // iteration's work: the diff was captured above, this record is
             // pushed, and the loop's own exit paths commit what is on disk.
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: the daemon did not confirm an author cancel \
-                     {unconfirmed_cancel_streak} times in a row; stopping with this iteration's \
-                     work preserved and reported."
+                     {unconfirmed_cancel_streak} time(s) in a row (abort threshold \
+                     {cancel_abort_threshold}); stopping with this iteration's work preserved \
+                     and reported."
                 );
             }
             iterations.push(json!({
@@ -9116,7 +10101,11 @@ diff is not a finished turn",
                 "verdict": "reviewer_unavailable",
                 "findings": [],
                 "resolved": false,
-                "abort_reason": "author cancel unconfirmed twice in a row",
+                "abort_reason": if cancel_abort_threshold == 1 {
+                    "author cancel unconfirmed on a shared daemon"
+                } else {
+                    "author cancel unconfirmed twice in a row"
+                },
             }));
             final_verdict = "reviewer_unavailable".into();
             break;
@@ -9133,6 +10122,54 @@ diff is not a finished turn",
             }
         }
 
+        // Whole-run deadline, checked before the review phase: the review is
+        // the longest optional phase left in the iteration, and starting it
+        // with no time on the clock is what turns "the loop ran long" into
+        // "the worker killed it before it could report". The iteration is
+        // recorded as unresolved with every byte of work preserved.
+        if deadline.expired() {
+            deadline_hit = true;
+            {
+                let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.set_phase(LOOP_PHASE_DONE, i);
+            }
+            if !cli.quiet {
+                eprintln!(
+                    "[loop] iter {i}: whole-run deadline of {}s reached before review; \
+                     recording the iteration as unresolved and stopping",
+                    deadline.secs
+                );
+            }
+            iterations.push(json!({
+                "iter": i,
+                "author_model": turn.as_ref().map(|t| t.model.clone()),
+                "author_error": author_err.clone(),
+                "author_outcome": turn.as_ref().map(|t| t.run.outcome.clone()),
+                "author_cancel_unconfirmed": cancel_unconfirmed,
+                "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                "diff_lines": diff_lines,
+                "substance": format!("{:?}", diff_substance),
+                "check": check.as_deref(),
+                "check_passed": check_passed,
+                "review_base": loop_base,
+                "review_base_tree": loop_start.tree,
+                "start_dirty": loop_start.dirty,
+                "review_chunks": 0,
+                "review_error": "review skipped: the whole-run deadline was reached",
+                "review_complete": false,
+                "reviewer_verdicts": [],
+                "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+                "findings": [],
+                "resolved": false,
+                "abort_reason": "whole-run deadline reached",
+            }));
+            final_verdict = REVIEWER_UNAVAILABLE_VERDICT.into();
+            break;
+        }
+        {
+            let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.set_phase(LOOP_PHASE_REVIEW, i);
+        }
         // 5. Adversarial review of the current diff (+ validation output).
         // When the patch journal has turns, use its `agent_diff` so the
         // reviewer sees EXACTLY what the agent changed — not the full
@@ -9177,10 +10214,16 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // (explicit `--reviewer`, then the configured reviewer pin, then the
         // routed chain head). `cli.model` is the AUTHOR pin and must not size
         // the reviewer's chunks.
-        let (reviewer_chain, review_cfg, caps_model) = match Engine::load() {
+        // ONE engine load per review iteration, reused for the reviewer
+        // chain, the author families and the whole review pass (D5.2). Before
+        // this, every iteration read the config, the engine TOML and the
+        // model corpus three times here alone (chain, author families, and
+        // again inside the review), and once more per reviewer dispatch.
+        let eng = Engine::load();
+        let (reviewer_chain, review_cfg, caps_model) = match eng.as_ref() {
             Ok(eng) => {
-                let health = HealthStore::load(&eng.cfg.health_path);
-                let chain = crate::resolve_chain(cli, &eng, &health)
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                let chain = crate::resolve_chain(cli, eng, &health)
                     .map(|r| r.reviewer)
                     .unwrap_or_default();
                 let caps_model = reviewer
@@ -9192,7 +10235,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
                             .next()
                     })
                     .or_else(|| chain.first().cloned());
-                (chain, Some(eng.cfg.review), caps_model)
+                (chain, Some(eng.cfg.review.clone()), caps_model)
             }
             Err(_) => (Vec::new(), None, reviewer.clone()),
         };
@@ -9201,14 +10244,14 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // candidates (a fallback author is still an author for this rule).
         let review_author_models = {
             let mut models = author_models.clone();
-            if let Ok(eng) = Engine::load() {
-                if let Some(primary) = crate::resolve_effective_primary(cli, &eng) {
+            if let Ok(eng) = eng.as_ref() {
+                if let Some(primary) = crate::resolve_effective_primary(cli, eng) {
                     if !models.contains(&primary) {
                         models.push(primary);
                     }
                 }
-                let health = HealthStore::load(&eng.cfg.health_path);
-                if let Ok(routes) = crate::resolve_chain(cli, &eng, &health) {
+                let health = crate::config_cache::health_store(&eng.cfg.health_path);
+                if let Ok(routes) = crate::resolve_chain(cli, eng, &health) {
                     for model in routes.primary {
                         if !models.contains(&model) {
                             models.push(model);
@@ -9245,8 +10288,27 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // 2026-10-21 a reviewer that returned `Context size has been
         // exceeded` (and a diff whose middle was silently truncated) still
         // recorded verdict=approve; that is the fail-open this closes.
+        // A failed engine load is a review that cannot run: it is reported
+        // as `reviewer_unavailable` (never a fail-open approve) and the
+        // iteration stays unresolved, exactly as any other incomplete review.
+        // Pre-D5.2 each of the three `Engine::load()` calls in this block
+        // degraded independently to an empty chain / no `[review]` config.
+        let engine_load_error = eng.as_ref().err().map(|e| format!("loading engine: {e}"));
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
-            if review_unconfirmed_cancel {
+            if let Some(detail) = engine_load_error {
+                let detail = format!("review skipped: {detail}");
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if review_unconfirmed_cancel {
                 let detail = "review skipped: the author cancel was never confirmed, so this \
 diff is not a finished turn"
                     .to_string();
@@ -9268,6 +10330,7 @@ diff is not a finished turn"
                     cli.quiet,
                     run_loop_review(
                         cli,
+                        eng.as_ref().expect("guarded above: engine loaded"),
                         reviewer.as_deref(),
                         &reviewer_chain,
                         &review_author_models,
@@ -9350,6 +10413,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
                 cli.quiet,
                 run_loop_review(
                     cli,
+                    eng.as_ref().expect("loop review requires a loaded engine"),
                     reviewer.as_deref(),
                     &reviewer_chain,
                     &review_author_models,
@@ -9732,6 +10796,7 @@ approve)…"
                         cli.quiet,
                         run_loop_review(
                             cli,
+                            eng.as_ref().expect("guarded above: engine loaded"),
                             reviewer.as_deref(),
                             &reviewer_chain,
                             &review_author_models,
@@ -9875,6 +10940,12 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         feedback = fb;
     }
 
+    // Final heartbeat: the run is over, whatever the reason. A run that
+    // stopped because the whole-run deadline fired says so in `run.json`
+    // before the result below, so a caller polling the heartbeat learns the
+    // reason even if it never reads the result document.
+    heartbeat.finalize(LOOP_PHASE_DONE, iterations.len(), deadline_hit);
+
     let payload = json!({
         "kind": "loop",
         "task": task_txt,
@@ -9889,6 +10960,15 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "final_verdict": final_verdict,
         "check": check,
         "loop_timeout_secs": loop_timeout_secs,
+        // The whole-run budget and whether IT is what ended the run, kept
+        // separate from `max_iters`/`final_verdict`: a deadline stop is a
+        // budget fact, not a verdict about the work.
+        "deadline_secs": deadline_secs,
+        "deadline_reached": deadline_hit,
+        // Present only for a run stopped by the free-policy gate: the reason
+        // the loop stopped, carried in the document instead of being lost
+        // with a mid-loop `bail!`.
+        "policy_violation": policy_violation,
         "total_cost_usd": total_cost,
         "duration_ms": started.elapsed().as_millis(),
         "log": iterations,
@@ -9905,6 +10985,10 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
 
     let teardown_reason = if resolved {
         "approved"
+    } else if policy_violation.is_some() {
+        "policy_violation"
+    } else if deadline_hit {
+        "deadline"
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
         "reviewer_unavailable"
     } else if iterations.is_empty() {
@@ -9917,6 +11001,7 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         "iterations": iterations.len(), "max_iters": max_iters,
         "final_verdict": final_verdict, "cost_usd": total_cost,
         "duration_s": started.elapsed().as_secs(),
+        "deadline_secs": deadline_secs, "deadline_reached": deadline_hit,
         "last_good_head_sha": rev_parse_head(cwd),
         "reviewer_model": iterations.last().and_then(|it| it.get("reviewer_model")).cloned(),
     });
@@ -9998,6 +11083,13 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         }
     }
 
+    // A free-policy violation is still a hard failure with the actionable
+    // hint the previous mid-loop `bail!` carried -- but it is applied only
+    // now, after the final result document, the result line and the final
+    // `run.json` have been written, so none of them is lost.
+    if let Some(v) = policy_violation {
+        anyhow::bail!("loop author turn violated free policy (use --allow-paid to permit): {v}");
+    }
     if !resolved {
         anyhow::bail!(
             "loop ended unresolved after {} iteration(s)",
@@ -10621,9 +11713,203 @@ pub(crate) fn cmd_cancel(_cli: &crate::Cli, job: Option<String>) -> anyhow::Resu
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Load the engine for a test that drives the review path directly.
+    /// `run_loop_review_once`, `complete_review_chunks` and the reviewer
+    /// dispatch all borrow ONE `&Engine` (D5.2); tests point it at the
+    /// fixture home they already installed in the environment.
+    pub(super) fn test_engine() -> Engine {
+        Engine::load().expect("the fixture home loads an engine")
+    }
+
     use clap::Parser;
     use std::path::PathBuf;
     use zoder_core::Config;
+
+    /// The whole-run deadline must land strictly BELOW the worker's timeout,
+    /// so the loop stops itself and can still commit, emit the final JSON
+    /// result and tear down — instead of being killed mid-run with no result
+    /// at all. Before this, nothing bounded the run: two compounding
+    /// unconfirmed-cancel iterations could spend all 7,200 s.
+    #[test]
+    fn loop_run_deadline_ends_run_before_worker_timeout() {
+        let deadline = default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS);
+        assert!(
+            deadline < WORKER_RUN_TIMEOUT_SECS,
+            "the loop deadline ({deadline} s) must land below the worker timeout \
+             ({WORKER_RUN_TIMEOUT_SECS} s), or the worker kills the run before the \
+             loop can emit its final result"
+        );
+        // And not so far below that it throws away usable run time: the
+        // headroom is the cleanup window, not most of the budget.
+        assert!(
+            deadline > WORKER_RUN_TIMEOUT_SECS / 2,
+            "the deadline ({deadline} s) must leave real run time, not just a \
+             cleanup window"
+        );
+        // The bound really is the deadline: just before it the run continues,
+        // at it the run stops.
+        let started = Instant::now();
+        let dl = LoopDeadline::new(deadline, started);
+        let just_before = started + Duration::from_secs(deadline - 1);
+        assert!(!dl.expired_at(just_before), "the run must not stop early");
+        let at = started + Duration::from_secs(deadline);
+        assert!(dl.expired_at(at), "the run must stop at the deadline");
+        assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// The "strictly below the worker's timeout" invariant is a property of the
+    /// FUNCTION, not of one favourable input: a small worker budget used to
+    /// make the headroom saturate the subtraction, and the degenerate branch
+    /// then returned the worker timeout itself — a deadline equal to the kill,
+    /// which is precisely the blind cut-off the deadline exists to prevent.
+    #[test]
+    fn loop_deadline_is_strictly_below_the_worker_timeout_for_every_budget() {
+        for worker in [2u64, 3, 10, 299, 300, 301, 600, 3600, 7200, 86400] {
+            let deadline = default_loop_deadline_secs(worker);
+            assert!(
+                deadline < worker,
+                "worker budget {worker} s produced deadline {deadline} s, which is not \
+                 strictly below the kill"
+            );
+            assert!(deadline > 0, "worker budget {worker} s left no run time");
+        }
+        // The fleet value: 7,200 s less the larger of a tenth of the budget
+        // and the five-minute floor — 7,200 / 10 = 720 s here, so 6,480 s.
+        assert_eq!(default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS), 6480);
+        assert_eq!(loop_deadline_headroom_secs(WORKER_RUN_TIMEOUT_SECS), 720);
+    }
+
+    /// On a SHARED daemon the FIRST unconfirmed author cancel stops the loop.
+    /// Two-in-a-row is only proof when this loop owns the daemon; on a fleet
+    /// host the second miss just queues behind other tenants' turns for
+    /// another full per-phase budget, which is how a run spends the worker's
+    /// whole timeout and gets killed blind.
+    #[test]
+    fn shared_daemon_unconfirmed_cancel_aborts_first_time() {
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(true),
+            1,
+            "a shared daemon must abort on the FIRST unconfirmed cancel"
+        );
+        // The standalone threshold is unchanged: one miss is a slow daemon.
+        assert_eq!(
+            unconfirmed_cancel_abort_threshold(false),
+            UNCONFIRMED_CANCEL_ABORT_THRESHOLD,
+            "a daemon serving this loop alone keeps the two-strike threshold"
+        );
+        assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
+    /// The three budget sources must compose in the documented order, and the
+    /// default must never equal or exceed the worker's timeout: a default at
+    /// the timeout is Incident A exactly, and a flag silently ignored is worse
+    /// than no flag.
+    #[test]
+    fn loop_run_budget_prefers_flag_then_config_then_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default_provider(dir.path());
+        // Flag wins over config.
+        cfg.loop_deadline_s = Some(1234);
+        assert_eq!(
+            resolve_loop_run_budget(Some(900), Some(&cfg)).deadline_secs,
+            900
+        );
+        // Config wins over the derived default.
+        assert_eq!(
+            resolve_loop_run_budget(None, Some(&cfg)).deadline_secs,
+            1234
+        );
+        // Unset everywhere: the derived default, which stays under the worker.
+        let bland = Config::default_provider(dir.path());
+        let derived = resolve_loop_run_budget(None, Some(&bland));
+        assert_eq!(
+            derived.deadline_secs,
+            default_loop_deadline_secs(WORKER_RUN_TIMEOUT_SECS)
+        );
+        assert!(derived.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        // A config that failed to load still yields a usable, safe budget
+        // rather than an error or an unbounded run.
+        let unloaded = resolve_loop_run_budget(None, None);
+        assert!(unloaded.deadline_secs < WORKER_RUN_TIMEOUT_SECS);
+        assert!(!unloaded.shared_daemon);
+        // The shared-daemon bit follows the deployment profile.
+        assert!(!resolve_loop_run_budget(None, Some(&bland)).shared_daemon);
+        // ...and flips to true for a fleet deployment, which is the only thing
+        // that makes the first unconfirmed cancel fatal.
+        let mut fleet = Config::default_provider(dir.path());
+        fleet.deployment.mode = zoder_core::config::DeploymentMode::Fleet;
+        assert!(resolve_loop_run_budget(None, Some(&fleet)).shared_daemon);
+    }
+
+    /// `run.json` must carry what a caller polling it instead of waiting out
+    /// the worker's 7,200 s actually needs: which PHASE the run is stuck in,
+    /// what each session is doing, why the last provider call failed, and
+    /// whether the whole-run deadline is what stopped the run. A heartbeat
+    /// that omits any of these is a liveness ping, not a status document.
+    #[test]
+    fn run_heartbeat_carries_phase_sessions_provider_error_and_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("job").join("run.json");
+        let started = Instant::now();
+        let mut hb = RunHeartbeat::new(Some(path.clone()), 6300, started, 5);
+        hb.set_phase(LOOP_PHASE_AUTHOR, 2);
+        hb.note_session("session-a", "running");
+        hb.note_provider_error("429 rate limited: provider overloaded");
+
+        // Written eagerly at loop entry and again on every tick, so the file
+        // exists before the first iteration finishes.
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json written"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+        assert_eq!(doc["iteration"], 2);
+        assert_eq!(doc["max_iters"], 5);
+        assert_eq!(doc["sessions"]["session-a"], "running");
+        assert_eq!(
+            doc["last_provider_error"],
+            "429 rate limited: provider overloaded"
+        );
+        assert_eq!(doc["deadline_secs"], 6300);
+        assert_eq!(doc["deadline_reached"], false);
+
+        // Re-recording the same session updates it in place: a caller must
+        // never see one session twice and have to guess which line is current.
+        hb.note_session("session-a", "cancel_unconfirmed");
+        hb.note_session("session-b", "completed:completed");
+        let doc = hb.to_json();
+        let sessions = doc["sessions"].as_object().expect("sessions object");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions["session-a"], "cancel_unconfirmed");
+        assert_eq!(sessions["session-b"], "completed:completed");
+
+        // The final document written at the deadline says so, so a caller
+        // polling the heartbeat learns the run ended without reading the
+        // result document at all.
+        hb.at_deadline();
+        hb.write();
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("run.json rewritten"))
+                .expect("run.json is JSON");
+        assert_eq!(doc["deadline_reached"], true);
+        assert_eq!(doc["phase"], LOOP_PHASE_AUTHOR);
+    }
+
+    /// A heartbeat write is observability, never a failure mode: a job
+    /// directory that cannot be created must not take the loop down.
+    #[test]
+    fn run_heartbeat_write_is_best_effort() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path whose parent is a regular FILE: create_dir_all must fail.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let mut hb = RunHeartbeat::new(Some(blocker.join("run.json")), 6300, Instant::now(), 1);
+        hb.set_phase(LOOP_PHASE_CHECK, 1);
+        hb.write(); // must not panic
+                    // With no path at all (a foreground run) it is a no-op.
+        RunHeartbeat::new(None, 6300, Instant::now(), 1).write();
+    }
 
     /// Regression test (2026-10-26): Codex's workspace-write sandbox keeps
     /// `~/.zoder` read-only, so
@@ -10804,7 +12090,10 @@ mod tests {
         );
         assert_eq!(merged.verdict, "request_changes");
         assert_eq!(merged.findings.len(), 1);
-        assert!(merged.summary.contains("Chunk 2/2"));
+        assert_eq!(
+            merged.summary,
+            "Chunk 1/2: authorization removed\nChunk 2/2: second hunk sound\n"
+        );
     }
 
     #[test]
@@ -15778,8 +17067,794 @@ mod review_diff_soundness_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod review_chunk_fanout_tests {
+    //! D5.1: the chunks of ONE reviewer run as chunk 0 first (it pins the
+    //! served model and warms the prompt cache) and then with bounded
+    //! concurrency, and the merged review is identical to the sequential walk.
+    //!
+    //! The fake provider is a real HTTP server (wiremock): each chunk body
+    //! carries its own plan index, and the server answers that chunk with a
+    //! verdict that names the index — so the merge, the prompt text and the
+    //! chunk order are all observable end to end, with no prompt change.
+    //!
+    //! Concurrency is selected through the `ZODER_REVIEW_CHUNK_CONCURRENCY`
+    //! parameter of the walk itself, never through the process environment, so
+    //! these tests hold no process-global lock while a review is in flight and
+    //! cannot deadlock against the `ZODER_HOME` tests.
+
+    use super::*;
+    use crate::agentic::reviewer_chain_dispatch_tests::{write_config, write_corpus, HomeGuard};
+    use crate::agentic::tests::test_engine;
+    use crate::Cli;
+    use clap::Parser;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// One request as the fake provider saw it: when it arrived, the chunk
+    /// index in the body, and whether the chunk asked to be blocked.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        at: Instant,
+        idx: usize,
+        blocks: bool,
+    }
+
+    #[derive(Clone)]
+    struct FakeProvider {
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    /// Extract the plan index from a review chunk prompt.
+    ///
+    /// The fixtures are one chunk per file (`+chunk N`), so the chunk's own
+    /// file marker is the authoritative index. The "part N of M" banner is
+    /// checked too, when present: it sits in the chunk's variable tail (the
+    /// default layout) and must agree with the file marker — a mis-numbered
+    /// banner would mean the merge renumbered the wrong chunk.
+    fn chunk_index(body: &str) -> usize {
+        let file_idx = body
+            .rsplit_once("\n+chunk ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .and_then(|n| n.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("no chunk marker in body: {body}"));
+        if let Some(at) = body.rfind("This is review part ") {
+            let banner = body[at + "This is review part ".len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("unparsable chunk banner: {body}"));
+            assert_eq!(
+                banner - 1,
+                file_idx,
+                "the part banner must name the chunk it carries"
+            );
+        }
+        file_idx
+    }
+
+    fn body_text(req: &Request) -> String {
+        let raw: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        raw["messages"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|m| m["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A fake reviewer: every request is logged (with its arrival time and
+    /// chunk index) and answered after `delay_ms`, so the caller can observe
+    /// concurrency and wall time. A body containing `BLOCK-ME` answers
+    /// `request_changes`; anything else approves. A body containing
+    /// `FAIL-ME` answers 401 (classified model-unavailable: with
+    /// `--retries 0` it is sent exactly once and fails a pinned chunk). A
+    /// body containing `MULTILINE` answers with a two-line summary, and one
+    /// containing `INVALID-FIRST` answers an unstructured reply until it is
+    /// re-asked with the verdict-repair instruction.
+    async fn start_fake(delay_ms: u64) -> (MockServer, FakeProvider) {
+        start_fake_with_zero_delay(delay_ms, delay_ms).await
+    }
+
+    /// Like [`start_fake`], but chunk 0 answers after `zero_delay_ms`. A
+    /// cancellation test must not pay chunk 0's (long) delay before the
+    /// fan-out even starts; the overlap test wants chunk 0 to be slow so it
+    /// can prove the later chunks wait for it.
+    async fn start_fake_with_zero_delay(
+        zero_delay_ms: u64,
+        delay_ms: u64,
+    ) -> (MockServer, FakeProvider) {
+        let server = MockServer::start().await;
+        let fake = FakeProvider {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let s = fake.seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/working/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let text = body_text(req);
+                let idx = chunk_index(&text);
+                let blocks = text.contains("BLOCK-ME");
+                s.lock().unwrap().push(Seen {
+                    at: Instant::now(),
+                    idx,
+                    blocks,
+                });
+                // The delay is applied by the response template (see below),
+                // NOT with a blocking sleep here: `MockServer` serves from a
+                // `new_current_thread` runtime, so a sleep in this handler
+                // would serialise every request and no fan-out could ever
+                // overlap. `set_delay` yields to the runtime instead, so the
+                // fixture measures zoder's concurrency rather than its own.
+                if text.contains("FAIL-ME") {
+                    return ResponseTemplate::new(401).set_body_string("bad key");
+                }
+                if text.contains("INVALID-FIRST")
+                    && !text.contains("did not satisfy the review schema")
+                {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "not a verdict"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
+                    }));
+                }
+                // Chunk 0 runs alone and only pins the model.
+                let this_delay = if idx == 0 { zero_delay_ms } else { delay_ms };
+                let review = serde_json::json!({
+                    "verdict": if blocks { "request_changes" } else { "approve" },
+                    "summary": if text.contains("MULTILINE") {
+                        format!("chunk {idx} sound\nsecond line of chunk {idx}")
+                    } else {
+                        format!("chunk {idx} sound")
+                    },
+                    "findings": [{
+                        "severity": "low",
+                        "title": format!("note from chunk {idx}"),
+                        "body": "a note",
+                        "location": format!("src/lib.rs:{}", idx + 1),
+                    }],
+                    "next_steps": [],
+                })
+                .to_string();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(this_delay))
+                    .set_body_string(
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": review},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}
+                        })
+                        .to_string(),
+                    )
+            })
+            .mount(&server)
+            .await;
+        (server, fake)
+    }
+
+    /// `n` chunk prompts; the ones listed in `markers` carry a marker in the
+    /// DIFF text (never in the instructions, so no prompt changes).
+    fn chunk_users(n: usize, markers: &[(usize, &str)]) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let marker = markers
+                    .iter()
+                    .find(|(at, _)| *at == i)
+                    .map(|(_, m)| *m)
+                    .unwrap_or("");
+                format!("diff --git a/f{i} b/f{i}\n+chunk {i}{marker}\n")
+            })
+            .collect()
+    }
+
+    fn install_fake_home(home: &Path, uri: &str) {
+        write_corpus(home, &["working-model/glm-5.1"]);
+        write_config(home, uri, "working-model/glm-5.1");
+    }
+
+    fn test_cli() -> Cli {
+        Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap()
+    }
+
+    async fn run_walk(
+        cli: &Cli,
+        users: &[String],
+        chunk_concurrency: usize,
+    ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+        complete_review_chunks_with_concurrency(
+            cli,
+            Some(&test_engine()),
+            Some("working-model/glm-5.1"),
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            users,
+            2048,
+            None,
+            &|_| panic!("no re-plan: the planned model serves"),
+            chunk_concurrency,
+        )
+        .await
+    }
+
+    fn seen_snapshot(fake: &FakeProvider) -> Vec<Seen> {
+        fake.seen.lock().unwrap().clone()
+    }
+
+    /// The parallel walk must produce the SAME merged result as the sequential
+    /// one on the same fixtures: verdict, summary text (chunk order) and the
+    /// full findings list. The chunks are supplied directly (a plan of N
+    /// chunks is exactly what the baton hands the walk), so the walk itself is
+    /// the only variable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_chunks_produce_the_same_merged_result_as_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let users = chunk_users(6, &[(2, " BLOCK-ME")]);
+        let cli = test_cli();
+
+        let (sequential, sequential_report) =
+            run_walk(&cli, &users, 1).await.expect("sequential walk");
+        let (parallel, parallel_report) = run_walk(&cli, &users, 4).await.expect("parallel walk");
+
+        let merged_sequential: ReviewOutput = serde_json::from_str(&sequential.content).unwrap();
+        let merged_parallel: ReviewOutput = serde_json::from_str(&parallel.content).unwrap();
+        assert_eq!(
+            merged_parallel.verdict, merged_sequential.verdict,
+            "the parallel merge must reach the same verdict"
+        );
+        assert_eq!(merged_parallel.verdict, "request_changes");
+        assert_eq!(
+            merged_parallel.summary, merged_sequential.summary,
+            "the summary text (one line per chunk, in chunk order) must be identical"
+        );
+        let summaries: Vec<&str> = merged_parallel.summary.lines().collect();
+        assert_eq!(summaries.len(), 6);
+        for (i, line) in summaries.iter().enumerate() {
+            assert_eq!(
+                *line,
+                format!("Chunk {}/6: chunk {i} sound", i + 1),
+                "{line}"
+            );
+        }
+        let finding_json = |r: &ReviewOutput| serde_json::to_string(&r.findings).unwrap();
+        assert_eq!(
+            finding_json(&merged_parallel),
+            finding_json(&merged_sequential),
+            "the findings must be appended in chunk order, not completion order"
+        );
+        let titles: Vec<&str> = merged_parallel
+            .findings
+            .iter()
+            .map(|f| f.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "note from chunk 0",
+                "note from chunk 1",
+                "note from chunk 2",
+                "note from chunk 3",
+                "note from chunk 4",
+                "note from chunk 5",
+            ],
+            "findings must be stable-ordered by chunk"
+        );
+        let structured = |r: &ReviewerChunkReport| -> Vec<bool> {
+            r.chunks.iter().map(|c| c.structured).collect()
+        };
+        assert_eq!(structured(&parallel_report), structured(&sequential_report));
+        assert_eq!(structured(&parallel_report).len(), 6);
+        assert_eq!(parallel.chunks, 6);
+        assert_eq!(parallel.model, "working-model/glm-5.1");
+    }
+
+    /// The worst verdict wins even when the blocking chunk answers LAST, and
+    /// the chunk numbering still follows the plan (not completion order).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worst_verdict_wins_and_order_is_plan_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let users = chunk_users(5, &[(4, " BLOCK-ME")]);
+        let cli = test_cli();
+        let (completion, report) = run_walk(&cli, &users, 4).await.expect("parallel walk");
+        let merged: ReviewOutput = serde_json::from_str(&completion.content).unwrap();
+        assert_eq!(
+            merged.verdict, "request_changes",
+            "the blocking verdict of one chunk must win the merge"
+        );
+        assert!(
+            merged.summary.contains("Chunk 5/5: chunk 4 sound"),
+            "the blocking chunk keeps its plan number: {}",
+            merged.summary
+        );
+        let seen = seen_snapshot(&fake);
+        assert_eq!(seen.len(), 5, "one request per chunk");
+        assert!(
+            seen.iter().any(|s| s.blocks && s.idx == 4),
+            "the marked chunk was sent"
+        );
+        assert_eq!(report.chunks.len(), 5);
+    }
+
+    /// `merge_chunk_reviews` is the deterministic rule the fan-out relies on:
+    /// the worst verdict wins and the fold is over the caller's order.
+    #[test]
+    fn merge_chunk_reviews_worst_verdict_wins() {
+        let chunk = |verdict: &str, summary: &str, title: &str| ReviewOutput {
+            verdict: verdict.into(),
+            summary: summary.into(),
+            findings: vec![Finding {
+                severity: "high".into(),
+                title: title.into(),
+                ..Finding::default()
+            }],
+            ..ReviewOutput::default()
+        };
+        let forward = merge_chunk_reviews(vec![
+            chunk("approve", "first sound", "a"),
+            chunk("comment", "second noted", "b"),
+            chunk("request_changes", "third broken", "c"),
+        ]);
+        let blocking_first = merge_chunk_reviews(vec![
+            chunk("request_changes", "third broken", "c"),
+            chunk("approve", "first sound", "a"),
+            chunk("comment", "second noted", "b"),
+        ]);
+        assert_eq!(forward.verdict, "request_changes");
+        assert_eq!(blocking_first.verdict, "request_changes");
+        assert_eq!(
+            forward.summary,
+            "Chunk 1/3: first sound\nChunk 2/3: second noted\nChunk 3/3: third broken\n"
+        );
+        assert_eq!(
+            blocking_first.summary,
+            "Chunk 1/3: third broken\nChunk 2/3: first sound\nChunk 3/3: second noted\n"
+        );
+    }
+
+    /// Chunk 0 runs ALONE before any later chunk is sent, and the later
+    /// chunks then overlap, bounded by the concurrency.
+    ///
+    /// Overlap is read from the fake's ARRIVAL timestamps against the delay
+    /// each response carries: a later chunk that arrives more than one delay
+    /// after its predecessor cannot have been overlapped with it. (The
+    /// fixture cannot count "in flight" in its handler — `wiremock` applies
+    /// the template delay after the handler returns — so arrival spacing is
+    /// the honest signal.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_zero_runs_first_and_later_chunks_overlap() {
+        let delay = Duration::from_millis(150);
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, fake) = start_fake(delay.as_millis() as u64).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        run_walk(&cli, &chunk_users(5, &[]), 4)
+            .await
+            .expect("parallel walk");
+        let mut seen = seen_snapshot(&fake);
+        assert_eq!(seen.len(), 5, "one request per chunk");
+        seen.sort_by_key(|s| s.at);
+        let first = &seen[0];
+        assert_eq!(
+            first.idx, 0,
+            "chunk 0 (the model-pinning, cache-warming chunk) must be sent first"
+        );
+        // Chunk 0 alone: the next arrival may not come until chunk 0's
+        // response is (nearly) delivered, i.e. about one delay later.
+        let gap_after_zero = seen[1].at - first.at;
+        assert!(
+            gap_after_zero >= delay.mul_f64(0.9),
+            "chunk 0 must finish alone before the fan-out starts; next chunk \
+             arrived after {gap_after_zero:?} (delay {delay:?})"
+        );
+        // The four later chunks fan out: they all arrive within one delay of
+        // each other, not one-per-delay as a serial walk would produce.
+        let later = &seen[1..];
+        let span = later
+            .iter()
+            .map(|s| s.at)
+            .max()
+            .unwrap()
+            .duration_since(later.iter().map(|s| s.at).min().unwrap());
+        assert!(
+            span < delay.mul_f64(0.9),
+            "the later chunks must be dispatched together, not one per delay; \
+             they were spread over {span:?} (delay {delay:?})"
+        );
+    }
+
+    /// Cancellation: when one later chunk fails, the walk fails the review
+    /// instead of merging a partial one, and it drops (cancels) the chunks
+    /// still in flight rather than waiting for them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_chunk_fails_the_review_instead_of_merging_partially() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        // Every chunk is slow except the failing one, so a walk that waited
+        // for its siblings would take ~30 s. The marked prompt is plan index
+        // 3, the FOURTH chunk, so it is "review chunk 4/6" (the number the
+        // sequential walk on master printed); the 20 s bound below proves the
+        // chunks still in flight were abandoned, not awaited.
+        let (server, _fake) = start_fake_with_zero_delay(0, 30_000).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        // Six chunks: chunk 0 pins the model (answered immediately), then
+        // plan indexes 1..=4 fan out four wide. The failure is on index 3,
+        // inside the first wave, so the 20 s bound proves the rest were
+        // abandoned.
+        let users = chunk_users(6, &[(3, " FAIL-ME")]);
+        let started = Instant::now();
+        let err = run_walk(&cli, &users, 4)
+            .await
+            .expect_err("a 401 chunk must fail the review");
+        let elapsed = started.elapsed();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("review chunk 4/6"),
+            "the error must name the failed chunk: {text}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "in-flight chunks must be cancelled, not awaited: {elapsed:?}"
+        );
+    }
+
+    /// Wall time scales with the fan-out: six chunks at 170 ms. The sequential
+    /// walk is one chunk 0 plus five serialized chunks (~1 s); the parallel
+    /// walk is chunk 0 plus two waves of four (~500 ms). The bound is generous
+    /// so a loaded box cannot flake it, but a walk that still ran the later
+    /// chunks one at a time cannot pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fake_provider_shows_wall_time_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(170).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(6, &[]);
+
+        let sequential_started = Instant::now();
+        run_walk(&cli, &users, 1).await.expect("sequential walk");
+        let sequential = sequential_started.elapsed();
+
+        let parallel_started = Instant::now();
+        run_walk(&cli, &users, 4).await.expect("parallel walk");
+        let parallel = parallel_started.elapsed();
+
+        assert!(
+            parallel < sequential.mul_f64(0.75),
+            "the parallel walk must be materially faster: sequential {sequential:?}, parallel {parallel:?}"
+        );
+    }
+
+    /// The legacy chunk layout keeps the sequential walk: its "part N of M"
+    /// banner sits in FRONT of the prompt.
+    #[test]
+    fn legacy_chunk_layout_keeps_the_sequential_walk() {
+        let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_STABLE_PREFIX", Some("0"));
+        let preface = !crate::review_baton::stable_prefix_enabled();
+        assert!(
+            preface,
+            "ZODER_REVIEW_STABLE_PREFIX=0 selects the legacy layout"
+        );
+        assert!(
+            chunk_parallelism_blocker_at(preface, 4).is_some(),
+            "the legacy layout must keep the sequential walk"
+        );
+        assert!(
+            chunk_parallelism_blocker_at(false, 4).is_none(),
+            "the default layout fans out"
+        );
+    }
+
+    /// The default layout names the chunk inside the variable tail (after the
+    /// cache-stable head) — the text the baton itself emits.
+    #[test]
+    fn default_chunk_layout_does_not_preface_the_prompt() {
+        let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_STABLE_PREFIX", None);
+        assert!(crate::review_baton::stable_prefix_enabled());
+        assert_eq!(chunk_user_text("BODY", 1, 3, false), "BODY");
+        let legacy = chunk_user_text("BODY", 1, 3, true);
+        assert!(
+            legacy.starts_with("This is review part 2 of 3."),
+            "{legacy}"
+        );
+        assert!(legacy.ends_with("BODY"), "{legacy}");
+    }
+
+    /// Every test above selects its walk through the parameter; this one pins
+    /// that the PRODUCTION path reads the same choice from the environment and
+    /// defaults to the bounded fan-out.
+    #[test]
+    fn chunk_concurrency_defaults_to_four_and_is_env_configurable() {
+        {
+            let _v = crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", None);
+            assert_eq!(chunk_concurrency(), DEFAULT_CHUNK_CONCURRENCY);
+            assert!(chunk_parallelism_blocker_at(false, 4).is_none());
+        }
+        {
+            let _v =
+                crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", Some("1"));
+            assert_eq!(chunk_concurrency(), 1);
+            assert!(chunk_parallelism_blocker_at(false, 1).is_some());
+        }
+        {
+            let _v =
+                crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", Some("bogus"));
+            assert_eq!(
+                chunk_concurrency(),
+                DEFAULT_CHUNK_CONCURRENCY,
+                "an unparsable value falls back to the default"
+            );
+        }
+        {
+            // `buffer_unordered(0)` never polls anything: a `0` here must not
+            // turn into a review that hangs forever.
+            let _v =
+                crate::test_env::EnvGuard::set_var("ZODER_REVIEW_CHUNK_CONCURRENCY", Some("0"));
+            assert_eq!(
+                chunk_concurrency(),
+                DEFAULT_CHUNK_CONCURRENCY,
+                "0 falls back to the default instead of stalling the fan-out"
+            );
+        }
+    }
+
+    /// A failing later chunk is named by its PLAN position, the number the
+    /// sequential walk always printed (`idx + 1` of `users.len()`), in both
+    /// walks. Plan index 1 is the second chunk: "review chunk 2/4", never
+    /// "1/4", which is chunk 0's own label.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_later_chunk_is_named_by_its_plan_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(4, &[(1, " FAIL-ME")]);
+        for concurrency in [1, 4] {
+            let err = run_walk(&cli, &users, concurrency)
+                .await
+                .expect_err("a 401 chunk must fail the review");
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with("review chunk 2/4:"),
+                "concurrency {concurrency}: the second chunk must be named 2/4: {text}"
+            );
+        }
+    }
+
+    /// A chunk summary that spans several lines keeps ONE number per chunk,
+    /// byte-identical to the sequential text (`Chunk N/M: <summary>\n` per
+    /// chunk). Numbering by summary LINE would label the second line of
+    /// chunk 2 as "Chunk 3/3" and push chunk 3 to a non-existent "4/3".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multi_line_chunk_summary_keeps_one_number_per_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(3, &[(1, " MULTILINE")]);
+        for concurrency in [1, 4] {
+            let (completion, _) = run_walk(&cli, &users, concurrency).await.expect("walk");
+            let merged: ReviewOutput = serde_json::from_str(&completion.content).unwrap();
+            assert_eq!(
+                merged.summary,
+                "Chunk 1/3: chunk 0 sound\n\
+                 Chunk 2/3: chunk 1 sound\nsecond line of chunk 1\n\
+                 Chunk 3/3: chunk 2 sound\n",
+                "concurrency {concurrency}"
+            );
+        }
+    }
+
+    /// The operator's `--retries` is the only same-model retry budget of a
+    /// chunk. A 401 on a later chunk under `--retries 0` reaches the
+    /// provider exactly once: no second retry layer re-sends a rejected
+    /// credential (and records its health failure again) behind the flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_later_chunk_is_sent_once_under_retries_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(2, &[(1, " FAIL-ME")]);
+        run_walk(&cli, &users, 4)
+            .await
+            .expect_err("a 401 chunk must fail the review");
+        let sends = seen_snapshot(&fake).iter().filter(|s| s.idx == 1).count();
+        assert_eq!(sends, 1, "--retries 0 must send the failing chunk once");
+    }
+
+    /// The fan-out takes a provider slot per dispatch: with
+    /// `ZODER_PROVIDER_CONCURRENCY=<provider>=1` the later chunks reach the
+    /// provider one at a time even though the walk allows four.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_fan_out_respects_provider_slots() {
+        let delay = Duration::from_millis(150);
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        // `HomeGuard` already holds the process-wide env lock, so the
+        // variable is set directly (a second guard would self-deadlock) and
+        // restored before the guard is released.
+        let prev = std::env::var("ZODER_PROVIDER_CONCURRENCY").ok();
+        std::env::set_var("ZODER_PROVIDER_CONCURRENCY", "wiremock-working=1");
+        let (server, fake) = start_fake(delay.as_millis() as u64).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let result = run_walk(&cli, &chunk_users(4, &[]), 4).await;
+        match prev {
+            Some(v) => std::env::set_var("ZODER_PROVIDER_CONCURRENCY", v),
+            None => std::env::remove_var("ZODER_PROVIDER_CONCURRENCY"),
+        }
+        result.expect("walk under a one-slot provider");
+        let mut seen = seen_snapshot(&fake);
+        seen.sort_by_key(|s| s.at);
+        assert_eq!(seen.len(), 4);
+        for pair in seen.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            assert!(
+                gap >= delay.mul_f64(0.9),
+                "one slot: chunk {} arrived {gap:?} after chunk {} (delay {delay:?})",
+                pair[1].idx,
+                pair[0].idx
+            );
+        }
+    }
+
+    /// A later chunk whose first reply was not a verdict is repaired on the
+    /// same model; BOTH of its calls are accounted (receipt per call), and the
+    /// chunk is recorded as not structured on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repaired_later_chunk_keeps_its_first_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        install_fake_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let users = chunk_users(3, &[(1, " INVALID-FIRST")]);
+        for concurrency in [1, 4] {
+            let (completion, report) = run_walk(&cli, &users, concurrency)
+                .await
+                .expect("the repair answers");
+            assert_eq!(
+                completion.receipts.len(),
+                4,
+                "concurrency {concurrency}: chunk 0 + chunk 1 (invalid, repair) + chunk 2"
+            );
+            let structured: Vec<bool> = report.chunks.iter().map(|c| c.structured).collect();
+            assert_eq!(structured, vec![true, false, true]);
+        }
+    }
+
+    /// Mount a first reviewer (`broken-model/reviewer`) that never returns a
+    /// structured verdict; its verdict-repair re-ask answers `repair_status`
+    /// (200 = another invalid reply).
+    async fn mount_invalid_first_reviewer(server: &MockServer, repair_status: u16) {
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(move |req: &Request| {
+                let text = body_text(req);
+                if repair_status != 200 && text.contains("did not satisfy the review schema") {
+                    return ResponseTemplate::new(repair_status)
+                        .set_body_string("max_tokens is too large for this request");
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "I could not review this diff."},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
+                }))
+            })
+            .mount(server)
+            .await;
+    }
+
+    fn install_two_reviewer_home(home: &Path, uri: &str) {
+        write_corpus(home, &["broken-model/reviewer", "working-model/glm-5.1"]);
+        write_config(home, uri, "broken-model/reviewer,working-model/glm-5.1");
+    }
+
+    async fn run_chain_walk(
+        cli: &Cli,
+        users: &[String],
+    ) -> anyhow::Result<(Completion, ReviewerChunkReport)> {
+        complete_review_chunks_with_concurrency(
+            cli,
+            Some(&test_engine()),
+            None,
+            &[],
+            &[],
+            REVIEW_SYSTEM,
+            users,
+            2048,
+            None,
+            &|_| None,
+            4,
+        )
+        .await
+    }
+
+    /// A repair re-ask that the provider REJECTS (here a 400 on the doubled
+    /// budget, a plain provider error) is not a verdict: chunk 0 records the
+    /// candidate as `invalid_verdict` and the chain advances to the next
+    /// reviewer, exactly as the sequential walk on master did. It must not
+    /// turn into a failed review while a candidate remains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rejected_repair_on_chunk_zero_still_advances_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        mount_invalid_first_reviewer(&server, 400).await;
+        install_two_reviewer_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let (completion, report) = run_chain_walk(&cli, &chunk_users(2, &[]))
+            .await
+            .expect("the next reviewer must answer after a rejected repair");
+        assert_eq!(completion.model, "working-model/glm-5.1");
+        assert_eq!(report.escalation_reason.as_deref(), Some("invalid_verdict"));
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| s.model == "broken-model/reviewer" && s.reason == "invalid_verdict"));
+    }
+
+    /// Every call chunk 0 made is accounted, including the attempts of a
+    /// candidate whose verdict was invalid: its first reply and its repair
+    /// each carry a provenance receipt (and spend), and the merged review
+    /// must report all of them, not only the candidate that answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalid_chunk_zero_attempts_keep_their_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::new(dir.path());
+        let (server, _fake) = start_fake(0).await;
+        mount_invalid_first_reviewer(&server, 200).await;
+        install_two_reviewer_home(dir.path(), &server.uri());
+        let cli = test_cli();
+        let (completion, _) = run_chain_walk(&cli, &chunk_users(2, &[]))
+            .await
+            .expect("the next reviewer must answer after an invalid verdict");
+        let models: Vec<&str> = completion
+            .receipts
+            .iter()
+            .filter_map(|r| r["requested_model"].as_str())
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                "broken-model/reviewer",
+                "broken-model/reviewer",
+                "working-model/glm-5.1",
+                "working-model/glm-5.1",
+            ],
+            "invalid first reply + its repair + chunk 0 + chunk 1, in dispatch order"
+        );
+    }
+}
+
+#[cfg(test)]
 mod reviewer_chain_dispatch_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::Cli;
     use clap::Parser;
     use std::path::{Path, PathBuf};
@@ -16193,6 +18268,7 @@ mod reviewer_chain_dispatch_tests {
 
         let (review, _, _, chunks, _) = run_loop_review_once(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -16233,6 +18309,163 @@ mod reviewer_chain_dispatch_tests {
         // The only finding was disproved, so a blocking verdict is
         // downgraded to `comment`, never `approve`.
         assert_eq!(review.verdict, "comment", "{review:?}");
+    }
+
+    /// D10.7: one review reads a given post-image file ONCE.
+    ///
+    /// `context_for` (the cross-chunk header), `filter_false_undefined_findings`
+    /// and the confirmation grounding each read the reviewed files, and a
+    /// branch read is a `git show HEAD:<path>` subprocess. Before the fix each
+    /// consumer had its own reader: the header read `pkg/mod.py` while planning
+    /// and re-read it on every re-plan/fallback, and the filter read it again,
+    /// so one small review forked the same file several times. All three now
+    /// share one per-review `PostImages` cache.
+    ///
+    /// The reader is injected (the counting closure below) so the read count is
+    /// observable without patching `std::fs`: `reads()` counts calls to the
+    /// UNDERLYING reader, i.e. real reads, not cache hits. Asserted as an
+    /// exact count of one per distinct path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_image_read_once_per_file() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // The counting reader stands in for production's disk read: it runs
+        // once per ACTUAL read, so `reads()` is a true read count, not a hit
+        // count.
+        let raw = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_counter = raw.clone();
+        let post_image = crate::config_cache::PostImages::new(move |path: &str| {
+            read_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::read_to_string(root.join(path)).ok()
+        });
+
+        let (review, _, _, chunks, _) = run_loop_review_once_with_reader(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            &post_image,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        assert_eq!(chunks, 1, "one chunk for a diff this small");
+        // Sanity: the filter really did run and read the file, so the count
+        // below is evidence that the read happened, not that nothing read.
+        assert_eq!(review.filtered_findings.len(), 1, "{review:?}");
+        assert_eq!(
+            raw.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pkg/mod.py must be read exactly once per review, shared by the \
+             context header and the false-\"undefined\" filter"
+        );
+    }
+
+    /// D5.2: one review loads the engine ONCE.
+    ///
+    /// Before the fix, a review re-read the config, the engine TOML and the
+    /// multi-megabyte model corpus on every reviewer dispatch, on every
+    /// invalid-verdict repair, and once more on each recorded fallback
+    /// failure — and the loop did it three times per iteration just to build
+    /// the chain, the author families and the review itself. The engine is
+    /// now loaded once and borrowed (`&Engine`) by `build_reviewer_plan`,
+    /// `dispatch_reviewer_for_model` and the repair/failure paths.
+    ///
+    /// The counter is keyed by `Config::home()` ([`crate::engine_load_count_for`]),
+    /// so this test reads the count for ITS fixture home (which `HomeGuard` makes the current one) and
+    /// asserts on the DELTA it caused, never an absolute count. A global
+    /// counter would be blind here: `Engine::load()` FAILS for this home
+    /// (it has no engine `config.toml`), and a failed load still does the
+    /// config read and the registry bind the fix removes. Measured on the
+    /// pre-fix tree this DELTA is 2 (plan load + dispatch load); with the
+    /// fix it is 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_loads_engine_once() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        // `HomeGuard` takes the process-wide env lock itself; taking it
+        // again here would deadlock this test before it measured anything.
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        mount_200_review_with_false_undefined_finding(&server).await;
+        write_corpus(home, &["working-model/reviewer"]);
+        write_config(home, &server.uri(), "working-model/reviewer");
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "RETRY_LIMIT = 3\n").unwrap();
+        let diff = concat!(
+            "diff --git a/pkg/mod.py b/pkg/mod.py\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pkg/mod.py\n",
+            "+++ b/pkg/mod.py\n",
+            "@@ -1,2 +1,3 @@\n",
+            " RETRY_LIMIT = 3\n",
+            "+RETRY_LIMIT_UNUSED = 4\n"
+        );
+        let cli = review_cli();
+
+        // One engine for the fixture, loaded OUTSIDE the measured window.
+        let eng = test_engine();
+
+        let before = crate::engine_load_count_for(home);
+        let _ = run_loop_review_once(
+            &cli,
+            &eng,
+            None,
+            &[],
+            &[],
+            "review the diff",
+            diff,
+            "working tree",
+            "",
+            Some("working-model/reviewer"),
+            None,
+            &[],
+            &[],
+            root,
+        )
+        .await
+        .expect("the loop review completes against the mock reviewer");
+        let delta = crate::engine_load_count_for(home) - before;
+
+        // The review dispatches one chunk through one candidate: the only
+        // load it may add is zero — every path now borrows the engine the
+        // caller loaded. Pre-fix this was 2 (plan load + dispatch load).
+        assert_eq!(
+            delta, 0,
+            "a review must not reload the engine; it borrowed &Engine but the count rose by {delta}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16421,6 +18654,7 @@ mod reviewer_chain_dispatch_tests {
         let author_models: Vec<String> = vec!["broken-model/coder".to_string()];
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &author_models,
@@ -16497,7 +18731,7 @@ mod reviewer_chain_dispatch_tests {
         // Configured chain: the same-family reviewer is dropped, the
         // cross-family tail remains, and the skip is recorded.
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16507,8 +18741,14 @@ mod reviewer_chain_dispatch_tests {
 
         // Explicit operator pin: kept, flagged, and warned about — not
         // silently dropped.
-        let pinned =
-            build_reviewer_plan(&cli, Some("broken-model/reviewer"), &[], &authors, None).unwrap();
+        let pinned = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            Some("broken-model/reviewer"),
+            &[],
+            &authors,
+        )
+        .unwrap();
         assert!(pinned.forced, "an explicit same-family pin must be flagged");
         assert_eq!(
             pinned.candidates.first().map(String::as_str),
@@ -16552,7 +18792,7 @@ mod reviewer_chain_dispatch_tests {
             "wiremock-working=working-model/other",
         ])
         .unwrap();
-        let pooled = build_reviewer_plan(&pool_cli, None, &[], &authors, None).unwrap();
+        let pooled = build_reviewer_plan(&pool_cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(pooled.candidates, vec!["working-model/other"]);
         assert!(pooled
             .skipped
@@ -16596,7 +18836,7 @@ mod reviewer_chain_dispatch_tests {
 
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
         let authors = vec!["broken-model/coder".to_string()];
-        let plan = build_reviewer_plan(&cli, None, &[], &authors, None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &authors).unwrap();
         assert_eq!(plan.candidates, vec!["working-model/other"]);
         assert_eq!(plan.author_families, vec!["family-a"]);
         assert!(plan
@@ -16614,9 +18854,15 @@ mod reviewer_chain_dispatch_tests {
         write_config(home, &runtime_loopback_uri(), "broken-model/reviewer");
         write_model_families(home, json!({"broken-model/*": "family-a"}));
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let err = build_reviewer_plan(&cli, None, &[], &["broken-model/coder".to_string()], None)
-            .unwrap_err()
-            .to_string();
+        let err = build_reviewer_plan(
+            &cli,
+            &test_engine(),
+            None,
+            &[],
+            &["broken-model/coder".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("no reviewer candidate remains outside the author model families"),
             "{err}"
@@ -16652,6 +18898,7 @@ mod reviewer_chain_dispatch_tests {
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             None,
             &[],
             &[],
@@ -16795,6 +19042,7 @@ mod reviewer_chain_dispatch_tests {
 +new\n";
         let (review, _model, _cost, _chunks, verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -16847,7 +19095,7 @@ mod reviewer_chain_dispatch_tests {
             "working-model/reviewer,broken-model/head",
         );
         let cli = Cli::try_parse_from(["zoder", "review"]).unwrap();
-        let plan = build_reviewer_plan(&cli, None, &[], &[], None).unwrap();
+        let plan = build_reviewer_plan(&cli, &test_engine(), None, &[], &[]).unwrap();
         assert_eq!(
             plan.candidates,
             vec!["working-model/reviewer", "broken-model/head"],
@@ -17387,6 +19635,7 @@ mod reviewer_chain_dispatch_tests {
         };
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17412,6 +19661,7 @@ mod reviewer_chain_dispatch_tests {
         // (the replanned model), not from the abandoned pre-replan dispatch.
         let report = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17444,6 +19694,7 @@ mod reviewer_chain_dispatch_tests {
         hits.store(0, Ordering::SeqCst);
         let result = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/glm-5.1"),
             &[],
             &[],
@@ -17746,6 +19997,7 @@ mod reviewer_chain_dispatch_tests {
             let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
             let result = complete_review_chunks(
                 &cli,
+                Some(&test_engine()),
                 Some("working-model/glm-5.1"),
                 &[],
                 &[],
@@ -18668,6 +20920,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18708,6 +20961,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 20);
         let (review, model, _cost, chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18765,6 +21019,7 @@ model_provider = "custom.nemotron35"
         let diff = synthetic_loop_diff(20, 100);
         let (review, model, _cost, chunks, reviewer_verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18840,6 +21095,7 @@ model_provider = "custom.nemotron35"
         let cli = dummy_cli();
         let err = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -18903,6 +21159,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -18995,6 +21252,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19076,6 +21334,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, report) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19161,6 +21420,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19246,6 +21506,7 @@ model_provider = "custom.nemotron35"
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19322,6 +21583,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19385,6 +21647,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19451,6 +21714,7 @@ data: [DONE]\n\n";
         std::fs::write(&path, serde_json::to_string_pretty(&body).unwrap()).unwrap();
         let (completion, _) = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &[],
             &[],
@@ -19518,6 +21782,7 @@ data: [DONE]\n\n";
         let cli = Cli::try_parse_from(["zoder", "exec", "--retries", "0"]).unwrap();
         let err = complete_review_chunks(
             &cli,
+            Some(&test_engine()),
             Some("working-model/reviewer"),
             &["working-model/fallback".into()],
             &[],
@@ -19867,6 +22132,7 @@ data: [DONE]\n\n";
         let cli = dummy_cli();
         let (review, _model, _cost, _chunks, _verdicts) = run_loop_review(
             &cli,
+            &test_engine(),
             None,
             &[],
             &[],
@@ -20191,6 +22457,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &cwd,
@@ -20268,6 +22538,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -20333,6 +22607,10 @@ data: [DONE]\n\n";
             false,
             900,
             900,
+            super::LoopRunBudget {
+                deadline_secs: super::default_loop_deadline_secs(super::WORKER_RUN_TIMEOUT_SECS),
+                shared_daemon: false,
+            },
             false,
             false,
             &_cwd,
@@ -22775,6 +25053,7 @@ mod loop_review_base_tests {
 #[cfg(test)]
 mod reviewer_request_settings_tests {
     use super::*;
+    use crate::agentic::tests::test_engine;
     use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
@@ -22856,7 +25135,7 @@ model_provider = "custom.reviewer"
         server: &MockServer,
         extra_cli: &[&str],
         home: &std::path::Path,
-        engine_path: &std::path::Path,
+        _engine_path: &std::path::Path,
         models_json: Option<serde_json::Value>,
     ) -> Result<Completion, ReviewerError> {
         let reply = serde_json::json!({
@@ -22886,12 +25165,12 @@ model_provider = "custom.reviewer"
         let cli = crate::Cli::try_parse_from(argv).expect("reviewer arguments parse");
         dispatch_reviewer_for_model(
             &cli,
+            &test_engine(),
             MODEL,
             MODEL,
             "system prompt",
             "diff",
             4096,
-            Some(engine_path),
             None,
         )
         .await
