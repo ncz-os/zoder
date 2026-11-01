@@ -3252,7 +3252,11 @@ mod tests {
                 append_lines(
                     &path,
                     &[slot_line(
-                        &stale_armed_entry_at(now - chrono::Duration::hours(7)),
+                        // Recovery reconciles it into an unknown-cost row,
+                        // which must not fall in the current month (see the
+                        // unknown-cost rows above). Dated before the month,
+                        // it is also stale by the wall clock (>= `now`).
+                        &stale_armed_entry_at(month_start - chrono::Duration::hours(7)),
                         BILLABLE_RESERVATION_BYTES,
                     )],
                 );
