@@ -6802,7 +6802,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         None
     };
 
-    // The cap outranks the policy prompt: a budget stop is reported as one.
+    // The budget verdict outranks the policy prompt: a budget stop is
+    // reported as one (a cap trip, an unreadable ledger, or an unpriced
+    // model -- every case this gate already answered with the budget code).
     if let Some(msg) = &budget_confirm {
         if !confirm_paid(msg)? {
             return Err(budget_declined(&primary, "over_budget", msg));
@@ -12633,7 +12635,9 @@ pub(crate) async fn agentic_turn(
         None
     };
 
-    // The cap outranks the policy prompt: a budget stop is reported as one.
+    // The budget verdict outranks the policy prompt: a budget stop is
+    // reported as one (a cap trip, an unreadable ledger, or an unpriced
+    // model -- every case this gate already answered with the budget code).
     if let Some(msg) = &budget_confirm {
         if !confirm_paid(msg)? {
             return Err(budget_declined(&primary, "over_budget", msg));
