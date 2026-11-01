@@ -192,6 +192,7 @@ The failure is printed as its own `error` object — the same keys, under
 | `detail.message`              | string  | yes            | The operator-facing human message.                              |
 | `detail.reviewers`            | array   | no             | Per-model `{model, err_kind}` for `reviewers_unavailable`.      |
 | `detail.resets_at`            | string  | no             | The engine's reset timestamp, verbatim, when it reported one.   |
+| `detail.result_write_error`   | string  | no             | A background job's `result.json` existed but could not be rewritten, so the failure is printed as this standalone `error` object instead (`agentic::attach_failure_to_result` returned the error; a warning also goes to stderr). |
 
 ### Backward compatibility
 

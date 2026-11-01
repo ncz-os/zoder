@@ -3113,9 +3113,21 @@ fn emit_json_failure(error: &anyhow::Error) {
         );
         return;
     };
-    if agentic::attach_failure_to_result(&classified) {
+    let mut classified = classified;
+    match agentic::attach_failure_to_result(&classified) {
         // The result object already carries the failure.
-        return;
+        Ok(true) => return,
+        Ok(false) => {}
+        // The result exists but could not be rewritten: the failure is NOT
+        // attached. Say so on stderr and carry the write error in the
+        // standalone envelope, so the classification is not lost.
+        Err(write_err) => {
+            eprintln!("zoder: warning: could not attach the failure to result.json: {write_err:#}");
+            classified.extra.insert(
+                "result_write_error".into(),
+                serde_json::Value::String(format!("{write_err:#}")),
+            );
+        }
     }
     println!(
         "{}",

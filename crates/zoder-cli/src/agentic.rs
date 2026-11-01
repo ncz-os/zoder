@@ -7227,40 +7227,71 @@ fn emit_reviews(
 /// Attach a classified failure to the result object this process already
 /// produced, when there is one.
 ///
-/// Returns `true` when the failure was attached (so the caller must NOT
-/// print a second JSON document), and `false` when there was no result to
-/// attach to — in which case the caller prints the standalone `error`
-/// object.
+/// * `Ok(true)`: the failure was attached (so the caller must NOT print a
+///   second JSON document).
+/// * `Ok(false)`: there was no result to attach to; the caller prints the
+///   standalone `error` object.
+/// * `Err(e)`: there WAS a result, but rewriting it failed. The failure is
+///   NOT attached, and the error says why, so the caller can surface it and
+///   fall back to the standalone `error` object instead of losing the
+///   classification.
 ///
 /// The attachment is possible only for a result that is still in this
 /// process's hands: the background-job `result.json` file. The stdout
 /// document was already printed, so it cannot be rewritten; that is why the
 /// review and loop paths attach the failure BEFORE emitting.
-pub(crate) fn attach_failure_to_result(failure: &crate::failure::ClassifiedFailure) -> bool {
+pub(crate) fn attach_failure_to_result(
+    failure: &crate::failure::ClassifiedFailure,
+) -> anyhow::Result<bool> {
     // The class must be one of the closed vocabulary's members. A class
     // outside it would be a contract violation, and writing it into the
     // result would publish a code no consumer can interpret.
     if crate::failure::FailureCode::from_code(failure.code.code()).is_none() {
-        return false;
+        return Ok(false);
     }
     // A result that was printed to stdout cannot be rewritten, so the
     // failure must already be inside it. Nothing to do here.
     let Some(dir) = active_job_dir() else {
-        return false;
+        return Ok(false);
     };
-    let path = dir.join("result.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
+    attach_failure_to_result_file(&dir.join("result.json"), failure)
+}
+
+/// Attach `failure` to the result document at `path` (the job's
+/// `result.json`).
+///
+/// The rewrite goes through a sibling temp file and a rename, so a failed
+/// write never leaves a truncated `result.json` behind.
+fn attach_failure_to_result_file(
+    path: &std::path::Path,
+    failure: &crate::failure::ClassifiedFailure,
+) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(false);
     };
     let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return false;
+        return Ok(false);
     };
     payload["failure"] = failure.to_json();
-    let _ = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&payload).unwrap_or_default(),
-    );
-    true
+    let body = serde_json::to_string_pretty(&payload)
+        .context("serializing result.json with the failure attached")?;
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    if let Err(e) = std::fs::write(&tmp, body) {
+        // A partially written temp FILE is removed; a non-file in the way
+        // is left alone (it is not ours).
+        if tmp.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replacing {}", path.display())
+    })?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -26640,6 +26671,60 @@ model_provider = "custom.reviewer"
             body.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("minimal"),
             "the confirmer must run at the effort the operator declared: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attach_failure_to_result_tests {
+    use super::*;
+    use crate::failure::{ClassifiedFailure, FailureCode};
+
+    fn failure() -> ClassifiedFailure {
+        ClassifiedFailure::new(FailureCode::LoopExhausted, "loop ended unresolved")
+    }
+
+    /// The happy path: the failure lands inside the existing result document.
+    #[test]
+    fn a_writable_result_gets_the_failure_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        std::fs::write(&path, r#"{"kind":"loop","resolved":false}"#).unwrap();
+        let attached = attach_failure_to_result_file(&path, &failure()).unwrap();
+        assert!(attached);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["failure"]["code"], "loop_exhausted");
+        assert_eq!(v["kind"], "loop");
+    }
+
+    /// Review (muse-spark-1.3, high): a result.json write that FAILS must not
+    /// report the failure as attached -- the caller would then print nothing
+    /// and the classification would be lost.
+    ///
+    /// The write is made to fail two ways so the test holds for any uid: the
+    /// file is read-only (blocks an in-place write for a non-root user) and the
+    /// sibling temp path is a directory (blocks a temp-file-and-rename write,
+    /// even for root).
+    #[test]
+    fn a_failed_result_write_is_not_reported_as_attached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        let original = r#"{"kind":"loop","resolved":false}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::create_dir(dir.path().join("result.json.tmp")).unwrap();
+
+        let err = attach_failure_to_result_file(&path, &failure())
+            .expect_err("a failed write must not report attached=true");
+        assert!(
+            format!("{err:#}").contains("result.json"),
+            "the error must name the file it failed to write: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a failed attach must leave the result document intact"
         );
     }
 }
