@@ -6698,6 +6698,7 @@ model_provider = "custom.primary"
                 violation: None,
                 tags: crate::ledger::FinOpsTags::default(),
                 billing: None,
+                estimated_cost_usd: None,
             })
             .collect()
     }

@@ -371,6 +371,7 @@ mod tests {
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let window = QuotaWindow {
             name: "monthly".into(),
@@ -557,6 +558,7 @@ mod tests {
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let entries = vec![mk("anthropic", 10, 1), mk("anthropic", 60, 1)];
         let plan = SubscriptionPlan {
@@ -600,6 +602,7 @@ mod tests {
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let window = w("5h", 5, 900.0, QuotaUnit::Messages);
         let usage = window_usage_at(&[entry], "anthropic", &window, None, None, now);
@@ -635,6 +638,7 @@ mod tests {
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         // 300 + 200 (+ a nonzero `calls` on one row to prove it's ignored
         // for tokens) + 400 + 100 == 1000 tokens.
@@ -664,6 +668,7 @@ mod tests {
             violation: None,
             tags: crate::ledger::FinOpsTags::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let plan = SubscriptionPlan {
             monthly_fee_usd: 200.0,
