@@ -2369,6 +2369,7 @@ async fn dispatch_reviewer_for_model(
                                 .as_str()
                                 .to_string(),
                         ),
+                        estimated_cost_usd: None,
                     };
                     let mut health = HealthStore::load(&eng.cfg.health_path);
                     crate::record_turn_entry(ledger_reservation, &entry, "reviewer turn").map_err(
@@ -2572,6 +2573,7 @@ async fn dispatch_reviewer_for_model(
         violation,
         tags: crate::finops_tags(cli, tokens_in, res.cached_prompt_tokens),
         billing: Some(posture.as_str().to_string()),
+        estimated_cost_usd: None,
     };
     let health = crate::config_cache::health_store(&eng.cfg.health_path);
     // The reservation's reconcile is a flock + write + fsync: keep it off the
@@ -2707,6 +2709,7 @@ mod reviewer_policy_tests {
             violation: Some(failure.clone()),
             tags: Default::default(),
             billing: None,
+            estimated_cost_usd: None,
         };
         let reservation = Ledger::new(&ledger_path).reserve_billable().unwrap();
         let mut health = HealthStore::load(&health_path);
