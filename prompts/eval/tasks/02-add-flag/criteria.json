@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/cli.py",
+    "text": "--color"
+  },
+  {
+    "kind": "file_contains",
+    "path": "src/cli.py",
+    "text": "auto"
+  },
+  {
+    "kind": "file_contains",
+    "path": "src/cli.py",
+    "text": "always"
+  },
+  {
+    "kind": "file_contains",
+    "path": "src/cli.py",
+    "text": "never"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  }
+]

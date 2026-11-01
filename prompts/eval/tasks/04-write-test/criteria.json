@@ -1,0 +1,16 @@
+[
+  {
+    "kind": "file_matches",
+    "path": "tests/test_strings.py",
+    "pattern": "slugify"
+  },
+  {
+    "kind": "file_contains",
+    "path": "tests/test_strings.py",
+    "text": "assert"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  }
+]

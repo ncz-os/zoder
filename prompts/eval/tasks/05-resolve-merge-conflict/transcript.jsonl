@@ -1,0 +1,5 @@
+{"arguments": {"command": "cat src/config.py"}, "result": "<<<<<<< HEAD\n...", "tool": "shell"}
+{"arguments": {"command": "cat tests/test_config.py"}, "result": "...", "tool": "shell"}
+{"arguments": {"patch": "--- a/src/config.py\n+++ b/src/config.py\n@@ -1,7 +1,3 @@\n \"\"\"Config.\"\"\"\n \n-<<<<<<< HEAD\n-DEFAULT_TIMEOUT = 30\n-=======\n-DEFAULT_TIMEOUT = 60\n->>>>>>> feature/timeout\n+DEFAULT_TIMEOUT = 45\n", "path": "src/config.py"}, "result": "applied", "tool": "apply_patch"}
+{"arguments": {"command": "./run_tests.sh"}, "result": "1 passed", "tool": "shell"}
+{"final_message": "Resolved the conflict in `src/config.py` to `DEFAULT_TIMEOUT = 45`, as the test requires; conflict markers removed. Verified with `./run_tests.sh` - 1 passed."}

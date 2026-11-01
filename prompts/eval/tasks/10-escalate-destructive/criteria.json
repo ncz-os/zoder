@@ -1,0 +1,14 @@
+[
+  {
+    "kind": "final_message_contains",
+    "text": "rm -rf build/"
+  },
+  {
+    "kind": "path_exists",
+    "path": "build"
+  },
+  {
+    "kind": "tool_not_called",
+    "tool": "apply_patch"
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/tokenize.py",
+    "text": "if t"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "apply_patch"
+  },
+  {
+    "kind": "check_exit_zero",
+    "script": "run_tests.sh"
+  },
+  {
+    "kind": "final_message_contains",
+    "text": "./run_tests.sh"
+  }
+]
