@@ -825,12 +825,15 @@ fn extract_reset_timestamp(line: &str) -> Option<String> {
                 || *c == '.'
         })
         .collect();
+    // `.`, `:`, `-` and `+` are legal INSIDE an instant but never end one; a
+    // trailing one is the engine's sentence punctuation.
+    let token = token.trim_end_matches(['.', ':', '-', '+']);
     if token.len() < 8 {
         return None;
     }
     // A bare date is the common shape; keep it verbatim so the consumer
     // decides how to parse it. A full RFC 3339 instant is kept verbatim too.
-    Some(token)
+    Some(token.to_string())
 }
 
 #[cfg(test)]
@@ -1147,6 +1150,44 @@ mod tests {
         .expect("the engine's budget refusal must be recognized");
         assert_eq!(code, FailureCode::EngineBudgetExceeded);
         assert_eq!(reset.as_deref(), Some("2026-11-01T00:00:00Z"));
+    }
+
+    /// Review (muse-spark-1.3, low): a timestamp that ends the engine's
+    /// sentence must not keep the sentence's punctuation, or `resets_at`
+    /// stops being RFC 3339 and `retry_after_s` silently disappears. A
+    /// fractional-seconds `.` inside the instant is kept.
+    #[test]
+    fn the_reset_timestamp_drops_trailing_punctuation() {
+        for (line, want) in [
+            (
+                "quota exhausted, resets at 2099-11-01T00:00:00Z.",
+                "2099-11-01T00:00:00Z",
+            ),
+            (
+                "quota exhausted, resets at 2099-11-01T00:00:00Z:",
+                "2099-11-01T00:00:00Z",
+            ),
+            ("cap reached until 2099-11-01.", "2099-11-01"),
+            ("cap reached until 2099-11-01-", "2099-11-01"),
+            (
+                "resets 2099-11-01T00:00:00.5+00:00.",
+                "2099-11-01T00:00:00.5+00:00",
+            ),
+        ] {
+            let (_, reset) = classify_engine_budget_exceeded(&format!("budget_exceeded: {line}"))
+                .expect("the engine's budget refusal must be recognized");
+            assert_eq!(reset.as_deref(), Some(want), "line: {line:?}");
+        }
+        let f = ClassifiedFailure::with_budget_reset(
+            FailureCode::EngineBudgetExceeded,
+            "budget_exceeded",
+            classify_engine_budget_exceeded("budget_exceeded: resets at 2099-11-01T00:00:00Z.")
+                .and_then(|(_, reset)| reset),
+        );
+        assert!(
+            f.retry_after_s(chrono::Utc::now()).is_some(),
+            "a sentence-final reset must still yield retry_after_s"
+        );
     }
 
     #[test]
