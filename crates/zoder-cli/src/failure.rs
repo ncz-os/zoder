@@ -641,7 +641,14 @@ pub(crate) fn in_contract_scope() -> bool {
 pub(crate) fn classify_message(message: &str) -> Option<(FailureCode, Option<String>)> {
     let lower = message.to_ascii_lowercase();
     let code = classify_message_code(&lower)?;
-    Some((code, None))
+    // Only the engine's budget refusal carries a reset; parse it from the
+    // ORIGINAL message (the timestamp is kept verbatim, not lower-cased).
+    let reset = if code == FailureCode::EngineBudgetExceeded {
+        classify_engine_budget_exceeded(message).and_then(|(_, reset)| reset)
+    } else {
+        None
+    };
+    Some((code, reset))
 }
 
 /// The lower-cased-message -> code half of [`classify_message`].
@@ -1212,6 +1219,41 @@ mod tests {
                 classify_message(msg).unwrap_or_else(|| panic!("{msg:?} must be recognized"));
             assert_eq!(code, want, "{msg:?}");
         }
+    }
+
+    /// Review (muse-spark-1.3, high): message recognition must KEEP the
+    /// engine's reset timestamp, not discard it, so an un-annotated budget
+    /// refusal still tells the caller when to come back.
+    #[test]
+    fn message_recognition_keeps_the_engine_budget_reset() {
+        let (code, reset) = classify_message(
+            "turn failed: Budget_Exceeded: quota exhausted, resets at 2099-11-01T00:00:00Z",
+        )
+        .expect("the engine's budget refusal must be recognized");
+        assert_eq!(code, FailureCode::EngineBudgetExceeded);
+        assert_eq!(reset.as_deref(), Some("2099-11-01T00:00:00Z"));
+
+        // Through `classify_error`, the timestamp reaches the failure, its
+        // envelope's `detail.resets_at` and `retry_after_s`.
+        let err =
+            anyhow::anyhow!("budget_exceeded: quota exhausted, resets at 2099-11-01T00:00:00Z")
+                .context("loop author turn");
+        let f = classify_error(&err).expect("the message must be recognized");
+        assert_eq!(f.code, FailureCode::EngineBudgetExceeded);
+        assert_eq!(f.budget_reset_at.as_deref(), Some("2099-11-01T00:00:00Z"));
+        let env = error_envelope(&f);
+        assert_eq!(env["error"]["detail"]["resets_at"], "2099-11-01T00:00:00Z");
+        assert!(env["error"]["retry_after_s"].as_i64().unwrap_or(0) > 0);
+
+        // A refusal without a timestamp, and any other code, carry none.
+        assert_eq!(
+            classify_message("budget_exceeded: month limit"),
+            Some((FailureCode::EngineBudgetExceeded, None))
+        );
+        assert_eq!(
+            classify_message("loop ended unresolved after 2 iteration(s); resets at 2099-11-01"),
+            Some((FailureCode::LoopExhausted, None))
+        );
     }
 
     // ---- carrying a code through an anyhow chain ------------------------
