@@ -21,7 +21,7 @@ function it comes from.
   (`code`, `class`, `exit_code`, `retryable`), `ClassifiedFailure`
   (`to_json`), `ClassifiedFailureError`, `classify_error`,
   `classify_message`, `classify_engine_budget_exceeded`, `error_envelope`.
-- `crates/zoder-cli/src/main.rs`: `main` and `error_exit_code` (the exit code), `run` (the `--json`
+- `crates/zoder-cli/src/main.rs`: `main`, `contract_exit_code` (the review / loop exit code) and `error_exit_code` (every other command), `run` (the `--json`
   failure emission), `emit_json_failure`, `turn_failure_error`.
 - `crates/zoder-cli/src/agentic.rs`: `cmd_review`, `cmd_loop`, `cmd_loop_run`,
   `emit_reviews`, `build_review_payload`, `aggregate_verdict`,
@@ -107,11 +107,16 @@ internal-class outcome: nothing to fix, nothing to retry).
   loop code.
 - `78` — a zoder budget-cap decline on the oneshot (`exec`) path
   (`main.rs`: `budget_declined`, `EXIT_BUDGET_EXCEEDED`). It is checked
-  before the classes above (`error_exit_code`) and is not a review / loop
+  before the classes above (`contract_exit_code`) and is not a review / loop
   rung.
 
 Every classified failure is NON-ZERO, so a caller that only tests "did it
 fail" (the fleet worker) is unaffected by the contract.
+
+The ladder applies ONLY to `zoder review` and `zoder loop`. Every other
+command (`exec` included) keeps its historical codes (`error_exit_code`):
+`78` for a budget-cap decline, `1` for any other failure, and its historical
+`--json` failure output.
 
 An UNCLASSIFIED failure (an error the contract cannot classify) prints the
 envelope with code `internal` and exits `50`: it is the `permanent` /
@@ -119,7 +124,7 @@ envelope with code `internal` and exits `50`: it is the `permanent` /
 
 The exit code and the JSON `class` always agree: the dispatcher in `main`
 derives the exit code from the same classified failure that the JSON
-carries (`error_exit_code`: `failure::classify_error(&e)` →
+carries (`contract_exit_code`: `failure::classify_error(&e)` →
 `classified.exit_code()`, falling back to `UNCLASSIFIED_EXIT_CODE`, which is
 `50`).
 

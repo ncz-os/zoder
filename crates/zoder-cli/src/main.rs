@@ -2738,18 +2738,27 @@ async fn main() {
     reap_ephemeral_daemons();
     if let Err(e) = res {
         eprintln!("zoder: error: {e:#}");
-        // The failure contract (see `docs/EXIT_CODES.md`), via
-        // `error_exit_code`: a budget-cap decline exits
-        // `EXIT_BUDGET_EXCEEDED` (78), a CLASSIFIED failure exits with the
-        // code its class documents, and an UNCLASSIFIED failure exits
-        // `UNCLASSIFIED_EXIT_CODE` (50, the `internal` / `permanent` rung).
-        std::process::exit(error_exit_code(&e));
+        // `zoder review` / `zoder loop` follow the failure contract (see
+        // `docs/EXIT_CODES.md`, `contract_exit_code`): a CLASSIFIED failure
+        // exits with the code its class documents, an UNCLASSIFIED one
+        // exits `UNCLASSIFIED_EXIT_CODE` (50). Every other command keeps its
+        // historical codes (`error_exit_code`: 78 for a budget-cap decline,
+        // 1 otherwise).
+        let code = if failure::in_contract_scope() {
+            contract_exit_code(&e)
+        } else {
+            error_exit_code(&e)
+        };
+        std::process::exit(code);
     }
 }
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    if matches!(cli.cmd, Some(Cmd::Review { .. }) | Some(Cmd::Loop { .. })) {
+        failure::enter_contract_scope();
+    }
 
     // `--list-schemas` is a read-only diagnostic that prints the
     // per-engine write-tool schema matrix the kernel uses to decide
@@ -3061,8 +3070,11 @@ async fn run() -> anyhow::Result<()> {
     //
     // A non-JSON run keeps the historical behaviour: the message goes to
     // stderr (the dispatcher in `main` prints it) and stdout stays empty.
+    //
+    // Only `zoder review` / `zoder loop` are in the contract's scope; every
+    // other command keeps the `--json` failure output it always had.
     if let Err(e) = &result {
-        if cli.json {
+        if cli.json && failure::in_contract_scope() {
             emit_json_failure(e);
         }
     }
@@ -13727,17 +13739,29 @@ fn budget_declined_error(msg: &str) -> anyhow::Error {
     budget_declined("", "over_budget", msg)
 }
 
-/// The process exit code for a failed `run()`.
+/// The process exit code for a failed `run()` of a command OUTSIDE the
+/// failure contract's scope (everything but `zoder review` / `zoder loop`).
 ///
-/// * Errors carrying [`BudgetExceededTag`] (a zoder budget-cap decline on the
-///   oneshot path) exit with [`EXIT_BUDGET_EXCEEDED`]. The tag is a typed
-///   CAUSE the gate attached, so it outranks the message-based inference.
+/// Errors carrying [`BudgetExceededTag`] exit with [`EXIT_BUDGET_EXCEEDED`];
+/// everything else keeps the historical `1`.
+fn error_exit_code(error: &anyhow::Error) -> i32 {
+    if error.chain().any(|c| c.is::<BudgetExceededTag>()) {
+        return EXIT_BUDGET_EXCEEDED;
+    }
+    1
+}
+
+/// The process exit code for a failed `zoder review` / `zoder loop`.
+///
+/// * Errors carrying [`BudgetExceededTag`] (a zoder budget-cap decline)
+///   exit with [`EXIT_BUDGET_EXCEEDED`]. The tag is a typed CAUSE the gate
+///   attached, so it outranks the message-based inference.
 /// * Otherwise the failure contract applies (`docs/EXIT_CODES.md`, decision
 ///   D3): a CLASSIFIED failure exits with the code its class documents, and
 ///   an UNCLASSIFIED failure exits [`failure::UNCLASSIFIED_EXIT_CODE`] (50,
 ///   the `internal` / `permanent` rung). Every failure stays non-zero, which
 ///   is the only thing a caller that predates the contract relied on.
-fn error_exit_code(error: &anyhow::Error) -> i32 {
+fn contract_exit_code(error: &anyhow::Error) -> i32 {
     if error.chain().any(|c| c.is::<BudgetExceededTag>()) {
         return EXIT_BUDGET_EXCEEDED;
     }
@@ -23885,22 +23909,44 @@ mod budget_decline_exit_tests {
         assert_eq!(error_exit_code(&e), EXIT_BUDGET_EXCEEDED);
     }
 
-    /// Every OTHER error keeps the generic exit code: the new code is a
-    /// distinct signal, not a reclassification of ordinary failures. Under
-    /// the failure contract (`docs/EXIT_CODES.md`, decision D3) the generic
-    /// code of an UNCLASSIFIED error is `UNCLASSIFIED_EXIT_CODE` (50), which
-    /// replaced the historical `1`.
+    /// Every OTHER error keeps the historical exit code `1`: the new code is a
+    /// distinct signal, not a reclassification of ordinary failures.
     #[test]
     fn ordinary_errors_keep_the_generic_exit_code() {
+        assert_eq!(error_exit_code(&anyhow::anyhow!("boom")), 1);
         assert_eq!(
-            error_exit_code(&anyhow::anyhow!("boom")),
+            error_exit_code(&anyhow::anyhow!("bad flag").context("parsing")),
+            1
+        );
+    }
+
+    /// The failure contract is scoped to `zoder review` / `zoder loop`: a
+    /// message the contract WOULD classify keeps exit `1` on any other
+    /// command, so `exec` callers are not moved onto the contract's ladder.
+    #[test]
+    fn a_command_outside_the_contract_ignores_its_classification() {
+        let e = failure::classified_err(failure::FailureCode::PolicyViolation, "use --allow-paid");
+        assert_eq!(error_exit_code(&e), 1);
+        assert_eq!(error_exit_code(&anyhow::anyhow!("failed to parse x")), 1);
+    }
+
+    /// Inside the contract's scope an UNCLASSIFIED error exits
+    /// `UNCLASSIFIED_EXIT_CODE` (50), and a budget-cap decline keeps 78.
+    #[test]
+    fn an_unclassified_contract_error_exits_the_internal_code() {
+        assert_eq!(
+            contract_exit_code(&anyhow::anyhow!("boom")),
             failure::UNCLASSIFIED_EXIT_CODE
         );
         assert_eq!(
-            error_exit_code(&anyhow::anyhow!("bad flag").context("parsing")),
+            contract_exit_code(&anyhow::anyhow!("bad flag").context("parsing")),
             failure::UNCLASSIFIED_EXIT_CODE
         );
         assert_ne!(failure::UNCLASSIFIED_EXIT_CODE, EXIT_BUDGET_EXCEEDED);
+        assert_eq!(
+            contract_exit_code(&budget_declined_error("x").context("outer")),
+            EXIT_BUDGET_EXCEEDED
+        );
     }
 
     /// The process exit code and the failure contract cannot drift: a
@@ -23910,11 +23956,11 @@ mod budget_decline_exit_tests {
     fn a_classified_error_exits_with_its_contract_code() {
         let e = failure::classified_err(failure::FailureCode::PolicyViolation, "use --allow-paid")
             .context("loop");
-        assert_eq!(error_exit_code(&e), 40);
+        assert_eq!(contract_exit_code(&e), 40);
         let e = failure::classified_err(failure::FailureCode::ReviewBlocked, "blocked");
-        assert_eq!(error_exit_code(&e), 10);
+        assert_eq!(contract_exit_code(&e), 10);
         let e = failure::classified_budget_err("budget_exceeded: window", None);
-        assert_eq!(error_exit_code(&e), 30);
+        assert_eq!(contract_exit_code(&e), 30);
     }
 
     /// Review r2: the budget tag must be found through every wrapping shape a
@@ -23923,8 +23969,7 @@ mod budget_decline_exit_tests {
     /// `anyhow::Error::new(anyhow_error)` does not compile (anyhow::Error is
     /// not StdError), so the shapes below are the complete set: bare,
     /// single/double context, `anyhow!(err).context(..)`, and `Result::context`.
-    /// Each must still exit 78, and a plain error must still exit the generic
-    /// (unclassified) code.
+    /// Each must still exit 78, and a plain error must still exit 1.
     #[test]
     fn the_budget_code_survives_every_wrapping_shape() {
         use anyhow::Context;
@@ -23960,11 +24005,7 @@ mod budget_decline_exit_tests {
         let message_only = (|| -> anyhow::Result<()> { anyhow::bail!("inner") })()
             .map_err(|e| e.context(budget_declined_error("x")))
             .unwrap_err();
-        assert_eq!(
-            error_exit_code(&message_only),
-            failure::UNCLASSIFIED_EXIT_CODE,
-            "message, not cause"
-        );
+        assert_eq!(error_exit_code(&message_only), 1, "message, not cause");
     }
 
     /// Branch review: the `--json` error object is printed ONCE, at the command
@@ -23993,7 +24034,7 @@ mod budget_decline_exit_tests {
         let v = exec_failure_json(Some("cli-model"), &other);
         assert_eq!(v, exec_error_json(Some("cli-model"), &other));
         assert!(v.get("code").is_none());
-        assert_eq!(error_exit_code(&other), failure::UNCLASSIFIED_EXIT_CODE);
+        assert_eq!(error_exit_code(&other), 1);
     }
 
     /// Review r3: the budget envelope must be a strict SUPERSET of the generic

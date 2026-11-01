@@ -609,6 +609,25 @@ pub(crate) fn result_was_emitted() -> bool {
     RESULT_EMITTED.load(Ordering::SeqCst)
 }
 
+static CONTRACT_SCOPE: AtomicBool = AtomicBool::new(false);
+
+/// Record that this process runs a command the contract covers
+/// (`zoder review` / `zoder loop`).
+///
+/// The contract is SCOPED: every other command keeps its historical exit
+/// codes (`1` for an ordinary failure, `78` for a budget-cap decline) and its
+/// historical `--json` output, so a caller of `zoder exec` is not silently
+/// moved onto a ladder it never opted into.
+pub(crate) fn enter_contract_scope() {
+    CONTRACT_SCOPE.store(true, Ordering::SeqCst);
+}
+
+/// Does the failure contract govern this process's exit code and `--json`
+/// failure output?
+pub(crate) fn in_contract_scope() -> bool {
+    CONTRACT_SCOPE.load(Ordering::SeqCst)
+}
+
 /// The code of an arbitrary error message, when one can be inferred.
 ///
 /// This is the RECOGNITION step: it maps the free-text shape of a failure onto
