@@ -128,6 +128,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use zoder_core::cancel_outcome::{classify_cancel_error, io_error_proves_no_listener};
+use zoder_core::CancelOutcome;
+
 /// SIGTERM -> settle -> SIGKILL grace on the normal exit path.
 pub(crate) const REAP_GRACE: Duration = Duration::from_millis(1500);
 /// Same, but tighter: this path runs inside a signal handler, and `zoder
@@ -453,50 +456,16 @@ static UNREACHABLE: std::sync::LazyLock<Mutex<HashSet<String>>> =
 
 /// Why a cancel could not be delivered. These are different facts about the
 /// world and must never be logged, retried, or counted alike.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelFailure {
-    /// The socket path does not exist, or nothing is listening on it. There is
-    /// no engine to cancel against, so the session is not running: it died with
-    /// the daemon that owned it.
-    EngineUnreachable,
-    /// The engine was reached and did not confirm the cancel — the ordinary
-    /// "a turn that already settled does not acknowledge a cancel" case, which
-    /// may still be a live turn and is therefore retried.
-    NotConfirmed,
-}
-
-/// Does this connect error prove there is no listener, as opposed to merely
-/// failing to reach one we can see?
 ///
-/// Only ENOENT (the path is gone — zeroclaw's `EndpointGuard` unlinks it when
-/// the daemon that bound it stops) and ECONNREFUSED (the entry is there but
-/// nobody is bound) do. Everything else — EACCES on somebody else's socket, a
-/// transport wrapper's own error, a connect timeout — leaves the engine
-/// unproven, and the conservative answer is to keep treating the session as
-/// possibly live.
-fn io_error_proves_no_listener(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-    )
-}
-
-/// Classify a `cancel_session` failure. The `io::Error` is inside the anyhow
-/// chain (the transport adds "connecting to engine at <path>" as context), so
-/// the chain is walked rather than the top-level message pattern-matched: a
-/// message that merely mentions a missing path is not proof, while the errno is.
-fn classify_cancel_error(error: &anyhow::Error) -> CancelFailure {
-    for cause in error.chain() {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return if io_error_proves_no_listener(io) {
-                CancelFailure::EngineUnreachable
-            } else {
-                CancelFailure::NotConfirmed
-            };
-        }
-    }
-    CancelFailure::NotConfirmed
-}
+/// D11 step 10 / D12: this type used to be private to the reaper. It is now
+/// [`zoder_core::CancelOutcome`], shared with the loop's author phase, so
+/// both callers answer "did the cancel land, and if not, why not?" from the
+/// SAME closed set instead of from two different private vocabularies (the
+/// reaper's errno-walking classifier and the loop's marker-prefix scan).
+///
+/// The reaper's own [`UnconfirmedCancelOutcome`] stays here: it carries the
+/// ATTEMPT COUNT, which is a fact about this module's retry sequence and has
+/// no meaning in the loop.
 
 /// Sessions whose cancel was never confirmed and whose daemon could not be
 /// identified: the socket answered, but there is no pid record that proves
@@ -1022,8 +991,10 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
             // session still editing the tree.
             mark_cancelled(id);
         }
-        Err(e) => match classify_cancel_error(&e) {
-            CancelFailure::EngineUnreachable => {
+        Err(e) => {
+            let outcome = classify_cancel_error(&e);
+            match outcome {
+            CancelOutcome::EngineUnreachable => {
                 // No engine, no cancel, and above all no live turn: the
                 // session died with the daemon that owned it. Retire it
                 // so no later pass or teardown round asks again, and so
@@ -1040,7 +1011,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                     );
                 }
             }
-            CancelFailure::NotConfirmed => {
+            CancelOutcome::NotConfirmed => {
                 // One attempt is not an answer: the daemon may be slow,
                 // may have already exited, or the turn may already have
                 // settled (a settled turn never acknowledges a cancel).
@@ -1056,6 +1027,15 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                 let left = deadline.saturating_duration_since(Instant::now());
                 let settled = retry_unconfirmed_cancel_within(socket, id, left).await;
                 settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
+            }
+            // `classify_cancel_error` only ever returns the two failure arms
+            // (it classifies an ERROR, and a confirmed cancel is not an
+            // error). The other two arms are unreachable here, and saying so
+            // is what the exhaustiveness check is for: a future arm cannot be
+            // added to the shared enum without this match noticing.
+            CancelOutcome::Confirmed | CancelOutcome::DeadlineExpired => {
+                unreachable!("classify_cancel_error never returns {outcome}")
+            }
             }
         },
     }
@@ -1274,7 +1254,7 @@ pub(crate) async fn retry_unconfirmed_cancel_within(
                 return UnconfirmedCancelOutcome::Confirmed(attempt + 1);
             }
             Err(e) => {
-                if classify_cancel_error(&e) == CancelFailure::EngineUnreachable {
+                if classify_cancel_error(&e) == CancelOutcome::EngineUnreachable {
                     // The daemon went away between attempts: nothing is left
                     // to cancel, and no retry can change that.
                     return UnconfirmedCancelOutcome::DaemonGone(attempt + 1);
@@ -3689,15 +3669,15 @@ mod tests {
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         for (error, expected) in [
-            (missing, CancelFailure::EngineUnreachable),
-            (refused, CancelFailure::EngineUnreachable),
+            (missing, CancelOutcome::EngineUnreachable),
+            (refused, CancelOutcome::EngineUnreachable),
             (
                 std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-                CancelFailure::NotConfirmed,
+                CancelOutcome::NotConfirmed,
             ),
             (
                 std::io::Error::from(std::io::ErrorKind::TimedOut),
-                CancelFailure::NotConfirmed,
+                CancelOutcome::NotConfirmed,
             ),
         ] {
             assert_eq!(classify_cancel_error(&anyhow::Error::new(error)), expected);
@@ -3708,12 +3688,12 @@ mod tests {
             .context("connecting to engine at /nowhere/daemon.sock");
         assert_eq!(
             classify_cancel_error(&wrapped),
-            CancelFailure::EngineUnreachable,
+            CancelOutcome::EngineUnreachable,
             "a transport-wrapped ENOENT must still read as an unreachable engine"
         );
         assert_eq!(
             classify_cancel_error(&anyhow::anyhow!("daemon did not acknowledge")),
-            CancelFailure::NotConfirmed,
+            CancelOutcome::NotConfirmed,
             "a handshake failure is the ordinary unconfirmed cancel"
         );
     }
