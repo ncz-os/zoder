@@ -416,3 +416,104 @@ fn a_non_tty_paid_model_decline_is_one_json_error_not_a_budget_stop() {
     );
     assert!(!err.contains("budget cap exceeded"), "stderr:\n{err}");
 }
+
+/// Seed a `$ZODER_HOME` whose single route is a METERED provider (so the
+/// pre-call budget gate prices it from the catalog) under a per-call cap far
+/// below the projected cost. Nothing here reaches the network: the budget
+/// gate refuses before dispatch, which is the behavior under test.
+fn seed_over_budget_home(home: &Path) {
+    seed_corpus(home);
+    fs::write(
+        home.join("config.json"),
+        format!(
+            r#"{{
+  "providers": [
+    {{
+      "id": "deepseek",
+      "base_url": "https://api.invalid/v1",
+      "kind": "openai-chat",
+      "auth": {{ "type": "env", "var": "DEEPSEEK_API_KEY" }},
+      "billing": "metered",
+      "serves": ["deepseek/"]
+    }}
+  ],
+  "default_provider": "deepseek",
+  "primary_model": "deepseek/deepseek-chat",
+  "budget": {{ "max_cost_per_call_usd": 0.000001, "est_output_tokens": 100000 }},
+  "corpus_path": "{}",
+  "ledger_path": "{}",
+  "health_path": "{}"
+}}
+"#,
+            home.join("model_corpus.json").display(),
+            home.join("ledger.jsonl").display(),
+            home.join("health.json").display(),
+        ),
+    )
+    .expect("write over-budget config");
+}
+
+/// D8 step 5 (Z3, second report): on a non-tty an OVER-BUDGET verdict must
+/// exit with the distinct budget code (78, `EX_CONFIG`) and a JSON error
+/// envelope naming the budget stop — not the generic `call declined` refusal
+/// with exit 1.
+///
+/// The budget exit code existed only as a helper contract: nothing in the
+/// real binary reached it. A metered route fails the paid-model policy gate
+/// FIRST (`paid = false` is still a metered provider, so the gate asks for
+/// confirmation), so a non-tty run whose projected cost blows every cap
+/// exited 1 with `paid model use declined` — indistinguishable from a broken
+/// invocation, and unparseable by the fleet back-off that keys on the budget
+/// class. The budget verdict has to be decided before the policy refusal: the
+/// caller is asking to spend, and the answer that matters is the cap.
+#[test]
+fn over_budget_non_tty_exits_with_budget_code_and_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_over_budget_home(dir.path());
+
+    let output = run(zoder(dir.path())
+        .env("DEEPSEEK_API_KEY", "smoke-key")
+        .stdin(std::process::Stdio::null())
+        .args(["--json", "exec", "--oneshot", "smoke"]));
+    let out = stdout(&output);
+    let err = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(78),
+        "a budget stop must exit with the budget code\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "--json must print exactly one error object\nstdout:\n{out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(lines[0]).expect("stdout is JSON");
+    assert_eq!(v["outcome"], "error");
+    assert_eq!(v["succeeded"], false);
+    assert_eq!(
+        v["code"], 78,
+        "the envelope must carry the budget code: {v}"
+    );
+    assert_eq!(
+        v["reason"], "over_budget",
+        "the envelope must name the budget reason: {v}"
+    );
+    assert_eq!(
+        v["model"], "deepseek/deepseek-chat",
+        "the envelope must name the model the cap stopped: {v}"
+    );
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("BUDGET"),
+        "the envelope must explain the cap: {v}"
+    );
+    // The policy refusal is NOT the answer here: the caller asked to spend and
+    // the cap said no.
+    assert!(
+        !v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("paid model use declined"),
+        "a budget stop must not be reported as a plain policy decline: {v}"
+    );
+}
