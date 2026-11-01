@@ -958,12 +958,27 @@ mod tests {
         // `retryable` is `class == Transient` by construction. Assert that
         // invariant directly instead of hand-negating the other variants, so
         // a new class defaulting to retryable still fails this test.
-        for c in FailureClass::ALL {
-            let retryable = *c == FailureClass::Transient;
-            if !retryable {
-                assert_ne!(*c, FailureClass::Transient);
-            }
-        }
+        //
+        // The retryable CODES are exactly the documented transient ones: a
+        // code that moves into (or out of) the transient class changes what
+        // a caller retries, so it must change this list too.
+        let retryable: Vec<&str> = FailureCode::ALL
+            .iter()
+            .filter(|c| c.class() == FailureClass::Transient)
+            .map(|c| c.code())
+            .collect();
+        assert_eq!(
+            retryable,
+            vec![
+                "reviewers_unavailable",
+                "author_failed",
+                "author_timeout",
+                "engine_unreachable",
+                "cancel_unconfirmed",
+                "worktree_tainted",
+            ],
+            "the retryable codes are exactly the transient ones"
+        );
         assert_eq!(
             FailureClass::ALL
                 .iter()
