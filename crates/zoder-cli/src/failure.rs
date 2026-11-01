@@ -640,7 +640,9 @@ pub(crate) fn in_contract_scope() -> bool {
 /// the frozen code list. It is deliberately conservative — it only recognizes
 /// specific, unambiguous markers that the failure sites in this codebase emit,
 /// and it returns `None` for everything else so an unrecognized error stays
-/// unclassified (`internal`, exit 50).
+/// unclassified (`internal`, exit 50). Markers match as whole words
+/// ([`has_word`]), never inside a longer identifier, and a banner such as
+/// `usage:` only where it opens a line or an error frame.
 ///
 /// The return value also carries the engine's reset timestamp when the
 /// message had one.
@@ -662,114 +664,114 @@ fn classify_message_code(lower: &str) -> Option<FailureCode> {
     // The EXTERNAL engine's budget refusal. Recognised FIRST: it is the most
     // specific marker, and a budget refusal can mention the daemon in its
     // own diagnostics.
-    if lower.contains(BUDGET_EXCEEDED_MARKER) {
+    if has_word(lower, BUDGET_EXCEEDED_MARKER) {
         return Some(FailureCode::EngineBudgetExceeded);
     }
 
     // The diff was cut off during acquisition, so the tail was never seen.
-    if lower.contains("review diff was truncated during acquisition")
-        || lower.contains(DIFF_TRUNCATED_MARKER)
+    if has_word(lower, "review diff was truncated during acquisition")
+        || has_word(lower, DIFF_TRUNCATED_MARKER)
     {
         return Some(FailureCode::DiffTruncated);
     }
 
     // Nothing was reviewed, so this is not an approval.
-    if lower.contains("no changes to review") || lower.contains("empty_diff") {
+    if has_word(lower, "no changes to review") || has_word(lower, "empty_diff") {
         return Some(FailureCode::EmptyDiff);
     }
 
     // No reviewer model could be resolved at all.
-    if lower.contains("no reviewer model resolved")
-        || lower.contains("no reviewer route matches")
-        || lower.contains("no_reviewer_model")
+    if has_word(lower, "no reviewer model resolved")
+        || has_word(lower, "no reviewer route matches")
+        || has_word(lower, "no_reviewer_model")
     {
         return Some(FailureCode::NoReviewerModel);
     }
 
-    // The diff is larger than the review budget.
-    if lower.contains("above the")
-        && (lower.contains("byte limit") || lower.contains("-byte limit"))
-    {
-        return Some(FailureCode::DiffTooLarge);
-    }
-    if lower.contains("review diff is") && lower.contains("byte") {
+    // The diff is larger than the review budget. Only the "above the
+    // N-byte limit" shape the size gate emits: "review diff is ... bytes"
+    // alone also describes a diff that is NOT too large.
+    if has_word(lower, "above the") && has_word(lower, "-byte limit") {
         return Some(FailureCode::DiffTooLarge);
     }
 
     // The review completed and blocked the change.
-    if lower.contains("review blocked") || lower.contains("requests changes") {
+    if has_word(lower, "review blocked") || has_word(lower, "requests changes") {
         return Some(FailureCode::ReviewBlocked);
     }
 
     // No reviewer produced a verdict.
-    if lower.contains("reviewers completed")
-        || lower.contains("review incomplete")
-        || lower.contains("reviewer_unavailable")
-        || lower.contains("reviewer refused")
-        || lower.contains("review refused")
+    if has_word(lower, "reviewers completed")
+        || has_word(lower, "review incomplete")
+        || has_word(lower, "reviewer_unavailable")
+        || has_word(lower, "reviewer refused")
+        || has_word(lower, "review refused")
     {
         return Some(FailureCode::ReviewersUnavailable);
     }
 
     // The engine never confirmed a cancel: the worktree may be tainted.
-    if lower.contains("author cancellation unconfirmed")
-        || lower.contains("cancel not confirmed")
-        || lower.contains("cancellation deadline expired")
+    if has_word(lower, "author cancellation unconfirmed")
+        || has_word(lower, "cancel not confirmed")
+        || has_word(lower, "cancellation deadline expired")
     {
         return Some(FailureCode::CancelUnconfirmed);
     }
 
     // The author turn hit its wall-clock budget, or failed outright.
-    if lower.contains("author turn timed out") || lower.contains("author timeout") {
+    if has_word(lower, "author turn timed out") || has_word(lower, "author timeout") {
         return Some(FailureCode::AuthorTimeout);
     }
-    if lower.contains("author turn did not finish")
-        || lower.contains("author_failed")
-        || lower.contains("author failed")
+    if has_word(lower, "author turn did not finish")
+        || has_word(lower, "author_failed")
+        || has_word(lower, "author failed")
     {
         return Some(FailureCode::AuthorFailed);
     }
 
     // The run was refused by policy.
-    if lower.contains("violated free policy")
-        || lower.contains("violates the free policy")
-        || lower.contains("policy violation")
+    if has_word(lower, "violated free policy")
+        || has_word(lower, "violates the free policy")
+        || has_word(lower, "policy violation")
     {
         return Some(FailureCode::PolicyViolation);
     }
 
     // The loop stopped without resolving.
-    if lower.contains("loop ended unresolved") || lower.contains("loop_exhausted") {
+    if has_word(lower, "loop ended unresolved") || has_word(lower, "loop_exhausted") {
         return Some(FailureCode::LoopExhausted);
     }
 
     // The agent engine could not be reached.
-    if lower.contains("connecting to engine")
-        || lower.contains("daemon not ready")
-        || lower.contains("daemon exited during startup")
-        || lower.contains("engine is unavailable")
-        || lower.contains("engine offline")
-        || lower.contains("no daemon is running")
+    if has_word(lower, "connecting to engine")
+        || has_word(lower, "daemon not ready")
+        || has_word(lower, "daemon exited during startup")
+        || has_word(lower, "engine is unavailable")
+        || has_word(lower, "engine offline")
+        || has_word(lower, "no daemon is running")
     {
         return Some(FailureCode::EngineUnreachable);
     }
 
     // The invocation was wrong.
-    if lower.contains("invalid --engine")
-        || lower.contains("usage:")
-        || lower.contains("mutually exclusive")
-        || lower.contains("requires --")
-        || lower.contains("unknown subcommand")
+    if has_word(lower, "invalid --engine")
+        || starts_a_line_or_frame(lower, "usage:")
+        || has_word(lower, "mutually exclusive")
+        || has_word(lower, "requires --")
+        || has_word(lower, "unknown subcommand")
     {
         return Some(FailureCode::UsageError);
     }
 
     // The environment is misconfigured.
-    if lower.contains("loading zoder config")
-        || lower.contains("loading engine")
-        || lower.contains("failed to parse")
-        || lower.contains("config error")
-        || lower.contains("invalid config")
+    if has_word(lower, "loading zoder config")
+        || has_word(lower, "loading engine")
+        // "failed to parse" is a config failure only when what failed to
+        // parse is a config; a reviewer response that failed to parse is not.
+        || has_word(lower, "failed to parse config")
+        || has_word(lower, "failed to parse engine config")
+        || has_word(lower, "config error")
+        || has_word(lower, "invalid config")
     {
         return Some(FailureCode::ConfigError);
     }
@@ -798,7 +800,9 @@ pub(crate) const DIFF_TRUNCATED_MARKER: &str = "truncated during acquisition";
 pub(crate) fn classify_engine_budget_exceeded(
     message: &str,
 ) -> Option<(FailureCode, Option<String>)> {
-    let start = message.to_ascii_lowercase().find(BUDGET_EXCEEDED_MARKER)?;
+    // Anchored on its word side: `reviewer_budget_exceeded:` is a different
+    // identifier, not the engine's refusal.
+    let start = word_matches(&message.to_ascii_lowercase(), BUDGET_EXCEEDED_MARKER).next()?;
     let rest = &message[start + BUDGET_EXCEEDED_MARKER.len()..];
     let line = rest.lines().next().unwrap_or("").trim();
     let reset = extract_reset_timestamp(line);
@@ -891,6 +895,16 @@ fn word_matches<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = 
 /// Does `haystack` contain `needle` as a whole word / phrase?
 fn has_word(haystack: &str, needle: &str) -> bool {
     word_matches(haystack, needle).next().is_some()
+}
+
+/// Does `needle` open the message, a line, or an error-chain frame (the
+/// `": "` [`classify_error`] joins frames with)? A banner like `usage:` is
+/// only a banner there; mid-sentence (`token usage: 1200`) it is prose.
+fn starts_a_line_or_frame(haystack: &str, needle: &str) -> bool {
+    word_matches(haystack, needle).any(|i| {
+        let before = haystack[..i].trim_end_matches([' ', '\t']);
+        before.is_empty() || before.ends_with('\n') || before.ends_with(':')
+    })
 }
 
 #[cfg(test)]
@@ -1293,6 +1307,91 @@ mod tests {
     }
 
     // ---- message recognition --------------------------------------------
+
+    /// Review (Muse, medium): bare substring matching misclassified
+    /// unrelated text. Each marker below used to fire inside a message that
+    /// is NOT that failure; every one of them must now stay unclassified.
+    #[test]
+    fn a_marker_inside_unrelated_text_does_not_classify() {
+        for (message, wrong) in [
+            // `budget_exceeded:` inside a longer identifier is not the
+            // external engine's refusal.
+            (
+                "reviewer_budget_exceeded: output budget spent twice",
+                FailureCode::EngineBudgetExceeded,
+            ),
+            // `empty_diff` inside a longer identifier is not an empty diff.
+            (
+                "config key allow_empty_diff ignored",
+                FailureCode::EmptyDiff,
+            ),
+            // `usage:` that is not a usage banner (line / frame start).
+            (
+                "reviewer reported token usage: 1200 tokens",
+                FailureCode::UsageError,
+            ),
+            // `failed to parse` that is not about configuration.
+            (
+                "failed to parse the reviewer response as json",
+                FailureCode::ConfigError,
+            ),
+            // `review diff is ... byte` that is not above any limit.
+            (
+                "review diff is 0 bytes after exclusions",
+                FailureCode::DiffTooLarge,
+            ),
+        ] {
+            let got = classify_message(message).map(|(code, _)| code);
+            assert_ne!(got, Some(wrong), "{message:?} must not read as {wrong}");
+            assert_eq!(got, None, "{message:?} must stay unclassified");
+        }
+        assert!(
+            classify_engine_budget_exceeded("reviewer_budget_exceeded: spent").is_none(),
+            "a longer identifier is not the engine's budget marker"
+        );
+    }
+
+    /// Review (Muse, medium): `reset` inside `preset` is not a reset marker,
+    /// so the date after it is not a reset timestamp.
+    #[test]
+    fn a_reset_marker_inside_a_word_is_not_a_reset() {
+        let (code, reset) =
+            classify_engine_budget_exceeded("budget_exceeded: plan preset 2099-11-01 applies")
+                .expect("the refusal itself is recognized");
+        assert_eq!(code, FailureCode::EngineBudgetExceeded);
+        assert_eq!(reset, None, "`preset` must not read as `reset`");
+    }
+
+    /// The tightened markers still recognize their real shapes.
+    #[test]
+    fn the_anchored_markers_still_recognize_their_real_shapes() {
+        for (message, want) in [
+            ("Usage: zoder review [OPTIONS]", FailureCode::UsageError),
+            (
+                "bad flags: usage: zoder loop <TASK>",
+                FailureCode::UsageError,
+            ),
+            (
+                "failed to parse engine config at /x: bad toml",
+                FailureCode::ConfigError,
+            ),
+            (
+                "turn failed: budget_exceeded: cap",
+                FailureCode::EngineBudgetExceeded,
+            ),
+            ("(budget_exceeded: cap)", FailureCode::EngineBudgetExceeded),
+            (
+                "empty_diff: no changes to review (x)",
+                FailureCode::EmptyDiff,
+            ),
+        ] {
+            assert_eq!(
+                classify_message(message).map(|(code, _)| code),
+                Some(want),
+                "{message:?}"
+            );
+        }
+    }
 
     #[test]
     fn an_unrecognized_message_stays_unclassified() {
