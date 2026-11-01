@@ -16242,46 +16242,20 @@ fn build_external_catalog(cat: &PricingCatalog, corpus: &Corpus) -> PricingCatal
             continue;
         }
         if let Some(price) = cat.lookup(&m.id) {
-            // A priced row, or an explicit $0 the operator pinned: both are
-            // statements about the model, and both must reach the engine.
-            if is_publishable(price) {
-                out.models.insert(m.id.clone(), price.clone());
-                if !m.leaf.is_empty() {
-                    out.models
-                        .entry(m.leaf.clone())
-                        .or_insert_with(|| price.clone());
-                }
+            // A priced row, or an explicit $0: both are statements about the
+            // model, and both must reach the engine (ADR D2 (1)). Every row a
+            // loaded catalog holds is one of the two -- the loader and
+            // `pricing sync` drop a row without a complete rate pair -- so a
+            // `source`-based filter here only ever dropped real explicit $0s.
+            out.models.insert(m.id.clone(), price.clone());
+            if !m.leaf.is_empty() {
+                out.models
+                    .entry(m.leaf.clone())
+                    .or_insert_with(|| price.clone());
             }
         }
     }
     out
-}
-
-/// Whether a catalog row says anything an engine can bill from.
-///
-/// Two shapes are statements: a non-zero rate, and an explicit `$0` an
-/// operator pinned (`source` = `operator`, or [`FREE_ENGINE_ENTRY_SOURCE`]).
-///
-/// A non-empty `source` on its own is NOT: `source` is provenance, and a row
-/// can carry it while omitting every rate (`{"source": "litellm"}` from a
-/// partial feed, or a hand-edited catalog). Publishing that row hands the
-/// engine neither a rate nor an explicit free declaration — it is rate-less
-/// filler that looks priced.
-fn is_publishable(price: &ModelPrice) -> bool {
-    price.is_priced() || is_operator_pinned_zero(&price.source)
-}
-
-/// Provenance an operator writes to pin a model at an explicit $0, and the
-/// provenance [`engine_catalog`] stamps on a config-declared free model.
-const OPERATOR_PINNED_ZERO_SOURCE: &str = "operator";
-
-/// An explicit-$0 provenance tag: the operator's, or a config-free stamp
-/// (which a re-read of a previously published catalog carries).
-fn is_operator_pinned_zero(source: &str) -> bool {
-    matches!(
-        source.trim(),
-        OPERATOR_PINNED_ZERO_SOURCE | FREE_ENGINE_ENTRY_SOURCE
-    )
 }
 
 /// The engine catalog zoder writes: only models of the providers this host
@@ -16320,8 +16294,10 @@ fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
             // the phantom-bill path: a local model that shares a cloud id (or
             // a leaf) was priced at the cloud rate and drove the engine's
             // monthly cap to $170 on a host that billed under $1. The
-            // operator's declaration wins; it is never downgraded to a feed
-            // rate.
+            // declaration beats the FEED (whatever the feed lists for the
+            // id); only a METERED provider that also serves the id replaces
+            // it below, because the engine prices by id alone and a real
+            // metered bill must never be hidden from its cap as $0.
             out.models.entry(target).or_insert_with(|| ModelPrice {
                 source: FREE_ENGINE_ENTRY_SOURCE.to_string(),
                 ..Default::default()
@@ -16333,9 +16309,9 @@ fn engine_catalog(cat: &PricingCatalog, cfg: &Config) -> PricingCatalog {
             let Some(price) = cat.models.get(&target) else {
                 continue;
             };
-            if is_publishable(price) {
-                out.models.insert(target, price.clone());
-            }
+            // A rate or an explicit $0 (see `build_external_catalog`): both
+            // are published, whatever the row's `source`.
+            out.models.insert(target, price.clone());
         }
     }
     out
@@ -16987,9 +16963,10 @@ fn engine_data_age_warning_due(stale_days: i64, data_date_age_days: Option<i64>)
 /// daemon it starts) sees current rates. Non-blocking and network-tolerant —
 /// a failed refresh just leaves the prior file in place.
 ///
-/// The age is read from the file's `generated_at`/`generated` metadata, never
-/// from its mtime: a re-write (or a copy, or a `touch`) of week-old data left
-/// the old check reporting "fresh" forever.
+/// The DATA age is read from the file's `generated_at`/`generated` metadata,
+/// not its mtime: a re-write (or a copy, or a `touch`) of week-old data left
+/// an mtime-only check reporting "fresh" forever. The 24 h mtime rule still
+/// runs alongside it, so the daily cadence is unchanged.
 ///
 /// In `file` pricing-source mode (env/config/managed marker) it never spawns:
 /// the installed files are authoritative and only their installer may update
@@ -24496,29 +24473,51 @@ mod engine_cost_accounting_tests {
         );
     }
 
-    /// A row that carries a `source` but no rate at all is not a price. It is
-    /// the shape a partial feed or a hand-edited catalog produces (a
-    /// `{"source": "litellm"}` object with both rates omitted), and the
-    /// loader accepts it because a complete zero pair is legitimate. Admitting
-    /// it into the engine catalog writes a rate-less row the engine cannot
-    /// bill from — neither a rate nor an explicit $0 declaration.
+    /// Load a catalog through the REAL loader (`PricingCatalog::load`), the
+    /// only way a feed row reaches `engine_catalog`.
+    fn load_catalog_json(body: &str) -> PricingCatalog {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pricing.json");
+        std::fs::write(&path, body).expect("write catalog");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod catalog");
+        }
+        PricingCatalog::load(&path)
+    }
+
+    /// A row that carries a `source` but no rate at all is not a price -- and
+    /// the catalog LOADER already drops it (`validate_model_price` requires a
+    /// complete input/output pair or a blended rate), so it can never reach
+    /// the engine catalog.
+    ///
+    /// Review r2 claimed the loader accepted `{"source": "litellm"}` and
+    /// answered with a `source`-based publish filter. The premise is false,
+    /// and the filter dropped every REAL explicit `$0` row instead (see
+    /// `explicit_zero_feed_rows_reach_the_engine_for_a_metered_route`). This
+    /// pins the true guard: the loader, on the real load path.
     #[test]
     fn a_source_with_no_rate_is_not_published_as_a_rate() {
-        let mut with_orphan = paid_catalog();
-        with_orphan.models.insert(
-            "vendor/orphan".to_string(),
-            ModelPrice {
-                source: "litellm".to_string(),
-                ..Default::default()
-            },
+        let with_orphan = load_catalog_json(
+            r#"{
+                "generated": "2026-10-30",
+                "models": {
+                    "deepseek/deepseek-r1": {
+                        "input_usd_per_mtok": 0.55, "output_usd_per_mtok": 2.19
+                    },
+                    "vendor/orphan": { "source": "litellm" },
+                    "internal/pinned-free": {
+                        "input_usd_per_mtok": 0.0, "output_usd_per_mtok": 0.0,
+                        "source": "operator"
+                    }
+                }
+            }"#,
         );
-        // An explicit $0 an operator wrote is still kept.
-        with_orphan.models.insert(
-            "internal/pinned-free".to_string(),
-            ModelPrice {
-                source: "operator".to_string(),
-                ..Default::default()
-            },
+        assert!(
+            with_orphan.models.contains_key("deepseek/deepseek-r1"),
+            "the loader must accept the priced row (the fixture is loadable)"
         );
         let cfg = config(
             r#"{
@@ -24539,6 +24538,101 @@ mod engine_cost_accounting_tests {
             out.models.contains_key("internal/pinned-free"),
             "a deliberate explicit $0 must still be published"
         );
+    }
+
+    /// When a cost-neutral AND a metered provider both serve one id, the
+    /// engine row is the metered rate.
+    ///
+    /// The engine prices by model id alone, so one row must serve both
+    /// routes. A `$0` row would hide every real metered call from the
+    /// engine's cap (an undercharge zoder never accepts); the cost-neutral
+    /// call is still recorded at $0 by zoder's own ledger (the posture rule,
+    /// D8 step 1). This pins the order the code comment now states.
+    #[test]
+    fn a_metered_claim_on_the_same_id_beats_the_free_declaration() {
+        let cfg = config(
+            r#"{
+                "id": "local",
+                "base_url": "http://local.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "free",
+                "serves": ["deepseek/deepseek-r1"]
+            }, {
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/"]
+            }"#,
+        );
+        let out = engine_catalog(&paid_catalog(), &cfg);
+        let row = &out.models["deepseek/deepseek-r1"];
+        assert!(row.is_priced(), "the metered rate must win: {row:?}");
+        assert_ne!(row.source, FREE_ENGINE_ENTRY_SOURCE);
+    }
+
+    /// ADR D2 decision (1): an explicit `$0` feed row reaches the engine, with
+    /// or without a `source`.
+    ///
+    /// The shipped list has 104 such rows and NONE carries a `source`
+    /// (`ollama/codegeex4`, `gemini/gemma-3-27b-it`, `openrouter/free`); a
+    /// `pricing sync` stamps `source = "litellm"` on the zero pairs it
+    /// fetches. A `source`-keyed filter dropped all of them, so a metered
+    /// route serving `gemini/` left the engine with no row for a model zoder
+    /// itself prices at $0 -- free to price it from a look-alike listing
+    /// (`google/gemma-3-27b-it` is paid), the Incident B shape.
+    #[test]
+    fn explicit_zero_feed_rows_reach_the_engine_for_a_metered_route() {
+        let cat = load_catalog_json(
+            r#"{
+                "generated": "2026-10-30",
+                "models": {
+                    "deepseek/deepseek-r1": {
+                        "input_usd_per_mtok": 0.55, "output_usd_per_mtok": 2.19
+                    },
+                    "gemini/gemma-3-27b-it": {
+                        "input_usd_per_mtok": 0.0, "output_usd_per_mtok": 0.0
+                    },
+                    "openrouter/some-model:free": {
+                        "input_usd_per_mtok": 0.0, "output_usd_per_mtok": 0.0,
+                        "source": "litellm"
+                    }
+                }
+            }"#,
+        );
+        let cfg = config(
+            r#"{
+                "id": "cloud",
+                "base_url": "https://cloud.invalid/v1",
+                "kind": "openai-chat",
+                "auth": { "type": "none" },
+                "billing": "metered",
+                "serves": ["deepseek/", "gemini/", "openrouter/"]
+            }"#,
+        );
+        let out = engine_catalog(&cat, &cfg);
+        for id in ["gemini/gemma-3-27b-it", "openrouter/some-model:free"] {
+            let row = out
+                .models
+                .get(id)
+                .unwrap_or_else(|| panic!("explicit $0 row {id} must reach the engine"));
+            assert!(!row.is_priced(), "{id} must stay an explicit $0");
+        }
+        assert!(out.models["deepseek/deepseek-r1"].is_priced());
+
+        // The non-zoder `--external` builder applies the same rule.
+        let corpus: Corpus = serde_json::from_str(
+            r#"{"models": [
+                {"id": "gemini/gemma-3-27b-it", "paid": true},
+                {"id": "deepseek/deepseek-r1", "paid": true}
+            ]}"#,
+        )
+        .expect("corpus parses");
+        let ext = build_external_catalog(&cat, &corpus);
+        assert!(ext.models.contains_key("gemini/gemma-3-27b-it"));
+        assert!(ext.models.contains_key("deepseek/deepseek-r1"));
     }
 
     /// D8 step 2 (Z3/Incident B): the engine catalog carries only the models

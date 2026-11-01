@@ -745,6 +745,16 @@ bypasses it, and a $0 (free-model) estimate is never gated.
   spend (current calendar month) over this total.
 - `est_output_tokens` — assumed completion size for the estimate (default 1024).
 
+`monthly_cap_usd` sums only **metered** ledger rows (a row with no billing
+tag counts as metered); calls on free and flat-fee routes never fill the cap.
+
+When the confirmation cannot be asked (stdin is not a terminal), a call a cap
+stopped exits with code **78** and, under `--json`, prints one error object
+on stdout with `"code": 78` and `"reason": "over_budget"` (plus the usual
+`outcome`/`succeeded`/`model`/`error` keys). A paid-model refusal (no
+`--allow-paid`) is a policy decline, not a budget stop: it keeps exit code 1
+and the generic error object (`paid model use declined`).
+
 Omit the `budget` block (or any field) for no cap. The estimate is a ballpark
 (token counts are approximate until the call's real telemetry lands in the
 ledger); it is a guard rail, not a hard meter.
@@ -1101,25 +1111,34 @@ until then use the commands above or re-run the installer.)
 ### Using your own price and corpus files
 
 By default (`auto`) zoder treats the installed price and corpus files as
-public data it may refresh: when the **data** inside the engine's copy is
-older than `$ZODER_PRICING_STALE_DAYS` (default 7) — read from the file's own
-`generated`/`generated_at` date, never its modification time, so re-writing or
-copying stale data cannot make it look fresh — `zoder report` and `zoder tui`
-spawn a detached `zoder pricing refresh`, and `zoder pricing refresh` /
-`zoder refresh` always overwrite their target files. A file with no
-parseable date falls back to the old 24 h mtime rule; `0` disables the
-data-age trigger (an old feed then prints one warning instead of refreshing).
+public data it may refresh: when the engine's copy is missing or older than
+24 h (by file modification time), **or** the data inside it is older than
+`$ZODER_PRICING_STALE_DAYS` (default 7) — read from the file's own
+`generated`/`generated_at` date, so re-writing or copying stale data cannot
+make it look fresh — `zoder report` and `zoder tui` spawn a detached
+`zoder pricing refresh`, and `zoder pricing refresh` / `zoder refresh` always
+overwrite their target files. `0` disables the data-age trigger only (the
+24 h rule stays); an old feed then prints one warning.
 
 The engine catalog zoder writes (`<engine data dir>/pricing.json`) carries
-every priced row **plus an explicit `$0` entry for each model your config
-declares free or local** (a `billing = "free"` or flat-fee provider's
-`serves` prefixes, tagged `"source": "zoder-config-free"`). A `serves` entry
-is a *prefix*: it is expanded to the full model ids the price feed lists
-under it, because the engine looks a model up by the id it routed, never by
-a prefix. A declaration that claims no feed model at all is not written.
-An absent row is not a statement that a model is free, and the engine prices
-what it cannot find its own way — that is how a local-only month tripped the
-engine's own monthly backstop at $170 while real billed usage was under $1.
+only the models your config routes to: the feed's row (a rate, or an
+explicit `$0`) for each model a **metered** provider `serves`, and an
+explicit `$0` entry for each model a `billing = "free"` or flat-fee provider
+`serves` (tagged `"source": "zoder-config-free"`). When a metered and a
+cost-neutral provider serve the same id, the metered rate is written: the
+engine prices by id alone, and a real bill must not be hidden as `$0`. A
+`serves` entry is a *prefix*: it is expanded to the full model ids the price
+feed lists under it, because the engine looks a model up by the id it
+routed, never by a prefix. A declaration that claims no feed model at all is
+not written. An absent row is not a statement that a model is free, and the
+engine prices what it cannot find its own way — that is how a local-only
+month tripped the engine's own monthly backstop at $170 while real billed
+usage was under $1.
+
+Price lookup never borrows a rate across vendors by short name: a model id
+**without** a vendor prefix (`qwen3-coder-30b`, as a local server reports
+it) is priced only by an exact catalog key, never by the leaf of a hosted
+listing such as `alibaba/qwen3-coder-30b`; without one its cost is unknown.
 
 Set the pricing source to **`file`** to make the installed files
 authoritative: they are used exactly as installed — never re-pulled, never
