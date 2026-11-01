@@ -318,6 +318,324 @@ pub struct Ledger {
     path: PathBuf,
 }
 
+/// Suffix of the sidecar checkpoint kept beside the ledger. Like the `.lock`
+/// companion it is derived from the ledger path, so the two move together.
+const CHECKPOINT_SUFFIX: &str = ".checkpoint";
+/// Layout version of the checkpoint. A checkpoint of another version is
+/// ignored (the full scan rebuilds it), never misread.
+///
+/// Version 2: month totals hold only metered rows (D8 step 1). A version-1
+/// checkpoint also summed `subscription`/`free` rows, so it is rebuilt.
+const CHECKPOINT_VERSION: u32 = 2;
+/// A checkpoint holds a few numbers per calendar month; a file this large was
+/// not written by this build and is not parsed.
+const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+/// Bytes hashed at each end of the checkpointed prefix. A ledger truncated in
+/// place and regrown past the old offset keeps its inode, so the inode alone
+/// cannot prove that the prefix still holds the bytes that were folded.
+const CHECKPOINT_FINGERPRINT_BYTES: u64 = 64 * 1024;
+
+/// What one calendar month's METERED rows cost, accumulated in file order exactly as
+/// `month_to_date_from_entries` accumulates it, so continuing a checkpointed
+/// total with later rows gives the same bits as summing every row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct MonthTotal {
+    /// Known-cost spend (USD), the running sum before any overflow. Stored as
+    /// its IEEE-754 bits: JSON's decimal text does not promise to parse back
+    /// to the same double, and the total must match the full scan exactly.
+    #[serde(with = "f64_bits")]
+    cost_usd: f64,
+    /// The running known-cost sum stopped being finite. Kept as a flag because
+    /// JSON cannot carry an infinite number.
+    overflowed: bool,
+    /// Calls in the month whose cost is unknown.
+    unknown_cost_calls: u64,
+}
+
+/// (De)serialize an `f64` as its exact bit pattern.
+mod f64_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(value.to_bits())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        u64::deserialize(deserializer).map(f64::from_bits)
+    }
+}
+
+impl MonthTotal {
+    fn add(&mut self, entry: &Entry) {
+        // The cap counts only BILLED spend: a `subscription` or `free` row is
+        // $0 marginal, exactly as `month_to_date_from_entries` filters it.
+        if !entry.is_metered() {
+            return;
+        }
+        if entry.cost_unknown {
+            self.unknown_cost_calls = self.unknown_cost_calls.saturating_add(entry.calls);
+            return;
+        }
+        if self.overflowed {
+            return;
+        }
+        let next = self.cost_usd + entry.cost_usd;
+        if next.is_finite() {
+            self.cost_usd = next;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    /// The same answer, and the same fail-closed errors in the same order, as
+    /// `month_to_date_from_entries` over the month's rows.
+    fn month_to_date(&self) -> anyhow::Result<f64> {
+        if self.overflowed {
+            anyhow::bail!("ledger cost rollup overflowed; refusing to report a misleading total");
+        }
+        if self.unknown_cost_calls > 0 {
+            anyhow::bail!(
+                "month-to-date spend contains {} call(s) with unknown cost",
+                self.unknown_cost_calls
+            );
+        }
+        Ok(self.cost_usd)
+    }
+}
+
+/// Sidecar checkpoint: every byte of the ledger before `offset` has been
+/// validated and folded into `months`, so only the rows after it are parsed
+/// again.
+///
+/// `offset` only ever covers *settled* rows -- rows no code path rewrites in
+/// place. A prepared or armed reservation slot is rewritten when it is armed,
+/// reconciled, cancelled or recovered, so the prefix stops at the first such
+/// row; a malformed or unterminated row stops it too, so a strict read keeps
+/// failing on it. The identity, fingerprints and checksum make any other
+/// change (rotation, compaction, truncation, a damaged checkpoint) discard the
+/// whole checkpoint: it is never partially believed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct LedgerCheckpoint {
+    version: u32,
+    /// Inode and device of the ledger the offset belongs to (0 off unix).
+    inode: u64,
+    device: u64,
+    /// Row boundary after the last settled row folded into `months`.
+    offset: u64,
+    /// Lines before `offset`, so a malformed row after it is still reported
+    /// by its line number in the file.
+    lines: usize,
+    /// FNV-1a of the first and of the last [`CHECKPOINT_FINGERPRINT_BYTES`]
+    /// bytes before `offset`.
+    head_fingerprint: u64,
+    tail_fingerprint: u64,
+    /// Per-month totals of the rows before `offset`, keyed `YYYY-MM`.
+    months: BTreeMap<String, MonthTotal>,
+    /// Compactable padding before `offset`, as the recovery scan counts it.
+    waste: u64,
+    /// Newest legacy-size reservation-provider row before `offset`; recovery
+    /// postpones compaction while it is younger than
+    /// [`LEGACY_INFLIGHT_GRACE_S`].
+    legacy_reservation_newest: Option<DateTime<Utc>>,
+    /// FNV-1a of this checkpoint serialized with `checksum = 0`.
+    checksum: u64,
+}
+
+/// FNV-1a, 64 bit. Stable across builds and platforms, which a fingerprint
+/// stored on disk needs (`DefaultHasher` promises neither).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+impl LedgerCheckpoint {
+    fn compute_checksum(&self) -> anyhow::Result<u64> {
+        let mut unsigned = self.clone();
+        unsigned.checksum = 0;
+        Ok(fnv1a(&serde_json::to_vec(&unsigned)?))
+    }
+
+    /// True when this checkpoint describes the bytes `file` holds now.
+    fn is_current_for(&self, file: &mut File) -> bool {
+        if self.version != CHECKPOINT_VERSION || self.compute_checksum().ok() != Some(self.checksum)
+        {
+            return false;
+        }
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if file_identity(&meta) != (self.inode, self.device) || meta.len() < self.offset {
+            return false;
+        }
+        prefix_fingerprints(file, self.offset).ok()
+            == Some((self.head_fingerprint, self.tail_fingerprint))
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.ino(), meta.dev())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Fingerprints of the first and the last [`CHECKPOINT_FINGERPRINT_BYTES`]
+/// bytes before `offset`.
+fn prefix_fingerprints(file: &mut File, offset: u64) -> std::io::Result<(u64, u64)> {
+    let window = offset.min(CHECKPOINT_FINGERPRINT_BYTES);
+    let mut read = |start: u64| -> std::io::Result<u64> {
+        let mut buf = vec![0; usize::try_from(window).unwrap_or(0)];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        Ok(fnv1a(&buf))
+    };
+    Ok((read(0)?, read(offset - window)?))
+}
+
+fn checkpoint_path_for(ledger_path: &Path) -> PathBuf {
+    let mut path = ledger_path.as_os_str().to_os_string();
+    path.push(CHECKPOINT_SUFFIX);
+    PathBuf::from(path)
+}
+
+/// Result of a strict read that starts from a checkpoint.
+struct Fold {
+    /// Per-month totals of every valid row in the file, prefix included.
+    months: BTreeMap<String, MonthTotal>,
+    /// The checkpoint describing the settled prefix after this read.
+    next: LedgerCheckpoint,
+    /// Lines actually read (not covered by the starting checkpoint).
+    #[cfg_attr(not(test), allow(dead_code))]
+    lines_read: usize,
+    /// Offset of the checkpoint the read started from, if any.
+    base_offset: Option<u64>,
+}
+
+impl Fold {
+    /// The settled prefix grew (or there was no checkpoint), so the sidecar
+    /// is worth rewriting.
+    fn advanced(&self) -> bool {
+        self.base_offset != Some(self.next.offset)
+    }
+
+    fn month_to_date(&self) -> anyhow::Result<f64> {
+        let bucket = Utc::now().format("%Y-%m").to_string();
+        self.months
+            .get(&bucket)
+            .map_or(Ok(0.0), MonthTotal::month_to_date)
+    }
+}
+
+/// Compactable padding of a settled row, counted exactly as
+/// [`Ledger::recover_abandoned_prepared`] counts it: everything in a
+/// reservation-sized row past its payload and newline.
+fn slot_padding(line: &LedgerLine) -> u64 {
+    if !is_reservation_slot_len(line.raw_len) {
+        return 0;
+    }
+    let mut kept = line.payload.as_slice();
+    while matches!(kept.last(), Some(b'\n') | Some(b'\r') | Some(b' ')) {
+        kept = &kept[..kept.len() - 1];
+    }
+    line.raw_len.saturating_sub(kept.len() + 1) as u64
+}
+
+/// True for a reservation row that some code path may still rewrite in place.
+fn is_unsettled_reservation(entry: &Entry) -> bool {
+    entry.provider == RESERVATION_PROVIDER
+        && (entry.model == PREPARED_RESERVATION_MODEL || entry.model == ARMED_RESERVATION_MODEL)
+}
+
+/// Strictly read the ledger from `base` (or from the start) and fold every
+/// valid row into per-month totals.
+///
+/// `skip_prepared(entry, raw_len)` says whether a prepared reservation row is
+/// abandoned and must be left out of the totals, as the recovery scan would
+/// have blanked it; callers that already ran recovery pass `|_, _| Ok(false)`.
+/// Malformed rows fail the read with the same error as
+/// [`Ledger::entries_strict`], numbered by their line in the whole file.
+fn fold_ledger(
+    file: &mut File,
+    path: &Path,
+    base: Option<LedgerCheckpoint>,
+    mut skip_prepared: impl FnMut(&Entry, usize) -> anyhow::Result<bool>,
+) -> anyhow::Result<Fold> {
+    let base_offset = base.as_ref().map(|cp| cp.offset);
+    let mut next = base.unwrap_or_default();
+    let mut months = next.months.clone();
+    let mut settled = true;
+    let mut malformed = Vec::new();
+    let mut lines_read = 0usize;
+    let mut lines = LedgerLines::new(file, path, next.offset, next.lines)
+        .with_context(|| format!("reading ledger from {}", path.display()))?;
+    for line in &mut lines {
+        let line = line.with_context(|| format!("reading ledger from {}", path.display()))?;
+        lines_read += 1;
+        settled &= line.terminated;
+        let end = line.start.saturating_add(line.raw_len as u64);
+        if line.payload.iter().all(u8::is_ascii_whitespace) {
+            if settled {
+                next.waste = next.waste.saturating_add(slot_padding(&line));
+                next.offset = end;
+                next.lines = line.line_no;
+            }
+            continue;
+        }
+        let entry = match serde_json::from_slice::<Entry>(&line.payload) {
+            Ok(entry) if entry_numbers_valid(&entry) => entry,
+            _ => {
+                malformed.push(line.line_no);
+                settled = false;
+                continue;
+            }
+        };
+        let bucket = Period::Month.bucket(&entry.ts_utc);
+        if is_unsettled_reservation(&entry) {
+            settled = false;
+            if entry.model == PREPARED_RESERVATION_MODEL && skip_prepared(&entry, line.raw_len)? {
+                continue;
+            }
+            months.entry(bucket).or_default().add(&entry);
+            continue;
+        }
+        months.entry(bucket.clone()).or_default().add(&entry);
+        if settled {
+            next.months.entry(bucket).or_default().add(&entry);
+            next.waste = next.waste.saturating_add(slot_padding(&line));
+            if line.raw_len == LEGACY_RESERVATION_BYTES && entry.provider == RESERVATION_PROVIDER {
+                next.legacy_reservation_newest = Some(
+                    next.legacy_reservation_newest
+                        .map_or(entry.ts_utc, |newest| newest.max(entry.ts_utc)),
+                );
+            }
+            next.offset = end;
+            next.lines = line.line_no;
+        }
+    }
+    if !malformed.is_empty() {
+        anyhow::bail!(
+            "cannot establish ledger integrity: {} contains malformed non-empty row(s) at line(s) {}",
+            path.display(),
+            malformed
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(Fold {
+        months,
+        next,
+        lines_read,
+        base_offset,
+    })
+}
+
 /// Durable, preallocated accounting transaction for one billable dispatch.
 /// If dropped without reconciliation, its valid unknown-cost row remains in
 /// the ledger, forcing subsequent budget/reporting decisions to fail closed.
@@ -743,8 +1061,9 @@ impl Ledger {
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
         lock.lock_exclusive()?;
-        let mut f = self.open_locked_rw("recording")?;
-        self.entries_strict_from_file(&mut f)?;
+        let (mut f, base) = self.open_locked_rw("recording")?;
+        let fold = fold_ledger(&mut f, &self.path, base, |_, _| Ok(false))?;
+        self.publish_checkpoint(&mut f, fold);
         f.seek(SeekFrom::End(0))?;
         f.write_all(line.as_bytes())?;
         f.sync_data()?;
@@ -764,9 +1083,12 @@ impl Ledger {
         let lock = open_lock_file(&lock_path)?;
         lock.lock_exclusive()
             .with_context(|| format!("locking ledger at {}", self.path.display()))?;
-        let mut file = self.open_locked_rw("reservation")?;
-        let entries = self.entries_strict_from_file(&mut file)?;
-        let month_to_date = month_to_date_from_entries(&entries).map_err(|error| error.to_string());
+        let (mut file, base) = self.open_locked_rw("reservation")?;
+        // Recovery ran under the exclusive lock, so no abandoned prepared row
+        // is left to skip.
+        let fold = fold_ledger(&mut file, &self.path, base, |_, _| Ok(false))?;
+        let month_to_date = fold.month_to_date().map_err(|error| error.to_string());
+        self.publish_checkpoint(&mut file, fold);
 
         let offset = file.seek(SeekFrom::End(0))?;
         let marker = format!("zoder-reservation-{:032x}", rand::random::<u128>());
@@ -857,17 +1179,27 @@ impl Ledger {
     /// Recover abandoned prepared reservations and return the number of
     /// padding bytes held by finished (non-reservation) rows and blank rows,
     /// which [`Self::compact_if_wasteful`] uses to decide on compaction.
-    fn recover_abandoned_prepared(&self, file: &mut File) -> anyhow::Result<ScanStats> {
-        file.seek(SeekFrom::Start(0))?;
+    ///
+    /// With a current checkpoint the scan starts at its offset: the settled
+    /// prefix holds no prepared or armed row, and its padding and newest
+    /// legacy reservation row are carried by the checkpoint.
+    fn recover_abandoned_prepared(
+        &self,
+        file: &mut File,
+        base: Option<&LedgerCheckpoint>,
+    ) -> anyhow::Result<ScanStats> {
+        let now = Utc::now();
+        let mut offset = base.map_or(0, |cp| cp.offset);
+        let mut line_no = base.map_or(0, |cp| cp.lines);
+        let mut waste = base.map_or(0, |cp| cp.waste);
+        let mut legacy_inflight = base
+            .and_then(|cp| cp.legacy_reservation_newest)
+            .is_some_and(|newest| (now - newest).num_seconds() < LEGACY_INFLIGHT_GRACE_S);
+        file.seek(SeekFrom::Start(offset))?;
         let mut reader = BufReader::new(&mut *file);
-        let mut offset = 0_u64;
-        let mut line_no = 0_usize;
         let mut line = Vec::new();
         let mut abandoned = Vec::new();
         let mut stale_armed_rows = Vec::new();
-        let mut waste = 0_u64;
-        let mut legacy_inflight = false;
-        let now = Utc::now();
         loop {
             line_no += 1;
             line.clear();
@@ -1110,7 +1442,8 @@ impl Ledger {
 
     /// Open the ledger for a locked read/write, recover abandoned reservations
     /// and compact it if it is mostly padding. Caller holds the ledger lock.
-    fn open_locked_rw(&self, what: &str) -> anyhow::Result<File> {
+    /// Also returns the checkpoint when it is current for the returned file.
+    fn open_locked_rw(&self, what: &str) -> anyhow::Result<(File, Option<LedgerCheckpoint>)> {
         let open = || {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -1121,11 +1454,127 @@ impl Ledger {
                 .with_context(|| format!("opening ledger for {what} at {}", self.path.display()))
         };
         let mut file = open()?;
-        let stats = self.recover_abandoned_prepared(&mut file)?;
+        let mut base = self.load_checkpoint(&mut file);
+        let stats = self.recover_abandoned_prepared(&mut file, base.as_ref())?;
         if self.compact_if_wasteful(&mut file, stats)? {
             file = open()?;
+            base = None;
         }
-        Ok(file)
+        Ok((file, base))
+    }
+
+    /// The sidecar checkpoint, when it describes the bytes `file` holds now.
+    fn load_checkpoint(&self, file: &mut File) -> Option<LedgerCheckpoint> {
+        let path = checkpoint_path_for(&self.path);
+        if std::fs::metadata(&path).ok()?.len() > MAX_CHECKPOINT_BYTES {
+            return None;
+        }
+        let checkpoint: LedgerCheckpoint =
+            serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        checkpoint.is_current_for(file).then_some(checkpoint)
+    }
+
+    /// Stamp `checkpoint` with `file`'s identity and fingerprints and replace
+    /// the sidecar atomically (temporary file, then rename). The caller holds
+    /// the ledger lock, shared or exclusive, so no writer changes the prefix
+    /// meanwhile; concurrent shared holders publish identical content.
+    ///
+    /// Best effort: the checkpoint is a cache, so a read-only directory or a
+    /// full disk only costs the next reader a longer scan, never a decision.
+    fn publish_checkpoint(&self, file: &mut File, fold: Fold) {
+        if !fold.advanced() {
+            return;
+        }
+        let mut checkpoint = fold.next;
+        let path = checkpoint_path_for(&self.path);
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".tmp-{:016x}", rand::random::<u64>()));
+        let tmp = PathBuf::from(tmp);
+        let result = (|| -> anyhow::Result<()> {
+            let meta = file.metadata()?;
+            (checkpoint.inode, checkpoint.device) = file_identity(&meta);
+            (checkpoint.head_fingerprint, checkpoint.tail_fingerprint) =
+                prefix_fingerprints(file, checkpoint.offset)?;
+            checkpoint.version = CHECKPOINT_VERSION;
+            checkpoint.checksum = checkpoint.compute_checksum()?;
+            let mut out = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            let _ = out.set_permissions(meta.permissions());
+            out.write_all(&serde_json::to_vec(&checkpoint)?)?;
+            drop(out);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!(
+                "not updating ledger checkpoint {}: {error:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// For a reader that may not run recovery (it holds only the shared lock):
+    /// true when a prepared row is one recovery would blank, i.e. a
+    /// reservation-sized row whose owner no longer holds its owner lock.
+    ///
+    /// The owner cannot arm or cancel the row while the shared ledger lock is
+    /// held (both need the exclusive lock), so the answer stays true until
+    /// the reader is done. Anything unclear keeps the row, which keeps its
+    /// unknown cost in the totals and fails the month closed.
+    fn prepared_owner_is_gone(&self, entry: &Entry, raw_len: usize) -> bool {
+        if !is_reservation_slot_len(raw_len) {
+            return false;
+        }
+        let Some(marker) = reservation_marker(entry) else {
+            return false;
+        };
+        let owner = match File::open(reservation_owner_lock_path(&self.path, marker)) {
+            Ok(owner) => owner,
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        };
+        // Released when `owner` is dropped.
+        owner.try_lock_exclusive().is_ok()
+    }
+
+    /// Open the ledger for a strict read under the SHARED sidecar lock. Readers
+    /// do not serialize behind one another; writers, which take the exclusive
+    /// lock, are still excluded, so the reader sees whole rows. `None` means
+    /// there is no ledger yet.
+    fn open_shared(&self) -> anyhow::Result<Option<(File, File)>> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating ledger directory {}", parent.display()))?;
+        }
+        let lock = open_lock_file(&self.lock_path())?;
+        // fs2's flock(LOCK_SH), named explicitly: std's inherent
+        // `File::lock_shared` is newer than this crate's MSRV.
+        FileExt::lock_shared(&lock)
+            .with_context(|| format!("locking ledger at {} for reading", self.path.display()))?;
+        match File::open(&self.path) {
+            Ok(file) => Ok(Some((lock, file))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(anyhow::Error::from(error)
+                .context(format!("opening ledger at {}", self.path.display()))),
+        }
+    }
+
+    /// [`Self::entries_strict`] for routing: the same strict, fail-closed
+    /// view, read under the shared lock so concurrent routing decisions do
+    /// not queue behind one another.
+    ///
+    /// It does not run recovery (that writes), so an abandoned prepared or a
+    /// stale armed reservation row is returned as it stands. Both are
+    /// unknown-cost rows of the reservation pseudo-provider, which no quota
+    /// window counts -- the same rows dry-run routing
+    /// ([`Self::entries_readonly`]) has always seen.
+    pub fn entries_strict_shared(&self) -> anyhow::Result<Vec<Entry>> {
+        let Some((_lock, mut file)) = self.open_shared()? else {
+            return Ok(Vec::new());
+        };
+        self.entries_strict_from_file(&mut file)
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -1159,7 +1608,7 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
-        self.recover_abandoned_prepared(&mut file)?;
+        self.recover_abandoned_prepared(&mut file, None)?;
         read_entries(&mut file, &self.path, on_malformed)
     }
 
@@ -1192,7 +1641,7 @@ impl Ledger {
                     .context(format!("opening ledger at {}", self.path.display())))
             }
         };
-        self.recover_abandoned_prepared(&mut file)?;
+        self.recover_abandoned_prepared(&mut file, None)?;
         self.entries_strict_from_file(&mut file)
     }
 
@@ -1280,8 +1729,22 @@ impl Ledger {
     /// confirmation" rather than as $0 — the old behavior of collapsing
     /// any read failure into `0.0` is what let a corrupted ledger under-
     /// report spend to $0 and bypass the monthly cap (Finding #10).
+    ///
+    /// Reads under the shared lock and parses only the rows after the sidecar
+    /// checkpoint. Recovery does not run here, so a prepared reservation whose
+    /// owner is gone -- one recovery would blank -- is left out of the total,
+    /// as it would be after recovery.
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
-        month_to_date_from_entries(&self.entries_strict()?)
+        let Some((_lock, mut file)) = self.open_shared()? else {
+            return Ok(0.0);
+        };
+        let base = self.load_checkpoint(&mut file);
+        let fold = fold_ledger(&mut file, &self.path, base, |entry, raw_len| {
+            Ok(self.prepared_owner_is_gone(entry, raw_len))
+        })?;
+        let month_to_date = fold.month_to_date();
+        self.publish_checkpoint(&mut file, fold);
+        month_to_date
     }
 
     /// Spend rolled up by period bucket within an optional date window.
@@ -1346,28 +1809,64 @@ impl Ledger {
     }
 }
 
-fn read_entries(
-    file: &mut File,
-    path: &Path,
-    mut on_malformed: impl FnMut(usize, &str),
-) -> anyhow::Result<Vec<Entry>> {
-    file.seek(SeekFrom::Start(0))?;
-    // Parse incrementally so one invalid UTF-8 byte cannot blank a large
-    // ledger, while bounding memory before accumulating an attacker-sized line.
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut out = Vec::new();
-    let mut line_no = 0usize;
-    let mut buf = Vec::new();
-    loop {
-        line_no += 1;
-        buf.clear();
+/// One line of the ledger as [`LedgerLines`] yields it.
+struct LedgerLine {
+    /// 1-based line number in the whole file.
+    line_no: usize,
+    /// Byte offset of the line's first byte.
+    start: u64,
+    /// Bytes the line occupies, terminator included.
+    raw_len: usize,
+    /// The line ends with `\n` (only the last line of a file may not).
+    terminated: bool,
+    /// The line without its trailing `\n`/`\r` bytes.
+    payload: Vec<u8>,
+}
+
+/// Incremental line reader over the ledger, starting at a row boundary.
+///
+/// Reading incrementally keeps one invalid UTF-8 byte from blanking a large
+/// ledger, and bounds memory before an attacker-sized line is accumulated.
+struct LedgerLines<'a> {
+    reader: BufReader<&'a mut File>,
+    path: &'a Path,
+    offset: u64,
+    line_no: usize,
+    done: bool,
+}
+
+impl<'a> LedgerLines<'a> {
+    /// Read from byte `start`, numbering the first line `lines_before + 1`.
+    fn new(
+        file: &'a mut File,
+        path: &'a Path,
+        start: u64,
+        lines_before: usize,
+    ) -> anyhow::Result<Self> {
+        file.seek(SeekFrom::Start(start))?;
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            path,
+            offset: start,
+            line_no: lines_before,
+            done: false,
+        })
+    }
+
+    fn read_line(&mut self) -> anyhow::Result<Option<LedgerLine>> {
+        self.line_no += 1;
+        let line_no = self.line_no;
+        let mut buf = Vec::new();
         loop {
-            let available = reader.fill_buf().with_context(|| {
-                format!("reading ledger at line {line_no} of {}", path.display())
+            let available = self.reader.fill_buf().with_context(|| {
+                format!(
+                    "reading ledger at line {line_no} of {}",
+                    self.path.display()
+                )
             })?;
             if available.is_empty() {
                 if buf.is_empty() {
-                    return Ok(out);
+                    return Ok(None);
                 }
                 break;
             }
@@ -1383,25 +1882,63 @@ fn read_entries(
             }
             let has_newline = available[chunk_len - 1] == b'\n';
             buf.extend_from_slice(&available[..chunk_len]);
-            reader.consume(chunk_len);
+            self.reader.consume(chunk_len);
             if has_newline {
                 break;
             }
         }
+        let start = self.offset;
+        let raw_len = buf.len();
+        self.offset = self.offset.saturating_add(raw_len as u64);
+        let terminated = buf.last() == Some(&b'\n');
         while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
             buf.pop();
         }
-        if buf.iter().all(|byte| byte.is_ascii_whitespace()) {
+        Ok(Some(LedgerLine {
+            line_no,
+            start,
+            raw_len,
+            terminated,
+            payload: buf,
+        }))
+    }
+}
+
+impl Iterator for LedgerLines<'_> {
+    type Item = anyhow::Result<LedgerLine>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let item = self.read_line().transpose();
+        if !matches!(item, Some(Ok(_))) {
+            self.done = true;
+        }
+        item
+    }
+}
+
+fn read_entries(
+    file: &mut File,
+    path: &Path,
+    mut on_malformed: impl FnMut(usize, &str),
+) -> anyhow::Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    for line in LedgerLines::new(file, path, 0, 0)? {
+        let line = line?;
+        if line.payload.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_slice::<Entry>(&buf) {
+        match serde_json::from_slice::<Entry>(&line.payload) {
             Ok(entry) if entry_numbers_valid(&entry) => out.push(entry),
             _ => {
-                let raw = String::from_utf8_lossy(&buf).into_owned();
-                on_malformed(line_no, &raw);
+                let raw = String::from_utf8_lossy(&line.payload).into_owned();
+                on_malformed(line.line_no, &raw);
             }
         }
     }
+    Ok(out)
 }
 
 fn reservation_marker(entry: &Entry) -> Option<&str> {
@@ -1429,6 +1966,11 @@ fn reservation_owner_lock_path(ledger_path: &Path, marker: &str) -> PathBuf {
 ///
 /// A row written before the `billing` field existed carries `None` and counts
 /// as metered: it is metered history, and dropping it would forget real spend.
+///
+/// This full scan is the oracle the checkpointed totals must reproduce; the
+/// production read is [`Fold::month_to_date`], whose [`MonthTotal::add`]
+/// applies the same metered filter.
+#[cfg(test)]
 fn month_to_date_from_entries(entries: &[Entry]) -> anyhow::Result<f64> {
     let bucket = Utc::now().format("%Y-%m").to_string();
     let mut rollup = Rollup::default();
@@ -2466,5 +3008,544 @@ mod tests {
         );
         assert!(reconciled.cost_unknown);
         assert_eq!(reconciled.model, UNKNOWN_COST_RESERVATION_MODEL);
+    }
+
+    // ---- sidecar checkpoint -------------------------------------------------
+
+    fn now_ts() -> String {
+        Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// Append rows the way a bulk writer would, bypassing `record` so a large
+    /// ledger can be built quickly.
+    fn append_lines(path: &Path, lines: &[Vec<u8>]) {
+        let mut file = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap(),
+        );
+        for line in lines {
+            file.write_all(line).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    fn row_line(entry: &Entry) -> Vec<u8> {
+        let mut line = serde_json::to_vec(entry).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    /// `entry` written into a reservation-sized slot, as a reconciled slot is.
+    fn slot_line(entry: &Entry, slot_bytes: usize) -> Vec<u8> {
+        let json = serde_json::to_vec(entry).unwrap();
+        let mut line = vec![b' '; slot_bytes];
+        line[..json.len()].copy_from_slice(&json);
+        line[slot_bytes - 1] = b'\n';
+        line
+    }
+
+    /// Per-month totals of a full strict scan: the oracle. Like the cap, it
+    /// sums only metered rows; a month holding only `subscription`/`free`
+    /// rows still appears, with nothing in it.
+    fn full_scan_months(entries: &[Entry]) -> BTreeMap<String, Rollup> {
+        let mut out: BTreeMap<String, Rollup> = BTreeMap::new();
+        for entry in entries {
+            let month = out.entry(Period::Month.bucket(&entry.ts_utc)).or_default();
+            if entry.is_metered() {
+                accumulate_rollup(month, entry).unwrap();
+            }
+        }
+        out
+    }
+
+    fn assert_months_match(fold: &Fold, oracle: &BTreeMap<String, Rollup>, context: &str) {
+        let got: Vec<_> = fold.months.keys().collect();
+        let want: Vec<_> = oracle.keys().collect();
+        assert_eq!(got, want, "{context}: month keys");
+        for (month, total) in &fold.months {
+            let full = &oracle[month];
+            assert!(!total.overflowed, "{context}: {month} overflowed");
+            assert_eq!(
+                total.cost_usd.to_bits(),
+                full.cost_usd.to_bits(),
+                "{context}: {month} cost {} vs full scan {}",
+                total.cost_usd,
+                full.cost_usd
+            );
+            assert_eq!(
+                total.unknown_cost_calls, full.unknown_cost_calls,
+                "{context}: {month} unknown-cost calls"
+            );
+        }
+    }
+
+    fn fold_from_checkpoint(ledger: &Ledger) -> (Option<LedgerCheckpoint>, Fold) {
+        let mut file = File::open(&ledger.path).unwrap();
+        let base = ledger.load_checkpoint(&mut file);
+        let fold = fold_ledger(&mut file, &ledger.path, base.clone(), |entry, raw_len| {
+            Ok(ledger.prepared_owner_is_gone(entry, raw_len))
+        })
+        .unwrap();
+        (base, fold)
+    }
+
+    /// Property test: on a synthetic 100k-row ledger grown in batches -- with
+    /// unknown-cost rows, blank rows, padded slots, legacy slots, live,
+    /// abandoned, armed and stale-armed reservations, and reservations that
+    /// are reconciled or cancelled in place after later rows were appended --
+    /// the checkpointed totals equal the full scan bit for bit after every
+    /// batch, and so do month-to-date and the recovery scan's compaction
+    /// statistics. `ZODER_LEDGER_SEED` replays another seed.
+    #[test]
+    fn summary_matches_full_scan() {
+        use rand::{Rng, SeedableRng};
+        let seed = std::env::var("ZODER_LEDGER_SEED")
+            .ok()
+            .and_then(|seed| seed.parse().ok())
+            .unwrap_or(0x5eed_0000_1ed9_e700_u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let now = Utc::now();
+        let month_start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let elapsed = (now - month_start).num_seconds().max(1);
+        const BATCHES: usize = 8;
+        const ROWS_PER_BATCH: usize = 12_500;
+        let mut live: Vec<BillableReservation> = Vec::new();
+        let mut armed: Vec<BillableReservation> = Vec::new();
+        let mut total_rows = 0usize;
+        for batch in 0..BATCHES {
+            let last = batch == BATCHES - 1;
+            // Rewrite rows that are already behind later rows: reconcile the
+            // armed reservations with a known cost, cancel the live ones.
+            if batch % 2 == 1 || last {
+                for reservation in armed.drain(..) {
+                    let mut done = entry(&now_ts(), "vendor/m", 0.0, 5, 5, 1);
+                    done.cost_usd = rng.gen_range(0.0..2.0);
+                    reservation.reconcile(&done).unwrap();
+                }
+                live.clear();
+            }
+            let mut lines = Vec::with_capacity(ROWS_PER_BATCH);
+            for _ in 0..ROWS_PER_BATCH {
+                let pick: u32 = rng.gen_range(0..1000);
+                if pick < 5 {
+                    lines.push(b"\n".to_vec());
+                    continue;
+                }
+                let ts = match rng.gen_range(0..3) {
+                    0 => now - chrono::Duration::seconds(rng.gen_range(0..elapsed)),
+                    1 => month_start - chrono::Duration::days(rng.gen_range(1..28)),
+                    _ => month_start - chrono::Duration::days(rng.gen_range(32..58)),
+                };
+                let mut row = entry("2026-01-01 00:00:00", "vendor/model", 0.0, 0, 0, 1);
+                row.ts_utc = ts;
+                row.provider = format!("p{}", rng.gen_range(0..7));
+                row.model = format!("vendor/model-{}", rng.gen_range(0..53));
+                row.tokens_in = rng.gen_range(0..5000);
+                row.tokens_out = rng.gen_range(0..2000);
+                row.calls = rng.gen_range(1..4);
+                // Magnitudes spread over six decades, so a different
+                // summation order would change the bits.
+                row.cost_usd = rng.gen_range(0.0..5.0) / 10f64.powi(rng.gen_range(0..6));
+                // Unknown cost only in past months: the current month must be
+                // able to come out as a figure.
+                if ts < month_start && pick < 20 {
+                    row.cost_unknown = true;
+                    row.cost_usd = 0.0;
+                }
+                // Every billing posture, so the checkpoint must leave out the
+                // same $0-marginal rows the full scan leaves out.
+                row.billing = match rng.gen_range(0..4) {
+                    0 => None,
+                    1 => Some("metered".into()),
+                    2 => Some("subscription".into()),
+                    _ => Some("free".into()),
+                };
+                if pick < 23 {
+                    lines.push(slot_line(&row, BILLABLE_RESERVATION_BYTES));
+                } else if pick == 23 {
+                    // A finished row in a legacy-size slot, some of them young
+                    // enough to postpone compaction.
+                    row.provider = RESERVATION_PROVIDER.to_string();
+                    row.model = UNKNOWN_COST_RESERVATION_MODEL.to_string();
+                    row.ts_utc = now - chrono::Duration::seconds(rng.gen_range(0..7200));
+                    lines.push(slot_line(&row, LEGACY_RESERVATION_BYTES));
+                } else {
+                    lines.push(row_line(&row));
+                }
+            }
+            total_rows += lines.len();
+            append_lines(&path, &lines);
+            if !last {
+                // A live prepared row, an armed one, an abandoned one (owner
+                // gone, never cancelled) and a stale armed row from a crash.
+                live.push(ledger.reserve_billable().unwrap());
+                let mut reservation = ledger.reserve_billable().unwrap();
+                reservation.arm_for("p1", "vendor/model-1").unwrap();
+                armed.push(reservation);
+                let mut abandoned = ledger.reserve_billable().unwrap();
+                drop(abandoned.owner_lock.take());
+                std::mem::forget(abandoned);
+                append_lines(
+                    &path,
+                    &[slot_line(&stale_armed_entry(), BILLABLE_RESERVATION_BYTES)],
+                );
+                total_rows += 4;
+            }
+
+            let context = format!("seed {seed:#x}, batch {batch}, ~{total_rows} rows");
+            let fast = ledger.month_to_date_usd();
+            let (base, fold) = fold_from_checkpoint(&ledger);
+            let base = base.unwrap_or_else(|| panic!("{context}: checkpoint was not published"));
+            assert!(
+                fold.lines_read < total_rows,
+                "{context}: the read started over ({} lines)",
+                fold.lines_read
+            );
+            // The oracle: the strict full scan, after recovery.
+            let oracle = ledger.entries_strict().unwrap();
+            assert_months_match(&fold, &full_scan_months(&oracle), &context);
+            match (&fast, month_to_date_from_entries(&oracle)) {
+                (Ok(fast), Ok(full)) => assert_eq!(fast.to_bits(), full.to_bits(), "{context}"),
+                (Err(fast), Err(full)) => {
+                    assert_eq!(fast.to_string(), full.to_string(), "{context}")
+                }
+                (fast, full) => panic!("{context}: checkpoint {fast:?} vs full scan {full:?}"),
+            }
+            // Recovery from the checkpoint sees the same padding and legacy
+            // in-flight state as a full recovery scan.
+            let mut file = File::open(&path).unwrap();
+            let current = ledger
+                .load_checkpoint(&mut file)
+                .unwrap_or_else(|| panic!("{context}: recovery invalidated the checkpoint"));
+            assert!(current.offset >= base.offset, "{context}");
+            let full = ledger.recover_abandoned_prepared(&mut file, None).unwrap();
+            let incremental = ledger
+                .recover_abandoned_prepared(&mut file, Some(&current))
+                .unwrap();
+            assert_eq!(full.waste, incremental.waste, "{context}: waste");
+            assert_eq!(
+                full.legacy_inflight, incremental.legacy_inflight,
+                "{context}: legacy in-flight"
+            );
+            if last {
+                assert!(fast.is_ok(), "{context}: everything settled, yet {fast:?}");
+            }
+        }
+        // Everything is settled: the checkpoint covers the whole file and a
+        // read parses nothing.
+        ledger.month_to_date_usd().unwrap();
+        let (base, fold) = fold_from_checkpoint(&ledger);
+        assert_eq!(
+            base.unwrap().offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        assert_eq!(fold.lines_read, 0);
+    }
+
+    #[test]
+    fn checkpoint_parses_only_new_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let rows: Vec<_> = (0..50)
+            .map(|_| row_line(&entry(&now_ts(), "m", 0.5, 1, 1, 1)))
+            .collect();
+        append_lines(&path, &rows);
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 25.0);
+        append_lines(&path, &[row_line(&entry(&now_ts(), "m", 0.25, 1, 1, 1))]);
+
+        let (base, fold) = fold_from_checkpoint(&ledger);
+        assert_eq!(base.unwrap().lines, 50);
+        assert_eq!(fold.lines_read, 1, "only the appended row is parsed");
+        assert_eq!(fold.month_to_date().unwrap(), 25.25);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 25.25);
+    }
+
+    /// A reservation slot is rewritten in place after later rows were
+    /// appended. The checkpoint must not have folded it while it was armed:
+    /// after reconciliation the month is a known figure again.
+    #[test]
+    fn reservation_rewritten_behind_later_rows_is_recounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        ledger.record(&entry(&now_ts(), "m", 1.0, 1, 1, 1)).unwrap();
+        let mut reservation = ledger.reserve_billable().unwrap();
+        reservation.arm_for("p", "m").unwrap();
+        for _ in 0..3 {
+            ledger.record(&entry(&now_ts(), "m", 0.5, 1, 1, 1)).unwrap();
+        }
+        let err = ledger.month_to_date_usd().unwrap_err().to_string();
+        assert!(err.contains("1 call(s) with unknown cost"), "{err}");
+
+        reservation
+            .reconcile(&entry(&now_ts(), "m", 0.25, 1, 1, 1))
+            .unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 2.75);
+        assert_eq!(
+            ledger
+                .reserve_billable()
+                .unwrap()
+                .month_to_date_usd()
+                .unwrap(),
+            2.75
+        );
+    }
+
+    /// A ledger truncated in place and regrown past the checkpoint keeps its
+    /// inode and its size; only the fingerprints show it is another file.
+    #[test]
+    fn truncated_and_regrown_ledger_falls_back_to_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ts = now_ts();
+        let rows = |cost: f64| -> Vec<Vec<u8>> {
+            (0..20)
+                .map(|_| row_line(&entry(&ts, "m", cost, 1, 1, 1)))
+                .collect()
+        };
+        append_lines(&path, &rows(0.25));
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 5.0);
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        for line in rows(0.75) {
+            file.write_all(&line).unwrap();
+        }
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 15.0);
+    }
+
+    #[test]
+    fn rotated_ledger_falls_back_to_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        for _ in 0..10 {
+            ledger.record(&entry(&now_ts(), "m", 1.0, 1, 1, 1)).unwrap();
+        }
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+
+        std::fs::rename(&path, dir.path().join("ledger.jsonl.1")).unwrap();
+        let rows: Vec<_> = (0..30)
+            .map(|_| row_line(&entry(&now_ts(), "m", 0.5, 1, 1, 1)))
+            .collect();
+        append_lines(&path, &rows);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 15.0);
+
+        // Rotated to an empty file: nothing this month.
+        std::fs::rename(&path, dir.path().join("ledger.jsonl.2")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 0.0);
+    }
+
+    /// A damaged checkpoint -- unparseable, edited, or from another layout
+    /// version -- is discarded and the full scan answers.
+    #[test]
+    fn corrupt_checkpoint_falls_back_to_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let rows: Vec<_> = (0..10)
+            .map(|_| row_line(&entry(&now_ts(), "m", 1.0, 1, 1, 1)))
+            .collect();
+        append_lines(&path, &rows);
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+        let checkpoint_path = checkpoint_path_for(&path);
+        let good = std::fs::read(&checkpoint_path).unwrap();
+        let bucket = Utc::now().format("%Y-%m").to_string();
+
+        std::fs::write(&checkpoint_path, b"{\"version\":1,\"offs").unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+
+        let mut edited: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        edited["months"][&bucket]["cost_usd"] = serde_json::json!(0.0_f64.to_bits());
+        std::fs::write(&checkpoint_path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+
+        let mut other: LedgerCheckpoint = serde_json::from_slice(&good).unwrap();
+        other.version = CHECKPOINT_VERSION + 1;
+        other.months.clear();
+        other.checksum = other.compute_checksum().unwrap();
+        std::fs::write(&checkpoint_path, serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+
+        std::fs::write(
+            &checkpoint_path,
+            vec![b' '; MAX_CHECKPOINT_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+        // Every fallback rebuilt it.
+        let mut file = File::open(&path).unwrap();
+        assert!(ledger.load_checkpoint(&mut file).is_some());
+    }
+
+    /// A version-1 checkpoint was written before the cap counted only metered
+    /// rows, so its month total may include `subscription`/`free` spend. It
+    /// must be rebuilt, never continued: otherwise a host upgraded from v1
+    /// keeps the phantom spend behind the checkpoint offset forever.
+    #[test]
+    fn version_one_checkpoint_with_unmetered_spend_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut metered = entry(&now_ts(), "cloud/m", 0.5, 1, 1, 1);
+        metered.billing = Some("metered".into());
+        let mut plan = entry(&now_ts(), "plan/m", 170.0, 1, 1, 1);
+        plan.billing = Some("subscription".into());
+        append_lines(&path, &[row_line(&metered), row_line(&plan)]);
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 0.5);
+
+        // What a v1 build left behind: the same prefix, the plan row summed.
+        let checkpoint_path = checkpoint_path_for(&path);
+        let mut v1: LedgerCheckpoint =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        let bucket = Utc::now().format("%Y-%m").to_string();
+        v1.version = 1;
+        v1.months.get_mut(&bucket).unwrap().cost_usd = 170.5;
+        v1.checksum = v1.compute_checksum().unwrap();
+        std::fs::write(&checkpoint_path, serde_json::to_vec(&v1).unwrap()).unwrap();
+
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 0.5);
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            ledger.load_checkpoint(&mut file).unwrap().version,
+            CHECKPOINT_VERSION
+        );
+    }
+
+    /// Rows after the checkpoint are still reported by their line in the file.
+    #[test]
+    fn malformed_row_after_checkpoint_keeps_its_file_line_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut rows: Vec<_> = (0..10)
+            .map(|_| row_line(&entry(&now_ts(), "m", 1.0, 1, 1, 1)))
+            .collect();
+        rows.push(b"\n".to_vec());
+        append_lines(&path, &rows);
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 10.0);
+        append_lines(&path, &[b"{\"ts_utc\":\"truncated\"\n".to_vec()]);
+
+        for err in [
+            ledger.month_to_date_usd().unwrap_err(),
+            ledger.reserve_billable().err().unwrap(),
+            ledger
+                .record(&entry(&now_ts(), "m", 1.0, 1, 1, 1))
+                .unwrap_err(),
+        ] {
+            let err = format!("{err:#}");
+            assert!(err.contains("malformed"), "{err}");
+            assert!(err.contains("line(s) 12"), "{err}");
+        }
+    }
+
+    /// An unterminated last row may be an interrupted write; it is read (as
+    /// the full scan reads it) but never checkpointed, so completing it later
+    /// is seen.
+    #[test]
+    fn unterminated_last_row_is_not_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let line = row_line(&entry(&now_ts(), "m", 1.0, 1, 1, 1));
+        append_lines(&path, &[line.clone(), line[..line.len() - 1].to_vec()]);
+        let ledger = Ledger::new(&path);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 2.0);
+        let (base, _) = fold_from_checkpoint(&ledger);
+        assert_eq!(base.unwrap().offset, line.len() as u64);
+        append_lines(&path, &[b"\n".to_vec(), line.clone()]);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 3.0);
+    }
+
+    /// Hold the ledger lock SHARED from another descriptor (as a concurrent
+    /// reader does) and run `read` on a thread: an exclusive lock would block
+    /// until the timeout.
+    fn completes_while_ledger_lock_is_held_shared<T: Send + 'static>(
+        path: &Path,
+        read: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock = open_lock_file(Path::new(&lock_path)).unwrap();
+        FileExt::lock_shared(&lock).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(read());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).ok();
+        FileExt::unlock(&lock).unwrap();
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn month_to_date_does_not_take_exclusive_ledger_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        Ledger::new(&path)
+            .record(&entry(&now_ts(), "m", 1.5, 1, 1, 1))
+            .unwrap();
+        let reader = path.clone();
+        let got = completes_while_ledger_lock_is_held_shared(&path, move || {
+            Ledger::new(&reader).month_to_date_usd().unwrap()
+        });
+        assert_eq!(got, Some(1.5), "month-to-date queued behind a reader");
+    }
+
+    #[test]
+    fn strict_shared_read_does_not_take_exclusive_ledger_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        Ledger::new(&path)
+            .record(&entry(&now_ts(), "m", 1.5, 1, 1, 1))
+            .unwrap();
+        let reader = path.clone();
+        let got = completes_while_ledger_lock_is_held_shared(&path, move || {
+            Ledger::new(&reader).entries_strict_shared().unwrap().len()
+        });
+        assert_eq!(got, Some(1), "the strict read queued behind a reader");
+    }
+
+    /// The shared read cannot run recovery, so it leaves out a prepared row
+    /// whose owner is gone (recovery would blank it) and keeps one whose owner
+    /// is alive -- without writing to the ledger.
+    #[test]
+    fn shared_month_to_date_skips_only_abandoned_prepared_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        ledger.record(&entry(&now_ts(), "m", 1.0, 1, 1, 1)).unwrap();
+        let mut abandoned = ledger.reserve_billable().unwrap();
+        drop(abandoned.owner_lock.take());
+        std::mem::forget(abandoned);
+        let before = std::fs::read(&path).unwrap();
+
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 1.0);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a read wrote");
+
+        let live = ledger.reserve_billable().unwrap();
+        let err = ledger.month_to_date_usd().unwrap_err().to_string();
+        assert!(err.contains("1 call(s) with unknown cost"), "{err}");
+        drop(live);
+        assert_eq!(ledger.month_to_date_usd().unwrap(), 1.0);
     }
 }
