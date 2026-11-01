@@ -1117,7 +1117,7 @@ fn plan_loop_review(
     // `run_git_diff` caps acquisition at 1 MiB and marks the tail. Reviewing
     // that marker would still be an approve on a partial view, so refuse it
     // even when `max_diff_bytes` was raised above the acquisition cap.
-    // The class is `diff_too_large`: the diff could not be acquired in
+    // The class is `diff_truncated`: the diff could not be acquired in
     // full, so it cannot be reviewed as configured.
     if diff_is_truncated(diff) {
         return Err(crate::failure::classified_err(
@@ -5822,7 +5822,13 @@ pub(crate) async fn cmd_review(
                 reason.clone(),
             )),
         );
-        anyhow::bail!("review refused (aggregate verdict `{agg}`): {reason}");
+        // The classification travels TYPED on the returned error, exactly as
+        // it was emitted: re-deriving it from the prose would let the
+        // "review refused" prefix read as a different code.
+        return Err(crate::failure::classified_err(
+            crate::failure::FailureCode::DiffTruncated,
+            format!("review refused (aggregate verdict `{agg}`): {reason}"),
+        ));
     }
     if let Some(reason) = empty_diff_hides_uncommitted_work(&cwd, scope, &label, &diff) {
         let failed = ReviewerSlot::Failed {
@@ -5869,6 +5875,18 @@ pub(crate) async fn cmd_review(
             next_steps: vec![],
             ..Default::default()
         };
+        // The empty diff is its OWN classified failure (`empty_diff`): it is
+        // attached to the emitted result (which already exists, so `main`
+        // prints nothing else) and carried typed on the returned error, so
+        // the JSON and the exit code read the same code.
+        let failure = crate::failure::ClassifiedFailure::new(
+            crate::failure::FailureCode::EmptyDiff,
+            format!(
+                "{EMPTY_DIFF_RESULT}: no changes to review ({label}); nothing was reviewed, so \
+                 this is not an approval. Check the scope and --base (an empty range usually \
+                 means the base already contains the change)."
+            ),
+        );
         emit_reviews(
             cli,
             &ReviewAggregate {
@@ -5885,13 +5903,12 @@ pub(crate) async fn cmd_review(
                 chunking: None,
                 confirm: &[],
             },
-            None,
+            Some(&failure),
         );
-        anyhow::bail!(
-            "{EMPTY_DIFF_RESULT}: no changes to review ({label}); nothing was reviewed, so \
-             this is not an approval. Check the scope and --base (an empty range usually means \
-             the base already contains the change)."
-        );
+        return Err(crate::failure::classified_err(
+            failure.code,
+            failure.message,
+        ));
     }
 
     let system = if adversarial {
@@ -23336,6 +23353,21 @@ mod review_refusal_tests {
             "the returned refusal must keep its class: {err:#}"
         );
         assert_eq!(classified.exit_code(), 50);
+        // Review (Muse + DeepSeek, high): the classification must travel
+        // TYPED on the returned error, not be re-guessed from its prose.
+        assert_eq!(
+            typed_failure_code(&err),
+            Some(crate::failure::FailureCode::DiffTruncated),
+            "the returned refusal must carry its classification: {err:#}"
+        );
+    }
+
+    /// The code a [`crate::failure::ClassifiedFailureError`] in the chain
+    /// carries, ignoring any message-based inference.
+    fn typed_failure_code(err: &anyhow::Error) -> Option<crate::failure::FailureCode> {
+        err.chain()
+            .find_map(|c| c.downcast_ref::<crate::failure::ClassifiedFailureError>())
+            .map(|c| c.failure().code)
     }
 
     /// D4.5 REGRESSION: an empty diff is its OWN result (`empty_diff`), never
@@ -23428,6 +23460,16 @@ mod review_refusal_tests {
             err.to_string().contains(EMPTY_DIFF_RESULT),
             "the empty diff must be reported as its own result: {err}"
         );
+        // Review (Muse + DeepSeek, high): an EMPTY (not truncated) diff is
+        // `empty_diff`, carried typed on the returned error.
+        assert_eq!(
+            typed_failure_code(&err),
+            Some(crate::failure::FailureCode::EmptyDiff),
+            "the empty diff must carry the empty_diff classification: {err:#}"
+        );
+        let classified = crate::failure::classify_error(&err).expect("an empty diff is classified");
+        assert_eq!(classified.code, crate::failure::FailureCode::EmptyDiff);
+        assert_ne!(classified.code, crate::failure::FailureCode::DiffTruncated);
     }
 }
 

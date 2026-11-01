@@ -420,6 +420,114 @@ fn a_json_failure_prints_exactly_one_json_document() {
     );
 }
 
+/// Parse stdout as exactly ONE JSON document (the `--json` contract).
+fn single_json_document(output: &Output) -> serde_json::Value {
+    let text = stdout(output);
+    let mut stream = serde_json::Deserializer::from_str(&text).into_iter::<serde_json::Value>();
+    let first = stream
+        .next()
+        .unwrap_or_else(|| panic!("stdout must carry a JSON document: {text:?}"))
+        .unwrap_or_else(|e| panic!("stdout must be parseable JSON ({e}): {text:?}"));
+    assert!(
+        stream.next().is_none(),
+        "stdout must carry exactly ONE JSON document: {text:?}"
+    );
+    first
+}
+
+/// Review (Muse + DeepSeek, high): an EMPTY diff is its own failure,
+/// `empty_diff`, and the result document must say so in its `failure`
+/// member. Before the fix the result carried no `failure` at all (only the
+/// legacy `error` string), so a `--json` caller could not read the code.
+#[test]
+fn an_empty_diff_is_classified_empty_diff_in_the_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = seed_repo(dir.path());
+    // Commit the pending edit so the tree is clean and `--base HEAD` is an
+    // empty range: nothing was truncated, there is simply nothing to review.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["commit", "-qam", "edit"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let output = run(zoder(dir.path())
+        .current_dir(&repo)
+        .args(["--json", "review", "--base", "HEAD"]));
+
+    assert_eq!(
+        exit_code(&output),
+        exit_code::UNCLASSIFIED,
+        "an empty diff exits the permanent rung\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let doc = single_json_document(&output);
+    assert_eq!(
+        doc["failure"]["code"], "empty_diff",
+        "the result must carry the empty_diff failure: {doc}"
+    );
+    assert_ne!(doc["failure"]["code"], "diff_truncated", "{doc}");
+    assert_eq!(doc["failure"]["class"], "permanent", "{doc}");
+    assert_eq!(carrier_class(&output), "permanent");
+    // The legacy fields keep their meaning.
+    assert_eq!(doc["result"], "empty_diff", "{doc}");
+    assert_eq!(doc["empty_diff"], true, "{doc}");
+}
+
+/// Review (Muse + DeepSeek, high): a diff genuinely cut off during
+/// acquisition is `diff_truncated`, and that classification reaches the
+/// emitted result document (and the exit code) intact.
+#[test]
+fn a_truncated_diff_is_classified_diff_truncated_in_the_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = seed_repo(dir.path());
+    // Well over the 1 MiB acquisition cap, as a TRACKED-file edit so the
+    // working-tree diff carries it.
+    let mut body = String::from("one\n");
+    for i in 0..60_000 {
+        body.push_str(&format!("line-{i:05}-padding-padding-padding\n"));
+    }
+    fs::write(repo.join("src.txt"), body).expect("write big edit");
+
+    let output = run(zoder(dir.path()).current_dir(&repo).args([
+        "--json",
+        "review",
+        "--scope",
+        "working-tree",
+        "--max-diff-bytes",
+        "200000000",
+    ]));
+
+    assert_eq!(
+        exit_code(&output),
+        exit_code::UNCLASSIFIED,
+        "a truncated diff exits the permanent rung\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let doc = single_json_document(&output);
+    assert_eq!(
+        doc["failure"]["code"], "diff_truncated",
+        "the result must carry the diff_truncated failure: {doc}"
+    );
+    assert_eq!(carrier_class(&output), "permanent");
+    assert!(
+        doc["failure"]["detail"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("truncated during acquisition")),
+        "{doc}"
+    );
+}
+
 /// A successful review must NOT carry a `failure` field: the field is
 /// additive and appears only on a failure.
 #[tokio::test]
