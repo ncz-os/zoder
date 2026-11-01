@@ -9319,18 +9319,29 @@ fn loop_failure(
     final_verdict: &str,
     iterations: usize,
 ) -> Option<crate::failure::ClassifiedFailure> {
-    let evidence = last_iter
-        .and_then(|it| {
-            it.get("review_error")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    it.get("author_error")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-        })
-        .unwrap_or_default();
+    let field = |name: &str| {
+        last_iter
+            .and_then(|it| it.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let review_error = field("review_error");
+    let author_error = field("author_error");
+    // The engine's budget refusal is the ROOT cause when the author turn hit
+    // it: the review that follows is skipped or incomplete only because the
+    // author never ran. Prefer it over the `review_error` so its code and
+    // its reset timestamp are not discarded.
+    let author_hit_engine_budget = author_error.as_deref().is_some_and(|e| {
+        matches!(
+            crate::failure::classify_message(e),
+            Some((crate::failure::FailureCode::EngineBudgetExceeded, _))
+        )
+    });
+    let evidence = if author_hit_engine_budget {
+        author_error.unwrap_or_default()
+    } else {
+        review_error.or(author_error).unwrap_or_default()
+    };
     // The free-policy gate is decided by the loop itself, not by a message
     // heuristic: `policy_violation` is only ever set by the break in
     // `cmd_loop_run`, so it outranks anything the last iteration recorded.
@@ -9380,6 +9391,14 @@ fn loop_failure(
         reviewers: Vec::new(),
         extra: serde_json::Map::new(),
     })
+}
+
+/// The error `cmd_loop_run` returns for an unresolved loop: the WHOLE
+/// [`loop_failure`] record (code, message, reset timestamp, detail), so the
+/// exit code and any re-attached `failure` object read exactly what the
+/// result document already carries.
+fn loop_failure_error(failure: crate::failure::ClassifiedFailure) -> anyhow::Error {
+    crate::failure::classified_failure_err(failure)
 }
 
 fn update_loop_streaks(
@@ -11519,10 +11538,7 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
     // exit 40) rather than a bare `bail!`, so the exit code still matches the
     // `failure` object in the document.
     if let Some(f) = failure {
-        return Err(match f.budget_reset_at.clone() {
-            Some(reset) => crate::failure::classified_budget_err(f.message, Some(reset)),
-            None => crate::failure::classified_err(f.code, f.message),
-        });
+        return Err(loop_failure_error(f));
     }
     Ok(())
 }
@@ -15273,6 +15289,41 @@ not run to max_iters"
             loop_failure(None, Some(&last), "comment", 1).expect("unresolved loop has a failure");
         assert_eq!(f.code, crate::failure::FailureCode::EngineBudgetExceeded);
         assert_eq!(f.code.exit_code(), 30);
+    }
+
+    /// Review (DeepSeek, medium): the author turn hit the engine's budget
+    /// refusal, and the iteration ALSO recorded a `review_error` (the review
+    /// was skipped). The failure record must still be the budget refusal and
+    /// must carry its reset timestamp — sentence punctuation stripped — into
+    /// `resets_at` / `retry_after_s` and onto the returned error.
+    #[test]
+    fn loop_failure_carries_the_engine_budget_reset_past_a_review_error() {
+        let last = serde_json::json!({
+            "author_error": "turn failed: budget_exceeded: quota exhausted, resets at \
+                             2099-11-01T00:00:00Z.",
+            "review_error": "review skipped: the whole-run deadline was reached",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(
+            f.code,
+            crate::failure::FailureCode::EngineBudgetExceeded,
+            "{}",
+            f.message
+        );
+        assert_eq!(f.budget_reset_at.as_deref(), Some("2099-11-01T00:00:00Z"));
+        let json = f.to_json();
+        assert_eq!(json["detail"]["resets_at"], "2099-11-01T00:00:00Z");
+        assert!(
+            json["retry_after_s"].as_i64().is_some_and(|s| s > 0),
+            "{json}"
+        );
+        assert!(f.message.contains("budget_exceeded"), "{}", f.message);
+
+        // The returned error carries the SAME record, reset included.
+        let err = loop_failure_error(f.clone());
+        let back = crate::failure::classify_error(&err).expect("classified");
+        assert_eq!(back, f);
     }
 
     #[test]

@@ -554,6 +554,12 @@ pub(crate) fn classified_err(code: FailureCode, message: impl Into<String>) -> a
     anyhow::Error::new(ClassifiedFailureError::new(code, message))
 }
 
+/// Build an `anyhow::Error` that carries an already-built classified failure
+/// unchanged (reset timestamp, reviewers and extra detail included).
+pub(crate) fn classified_failure_err(failure: ClassifiedFailure) -> anyhow::Error {
+    anyhow::Error::new(ClassifiedFailureError(failure))
+}
+
 /// Build an `engine_budget_exceeded` error that carries the engine's reset
 /// timestamp (when it gave one) into the envelope.
 pub(crate) fn classified_budget_err(
@@ -805,13 +811,24 @@ pub(crate) fn classify_engine_budget_exceeded(
 /// `2026-11-01T00:00:00+00:00`) and a bare date (`2026-11-01`) that follows
 /// a `reset`/`resets`/`until` marker. Returns `None` when the line carries
 /// no timestamp — the timestamp is never fabricated.
+///
+/// Every marker is tried in order: a marker followed by something that is not
+/// a date (`reset window 30d`) does not hide a real timestamp after a later
+/// one.
 fn extract_reset_timestamp(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
-    let marker_at = ["reset", "resets", "until"]
+    let mut markers: Vec<usize> = ["reset", "resets", "until"]
         .iter()
-        .filter_map(|m| lower.find(m))
-        .min()?;
-    let tail = &line[marker_at..];
+        .flat_map(|m| word_matches(&lower, m))
+        .collect();
+    markers.sort_unstable();
+    markers
+        .into_iter()
+        .find_map(|at| reset_timestamp_after(&line[at..]))
+}
+
+/// The first date-shaped token in `tail`, without trailing punctuation.
+fn reset_timestamp_after(tail: &str) -> Option<String> {
     let token: String = tail
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
@@ -828,12 +845,52 @@ fn extract_reset_timestamp(line: &str) -> Option<String> {
     // `.`, `:`, `-` and `+` are legal INSIDE an instant but never end one; a
     // trailing one is the engine's sentence punctuation.
     let token = token.trim_end_matches(['.', ':', '-', '+']);
-    if token.len() < 8 {
+    // Only a `YYYY-MM-DD`-led token is a reset; a count (`30`, `5`) after a
+    // marker is not, and is never turned into one.
+    let b = token.as_bytes();
+    let date_led = b.len() >= 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit);
+    if !date_led {
         return None;
     }
     // A bare date is the common shape; keep it verbatim so the consumer
     // decides how to parse it. A full RFC 3339 instant is kept verbatim too.
     Some(token.to_string())
+}
+
+/// Does `b` continue a word (so a marker touching it is part of a longer
+/// word, like `reset` inside `preset` or `budget_exceeded:` inside
+/// `reviewer_budget_exceeded:`)?
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte offsets of every occurrence of `needle` in `haystack` that is not
+/// part of a longer word. The boundary is checked only on a side where the
+/// needle itself starts / ends with a word character, so `-byte limit` or
+/// `budget_exceeded:` still anchor on their word side.
+fn word_matches<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let check_before = n.first().is_some_and(|b| is_word_byte(*b));
+    let check_after = n.last().is_some_and(|b| is_word_byte(*b));
+    haystack
+        .match_indices(needle)
+        .map(|(i, _)| i)
+        .filter(move |&i| {
+            let end = i + n.len();
+            (!check_before || i == 0 || !is_word_byte(h[i - 1]))
+                && (!check_after || end >= h.len() || !is_word_byte(h[end]))
+        })
+}
+
+/// Does `haystack` contain `needle` as a whole word / phrase?
+fn has_word(haystack: &str, needle: &str) -> bool {
+    word_matches(haystack, needle).next().is_some()
 }
 
 #[cfg(test)]
@@ -1188,6 +1245,36 @@ mod tests {
             f.retry_after_s(chrono::Utc::now()).is_some(),
             "a sentence-final reset must still yield retry_after_s"
         );
+    }
+
+    /// Review (DeepSeek, medium): a `reset` marker that is not followed by a
+    /// date (a window length, say) must not hide the real reset timestamp
+    /// later in the line, and punctuation around the instant is not part of
+    /// it.
+    #[test]
+    fn the_reset_timestamp_is_found_past_a_non_date_marker() {
+        for (line, want) in [
+            (
+                "cap reached; reset window 30d; resets at 2099-11-01T00:00:00Z.",
+                "2099-11-01T00:00:00Z",
+            ),
+            (
+                "cap reached (resets at 2099-11-01T00:00:00Z);",
+                "2099-11-01T00:00:00Z",
+            ),
+            (
+                "try again until 5 retries, resets 2099-11-01!",
+                "2099-11-01",
+            ),
+        ] {
+            let (_, reset) = classify_engine_budget_exceeded(&format!("budget_exceeded: {line}"))
+                .expect("the engine's budget refusal must be recognized");
+            assert_eq!(reset.as_deref(), Some(want), "line: {line:?}");
+        }
+        // Digits after a marker that are not a date are never a reset.
+        let (_, reset) =
+            classify_engine_budget_exceeded("budget_exceeded: resets in 30 minutes").unwrap();
+        assert_eq!(reset, None);
     }
 
     #[test]
