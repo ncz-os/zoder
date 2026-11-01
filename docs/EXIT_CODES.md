@@ -21,7 +21,7 @@ function it comes from.
   (`code`, `class`, `exit_code`, `retryable`), `ClassifiedFailure`
   (`to_json`), `ClassifiedFailureError`, `classify_error`,
   `classify_message`, `classify_engine_budget_exceeded`, `error_envelope`.
-- `crates/zoder-cli/src/main.rs`: `main` (the exit code), `run` (the `--json`
+- `crates/zoder-cli/src/main.rs`: `main` and `error_exit_code` (the exit code), `run` (the `--json`
   failure emission), `emit_json_failure`, `turn_failure_error`.
 - `crates/zoder-cli/src/agentic.rs`: `cmd_review`, `cmd_loop`, `cmd_loop_run`,
   `emit_reviews`, `build_review_payload`, `aggregate_verdict`,
@@ -105,6 +105,10 @@ internal-class outcome: nothing to fix, nothing to retry).
   unclassified error.
 - `75` — reserved for the oneshot refusal band. Never assigned to a review /
   loop code.
+- `78` — a zoder budget-cap decline on the oneshot (`exec`) path
+  (`main.rs`: `budget_declined`, `EXIT_BUDGET_EXCEEDED`). It is checked
+  before the classes above (`error_exit_code`) and is not a review / loop
+  rung.
 
 Every classified failure is NON-ZERO, so a caller that only tests "did it
 fail" (the fleet worker) is unaffected by the contract.
@@ -115,8 +119,9 @@ envelope with code `internal` and exits `50`: it is the `permanent` /
 
 The exit code and the JSON `class` always agree: the dispatcher in `main`
 derives the exit code from the same classified failure that the JSON
-carries (`main`: `failure::classify_error(&e)` → `classified.exit_code()`,
-falling back to `UNCLASSIFIED_EXIT_CODE`, which is `50`).
+carries (`error_exit_code`: `failure::classify_error(&e)` →
+`classified.exit_code()`, falling back to `UNCLASSIFIED_EXIT_CODE`, which is
+`50`).
 
 ## The `--json` shape
 

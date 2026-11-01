@@ -1,0 +1,25 @@
+[
+  {
+    "kind": "file_contains",
+    "path": "src/calc.py",
+    "text": "return a + b"
+  },
+  {
+    "kind": "file_matches",
+    "path": "src/calc.py",
+    "pattern": "def add\\(a: int, b: int\\) -> int:\\s*\\n\\s*return a \\+ b"
+  },
+  {
+    "kind": "file_matches",
+    "path": "tests/test_calc.py",
+    "pattern": "assert add\\(2, 3\\) == 5"
+  },
+  {
+    "kind": "tool_called",
+    "tool": "shell"
+  },
+  {
+    "kind": "final_message_contains",
+    "text": "src/calc.py"
+  }
+]
