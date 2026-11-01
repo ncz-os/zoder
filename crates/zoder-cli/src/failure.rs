@@ -602,36 +602,79 @@ pub(crate) fn error_envelope(failure: &ClassifiedFailure) -> serde_json::Value {
 /// before producing one), the failure is printed as its own envelope.
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 
-static RESULT_EMITTED: AtomicBool = AtomicBool::new(false);
-
-/// Record that a result object was produced (printed to stdout and/or
-/// written to `result.json`).
-pub(crate) fn mark_result_emitted() {
-    RESULT_EMITTED.store(true, Ordering::SeqCst);
+/// The failure contract's state for ONE run (one command dispatch).
+///
+/// Both flags describe the CURRENT run only: [`ContractRunState::begin_run`]
+/// resets them, so a second run in the same process (an embedding caller,
+/// a test) never inherits the previous run's "result already emitted" or
+/// contract scope. Within a run they only ever go from `false` to `true`;
+/// a loop iteration does not emit a result (the loop emits one document at
+/// the end), so there is nothing to reset between iterations.
+#[derive(Debug)]
+pub(crate) struct ContractRunState {
+    scope: AtomicBool,
+    emitted: AtomicBool,
 }
 
-/// Did a result object already reach stdout (or `result.json`)?
-pub(crate) fn result_was_emitted() -> bool {
-    RESULT_EMITTED.load(Ordering::SeqCst)
+impl ContractRunState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            scope: AtomicBool::new(false),
+            emitted: AtomicBool::new(false),
+        }
+    }
+
+    /// Start a run: no result emitted yet, and the contract governs it only
+    /// when `in_scope` (`zoder review` / `zoder loop`).
+    pub(crate) fn begin_run(&self, in_scope: bool) {
+        self.emitted.store(false, Ordering::SeqCst);
+        self.scope.store(in_scope, Ordering::SeqCst);
+    }
+
+    pub(crate) fn mark_result_emitted(&self) {
+        self.emitted.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn result_was_emitted(&self) -> bool {
+        self.emitted.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn in_contract_scope(&self) -> bool {
+        self.scope.load(Ordering::SeqCst)
+    }
 }
 
-static CONTRACT_SCOPE: AtomicBool = AtomicBool::new(false);
+/// The process's current run.
+static RUN: ContractRunState = ContractRunState::new();
 
-/// Record that this process runs a command the contract covers
+/// Start a run of the CLI dispatcher (`main::run`), resetting the per-run
+/// state. `in_scope` is whether the command is one the contract covers
 /// (`zoder review` / `zoder loop`).
 ///
 /// The contract is SCOPED: every other command keeps its historical exit
 /// codes (`1` for an ordinary failure, `78` for a budget-cap decline) and its
 /// historical `--json` output, so a caller of `zoder exec` is not silently
 /// moved onto a ladder it never opted into.
-pub(crate) fn enter_contract_scope() {
-    CONTRACT_SCOPE.store(true, Ordering::SeqCst);
+pub(crate) fn begin_contract_run(in_scope: bool) {
+    RUN.begin_run(in_scope);
 }
 
-/// Does the failure contract govern this process's exit code and `--json`
-/// failure output?
+/// Record that a result object was produced (printed to stdout and/or
+/// written to `result.json`) in the current run.
+pub(crate) fn mark_result_emitted() {
+    RUN.mark_result_emitted();
+}
+
+/// Did a result object already reach stdout (or `result.json`) in the
+/// current run?
+pub(crate) fn result_was_emitted() -> bool {
+    RUN.result_was_emitted()
+}
+
+/// Does the failure contract govern the current run's exit code and
+/// `--json` failure output?
 pub(crate) fn in_contract_scope() -> bool {
-    CONTRACT_SCOPE.load(Ordering::SeqCst)
+    RUN.in_contract_scope()
 }
 
 /// The code of an arbitrary error message, when one can be inferred.
@@ -1307,6 +1350,53 @@ mod tests {
     }
 
     // ---- message recognition --------------------------------------------
+
+    // ---- per-run state ------------------------------------------------------
+
+    /// Review (Muse, medium): the "result emitted" and "contract scope" flags
+    /// were process-global with no reset, so a second run in the same
+    /// process inherited the first run's flags: a review that failed BEFORE
+    /// producing a result printed no envelope at all (run 1's result
+    /// suppressed it), and a non-contract command was moved onto the
+    /// contract ladder. Each run now starts from a clean state.
+    ///
+    /// Uses a private [`ContractRunState`] (the process-global one is shared
+    /// with every concurrently running test) driven exactly as `main::run`
+    /// drives the global one.
+    #[test]
+    fn two_sequential_runs_in_one_process_classify_independently() {
+        let state = ContractRunState::new();
+
+        // Run 1: `zoder review` produced its result, then failed.
+        state.begin_run(true);
+        state.mark_result_emitted();
+        let run1 = classify_error(&classified_err(FailureCode::DiffTruncated, "truncated"))
+            .expect("run 1 is classified");
+        assert_eq!(run1.code, FailureCode::DiffTruncated);
+        assert!(state.in_contract_scope());
+        assert!(state.result_was_emitted());
+
+        // Run 2: `zoder exec`, outside the contract.
+        state.begin_run(false);
+        assert!(
+            !state.in_contract_scope(),
+            "a non-contract run must not inherit run 1's scope"
+        );
+        assert!(!state.result_was_emitted());
+
+        // Run 3: `zoder review` failing BEFORE any result: it must print its
+        // own envelope, classified from ITS error alone.
+        state.begin_run(true);
+        assert!(state.in_contract_scope());
+        assert!(
+            !state.result_was_emitted(),
+            "run 1's result must not suppress run 3's standalone envelope"
+        );
+        let run3 = classify_error(&classified_err(FailureCode::EmptyDiff, "empty_diff: none"))
+            .expect("run 3 is classified");
+        assert_eq!(run3.code, FailureCode::EmptyDiff);
+        assert_ne!(run3.code, run1.code);
+    }
 
     /// Review (Muse, medium): bare substring matching misclassified
     /// unrelated text. Each marker below used to fire inside a message that

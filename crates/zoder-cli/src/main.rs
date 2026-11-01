@@ -2759,9 +2759,12 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
-    if matches!(cli.cmd, Some(Cmd::Review { .. }) | Some(Cmd::Loop { .. })) {
-        failure::enter_contract_scope();
-    }
+    // A fresh per-run contract state: nothing a previous run in this
+    // process recorded (an emitted result, the contract scope) leaks in.
+    failure::begin_contract_run(matches!(
+        cli.cmd,
+        Some(Cmd::Review { .. }) | Some(Cmd::Loop { .. })
+    ));
 
     // `--list-schemas` is a read-only diagnostic that prints the
     // per-engine write-tool schema matrix the kernel uses to decide
