@@ -2206,9 +2206,12 @@ struct RoutingContext {
 }
 
 impl RoutingContext {
+    /// Reads the ledger strictly but under the SHARED lock: a routing
+    /// decision only reads, so concurrent sessions must not queue behind one
+    /// another (or behind a reservation's recovery scan) to route.
     fn load(cfg: &Config) -> anyhow::Result<Self> {
         let entries = Ledger::new(&cfg.ledger_path)
-            .entries_strict()
+            .entries_strict_shared()
             .with_context(|| {
                 format!(
                     "loading quota-routing ledger from {}",
@@ -11782,6 +11785,34 @@ mod ledger_integrity_tests {
             });
         assert!(result.is_err(), "reservation must fail before dispatch");
         assert!(!dispatched.get(), "provider dispatch must never be reached");
+    }
+
+    /// A routing decision only reads the ledger, so it must not take the
+    /// exclusive ledger lock: with another reader holding the lock shared, the
+    /// load still completes (an exclusive lock would wait for the reader).
+    #[test]
+    fn routing_does_not_take_exclusive_ledger_lock() {
+        use fs2::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default_provider(dir.path());
+        Ledger::new(&cfg.ledger_path).record(&test_entry()).unwrap();
+        let mut lock_path = cfg.ledger_path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let reader_lock = std::fs::File::open(&lock_path).unwrap();
+        FileExt::lock_shared(&reader_lock).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(RoutingContext::load(&cfg).map(|rc| rc.entries.len()));
+        });
+        let loaded = rx.recv_timeout(std::time::Duration::from_secs(10));
+        FileExt::unlock(&reader_lock).unwrap();
+        worker.join().unwrap();
+        let entries = loaded
+            .expect("routing queued behind a concurrent ledger reader")
+            .unwrap();
+        assert_eq!(entries, 1);
     }
 
     #[test]
