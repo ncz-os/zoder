@@ -23272,6 +23272,20 @@ mod review_refusal_tests {
             err.to_string().contains("truncated during acquisition"),
             "the refusal must name the truncation: {err}"
         );
+        // Review (muse-spark-1.3, high): the loop's return path flattens this
+        // error to text (`phase_watchdog` -> `review incomplete: {msg}` ->
+        // the iteration's `review_error`). The classification the loop
+        // reports must still be `diff_truncated`, not the
+        // `reviewers_unavailable` that "review incomplete" alone would read.
+        let iter = json!({ "review_error": format!("review incomplete: {err}") });
+        let loop_failed = loop_failure(None, Some(&iter), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("an unresolved loop has a failure");
+        assert_eq!(
+            loop_failed.code,
+            crate::failure::FailureCode::DiffTruncated,
+            "the loop's truncated-diff refusal must keep its class: {}",
+            loop_failed.message
+        );
 
         let cli = review_cli(&repo, Some(&parent));
         let err = cmd_review(
@@ -23302,6 +23316,18 @@ mod review_refusal_tests {
             err.to_string().contains("refused"),
             "refusal must be an explicit refusal, not a reviewer failure: {err}"
         );
+        // Review (muse-spark-1.3, high): the error `cmd_review` RETURNS is
+        // what `main` classifies for the exit code. It must still read as
+        // `diff_truncated` (permanent, exit 50), not as the transient
+        // `reviewers_unavailable` its "review refused" prefix also matches.
+        let classified = crate::failure::classify_error(&err)
+            .expect("the truncated-diff refusal must be classified");
+        assert_eq!(
+            classified.code,
+            crate::failure::FailureCode::DiffTruncated,
+            "the returned refusal must keep its class: {err:#}"
+        );
+        assert_eq!(classified.exit_code(), 50);
     }
 
     /// D4.5 REGRESSION: an empty diff is its OWN result (`empty_diff`), never
