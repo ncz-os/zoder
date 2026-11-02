@@ -3012,20 +3012,21 @@ async fn drive<F: FnMut(AgentEvent)>(
     // dropped connection) is surfaced unchanged so the caller can
     // decide.
     let new_params = zeroclaw_session_new_params(opts, effective_session_id.as_deref());
-    write_frame(
+    // Session-capacity refusals (-32001 / "session limit") are retried
+    // in-client with bounded backoff (see `session_new_with_limit_retry`):
+    // a full daemon is infrastructure state, not a model failure, and the
+    // caller must not see it until the budget is spent.
+    let new_res = match session_new_with_limit_retry(
+        &mut reader,
         &mut write_half,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": "new",
-            "method": "session/new",
-            "params": Value::Object(new_params),
-        }),
+        "new",
+        &Value::Object(new_params),
+        SETUP_RPC_TIMEOUT,
+        format!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"),
+        &session_limit_production_delays(),
     )
-    .await?;
-    let new_res = tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result_inner(&mut reader, "new"))
-        .await
-        .map_err(|_| anyhow!("session/new timed out after {SETUP_RPC_TIMEOUT:?}"))??;
-    let new_res = match new_res {
+    .await?
+    {
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
@@ -3052,29 +3053,30 @@ async fn drive<F: FnMut(AgentEvent)>(
             // success-path persist overwrites the record, the
             // failure path leaves it untouched.
             //
-            // Retry without session_id.
+            // Retry without session_id. The fresh-create retry runs the
+            // same limit-retry helper: a full daemon refuses a fresh id
+            // exactly like a resume, and the terminal error keeps both
+            // diagnostics (the original reject and the retry failure).
             let retry_params = zeroclaw_session_new_params(opts, None);
-            write_frame(
-                &mut write_half,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": "new",
-                    "method": "session/new",
-                    "params": Value::Object(retry_params),
-                }),
-            )
-            .await?;
             // A retry failure is fatal: only an eligible rejection (a
             // missing session or a different-agent owner, for a
             // replaceable resume) reaches this fresh-create path.
-            tokio::time::timeout(SETUP_RPC_TIMEOUT, read_result(&mut reader, "new"))
-                .await
-                .map_err(|_| anyhow!("session/new retry timed out after {SETUP_RPC_TIMEOUT:?}"))?
-                .map_err(|_| {
-                    anyhow!(
-                        "engine error on session/new: {err} (and the fresh-create retry also failed)"
-                    )
-                })?
+            match session_new_with_limit_retry(
+                &mut reader,
+                &mut write_half,
+                "new",
+                &Value::Object(retry_params),
+                SETUP_RPC_TIMEOUT,
+                format!("session/new retry timed out after {SETUP_RPC_TIMEOUT:?}"),
+                &session_limit_production_delays(),
+            )
+            .await?
+            {
+                Ok(v) => v,
+                Err(retry_err) => anyhow::bail!(
+                    "engine error on session/new: {err} (and the fresh-create retry also failed: {retry_err})"
+                ),
+            }
         }
     };
     let session_id = new_res
@@ -4957,29 +4959,26 @@ where
     if let Some(sid) = &effective_session_id {
         new_params.insert("sessionId".into(), json!(sid));
     }
-    write_frame(
+    // Session-capacity refusals (-32001 / "session limit") are retried
+    // in-client with bounded backoff (see `session_new_with_limit_retry`).
+    // Reads stay bounded by the turn deadline (as before): the per-attempt
+    // budget is the time LEFT on it, recomputed for every attempt, and a
+    // goose session/new timeout still surfaces the clean error below — no
+    // session id was ever issued, so no `session/cancel` may be sent.
+    let goose_timeout_msg =
+        || format!("goose session/new timed out after {:?}", opts.timeout);
+    let goose_read_budget = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let new_res = match session_new_with_limit_retry(
+        reader,
         write_half,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": "new",
-            "method": "session/new",
-            "params": Value::Object(new_params),
-        }),
+        "new",
+        &Value::Object(new_params),
+        goose_read_budget(),
+        goose_timeout_msg(),
+        &session_limit_production_delays(),
     )
-    .await?;
-    let new_res = match tokio::time::timeout_at(deadline, read_result_inner(reader, "new")).await {
-        Ok(r) => r?,
-        // session/new timed out. No session id was ever issued, so we
-        // cannot send a `session/cancel` (it would carry an empty
-        // `sessionId`). Surface a clean error.
-        Err(_) => {
-            return Err(anyhow!(
-                "goose session/new timed out after {:?}",
-                opts.timeout
-            ))
-        }
-    };
-    let new_res = match new_res {
+    .await?
+    {
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
@@ -4997,32 +4996,28 @@ where
             // benefit to dropping the existing record on the
             // reject path. The success-path persist overwrites
             // the record; the failure path leaves it untouched.
+            //
+            // The fresh-create retry runs the same limit-retry helper:
+            // a full daemon refuses a fresh id exactly like a resume.
             let mut retry_params = serde_json::Map::new();
             retry_params.insert("cwd".into(), json!(opts.cwd.to_string_lossy()));
             retry_params.insert("mcpServers".into(), json!(opts.mcp_servers));
-            write_frame(
+            match session_new_with_limit_retry(
+                reader,
                 write_half,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": "new",
-                    "method": "session/new",
-                    "params": Value::Object(retry_params),
-                }),
+                "new",
+                &Value::Object(retry_params),
+                goose_read_budget(),
+                goose_timeout_msg(),
+                &session_limit_production_delays(),
             )
-            .await?;
-            let retry =
-                match tokio::time::timeout_at(deadline, read_result_inner(reader, "new")).await {
-                    Ok(r) => r?,
-                    Err(_) => {
-                        return Err(anyhow!(
-                            "goose session/new timed out after {:?}",
-                            opts.timeout
-                        ))
-                    }
-                };
-            retry.map_err(|retry_err| {
-                anyhow!("engine error on session/new: {err} (and the fresh-create retry also failed: {retry_err})")
-            })?
+            .await?
+            {
+                Ok(v) => v,
+                Err(retry_err) => {
+                    return Err(anyhow!("engine error on session/new: {err} (and the fresh-create retry also failed: {retry_err})"))
+                }
+            }
         }
     };
     let session_id: Option<String> = new_res
@@ -5818,6 +5813,186 @@ const SESSION_NOT_FOUND: i64 = -32000;
 /// JSON-RPC "invalid params", the code Zeroclaw uses for a `session/new`
 /// resume whose session is bound to a DIFFERENT agent alias.
 const INVALID_PARAMS: i64 = -32602;
+/// The daemon's session-capacity refusal on `session/new`: no slot is free.
+///
+/// The numeric code alone is NOT diagnostic — the daemon reuses -32001 for
+/// unrelated replies (e.g. "user denied approval" on approve ids), so every
+/// match also requires the "session limit" message text (see
+/// [`is_session_limit_message`)), and the retry below applies ONLY to
+/// `session/new` responses, never to prompt/approve replies.
+const SESSION_LIMIT_REACHED: i64 = -32001;
+
+/// Stable marker opening the terminal session-capacity error the retry
+/// helper returns after its attempt budget is spent. `zoder-cli` classifies
+/// on it (failure code `session_limit`); it is part of the contract, not
+/// prose.
+pub const SESSION_LIMIT_MARKER: &str = "session_limit:";
+
+/// Whether free text reports a daemon session-capacity refusal.
+///
+/// True for the helper's terminal error (it opens with
+/// [`SESSION_LIMIT_MARKER`]) and for a raw daemon refusal that never went
+/// through the helper (`Session limit reached (code -32001)` from a bail
+/// on a non-replaceable session). The -32001 code alone is NOT enough: the
+/// daemon reuses it for unrelated replies such as "user denied approval".
+pub fn is_session_limit_message(text: &str) -> bool {
+    if text.contains(SESSION_LIMIT_MARKER) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("session limit") && lower.contains("32001")
+}
+
+/// Whether a `session/new` JSON-RPC error reply is a capacity refusal worth
+/// retrying in-client (code AND message; see [`SESSION_LIMIT_REACHED`]).
+fn is_session_limit_error(error: &RpcError) -> bool {
+    error.code == SESSION_LIMIT_REACHED
+        && error.message.to_ascii_lowercase().contains("session limit")
+}
+
+
+
+/// Attempt budget for a daemon session-capacity refusal: 1 initial try plus
+/// one retry per schedule entry (6 tries total).
+pub(crate) const SESSION_LIMIT_MAX_ATTEMPTS: u32 = 6;
+
+/// Base backoff before retry attempt `attempt` (1-based: the delay slept
+/// after attempt N hit the session limit). 2 s doubling, 30 s cap:
+/// attempt 1 -> 2 s, 2 -> 4 s, 3 -> 8 s, 4 -> 16 s, 5 -> 30 s (capped).
+/// The caller adds jitter (see [`session_limit_jitter`]); this schedule is
+/// pure so tests pin it exactly.
+fn session_limit_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4)).min(30))
+}
+
+/// Uplift `base` by 0..25% using a time-seeded xorshift: enough to spread a
+/// fleet of workers retrying a full daemon, small enough to keep the
+/// schedule's worst case near its nominal sum. No RNG dependency — the
+/// helper lives in `acp-client`, which has none.
+fn session_limit_jitter(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0x9E3779B9);
+    let mut x = nanos | 1;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let uplift_pct = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 33) % 26;
+    base + Duration::from_millis(base.as_millis() as u64 * uplift_pct / 100)
+}
+
+/// Production retry delays: one jittered entry per retry (attempts 1..5).
+fn session_limit_production_delays() -> Vec<Duration> {
+    (1..SESSION_LIMIT_MAX_ATTEMPTS)
+        .map(|attempt| session_limit_jitter(session_limit_retry_delay(attempt)))
+        .collect()
+}
+
+/// The recoverable outcome of one `session/new` frame exchange.
+enum SessionNewAttempt {
+    /// The daemon answered with a result.
+    Done(Value),
+    /// The daemon answered -32001 / "session limit": sleep and resend.
+    Limited(RpcError),
+    /// Any other JSON-RPC error: the caller's resume-reject logic decides.
+    Rejected(RpcError),
+}
+
+/// Send one `session/new` frame (`params` under `id`) and await the matching
+/// reply, bounded by a FRESH `read_timeout` per attempt (a silence budget,
+/// not a sequence budget: backoff sleeps between attempts do not consume
+/// it). Transport and timeout failures are fatal `Err`s; a JSON-RPC error
+/// reply is returned as an attempt so the caller can classify it (capacity
+/// refusal vs resume rejection).
+async fn exchange_session_new<R, W>(
+    reader: &mut R,
+    write_half: &mut W,
+    id: &str,
+    params: &Value,
+    read_timeout: Duration,
+    timeout_msg: String,
+) -> anyhow::Result<SessionNewAttempt>
+where
+    R: tokio::io::AsyncBufReadExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    write_frame(
+        write_half,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": params,
+        }),
+    )
+    .await?;
+    let attempt_deadline = tokio::time::Instant::now() + read_timeout;
+    let reply = match tokio::time::timeout_at(attempt_deadline, read_result_inner(reader, id)).await
+    {
+        Ok(r) => r?,
+        Err(_) => return Err(anyhow!("{timeout_msg}")),
+    };
+    match reply {
+        Ok(v) => Ok(SessionNewAttempt::Done(v)),
+        Err(rpc) if is_session_limit_error(&rpc) => Ok(SessionNewAttempt::Limited(rpc)),
+        Err(rpc) => Ok(SessionNewAttempt::Rejected(rpc)),
+    }
+}
+
+/// `session/new` with bounded retries across daemon session-capacity
+/// refusals (-32001 / "session limit").
+///
+/// `delays[i]` is slept (as-is) after attempt `i + 1` hits the limit, so
+/// `delays.len() + 1` is the attempt budget. Production passes
+/// [`session_limit_production_delays`] (6 tries, ~2+4+8+16+30 s plus
+/// jitter); tests pass short or empty schedules for fast determinism.
+///
+/// Returns the result value on success, the non-limit JSON-RPC error as
+/// `Ok(Err(..))` for the caller's resume-reject path, and a fatal `Err` on
+/// transport/timeout failure or when the budget is spent (the error opens
+/// with [`SESSION_LIMIT_MARKER`] so the CLI classifies `session_limit`).
+async fn session_new_with_limit_retry<R, W>(
+    reader: &mut R,
+    write_half: &mut W,
+    id: &str,
+    params: &Value,
+    read_timeout: Duration,
+    timeout_msg: String,
+    delays: &[Duration],
+) -> anyhow::Result<Result<Value, RpcError>>
+where
+    R: tokio::io::AsyncBufReadExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match exchange_session_new(
+            reader,
+            write_half,
+            id,
+            params,
+            read_timeout,
+            timeout_msg.clone(),
+        )
+        .await?
+        {
+            SessionNewAttempt::Done(v) => return Ok(Ok(v)),
+            SessionNewAttempt::Rejected(rpc) => return Ok(Err(rpc)),
+            SessionNewAttempt::Limited(rpc) => {
+                let idx = attempts.saturating_sub(1) as usize;
+                if idx >= delays.len() {
+                    return Err(anyhow!(
+                        "{SESSION_LIMIT_MARKER} daemon session capacity reached after \
+                         {attempts} tries (session/new answered {rpc}); not retrying further"
+                    ));
+                }
+                tokio::time::sleep(delays[idx]).await;
+            }
+        }
+    }
+}
 
 /// The engine's ownership rejection: a session id exists but belongs to
 /// another agent, so it can never be resumed under the alias in this
@@ -13888,6 +14063,300 @@ mod mr1_reliability_regression {
             run.outcome
         );
         assert!(!run.succeeded());
+        drop(dir);
+    }
+
+    /// FB110: the session-limit backoff schedule is 2 s doubling, 30 s cap.
+    /// Pinned exactly: a regression that stretches it delays every fleet
+    /// turn against a full daemon; one that shrinks it hot-loops the daemon.
+    #[test]
+    fn session_limit_retry_schedule_is_2s_doubling_capped_at_30s() {
+        let got: Vec<Duration> = (1..=SESSION_LIMIT_MAX_ATTEMPTS).map(session_limit_retry_delay).collect();
+        assert_eq!(
+            got,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ],
+            "schedule must be 2/4/8/16/30/30 s"
+        );
+        assert_eq!(
+            SESSION_LIMIT_MAX_ATTEMPTS, 6,
+            "attempt budget is 6 tries (1 initial + 5 retries)"
+        );
+    }
+
+    /// FB110: jitter spreads a fleet of retrying workers without changing
+    /// the schedule's order of magnitude: never below base, never more
+    /// than 25% above it.
+    #[test]
+    fn session_limit_jitter_stays_within_quarter_uplift() {
+        let base = Duration::from_secs(8);
+        for _ in 0..50 {
+            let j = session_limit_jitter(base);
+            assert!(j >= base, "jitter must never shorten the backoff: {j:?}");
+            assert!(
+                j <= base + Duration::from_secs(2),
+                "jitter must add at most 25%: {j:?}"
+            );
+        }
+    }
+
+    /// FB110: the capacity matcher requires code AND message. -32001 alone
+    /// is not diagnostic: the daemon reuses it for "user denied approval"
+    /// on approve replies, which must never trigger a session/new retry.
+    #[test]
+    fn session_limit_matcher_requires_code_and_message() {
+        let limit = RpcError {
+            code: -32001,
+            message: "Session limit reached".into(),
+        };
+        assert!(is_session_limit_error(&limit));
+        // The approval-denial reuse of -32001 must NOT match.
+        let approval_denial = RpcError {
+            code: -32001,
+            message: "user denied approval".into(),
+        };
+        assert!(!is_session_limit_error(&approval_denial));
+        // Right text, wrong code: not a capacity refusal.
+        let wrong_code = RpcError {
+            code: -32000,
+            message: "Session limit reached".into(),
+        };
+        assert!(!is_session_limit_error(&wrong_code));
+        // Message-level predicate: the terminal marker and the raw daemon
+        // shape match; the approval denial does not.
+        assert!(is_session_limit_message("session_limit: daemon session capacity reached"));
+        assert!(is_session_limit_message(
+            "session/new resume failed: Session limit reached (code -32001)"
+        ));
+        assert!(!is_session_limit_message("user denied approval (code -32001)"));
+        assert!(!is_session_limit_message("Session limit reached (code -32000)"));
+    }
+
+    /// Drive one `session/new` exchange against a fake server over a duplex
+    /// pair. `script` answers each attempt: `Err(code, msg)` for a JSON-RPC
+    /// error reply, `Ok(session_id)` for success. Returns the attempt count.
+    async fn drive_session_new_script(
+        script: Vec<Result<&'static str, (i64, &'static str)>>,
+        delays: &[Duration],
+    ) -> (anyhow::Result<Result<Value, RpcError>>, usize) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(65536);
+        let (client_r, mut client_w) = tokio::io::split(client);
+        let mut client_reader = tokio::io::BufReader::new(client_r);
+        let server_task = tokio::spawn(async move {
+            let (server_r, mut server_w) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(server_r);
+            let mut attempts = 0usize;
+            let mut line = String::new();
+            for step in &script {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let frame: Value = serde_json::from_str(line.trim()).unwrap();
+                assert_eq!(frame["method"], "session/new");
+                attempts += 1;
+                let id = frame.get("id").cloned().unwrap_or(json!("new"));
+                let reply = match step {
+                    Ok(sid) => json!({"jsonrpc":"2.0","id":id,"result":{"session_id":sid}}),
+                    Err((code, msg)) => {
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":msg}})
+                    }
+                };
+                let s = serde_json::to_string(&reply).unwrap();
+                server_w.write_all(format!("{s}\n").as_bytes()).await.unwrap();
+                server_w.flush().await.unwrap();
+            }
+            attempts
+        });
+        let params = json!({"agent_alias":"a","cwd":"/tmp","chat_mode":"acp"});
+        let res = session_new_with_limit_retry(
+            &mut client_reader,
+            &mut client_w,
+            "new",
+            &params,
+            Duration::from_secs(5),
+            "test session/new timed out".into(),
+            delays,
+        )
+        .await;
+        // Drop the client halves first: the script may hold more steps than
+        // the client consumes (budget-exhausted / non-limit paths stop
+        // reading), and the server only sees EOF once they are gone.
+        drop(client_reader);
+        drop(client_w);
+        (res, server_task.await.unwrap())
+    }
+
+    /// FB110: -32001 N times then success — the client rides out a full
+    /// daemon and mints the session once a slot frees.
+    #[tokio::test]
+    async fn session_new_retries_limit_until_a_slot_frees() {
+        let (res, attempts) = drive_session_new_script(
+            vec![
+                Err((-32001, "Session limit reached")),
+                Err((-32001, "Session limit reached")),
+                Ok("slot-freed"),
+            ],
+            &[Duration::from_millis(10), Duration::from_millis(10)],
+        )
+        .await;
+        let value = res.unwrap().expect("limit then success must resolve");
+        assert_eq!(
+            value.get("session_id").and_then(Value::as_str),
+            Some("slot-freed")
+        );
+        assert_eq!(attempts, 3, "two refusals then a success is 3 attempts");
+    }
+
+    /// FB110: N past the budget — the client stops retrying and reports the
+    /// terminal `session_limit:` error the CLI classifies on.
+    #[tokio::test]
+    async fn session_new_reports_session_limit_past_the_budget() {
+        let script: Vec<Result<&'static str, (i64, &'static str)>> =
+            vec![Err((-32001, "Session limit reached")); 10];
+        let (res, attempts) =
+            drive_session_new_script(script, &[Duration::from_millis(10), Duration::from_millis(10)])
+                .await;
+        // The budget-exhausted path is a fatal outer error (not an RpcError
+        // for the resume-reject path): nothing is resumable about a full
+        // daemon.
+        let err = res.expect_err("budget spent must be fatal");
+        let text = err.to_string();
+        assert!(
+            is_session_limit_message(&text),
+            "terminal error must carry the session_limit marker; got: {text}"
+        );
+        assert!(text.contains("3 tries"), "error must state the attempt count; got: {text}");
+        assert_eq!(attempts, 3, "2 delays means 3 attempts, then stop");
+    }
+
+    /// FB110: a non-limit JSON-RPC error is NOT retried — it flows to the
+    /// caller's resume-reject path unchanged (one attempt, no sleep).
+    #[tokio::test]
+    async fn session_new_does_not_retry_non_limit_errors() {
+        let (res, attempts) = drive_session_new_script(
+            vec![Err((-32000, "Session not found")), Ok("unused")],
+            &[Duration::from_millis(10)],
+        )
+        .await;
+        let rpc = res.unwrap().expect_err("non-limit error returns as RpcError");
+        assert_eq!(rpc.code, -32000);
+        assert_eq!(attempts, 1, "no retry on a non-limit error");
+    }
+
+    /// Fake zeroclaw daemon for the FB110 wiring test: answers the first
+    /// `session/new` with -32001 / "Session limit reached", the second
+    /// with a session, then completes the turn. Pre-retry code bailed on
+    /// the first refusal, so a green run proves the fresh path retries.
+    async fn session_limit_then_success_daemon(
+        socket: std::path::PathBuf,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        use tokio::net::UnixListener;
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut frames: Vec<Value> = Vec::new();
+            let mut line = String::new();
+
+            // initialize
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": { "protocol_version": ACP_PROTOCOL_VERSION },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // first session/new -> at capacity
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "error": { "code": -32001, "message": "Session limit reached" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // retried session/new -> a slot freed
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "new",
+                    "result": { "session_id": "slot-freed" },
+                }),
+            )
+            .await
+            .unwrap();
+
+            // session/prompt -> terminal result + turn_complete
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            frames.push(serde_json::from_str(line.trim()).unwrap());
+            write_frame(
+                &mut write_half,
+                &json!({ "jsonrpc": "2.0", "id": "prompt", "result": {} }),
+            )
+            .await
+            .unwrap();
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": { "type": "turn_complete", "outcome": "completed" },
+                }),
+            )
+            .await
+            .unwrap();
+            frames
+        })
+    }
+
+    /// FB110 wiring: a full `run_agent` turn against a daemon that is full
+    /// exactly once. The production backoff (~2 s) makes this a ~2 s test.
+    #[tokio::test]
+    async fn run_agent_rides_out_one_session_limit_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sess-limit-once.sock");
+        let server = session_limit_then_success_daemon(socket.clone()).await;
+
+        let mut opts = AgentOptions::new(&socket, "mr1-test", "/tmp", "test prompt");
+        opts.timeout = Duration::from_secs(60);
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("one capacity refusal must be retried, not fatal");
+        assert_eq!(run.session_id, "slot-freed");
+        assert_eq!(run.outcome, AgentOutcome::Completed);
+        let frames = server.await.unwrap();
+        let news: Vec<&Value> = frames
+            .iter()
+            .filter(|f| f["method"] == "session/new")
+            .collect();
+        assert_eq!(news.len(), 2, "exactly one retry after the refusal: {frames:?}");
         drop(dir);
     }
 
