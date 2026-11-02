@@ -890,15 +890,18 @@ impl BillableReservation {
 ///
 /// - an ARMED, unreconciled reservation (the call reached the provider, so
 ///   its cost is real) leaves `reconciled` false when the write fails, so
-///   the in-memory state stays honest: nothing was written. The on-disk row
-///   stays the armed reservation row, and a later writer's recovery scan
-///   (`recover_abandoned_prepared` + the stale-armed pass) finds it once
-///   this process's owner lock is gone and reconciles it into an
-///   unknown-cost row. Retrying here would only extend a hang that has
-///   already blocked for the whole budget.
+///   the in-memory state stays honest: nothing was written. The row on disk
+///   STAYS the armed reservation row — unknown-cost, with its violation
+///   note — so the call remains visible and month-to-date spend keeps
+///   reporting "unknown cost" instead of silently dropping the spend. The
+///   row is settled later by the stale-armed pass in
+///   `recover_abandoned_prepared`, which requires STALE_RESERVATION_TRIM_S
+///   of age because a fresh armed row may still belong to a live owner; the
+///   owner lock this impl releases is that pass's precondition. Retrying
+///   here would only extend a hang that has already blocked for the budget.
 /// - an UNARMED reservation (nothing was dispatched) leaves its prepared row
-///   for the same recovery scan, which blanks it because the owner lock is
-///   released by the code that follows.
+///   for the same scan, which closes prepared rows once the owner lock is
+///   gone — released at the end of this impl.
 ///
 /// `Drop` cannot report an error (it runs on unwinding and at scope exit),
 /// so `tracing::warn!` names the lock and the budget: that is the only
@@ -4189,7 +4192,8 @@ mod lock_deadline_tests {
     fn the_drop_guard_gives_up_on_a_contended_lock_without_panicking() {
         with_budget(0.3, || {
             let dir = tempfile::tempdir().unwrap();
-            let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+            let ledger_path = dir.path().join("ledger.jsonl");
+            let ledger = Ledger::new(&ledger_path);
             let lock_path = ledger.lock_path();
             let mut reservation = ledger.reserve_billable().unwrap();
             reservation.arm_for("test", "test/model").unwrap();
@@ -4203,6 +4207,63 @@ mod lock_deadline_tests {
             assert!(
                 elapsed < Duration::from_secs(5),
                 "dropping an armed reservation must be bounded, took {elapsed:?}"
+            );
+
+            // Drop logs and gives up without blanking the row, so the armed
+            // reservation must still be on disk as unknown-cost spend with
+            // its violation note. An implementation that blanked the slot
+            // would pass the elapsed check but lose the accounting.
+            let survivors: Vec<Entry> = std::fs::read_to_string(&ledger_path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+                .collect();
+            let armed = survivors
+                .iter()
+                .find(|entry| {
+                    entry.provider == RESERVATION_PROVIDER && entry.model == ARMED_RESERVATION_MODEL
+                })
+                .unwrap_or_else(|| {
+                    panic!("the armed reservation must survive Drop: {survivors:?}")
+                });
+            assert!(armed.cost_unknown, "the surviving row must be unknown-cost");
+            assert!(
+                armed.violation.is_some(),
+                "the surviving row must keep its violation note: {armed:?}"
+            );
+
+            // Pinned current behaviour, which the earlier doc comment
+            // overstated: a FRESH armed row is NOT settled by the next
+            // writer. The recovery scan closes prepared rows and stale-armed
+            // rows only (past STALE_RESERVATION_TRIM_S), because a fresh
+            // armed row may still belong to a live owner. The spend is still
+            // counted as unknown-cost, and the row goes stale later.
+            let next = Ledger::new(&ledger_path);
+            next.record(&row())
+                .expect("a later writer must still record");
+            let after: Vec<Entry> = std::fs::read_to_string(&ledger_path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+                .collect();
+            assert!(
+                after.iter().any(|entry| {
+                    entry.provider == RESERVATION_PROVIDER && entry.model == ARMED_RESERVATION_MODEL
+                }),
+                "a fresh armed row stays armed until it goes stale: {after:?}"
+            );
+            // The unattributed call is why the row stays: month-to-date
+            // spend refuses to report while a call has unknown cost, so the
+            // surviving row is what surfaces the problem rather than being
+            // silently dropped.
+            assert!(
+                next.month_to_date_usd()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown cost"),
+                "the armed row must keep the call visible as unknown cost"
             );
         });
     }
