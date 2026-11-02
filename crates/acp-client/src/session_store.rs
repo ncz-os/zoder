@@ -982,16 +982,20 @@ mod tests {
     /// taken on the first attempt, with no backoff sleep.
     #[test]
     fn an_uncontended_session_store_lock_is_taken_immediately() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("engine_sessions.json");
-        let started = std::time::Instant::now();
-        let guard = LockGuard::acquire(&path).expect("acquire an uncontended lock");
-        let elapsed = started.elapsed();
-        drop(guard);
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
-        );
+        // Serialize on ENV_LOCK like every other test in this module: without
+        // it this could observe the 1 s budget the contended test sets.
+        with_budget(DEFAULT_LOCK_TIMEOUT_SECS, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("engine_sessions.json");
+            let started = std::time::Instant::now();
+            let guard = LockGuard::acquire(&path).expect("acquire an uncontended lock");
+            let elapsed = started.elapsed();
+            drop(guard);
+            assert!(
+                elapsed < std::time::Duration::from_millis(100),
+                "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
+            );
+        });
     }
 
     /// Fresh scope key for `/repo` and the `goose` engine.
