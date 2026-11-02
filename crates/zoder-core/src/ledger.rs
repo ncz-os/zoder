@@ -1036,11 +1036,14 @@ fn ledger_lock_budget() -> Option<Duration> {
 /// `0.5` otherwise.
 fn format_budget(budget: Duration) -> String {
     let secs = budget.as_secs_f64();
-    if secs.fract() == 0.0 {
+    // Test the Duration itself for whole seconds rather than `secs.fract()`:
+    // the f64 can be non-integral through rounding while the Duration still
+    // prints as an integer, and vice versa.
+    if budget.subsec_nanos() == 0 {
         // `as u64` would saturate for an absurdly large configured budget
-        // (e.g. 1e30 s), printing a number the operator never set. Render
-        // the f64 integral value exactly instead.
-        format!("{secs:.0}")
+        // (e.g. 1e30 s), printing a number the operator never set. The
+        // Duration is an exact whole number of seconds here, so render that.
+        format!("{:?}", budget.as_secs())
     } else {
         format!("{secs}")
     }

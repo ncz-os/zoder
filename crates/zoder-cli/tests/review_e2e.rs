@@ -278,8 +278,19 @@ async fn a_held_ledger_lock_fails_the_review_within_the_deadline_and_makes_no_pr
         stderr(&output)
     );
     let combined = format!("{}\n{}", stdout(&output), stderr(&output));
+    // The exact timeout text, not just the word "lock": any earlier failure
+    // (a bad config, a missing corpus) that merely mentions the ledger would
+    // otherwise satisfy this test without the bound ever firing.
     assert!(
-        combined.contains("ledger lock"),
-        "the operator must be told which lock timed out:\n{combined}"
+        combined.contains(&format!(
+            "timed out after {LOCK_BUDGET_SECS}s waiting for the ledger lock at"
+        )),
+        "the failure must be the lock deadline firing, not an earlier error:\n{combined}"
+    );
+    // And it must have actually waited for the budget rather than bailing out
+    // immediately: a lower bound proves acquisition was attempted and polled.
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "zoder review failed in {elapsed:?}, before the {LOCK_BUDGET_SECS} s budget could expire"
     );
 }

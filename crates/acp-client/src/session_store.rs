@@ -681,11 +681,13 @@ fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> 
 /// `30` for whole seconds, `0.5` otherwise.
 fn format_budget(budget: std::time::Duration) -> String {
     let secs = budget.as_secs_f64();
-    if secs.fract() == 0.0 {
+    // Test the Duration itself for whole seconds, matching the ledger-side
+    // helper: `secs.fract()` can disagree with the Duration through rounding.
+    if budget.subsec_nanos() == 0 {
         // `as u64` saturates for an absurdly large budget and would print a
-        // number the operator never set. Render the integral f64 exactly,
-        // matching the ledger-side helper.
-        format!("{secs:.0}")
+        // number the operator never set. The Duration is an exact whole
+        // number of seconds here, so render that.
+        format!("{:?}", budget.as_secs())
     } else {
         format!("{secs}")
     }
