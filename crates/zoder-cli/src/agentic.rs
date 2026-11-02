@@ -9507,7 +9507,16 @@ fn loop_failure(
             Some((crate::failure::FailureCode::EngineBudgetExceeded, _))
         )
     });
-    let evidence = if author_hit_engine_budget {
+    // FB110 (audit F2): the author is the ROOT cause when it failed before
+    // producing a model — any review error after that is derivative (a
+    // review of nothing the engine authored), and reporting it blames a
+    // reviewer that never ran, with a null reviewer model. A budget refusal
+    // already took this path; session capacity and every other author-side
+    // failure join it here. When the author DID produce a model and the
+    // review then failed, the review error still wins as before.
+    let author_failed_before_model =
+        field("author_model").is_none() && author_error.is_some();
+    let evidence = if author_hit_engine_budget || author_failed_before_model {
         author_error.unwrap_or_default()
     } else {
         review_error.or(author_error).unwrap_or_default()
@@ -9569,6 +9578,54 @@ fn loop_failure(
 /// result document already carries.
 fn loop_failure_error(failure: crate::failure::ClassifiedFailure) -> anyhow::Error {
     crate::failure::classified_failure_err(failure)
+}
+
+/// The loop's terminal accounting: WHY the run stopped.
+///
+/// Priority: resolved > free-policy gate > whole-run deadline > the failure
+/// CODE for author-side failures > the final verdict > empty > exhausted.
+/// The code-outranks-verdict rule is the F2 fix: when the author failed
+/// (session capacity, a failed or timed-out turn, an unconfirmed cancel,
+/// an unreachable engine), the teardown names the author-side failure and
+/// never `reviewer_unavailable` with a null reviewer — the reviewer never
+/// ran. A genuinely unanswered review (author fine, reviewer silent) still
+/// reports `reviewer_unavailable` as before.
+fn loop_teardown_reason(
+    resolved: bool,
+    policy_violation: Option<&str>,
+    deadline_hit: bool,
+    failure_code: Option<crate::failure::FailureCode>,
+    final_verdict: &str,
+    iterations_empty: bool,
+) -> String {
+    if resolved {
+        return "approved".to_string();
+    }
+    if policy_violation.is_some() {
+        return "policy_violation".to_string();
+    }
+    if deadline_hit {
+        return "deadline".to_string();
+    }
+    if let Some(code) = failure_code {
+        if matches!(
+            code,
+            crate::failure::FailureCode::SessionLimit
+                | crate::failure::FailureCode::AuthorFailed
+                | crate::failure::FailureCode::AuthorTimeout
+                | crate::failure::FailureCode::CancelUnconfirmed
+                | crate::failure::FailureCode::EngineUnreachable
+        ) {
+            return code.code().to_string();
+        }
+    }
+    if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
+        return "reviewer_unavailable".to_string();
+    }
+    if iterations_empty {
+        return "author_failed".to_string();
+    }
+    "exhausted".to_string()
 }
 
 fn update_loop_streaks(
@@ -10471,6 +10528,26 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             .await;
         }
 
+        // FB110: a daemon at session capacity is infrastructure state, not
+        // a model defect, and the ACP client already spent its retry
+        // budget getting here. This iteration records the refusal and the
+        // loop stops: check, review and commit phases are skipped below
+        // (there is nothing the engine authored to validate), and the
+        // failure classifies as `session_limit` instead of blaming a
+        // reviewer that never ran.
+        let author_session_limit = author_err.as_deref().is_some_and(|e| {
+            matches!(
+                crate::failure::classify_message(e).map(|(code, _)| code),
+                Some(crate::failure::FailureCode::SessionLimit)
+            )
+        });
+        if author_session_limit && !cli.quiet {
+            eprintln!(
+                "[loop] iter {i}: author turn never obtained a daemon session (session limit); \
+                 recording the refusal and stopping before check/review/commit"
+            );
+        }
+
         // 2. Post-commit author reconciliation. The default engine is a
         //    long-lived zeroclaw daemon whose git identity is out of
         //    zoder's control, so any commit the author turn landed in
@@ -10585,8 +10662,15 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // a hung script blocked the loop forever. Wrap with `run_check_watched`
         // so a wedged check is killed at `loop_timeout_secs` and recorded as a
         // failure (tail carries a clear phase-timed-out marker).
+        // FB110: no check runs when the author never obtained a session —
+        // there is nothing the engine authored to validate. `check` still
+        // names the configured command in the record; `check_passed: None`
+        // is the honest "not run", never a fabricated green.
         let mut check_timed_out = false;
-        let (check_passed, check_tail) = match &check {
+        let (check_passed, check_tail) = if author_session_limit {
+            (None, String::new())
+        } else {
+            match &check {
             Some(c) => {
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: check `{c}`…");
@@ -10616,6 +10700,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 (Some(ok), tail)
             }
             None => (None, String::new()),
+            }
         };
 
         // Streak bookkeeping — both failure modes live in one helper so the
@@ -10910,6 +10995,28 @@ diff is not a finished turn"
                     .to_string();
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if author_session_limit {
+                // FB110: the author never obtained a daemon session, so
+                // there is no authored diff to review. Same record shape
+                // as the other skip arms (`reviewer_unavailable` is the
+                // true state of the review phase); attribution is fixed
+                // downstream — `loop_failure` prefers the author error
+                // and the teardown reason names the failure code, never
+                // a null-reviewer `reviewer_unavailable`.
+                let detail = "review skipped: the author turn never obtained a daemon session \
+(session limit reached); nothing was authored to review"
+                    .to_string();
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved");
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11600,21 +11707,26 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
     // from the same object that carries the loop.
     if let Some(f) = &failure {
         payload["failure"] = f.to_json();
+        // FB110: the combined `class:code` handle (for example
+        // `infrastructure:session_limit`) as one parseable string, so a
+        // fleet worker reads the dispatch handle without joining two keys.
+        // Additive: `failure.code` / `failure.class` keep their exact
+        // previous meaning.
+        payload["failure_class"] = serde_json::Value::String(format!(
+            "{}:{}",
+            f.code.class().as_str(),
+            f.code.code()
+        ));
     }
 
-    let teardown_reason = if resolved {
-        "approved"
-    } else if policy_violation.is_some() {
-        "policy_violation"
-    } else if deadline_hit {
-        "deadline"
-    } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
-        "reviewer_unavailable"
-    } else if iterations.is_empty() {
-        "author_failed"
-    } else {
-        "exhausted"
-    };
+    let teardown_reason = loop_teardown_reason(
+        resolved,
+        policy_violation.as_deref(),
+        deadline_hit,
+        failure.as_ref().map(|f| f.code),
+        &final_verdict,
+        iterations.is_empty(),
+    );
     let teardown = json!({
         "reason": teardown_reason, "resolved": resolved,
         "iterations": iterations.len(), "max_iters": max_iters,
@@ -15576,6 +15688,121 @@ not run to max_iters"
         let err = loop_failure_error(f.clone());
         let back = crate::failure::classify_error(&err).expect("classified");
         assert_eq!(back, f);
+    }
+
+    /// FB110 (audit F2): the incident shape — the author never obtained a
+    /// session (no model, recorded refusal) and the review of the empty
+    /// diff then failed. The failure must be the AUTHOR's (`session_limit`),
+    /// never `reviewer_unavailable` with a null reviewer.
+    #[test]
+    fn loop_failure_prefers_author_error_when_no_model_was_produced() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "session/new resume failed: Session limit reached (code -32001)",
+            "review_error": "review incomplete: no review chunks were generated",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::SessionLimit);
+        assert_eq!(f.code.exit_code(), 60);
+        assert!(
+            f.message.contains("Session limit"),
+            "the author evidence must survive: {}",
+            f.message
+        );
+    }
+
+    /// The complement: when the author DID produce a model and the review
+    /// then failed, the review error still wins (pre-existing behavior
+    /// kept — the author is only the root cause when it never ran).
+    #[test]
+    fn loop_failure_keeps_review_error_when_author_produced_a_model() {
+        let last = serde_json::json!({
+            "author_model": "some-model",
+            "author_error": "author turn did not finish: boom",
+            "review_error": "review incomplete: no review chunks were generated",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::ReviewersUnavailable);
+    }
+
+    /// FB110 (audit F2): the teardown names the author-side failure code
+    /// and never `reviewer_unavailable` when the author failed. A genuinely
+    /// unanswered review (author fine) still reports `reviewer_unavailable`.
+    #[test]
+    fn loop_teardown_reason_names_author_side_failure_codes() {
+        use crate::failure::FailureCode;
+        for code in [
+            FailureCode::SessionLimit,
+            FailureCode::AuthorFailed,
+            FailureCode::AuthorTimeout,
+            FailureCode::CancelUnconfirmed,
+            FailureCode::EngineUnreachable,
+        ] {
+            assert_eq!(
+                loop_teardown_reason(
+                    false,
+                    None,
+                    false,
+                    Some(code),
+                    REVIEWER_UNAVAILABLE_VERDICT,
+                    false
+                ),
+                code.code(),
+                "author-side {code} must be the teardown reason, not the verdict"
+            );
+        }
+        // A genuinely unanswered review (author produced a model, reviewer
+        // silent) still reports reviewer_unavailable.
+        assert_eq!(
+            loop_teardown_reason(
+                false,
+                None,
+                false,
+                Some(FailureCode::ReviewersUnavailable),
+                REVIEWER_UNAVAILABLE_VERDICT,
+                false
+            ),
+            "reviewer_unavailable"
+        );
+        // Priority: resolved > policy > deadline > code > verdict > empty.
+        assert_eq!(
+            loop_teardown_reason(
+                true,
+                None,
+                false,
+                Some(FailureCode::SessionLimit),
+                REVIEWER_UNAVAILABLE_VERDICT,
+                false
+            ),
+            "approved"
+        );
+        assert_eq!(
+            loop_teardown_reason(
+                false,
+                Some("free policy"),
+                false,
+                Some(FailureCode::SessionLimit),
+                REVIEWER_UNAVAILABLE_VERDICT,
+                false
+            ),
+            "policy_violation"
+        );
+        assert_eq!(
+            loop_teardown_reason(
+                false, None, true, None, REVIEWER_UNAVAILABLE_VERDICT, false
+            ),
+            "deadline"
+        );
+        assert_eq!(
+            loop_teardown_reason(false, None, false, None, "comment", false),
+            "exhausted"
+        );
+        assert_eq!(
+            loop_teardown_reason(false, None, false, None, "comment", true),
+            "author_failed"
+        );
     }
 
     #[test]
