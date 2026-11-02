@@ -67,18 +67,92 @@ pub enum BudgetVerdict {
     Confirm(String),
 }
 
+/// WHICH cap a [`BudgetVerdict::Confirm`] tripped.
+///
+/// The host-level back-off (D8 step 12) keys on the MONTHLY cap only: it
+/// is a host-wide condition (this month's budget is gone) that a sibling
+/// worker must respect. A per-call cap is a per-CALL condition — the very
+/// next cheap call may fit under it — so it must NOT park the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrippedCap {
+    /// The per-call cap was exceeded.
+    PerCall,
+    /// The month-to-date cap was exceeded.
+    Monthly,
+}
+
+/// A [`BudgetVerdict::Confirm`] plus the machine-readable reason it exists.
+///
+/// The human string stays EXACTLY as before (`"BUDGET: ..."`), so every
+/// caller that matches on prose is unaffected; this adds a typed
+/// [`TrippedCap`] so a caller can decide "is this a host-wide event?" without
+/// parsing English.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetDecline {
+    /// The reason text shown to the operator.
+    pub message: String,
+    /// Which cap tripped. `None` when the decline was not a cap trip at all
+    /// (an unpriceable model, an unreadable ledger).
+    pub tripped: Option<TrippedCap>,
+    /// The configured cap that was exceeded, in USD.
+    pub limit_usd: Option<f64>,
+    /// The month-to-date BILLED spend that was already on the books when the
+    /// cap tripped, in USD. `None` when no month-to-date read happened.
+    pub spent_usd: Option<f64>,
+}
+
+impl BudgetDecline {
+    /// `true` when the MONTHLY cap tripped — the host-wide condition that
+    /// must write the cooldown marker.
+    pub fn monthly_cap_tripped(&self) -> bool {
+        self.tripped == Some(TrippedCap::Monthly)
+    }
+}
+
 impl Budget {
     /// Pure pre-call decision. `estimate_usd` is the projected cost of this call
     /// (pricing catalog × estimated tokens); `month_spent_usd` is the ledger's
     /// month-to-date total. A non-positive estimate is always within budget
     /// (the free path is never gated by spend caps).
     pub fn evaluate(&self, estimate_usd: f64, month_spent_usd: f64) -> BudgetVerdict {
+        match self.evaluate_decline(estimate_usd, month_spent_usd) {
+            Ok(Some(decline)) => BudgetVerdict::Confirm(decline.message),
+            Ok(None) => BudgetVerdict::WithinBudget,
+            // `evaluate_decline` never fails on these inputs; a decline is
+            // still the safe answer if it ever did.
+            Err(_) => BudgetVerdict::WithinBudget,
+        }
+    }
+
+    /// The same decision as [`Budget::evaluate`], but with the tripped cap
+    /// reported STRUCTURALLY.
+    ///
+    /// `Ok(None)` = within budget; `Ok(Some(decline))` = a cap tripped. The
+    /// error case does not exist in practice (the inputs are two finite
+    /// numbers), but it is typed so a future input can fail loudly rather
+    /// than silently.
+    ///
+    /// The message is byte-identical to [`Budget::evaluate`]'s
+    /// `BudgetVerdict::Confirm` text, so switching a caller to this method
+    /// cannot change what an operator sees.
+    pub fn evaluate_decline(
+        &self,
+        estimate_usd: f64,
+        month_spent_usd: f64,
+    ) -> anyhow::Result<Option<BudgetDecline>> {
         if estimate_usd <= 0.0 {
-            return BudgetVerdict::WithinBudget;
+            return Ok(None);
         }
         let mut reasons = Vec::new();
+        // `None` = no cap of this kind is configured; `Some` = it tripped.
+        // The monthly cap wins when BOTH tripped: it is the host-wide one,
+        // and a host whose monthly budget is gone must back off even if the
+        // per-call cap also fired.
+        let mut per_call_tripped = false;
+        let mut monthly_tripped = false;
         if let Some(cap) = self.max_cost_per_call_usd {
             if estimate_usd > cap {
+                per_call_tripped = true;
                 reasons.push(format!(
                     "estimated call cost ${estimate_usd:.4} exceeds the per-call cap ${cap:.2}"
                 ));
@@ -87,6 +161,7 @@ impl Budget {
         if let Some(cap) = self.monthly_cap_usd {
             let after = month_spent_usd + estimate_usd;
             if after > cap {
+                monthly_tripped = true;
                 reasons.push(format!(
                     "this call (~${estimate_usd:.4}) would push month-to-date spend to \
                      ${after:.2}, over the monthly cap ${cap:.2} (already ${month_spent_usd:.2})"
@@ -94,10 +169,28 @@ impl Budget {
             }
         }
         if reasons.is_empty() {
-            BudgetVerdict::WithinBudget
-        } else {
-            BudgetVerdict::Confirm(format!("BUDGET: {}", reasons.join("; ")))
+            return Ok(None);
         }
+        let tripped = if monthly_tripped {
+            Some(TrippedCap::Monthly)
+        } else if per_call_tripped {
+            Some(TrippedCap::PerCall)
+        } else {
+            None
+        };
+        // The numbers go into the marker so an operator (and the Hive
+        // worker) can see WHY the host backed off without re-deriving them.
+        let (limit_usd, spent_usd) = match tripped {
+            Some(TrippedCap::Monthly) => (self.monthly_cap_usd, Some(month_spent_usd)),
+            Some(TrippedCap::PerCall) => (self.max_cost_per_call_usd, None),
+            None => (None, None),
+        };
+        Ok(Some(BudgetDecline {
+            message: format!("BUDGET: {}", reasons.join("; ")),
+            tripped,
+            limit_usd,
+            spent_usd,
+        }))
     }
 
     /// Catalog-aware pre-call decision. Distinct from [`Budget::evaluate`]
@@ -156,6 +249,33 @@ impl Budget {
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
+        match self.evaluate_call_decline(pricing, model, tokens, ts, month_spent) {
+            Ok(Some(decline)) => BudgetVerdict::Confirm(decline.message),
+            Ok(None) => BudgetVerdict::WithinBudget,
+            Err(_) => BudgetVerdict::WithinBudget,
+        }
+    }
+
+    /// The catalog-aware decision, with the tripped cap reported
+    /// STRUCTURALLY.
+    ///
+    /// `Ok(None)` = within budget. `Ok(Some(decline))` = the call must be
+    /// confirmed: a cap tripped, the cost could not be priced, or the
+    /// ledger could not be read. Only a MONTHLY-cap trip carries
+    /// `Some(TrippedCap::Monthly)` — that is the host-wide event that must
+    /// write the cooldown marker (D8 step 12). An unpriceable model or an
+    /// unreadable ledger is a per-call event and carries `None`.
+    ///
+    /// The message is byte-identical to
+    /// [`Budget::evaluate_call_with_cache`]'s `BudgetVerdict::Confirm` text.
+    pub fn evaluate_call_decline(
+        &self,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    ) -> anyhow::Result<Option<BudgetDecline>> {
         // Step 1: cost verdict. Unknown = could not price = fail closed.
         let verdict = pricing.classify_cost_with_cache(
             model,
@@ -166,7 +286,7 @@ impl Budget {
         );
         let estimate_usd = match verdict {
             CostVerdict::Priced(v) => v,
-            CostVerdict::Free => return BudgetVerdict::WithinBudget,
+            CostVerdict::Free => return Ok(None),
             CostVerdict::Unknown => {
                 // The pre-call gate fails closed: an unknown cost for a
                 // would-be-metred call must be confirmed by the user.
@@ -179,7 +299,13 @@ impl Budget {
                 if let Some(cap) = self.max_cost_per_call_usd {
                     msg.push_str(&format!(" (per-call cap ${cap:.2} cannot be evaluated)"));
                 }
-                return BudgetVerdict::Confirm(msg);
+                return Ok(Some(BudgetDecline {
+                    message: msg,
+                    // NOT a cap trip: the cost is unknown, not over a cap.
+                    tripped: None,
+                    limit_usd: None,
+                    spent_usd: None,
+                }));
             }
         };
         // Step 2: month-to-date spend. Fail closed on I/O errors so a
@@ -187,13 +313,21 @@ impl Budget {
         let month_spent_usd = match month_spent() {
             Ok(v) => v,
             Err(e) => {
-                return BudgetVerdict::Confirm(format!(
-                    "BUDGET: could not read month-to-date spend from the ledger ({e}); \
-                     confirm to proceed"
-                ));
+                return Ok(Some(BudgetDecline {
+                    message: format!(
+                        "BUDGET: could not read month-to-date spend from the ledger ({e}); \
+                         confirm to proceed"
+                    ),
+                    // NOT a cap trip: the spend is UNKNOWN, not over a cap.
+                    // Parking the host on an unreadable ledger would be
+                    // exactly the phantom back-off D8 step 12 must avoid.
+                    tripped: None,
+                    limit_usd: None,
+                    spent_usd: None,
+                }));
             }
         };
-        self.evaluate(estimate_usd, month_spent_usd)
+        Ok(self.evaluate_decline(estimate_usd, month_spent_usd)?)
     }
 }
 

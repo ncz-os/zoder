@@ -33,6 +33,12 @@ pub mod finops;
 pub mod gate;
 pub mod gate_bundle;
 pub mod health_probe;
+pub mod host_cooldown;
+pub use host_cooldown::{
+    clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown, read_cooldown_at,
+    trip_monthly_cap_cooldown, write_cooldown, HostCooldown, COOLDOWN_SUFFIX, COOLDOWN_VERSION,
+    REASON_MONTHLY_CAP,
+};
 pub use health_probe::{
     cap_targets, classify_err, classify_err_kind, probe_all, probe_request, Probe, ProbeOutcome,
     ProbePlan, ProbeResolver, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_MAX_TOKENS,
@@ -109,10 +115,8 @@ pub fn agent_idle_between_events_s_from_env() -> Option<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
 }
-pub use budget::{estimate_tokens, Budget, BudgetVerdict};
-pub use cancel_outcome::{
-    classify_cancel_error, io_error_proves_no_listener, CancelOutcome,
-};
+pub use budget::{estimate_tokens, Budget, BudgetDecline, BudgetVerdict, TrippedCap};
+pub use cancel_outcome::{classify_cancel_error, io_error_proves_no_listener, CancelOutcome};
 pub use catalog_models::{
     fetch_catalog_models, merge_into_corpus, merge_or_degrade, CatalogModel, CatalogResponse,
     EnrichmentOutcome,
