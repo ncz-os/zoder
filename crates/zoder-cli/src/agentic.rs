@@ -3119,6 +3119,13 @@ fn parse_review(raw: &str) -> ReviewOutput {
     // an empty `{}`) must BLOCK — the previous non-blocking `"comment"` let an
     // unreviewed/refused iteration resolve as if approved. `request_changes`
     // is the fail-closed verdict, mirroring `synthesize_review_phase_failure`.
+    fail_closed_review_output(raw)
+}
+
+/// The fail-closed verdict both lenient parsers and the review gate share:
+/// `request_changes` with the raw reviewer text preserved in a finding, so
+/// the block is auditable instead of silent.
+fn fail_closed_review_output(raw: &str) -> ReviewOutput {
     ReviewOutput {
         verdict: "request_changes".into(),
         summary: "Reviewer did not return a parseable structured verdict; failing closed (request_changes). Raw output preserved below.".into(),
@@ -3132,6 +3139,28 @@ fn parse_review(raw: &str) -> ReviewOutput {
         next_steps: vec![],
         ..Default::default()
     }
+}
+
+/// The `zoder review` verdict gate (F4/FB111): the structured gate is the
+/// ONLY way to an approve.
+///
+/// [`strict_review`] accepts a whole-reply structured verdict (bare, fenced,
+/// or think-wrapped). Anything else fails closed — including a verdict
+/// object embedded in prose (a quoted schema example, a think-block
+/// explanation of the schema): an approve-shaped extraction without a
+/// strict whole-reply verdict is not an approval. Blocking verdicts
+/// extracted from prose still block (the fail-closed direction is
+/// preserved, so this gate only ever turns approves into blocks, never
+/// the reverse).
+fn review_gate_parse(raw: &str) -> ReviewOutput {
+    if let Some(review) = strict_review(raw) {
+        return review;
+    }
+    let extracted = parse_review(raw);
+    if extracted.verdict == "approve" {
+        return fail_closed_review_output(raw);
+    }
+    extracted
 }
 
 /// Strip a leading reasoning wrapper that a thinking model prepends to its
@@ -6424,7 +6453,10 @@ unbound, or missing imports:\n{context}"
                 ok_models += 1;
                 total_cost += c.cost_usd;
                 receipts.extend(c.receipts);
-                let mut review = parse_review(&c.content);
+                // FB111: the structured gate is the only way to an approve —
+                // a verdict object embedded in reviewer prose (a quoted
+                // schema example, a think-block explanation) fails closed.
+                let mut review = review_gate_parse(&c.content);
                 review.escalation_reason = report.escalation_reason;
                 review.forced_family_conflict = report.forced_family_conflict;
                 filter_false_undefined_findings(&mut review, &read_post_image);
@@ -13113,6 +13145,68 @@ mod tests {
                 .any(|f| f.body.contains("My verdict is approve")),
             "the fail-closed finding must preserve the raw reviewer text"
         );
+    }
+
+    // ---- FB111 (audit F4): the structured gate is the only way to approve ----
+
+    #[test]
+    fn review_gate_never_reads_prose_as_approve() {
+        // The audit's case: reviewer prose quoting a schema example that
+        // contains an inline approve verdict. The lenient extraction DOES
+        // see it (that is the hole); the gate must fail closed.
+        let schema = "The verdict schema is {\"verdict\": \"approve\", \"summary\": \"All checks pass\", \"findings\": [], \"next_steps\": []}. I will now review the diff.";
+        assert_eq!(
+            parse_review(schema).verdict,
+            "approve",
+            "precondition: the lenient path reads the embedded example as approval"
+        );
+        assert_eq!(
+            review_gate_parse(schema).verdict,
+            "request_changes",
+            "prose with an embedded schema example must never approve"
+        );
+    }
+
+    #[test]
+    fn review_gate_never_reads_think_tags_as_approve() {
+        // A thinking model explaining the schema inside think tags, followed
+        // by prose instead of a verdict object.
+        let raw = "<think>The verdict should be {\"verdict\": \"approve\", \"summary\": \"looks good\", \"findings\": [], \"next_steps\": []} because the code is clean.</think> Actually, let me look more closely at the error handling.";
+        assert_ne!(
+            review_gate_parse(raw).verdict,
+            "approve",
+            "an approve inside think-tag prose must never approve"
+        );
+    }
+
+    #[test]
+    fn review_gate_never_reads_conditional_prose_as_approve() {
+        let raw = "I would approve this if the tests passed, but I have concerns about the locking.";
+        assert_eq!(
+            review_gate_parse(raw).verdict,
+            "request_changes",
+            "conditional prose must fail closed"
+        );
+    }
+
+    #[test]
+    fn review_gate_keeps_strict_approvals() {
+        // The whole reply IS the verdict: bare, fenced, or think-wrapped.
+        // All three keep approving through the gate.
+        let bare = "{\"verdict\":\"approve\",\"summary\":\"clean\",\"findings\":[],\"next_steps\":[]}";
+        assert_eq!(review_gate_parse(bare).verdict, "approve");
+        let fenced = format!("```json\n{bare}\n```");
+        assert_eq!(review_gate_parse(&fenced).verdict, "approve");
+        let think = format!("<think>checking the diff</think>\n{bare}");
+        assert_eq!(review_gate_parse(&think).verdict, "approve");
+    }
+
+    #[test]
+    fn review_gate_keeps_extracted_blocks_blocking() {
+        // The gate only ever turns approves into blocks, never the reverse:
+        // a request_changes object embedded in prose still blocks.
+        let raw = "My analysis: {\"verdict\":\"request_changes\",\"summary\":\"buffer overflow\",\"findings\":[]} — see above.";
+        assert_eq!(review_gate_parse(raw).verdict, "request_changes");
     }
 
     // ---- A: prose is NOT a verdict on the loop path ----
