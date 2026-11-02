@@ -1107,11 +1107,15 @@ async fn complete_once_tracked(
 /// out separately because an operator triaging "why did this reviewer take a
 /// second model?" needs to tell a slow endpoint from a dead one.
 fn reviewer_skip_reason(kind: zoder_core::ErrKind, message: &str) -> &'static str {
+    // F2.5: only the diagnostic HEAD describes the failure. A provider error
+    // body can name a parameter like `stream_timeout` on a plain 400, and
+    // reporting that as "timeout" sends an operator after the wrong cause.
     let lower = message.to_ascii_lowercase();
+    let head = lower.split('{').next().unwrap_or("");
     if matches!(kind, zoder_core::ErrKind::Timeout)
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("deadline")
+        || head.contains("timed out")
+        || head.contains("timeout")
+        || head.contains("deadline")
     {
         "timeout"
     } else {
@@ -19915,6 +19919,29 @@ mod reviewer_chain_dispatch_tests {
         assert_eq!(
             fallback_reset_wall_from(Some(500), None, None, "no-state-provider", now),
             None
+        );
+    }
+
+    /// F2.5: a provider error BODY can name a parameter called
+    /// `stream_timeout` without the call having timed out. `skipped[].reason`
+    /// is what an operator triages from, so it must not report "timeout" for
+    /// a 400 that says the parameter is unsupported.
+    #[test]
+    fn skip_reason_does_not_match_timeout_inside_error_body() {
+        assert_eq!(
+            reviewer_skip_reason(
+                zoder_core::ErrKind::Http,
+                "provider HTTP 400: {\"error\":\"unsupported parameter: stream_timeout\"}"
+            ),
+            "unavailable"
+        );
+        // The transport-level wording before any body still reads as a timeout.
+        assert_eq!(
+            reviewer_skip_reason(
+                zoder_core::ErrKind::Http,
+                "provider HTTP 504: upstream timed out"
+            ),
+            "timeout"
         );
     }
 
