@@ -923,7 +923,8 @@ impl Drop for BillableReservation {
             // A lock deadline is not fatal to the accounting: the row on
             // disk is still the armed reservation row, and the next writer's
             // recovery scan turns it into an unknown-cost row once this
-            // process's owner lock is gone. Give up, keep the row, say so.
+            // process's owner lock is gone (`self.owner_lock.take()` at the
+            // end of this impl). Give up, keep the row, say so.
             if let Err(error) = self.reconcile_unknown() {
                 tracing::warn!(
                     "could not reconcile the armed ledger reservation at {}: {error:#}",
@@ -937,8 +938,9 @@ impl Drop for BillableReservation {
             //
             // On a lock deadline the prepared row is left alone: it is
             // already unknown-cost, and the recovery scan blanks it because
-            // the owner lock is released below. Never panic, never wait
-            // past the budget.
+            // this impl releases the owner sidecar lock at its end
+            // (`self.owner_lock.take()`), which is that scan's precondition.
+            // Never panic, never wait past the budget.
             if let Ok(lock) = open_lock_file(&self.lock_path) {
                 match lock_exclusive_bounded(&lock, &self.lock_path) {
                     Ok(()) => {
@@ -3886,7 +3888,7 @@ mod lock_deadline_tests {
     /// guard's lifetime tied to the call, not to `'static`.
     fn with_budget<T>(seconds: f64, body: impl FnOnce() -> T) -> T {
         let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
+        let previous = std::env::var_os(LEDGER_LOCK_TIMEOUT_ENV);
         std::env::set_var(LEDGER_LOCK_TIMEOUT_ENV, format!("{seconds}"));
         // Restore on the way out of the scope even if `body` panics (an
         // assertion failure in a test does), so a failed test cannot leak
@@ -4089,17 +4091,23 @@ mod lock_deadline_tests {
         });
     }
 
-    /// A budget that is a VALID `Duration` but far too large to add to an
-    /// `Instant` must degrade to unbounded rather than overflow-panic. Pins
-    /// the `checked_add` guard around the deadline computation.
+    /// A budget that is a VALID `Duration` but absurdly large must not panic
+    /// anywhere on the acquisition path. On this platform `Instant` is wide
+    /// enough that `checked_add` succeeds and the `checked_add` fallback is
+    /// not reached for 1e18 s — the assertion below states that limit rather
+    /// than pretending to exercise it; what this pins is that no caller
+    /// panics (the earlier `from_secs_f64` abort) under such a budget.
     #[test]
-    fn an_absurd_but_representable_budget_does_not_overflow_the_deadline() {
+    fn an_absurd_but_representable_budget_does_not_panic_on_the_acquisition_path() {
         with_budget(1e18, || {
             let budget = ledger_lock_budget().expect("a huge budget must not mean unbounded");
+            // Documents the real limit: on this platform the wide Instant
+            // tolerates even 1e18 s, so the checked_add fallback is dead code
+            // here and is kept purely as a portable guarantee.
             assert!(
                 std::time::Instant::now().checked_add(budget).is_some(),
-                "the platform Instant must tolerate this budget, so the guard is never hit \
-                 here; the assertion documents the real limit"
+                "if this ever fails, the checked_add fallback is what must keep \
+                 acquisition from panicking"
             );
             // And an uncontended ledger still acquires under it, no panic.
             let dir = tempfile::tempdir().unwrap();
