@@ -2461,7 +2461,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
-        let now = Utc::now();
+        // T1-2: a pinned clock. Reading `Utc::now()` here and in production
+        // made this test race the month boundary: a row written at 23:59:59
+        // and read at 00:00:00 lands in different buckets a moment apart.
+        // The pin also keeps the two rows in the same month as `now` forever.
+        let now: DateTime<Utc> = "2026-11-30T23:59:59Z".parse().unwrap();
         let month = now.format("%Y-%m").to_string();
         // Two entries in the current month.
         let line_a = format!(
@@ -2477,7 +2481,7 @@ mod tests {
         drop(f);
 
         let led = Ledger::new(&path);
-        let got = led.month_to_date_usd().unwrap();
+        let got = led.month_to_date_usd_at(now).unwrap();
         assert!((got - 1.0).abs() < 1e-9, "month total {got}");
         // Spot-check the bucket exists under the expected key.
         let _ = month;
@@ -2487,8 +2491,12 @@ mod tests {
     fn month_to_date_fails_closed_when_current_cost_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        // T1-1: the row and the read share one pinned instant. With both taken
+        // from `Utc::now()` a midnight crossing made the unknown-cost row fall
+        // outside "this month", so the gate returned Ok(0.0) instead of Err.
+        let now: DateTime<Utc> = "2026-11-30T23:59:59Z".parse().unwrap();
         let unknown = Entry {
-            ts_utc: Utc::now(),
+            ts_utc: now,
             provider: "p".into(),
             model: "uncatalogued".into(),
             host: String::new(),
@@ -2503,7 +2511,7 @@ mod tests {
             estimated_cost_usd: None,
         };
         led.record(&unknown).unwrap();
-        assert!(led.month_to_date_usd().is_err());
+        assert!(led.month_to_date_usd_at(now).is_err());
     }
 
     #[test]
