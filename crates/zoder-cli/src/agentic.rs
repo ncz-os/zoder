@@ -4582,6 +4582,9 @@ fn is_test_path(path: &str) -> bool {
 /// and makes no git calls.
 ///
 /// Precedence (strictest first wins):
+///   0. A diff carrying the acquisition-truncation marker is `Substantive`:
+///      the visible prefix cannot prove anything about the bytes that were
+///      never captured, and the review side refuses a truncated diff.
 ///   1. `Empty` — no `+`/`-` content lines at all.
 ///   2. `WhitespaceOnly` — every content line is empty/whitespace.
 ///   3. `CommentOnly` — every content line is empty or starts with a comment marker.
@@ -4594,6 +4597,14 @@ fn is_test_path(path: &str) -> bool {
 /// (preferred, mirrors the post-image) and, as a fallback, from
 /// `diff --git a/... b/...` headers.
 pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
+    // F2.2: a capture truncated during acquisition is not judged on what
+    // arrived. `Empty`/`CommentOnly` would reject a real fix whose production
+    // hunk sits past the cap, and `TestOnly` could accept production code the
+    // classifier never saw. `plan_loop_review` refuses a truncated diff
+    // outright, so deferring here cannot let one through unreviewed.
+    if diff.contains(DIFF_ACQUISITION_TRUNCATION_MARKER) {
+        return DiffSubstance::Substantive;
+    }
     let mut content_lines: Vec<&str> = Vec::new();
     // Track every path that appears as the *new* side of a file header.
     // Either source is fine: `+++ b/PATH` is the post-image, and on
@@ -15675,6 +15686,24 @@ not run to max_iters"
                     +    assert!(true);\n\
                     +}\n";
         assert_eq!(classify_diff_substance(diff), DiffSubstance::TestOnly);
+    }
+
+    /// F2.2: a capture truncated during acquisition must not be judged on the
+    /// bytes that happened to arrive. A comment-only visible prefix is not
+    /// proof the change is comment-only — the production code may sit in the
+    /// part that never arrived — and `Empty`/`CommentOnly` would reject a real
+    /// fix as gaming, while `TestOnly` could accept code it never saw. The
+    /// review side already refuses a truncated diff (`plan_loop_review`), so
+    /// the classifier defers instead of guessing.
+    #[test]
+    fn classify_diff_substance_truncated_diff_is_not_judged_on_prefix() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,1 +1,2 @@\n\
+                    +// a note\n\
+                    \n...[git diff truncated during acquisition at 1048576 bytes]...\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
     }
 
     /// A diff with at least one substantive content line, where every
