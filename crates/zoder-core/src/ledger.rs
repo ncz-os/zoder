@@ -1078,7 +1078,7 @@ impl LockMode {
 ///
 /// On timeout the error names the budget, the lock path, and the holder
 /// situation, so an operator can tell a wedged peer from a slow one.
-fn lock_bounded(file: &File, path: &Path, mode: LockMode) -> anyhow::Result<()> {
+fn lock_bounded(file: &File, path: &Path, mode: LockMode, holder: &str) -> anyhow::Result<()> {
     let Some(budget) = ledger_lock_budget() else {
         return match mode {
             LockMode::Exclusive => FileExt::lock_exclusive(file),
@@ -1119,13 +1119,13 @@ fn lock_bounded(file: &File, path: &Path, mode: LockMode) -> anyhow::Result<()> 
         let now = std::time::Instant::now();
         if now >= deadline {
             anyhow::bail!(
-                "timed out after {}s waiting for the ledger lock at {} ({} lock; another \
-                 process holds it; waited {attempt} time(s) up to this budget — set \
+                "timed out after {}s waiting for the ledger lock at {} ({} lock; {holder}; \
+                 waited {attempt} time(s) up to this budget — set \
                  {LEDGER_LOCK_TIMEOUT_ENV} to a larger number of seconds, or 0 to wait \
                  indefinitely)",
                 format_budget(budget),
                 path.display(),
-                mode.describe()
+                mode.describe(),
             );
         }
         std::thread::sleep(wait.min(deadline.saturating_duration_since(now)));
@@ -1136,12 +1136,25 @@ fn lock_bounded(file: &File, path: &Path, mode: LockMode) -> anyhow::Result<()> 
 /// [`lock_bounded`] for the exclusive side: the ledger lock every writer
 /// and every strict reader takes.
 fn lock_exclusive_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
-    lock_bounded(file, path, LockMode::Exclusive)
+    lock_bounded(file, path, LockMode::Exclusive, "another process holds it")
+}
+
+/// [`lock_exclusive_bounded`] for the per-reservation OWNER sidecar, whose
+/// path carries a random per-reservation marker: only a thread of THIS
+/// process can hold it, so the shared "another process holds it" hint would
+/// send an operator hunting for a phantom peer.
+fn lock_owner_sidecar_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
+    lock_bounded(
+        file,
+        path,
+        LockMode::Exclusive,
+        "another thread of this process holds it",
+    )
 }
 
 /// [`lock_bounded`] for the shared side: the routing snapshot's read.
 fn lock_shared_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
-    lock_bounded(file, path, LockMode::Shared)
+    lock_bounded(file, path, LockMode::Shared, "another process holds it")
 }
 
 fn open_lock_file(path: &Path) -> anyhow::Result<File> {
@@ -1331,7 +1344,7 @@ impl Ledger {
         // A per-reservation sidecar, so its only holder is a thread of this
         // process. Bounded like the ledger lock (never behind another
         // process, so it cannot be the 30 s hang) and named in its error.
-        lock_exclusive_bounded(&owner_lock, &owner_lock_path)?;
+        lock_owner_sidecar_bounded(&owner_lock, &owner_lock_path)?;
         let pending = Entry {
             ts_utc: Utc::now(),
             provider: RESERVATION_PROVIDER.to_string(),
@@ -3922,6 +3935,33 @@ mod lock_deadline_tests {
         let holder = open_lock_file(path).unwrap();
         holder.lock_exclusive().unwrap();
         holder
+    }
+
+    /// The per-reservation owner sidecar carries a random marker in its
+    /// path, so only a thread of THIS process can hold it. Its timeout
+    /// message must say so instead of blaming an imaginary peer process.
+    #[test]
+    fn the_owner_sidecar_timeout_blames_this_process_not_another() {
+        with_budget(0.3, || {
+            let dir = tempfile::tempdir().unwrap();
+            let lock_path = dir.path().join("ledger.jsonl.lock.owner");
+            let holder = hold_from_another_open(&lock_path);
+
+            let file = open_lock_file(&lock_path).unwrap();
+            let error = lock_owner_sidecar_bounded(&file, &lock_path)
+                .expect_err("a held sidecar must time out");
+            drop(holder);
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("another thread of this process holds it"),
+                "the owner-sidecar message must name the real holder: {message}"
+            );
+            assert!(
+                !message.contains("another process holds it"),
+                "the owner sidecar cannot be held by another process: {message}"
+            );
+        });
     }
 
     /// Regression: with the lock held elsewhere and a 1 s budget, `record()`

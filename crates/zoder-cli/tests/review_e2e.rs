@@ -255,9 +255,13 @@ async fn a_held_ledger_lock_fails_the_review_within_the_deadline_and_makes_no_pr
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     let elapsed = started.elapsed();
-    let output = child.wait_with_output().expect("collect output");
+    // The child has exited (that is why the poll loop broke), so collection
+    // cannot block. Release the holder first anyway, so the holder's lifetime
+    // never straddles the assertions: the lock is meant to be held only while
+    // the child is running.
     drop(release);
     holder.join().expect("join holder");
+    let output = child.wait_with_output().expect("collect output");
 
     assert!(
         status.code().is_some_and(|code| code != 0),
