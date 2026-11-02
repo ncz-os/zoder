@@ -1021,28 +1021,55 @@ fn format_budget(budget: Duration) -> String {
     }
 }
 
-/// Take the exclusive ledger lock, polling `try_lock_exclusive` with a
-/// 5 ms backoff that doubles to a 100 ms ceiling and giving up when the
-/// budget from [`LEDGER_LOCK_TIMEOUT_ENV`] expires.
+/// Which side of the lock a bounded acquisition takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Exclusive,
+    Shared,
+}
+
+impl LockMode {
+    /// The mode's name in a timeout message.
+    fn describe(self) -> &'static str {
+        match self {
+            LockMode::Exclusive => "exclusive",
+            LockMode::Shared => "shared",
+        }
+    }
+}
+
+/// Take the ledger lock in `mode`, polling `try_lock_exclusive` /
+/// `try_lock_shared` with a 5 ms backoff that doubles to a 100 ms ceiling
+/// and giving up when the budget from [`LEDGER_LOCK_TIMEOUT_ENV`] expires.
 ///
-/// Polling (not a blocking `lock_exclusive`) is what makes the bound
-/// possible: `flock(2)` has no timeout, so the only way to stop waiting is
-/// to not wait indefinitely in the first place. The first attempt is an
-/// immediate `try_lock_exclusive`, so an uncontended lock costs nothing.
+/// Polling (not a blocking `lock_exclusive`/`lock_shared`) is what makes the
+/// bound possible: `flock(2)` has no timeout, so the only way to stop
+/// waiting is to not wait indefinitely in the first place. The first
+/// attempt is immediate, so an uncontended lock costs nothing — keeping the
+/// granularity of the ledger sidecar unchanged.
 ///
 /// On timeout the error names the budget, the lock path, and the holder
 /// situation, so an operator can tell a wedged peer from a slow one.
-fn lock_exclusive_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
+fn lock_bounded(file: &File, path: &Path, mode: LockMode) -> anyhow::Result<()> {
     let Some(budget) = ledger_lock_budget() else {
-        return file
-            .lock_exclusive()
-            .with_context(|| format!("locking ledger at {}", path.display()));
+        return match mode {
+            LockMode::Exclusive => FileExt::lock_exclusive(file),
+            LockMode::Shared => FileExt::lock_shared(file),
+        }
+        .with_context(|| format!("locking ledger at {}", path.display()));
     };
     let deadline = std::time::Instant::now() + budget;
     let mut wait = LOCK_BACKOFF_START;
     let mut attempt: u64 = 0;
     loop {
-        match file.try_lock_exclusive() {
+        // fs2's `flock(2)` wrappers, named explicitly: std's inherent
+        // `File::try_lock_*` are newer than this crate's MSRV (1.88) and
+        // return a different error type.
+        let result = match mode {
+            LockMode::Exclusive => FileExt::try_lock_exclusive(file),
+            LockMode::Shared => FileExt::try_lock_shared(file),
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => {
@@ -1054,16 +1081,29 @@ fn lock_exclusive_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
         let now = std::time::Instant::now();
         if now >= deadline {
             anyhow::bail!(
-                "timed out after {}s waiting for the ledger lock at {} (another process holds \
-                 it; waited {attempt} time(s) up to this budget — set {LEDGER_LOCK_TIMEOUT_ENV} \
-                 to a larger number of seconds, or 0 to wait indefinitely)",
+                "timed out after {}s waiting for the ledger lock at {} ({} lock; another \
+                 process holds it; waited {attempt} time(s) up to this budget — set \
+                 {LEDGER_LOCK_TIMEOUT_ENV} to a larger number of seconds, or 0 to wait \
+                 indefinitely)",
                 format_budget(budget),
-                path.display()
+                path.display(),
+                mode.describe()
             );
         }
         std::thread::sleep(wait.min(deadline.saturating_duration_since(now)));
         wait = (wait * 2).min(LOCK_BACKOFF_MAX);
     }
+}
+
+/// [`lock_bounded`] for the exclusive side: the ledger lock every writer
+/// and every strict reader takes.
+fn lock_exclusive_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
+    lock_bounded(file, path, LockMode::Exclusive)
+}
+
+/// [`lock_bounded`] for the shared side: the routing snapshot's read.
+fn lock_shared_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
+    lock_bounded(file, path, LockMode::Shared)
 }
 
 fn open_lock_file(path: &Path) -> anyhow::Result<File> {
@@ -1698,27 +1738,23 @@ impl Ledger {
     /// lock, are still excluded, so the reader sees whole rows. `None` means
     /// there is no ledger yet.
     ///
-    /// The SHARED acquisition stays a blocking `lock_shared` on purpose. It
-    /// cannot hang the way an exclusive acquisition did: the only holders
-    /// that block it are ledger writers, and every one of those now gives up
-    /// at [`LEDGER_LOCK_TIMEOUT_ENV`] — so a shared wait is bounded by that
-    /// same budget transitively (a writer holding the lock for ever is
-    /// exactly the bug the bounded exclusive lock removed). Readers also
-    /// never block each other, and do not hold the lock while any provider
-    /// call runs, so there is no unbounded holder left to wait on. Bounding
-    /// it here would additionally require polling `try_lock_shared`, whose
-    /// `WouldBlock` is indistinguishable from the error path we must keep
-    /// propagating.
+    /// The SHARED acquisition is bounded too, for the same reason as the
+    /// exclusive one: `flock(2)` has no timeout, so a holder that never
+    /// releases — the case this whole change exists for — blocked the
+    /// routing snapshot before the reviewer's first provider call exactly
+    /// as it blocked the writers. "Only writers hold it exclusively" was
+    /// true of well-behaved processes and false of the wedged one. Polling
+    /// `try_lock_shared` (the shared mirror of
+    /// [`lock_exclusive_bounded`]) keeps the shared read shared while
+    /// giving it the same deadline.
     fn open_shared(&self) -> anyhow::Result<Option<(File, File)>> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating ledger directory {}", parent.display()))?;
         }
-        let lock = open_lock_file(&self.lock_path())?;
-        // fs2's flock(LOCK_SH), named explicitly: std's inherent
-        // `File::lock_shared` is newer than this crate's MSRV.
-        FileExt::lock_shared(&lock)
-            .with_context(|| format!("locking ledger at {} for reading", self.path.display()))?;
+        let lock_path = self.lock_path();
+        let lock = open_lock_file(&lock_path)?;
+        lock_shared_bounded(&lock, &lock_path)?;
         match File::open(&self.path) {
             Ok(file) => Ok(Some((lock, file))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3907,6 +3943,49 @@ mod lock_deadline_tests {
         assert!(
             !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
             "a failed acquisition must not write a ledger row"
+        );
+    }
+
+    /// REGRESSION: the routing snapshot's SHARED read hung the same way.
+    /// A wedged process holding the lock exclusively blocked
+    /// `entries_strict_shared` (the QUOTA-ROUTING read `zoder review` takes
+    /// before it dispatches) for ever, because a plain `lock_shared` is just
+    /// as unbounded as `lock_exclusive`. Bounded like the writers.
+    #[test]
+    fn a_contended_shared_read_fails_within_the_deadline_instead_of_hanging() {
+        let _budget = BudgetGuard::new(1.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        ledger.record(&row()).unwrap();
+        let holder = hold_from_another_open(&ledger.lock_path());
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let _ = tx.send(Ledger::new(&path).entries_strict_shared());
+            }
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the shared read must give up on the ledger lock, not block for ever");
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        drop(holder);
+
+        let error = result.expect_err("the shared read must fail when the lock budget expires");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("timed out after 1s waiting for the ledger lock at")
+                && message.contains("(shared lock"),
+            "the deadline error must name the timeout and the shared lock: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the shared read took {elapsed:?}, not bounded by its 1 s budget"
         );
     }
 
