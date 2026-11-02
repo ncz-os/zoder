@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Optional FinOps tags attached to a ledger entry at ingestion time.
 /// Mirrors the TypeScript `FinOpsTags` interface (snake_case wire format).
@@ -736,7 +737,7 @@ impl BillableReservation {
             anyhow::bail!("billable reservation is already armed");
         }
         let lock = open_lock_file(&self.lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, &self.lock_path)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -818,7 +819,7 @@ impl BillableReservation {
         line[..json.len()].copy_from_slice(&json);
         line[self.slot_bytes - 1] = b'\n';
         let lock = open_lock_file(&self.lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, &self.lock_path)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -855,7 +856,7 @@ impl BillableReservation {
         line[..json.len()].copy_from_slice(&json);
         line[self.slot_bytes - 1] = b'\n';
         let lock = open_lock_file(&self.lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, &self.lock_path)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -878,6 +879,29 @@ impl BillableReservation {
     }
 }
 
+/// # Lock deadline in `Drop`
+///
+/// Both branches below take the exclusive ledger lock through
+/// [`lock_exclusive_bounded`], so a held lock cannot wedge the process on
+/// the way out of a reservation.
+///
+/// On timeout, `Drop` LOGS AND GIVES UP — it never panics and never blocks
+/// past the budget:
+///
+/// - an ARMED, unreconciled reservation (the call reached the provider, so
+///   its cost is real) sets `reconciled` even when the write failed, because
+///   the on-disk row stays the armed reservation row. A later writer's
+///   recovery scan (`recover_abandoned_prepared` + the stale-armed pass)
+///   finds that row once this process's owner lock is gone and reconciles
+///   it into an unknown-cost row. Retrying here would only extend a hang
+///   that has already blocked for the whole budget.
+/// - an UNARMED reservation (nothing was dispatched) leaves its prepared row
+///   for the same recovery scan, which blanks it because the owner lock is
+///   released by the code that follows.
+///
+/// `Drop` cannot report an error (it runs on unwinding and at scope exit),
+/// so `tracing::warn!` names the lock and the budget: that is the only
+/// signal the operator gets that the ledger lock is stuck.
 impl Drop for BillableReservation {
     fn drop(&mut self) {
         if self.armed && !self.reconciled {
@@ -886,31 +910,159 @@ impl Drop for BillableReservation {
             // Without this the row stayed an armed reservation for ever and
             // every failed dispatch left a "reserved but not reconciled"
             // violation behind: thousands of them, fleet-wide.
-            let _ = self.reconcile_unknown();
+            //
+            // A lock deadline is not fatal to the accounting: the row on
+            // disk is still the armed reservation row, and the next writer's
+            // recovery scan turns it into an unknown-cost row once this
+            // process's owner lock is gone. Give up, keep the row, say so.
+            if let Err(error) = self.reconcile_unknown() {
+                tracing::warn!(
+                    "could not reconcile the armed ledger reservation at {}: {error:#}",
+                    self.path.display()
+                );
+            }
         } else if !self.armed {
             // Other writers may have appended after this reservation was
             // created, so cancellation must blank only our fixed-size slot;
             // truncating to `offset` would discard their rows.
+            //
+            // On a lock deadline the prepared row is left alone: it is
+            // already unknown-cost, and the recovery scan blanks it because
+            // the owner lock is released below. Never panic, never wait
+            // past the budget.
             if let Ok(lock) = open_lock_file(&self.lock_path) {
-                if lock.lock_exclusive().is_ok() {
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&self.path)
-                    {
-                        if self.relocate(&mut file).is_ok() {
-                            let mut blank = vec![b' '; self.slot_bytes];
-                            blank[self.slot_bytes - 1] = b'\n';
-                            let _ = file.seek(SeekFrom::Start(self.offset));
-                            let _ = file.write_all(&blank);
-                            let _ = file.sync_data();
+                match lock_exclusive_bounded(&lock, &self.lock_path) {
+                    Ok(()) => {
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&self.path)
+                        {
+                            if self.relocate(&mut file).is_ok() {
+                                let mut blank = vec![b' '; self.slot_bytes];
+                                blank[self.slot_bytes - 1] = b'\n';
+                                let _ = file.seek(SeekFrom::Start(self.offset));
+                                let _ = file.write_all(&blank);
+                                let _ = file.sync_data();
+                            }
                         }
                     }
+                    Err(error) => tracing::warn!(
+                        "could not cancel the ledger reservation at {}: {error:#}",
+                        self.path.display()
+                    ),
                 }
             }
         }
         self.owner_lock.take();
         let _ = std::fs::remove_file(&self.owner_lock_path);
+    }
+}
+
+/// Environment variable naming the ledger lock budget in seconds.
+///
+/// `fs2::FileExt::lock_exclusive` is a KERNEL WAIT with no deadline: it
+/// blocks until the holder releases the `flock(2)`. A wedged holder — or an
+/// orphaned flock — therefore hung every ledger writer for ever, and with it
+/// `zoder review`/`zoder loop`, BEFORE the first provider call (zero tokens
+/// spent, nothing to kill but the process). Reported as a 30 s-plus hang in
+/// `zoder review` with 0 provider calls.
+///
+/// `ZODER_LEDGER_LOCK_TIMEOUT_S` bounds that wait:
+///
+/// - unset or empty: [`DEFAULT_LEDGER_LOCK_TIMEOUT_SECS`] (30 s);
+/// - a positive number: that many seconds (fractions allowed, e.g. `0.5`);
+/// - `0`: UNBOUNDED — the documented opt-out that restores the old
+///   wait-for-ever behaviour, for callers that would rather queue behind a
+///   slow but healthy holder than fail;
+/// - anything else (negative, NaN, unparseable): the default, and a warning
+///   naming the rejected value, because a typo must not silently disable the
+///   bound.
+pub const LEDGER_LOCK_TIMEOUT_ENV: &str = "ZODER_LEDGER_LOCK_TIMEOUT_S";
+
+/// Default ledger lock budget: 30 s. Long enough to queue behind a healthy
+/// holder doing a recovery scan of a large ledger, short enough that a
+/// wedged lock surfaces as an error instead of an indefinite hang.
+pub const DEFAULT_LEDGER_LOCK_TIMEOUT_SECS: f64 = 30.0;
+
+/// First backoff step: 5 ms.
+const LOCK_BACKOFF_START: Duration = Duration::from_millis(5);
+/// Backoff ceiling: 100 ms, reached after five doublings.
+const LOCK_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+/// The configured ledger lock budget. `None` means unbounded.
+fn ledger_lock_budget() -> Option<Duration> {
+    let raw = std::env::var(LEDGER_LOCK_TIMEOUT_ENV).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Some(Duration::from_secs_f64(DEFAULT_LEDGER_LOCK_TIMEOUT_SECS));
+    }
+    match raw.parse::<f64>() {
+        Ok(secs) if secs == 0.0 => None,
+        Ok(secs) if secs.is_finite() && secs > 0.0 => Some(Duration::from_secs_f64(secs)),
+        _ => {
+            tracing::warn!(
+                "{LEDGER_LOCK_TIMEOUT_ENV}={raw:?} is not a number of seconds (or 0 for \
+                 unbounded); using the {DEFAULT_LEDGER_LOCK_TIMEOUT_SECS} s default"
+            );
+            Some(Duration::from_secs_f64(DEFAULT_LEDGER_LOCK_TIMEOUT_SECS))
+        }
+    }
+}
+
+/// Human-readable budget for the timeout message: `30` for whole seconds,
+/// `0.5` otherwise.
+fn format_budget(budget: Duration) -> String {
+    let secs = budget.as_secs_f64();
+    if secs.fract() == 0.0 {
+        format!("{}", secs as u64)
+    } else {
+        format!("{secs}")
+    }
+}
+
+/// Take the exclusive ledger lock, polling `try_lock_exclusive` with a
+/// 5 ms backoff that doubles to a 100 ms ceiling and giving up when the
+/// budget from [`LEDGER_LOCK_TIMEOUT_ENV`] expires.
+///
+/// Polling (not a blocking `lock_exclusive`) is what makes the bound
+/// possible: `flock(2)` has no timeout, so the only way to stop waiting is
+/// to not wait indefinitely in the first place. The first attempt is an
+/// immediate `try_lock_exclusive`, so an uncontended lock costs nothing.
+///
+/// On timeout the error names the budget, the lock path, and the holder
+/// situation, so an operator can tell a wedged peer from a slow one.
+fn lock_exclusive_bounded(file: &File, path: &Path) -> anyhow::Result<()> {
+    let Some(budget) = ledger_lock_budget() else {
+        return file
+            .lock_exclusive()
+            .with_context(|| format!("locking ledger at {}", path.display()));
+    };
+    let deadline = std::time::Instant::now() + budget;
+    let mut wait = LOCK_BACKOFF_START;
+    let mut attempt: u64 = 0;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("locking ledger at {}", path.display())))
+            }
+        }
+        attempt += 1;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "timed out after {}s waiting for the ledger lock at {} (another process holds \
+                 it; waited {attempt} time(s) up to this budget — set {LEDGER_LOCK_TIMEOUT_ENV} \
+                 to a larger number of seconds, or 0 to wait indefinitely)",
+                format_budget(budget),
+                path.display()
+            );
+        }
+        std::thread::sleep(wait.min(deadline.saturating_duration_since(now)));
+        wait = (wait * 2).min(LOCK_BACKOFF_MAX);
     }
 }
 
@@ -1065,7 +1217,7 @@ impl Ledger {
         line.push('\n');
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
         let (mut f, base) = self.open_locked_rw("recording")?;
         let fold = fold_ledger(&mut f, &self.path, base, |_, _| Ok(false))?;
         self.publish_checkpoint(&mut f, fold);
@@ -1086,8 +1238,7 @@ impl Ledger {
         }
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        lock.lock_exclusive()
-            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
         let (mut file, base) = self.open_locked_rw("reservation")?;
         // Recovery ran under the exclusive lock, so no abandoned prepared row
         // is left to skip.
@@ -1099,12 +1250,10 @@ impl Ledger {
         let marker = format!("zoder-reservation-{:032x}", rand::random::<u128>());
         let owner_lock_path = reservation_owner_lock_path(&self.path, &marker);
         let owner_lock = open_lock_file(&owner_lock_path)?;
-        owner_lock.lock_exclusive().with_context(|| {
-            format!(
-                "locking billable reservation owner at {}",
-                owner_lock_path.display()
-            )
-        })?;
+        // A per-reservation sidecar, so its only holder is a thread of this
+        // process. Bounded like the ledger lock (never behind another
+        // process, so it cannot be the 30 s hang) and named in its error.
+        lock_exclusive_bounded(&owner_lock, &owner_lock_path)?;
         let pending = Entry {
             ts_utc: Utc::now(),
             provider: RESERVATION_PROVIDER.to_string(),
@@ -1548,6 +1697,18 @@ impl Ledger {
     /// do not serialize behind one another; writers, which take the exclusive
     /// lock, are still excluded, so the reader sees whole rows. `None` means
     /// there is no ledger yet.
+    ///
+    /// The SHARED acquisition stays a blocking `lock_shared` on purpose. It
+    /// cannot hang the way an exclusive acquisition did: the only holders
+    /// that block it are ledger writers, and every one of those now gives up
+    /// at [`LEDGER_LOCK_TIMEOUT_ENV`] — so a shared wait is bounded by that
+    /// same budget transitively (a writer holding the lock for ever is
+    /// exactly the bug the bounded exclusive lock removed). Readers also
+    /// never block each other, and do not hold the lock while any provider
+    /// call runs, so there is no unbounded holder left to wait on. Bounding
+    /// it here would additionally require polling `try_lock_shared`, whose
+    /// `WouldBlock` is indistinguishable from the error path we must keep
+    /// propagating.
     fn open_shared(&self) -> anyhow::Result<Option<(File, File)>> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -1604,7 +1765,7 @@ impl Ledger {
         }
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
         let mut file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1636,8 +1797,7 @@ impl Ledger {
         }
         let lock_path = self.lock_path();
         let lock = open_lock_file(&lock_path)?;
-        lock.lock_exclusive()
-            .with_context(|| format!("locking ledger at {}", self.path.display()))?;
+        lock_exclusive_bounded(&lock, &lock_path)?;
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3608,5 +3768,231 @@ mod tests {
         assert!(err.contains("1 call(s) with unknown cost"), "{err}");
         drop(live);
         assert_eq!(ledger.month_to_date_usd().unwrap(), 1.0);
+    }
+}
+
+/// Bounded ledger lock acquisition.
+///
+/// `fs2::FileExt::lock_exclusive` is a kernel wait: it blocks until the
+/// holder releases the `flock(2)`, with no deadline. A second process that
+/// is wedged (or a lock orphaned on a filesystem where the flock outlives
+/// its writer) therefore hung `zoder review`/`zoder loop` forever BEFORE the
+/// first provider call — a zero-token run that never finished. These tests
+/// hold the lock from a second open file description and pin the bounded
+/// acquisition that replaces it.
+///
+/// The deadline is a process-wide environment variable, so every test in
+/// this module serializes on `env_lock` to keep one test's budget from
+/// leaking into another's.
+#[cfg(test)]
+mod lock_deadline_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// Serializes tests that set `ZODER_LEDGER_LOCK_TIMEOUT_S`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set the lock budget for the duration of a test, restoring the prior
+    /// value (unless it was already set, in which case the test is the only
+    /// writer because it holds `env_lock`).
+    struct BudgetGuard {
+        _env: MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl BudgetGuard {
+        fn new(seconds: f64) -> Self {
+            let env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
+            std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", format!("{seconds}"));
+            Self {
+                _env: env,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for BudgetGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
+                None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
+            }
+        }
+    }
+
+    /// One valid metered row, timestamped now.
+    fn row() -> Entry {
+        Entry {
+            ts_utc: Utc::now(),
+            provider: "test".into(),
+            model: "test/model".into(),
+            host: String::new(),
+            tokens_in: 1,
+            tokens_out: 1,
+            cost_usd: 1.0,
+            cost_unknown: false,
+            calls: 1,
+            violation: None,
+            tags: FinOpsTags::default(),
+            billing: None,
+            estimated_cost_usd: None,
+        }
+    }
+
+    fn ledger_lock(ledger: &Ledger) -> File {
+        open_lock_file(&ledger.lock_path()).unwrap()
+    }
+
+    /// A second open file description holds the exclusive flock, exactly as
+    /// a concurrent `zoder` process would. `flock(2)` is per open file
+    /// description, so this FD's lock genuinely excludes other opens of the
+    /// same path even from this process.
+    fn hold_from_another_open(path: &Path) -> File {
+        let holder = open_lock_file(path).unwrap();
+        holder.lock_exclusive().unwrap();
+        holder
+    }
+
+    /// Regression: with the lock held elsewhere and a 1 s budget, `record()`
+    /// must FAIL within the budget instead of blocking for ever. On the
+    /// unbounded implementation the worker thread never returns and the
+    /// 10 s `recv_timeout` below is what ends the test.
+    #[test]
+    fn a_contended_ledger_lock_fails_within_the_deadline_instead_of_hanging() {
+        let _budget = BudgetGuard::new(1.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let lock_path = ledger.lock_path();
+        let holder = hold_from_another_open(&lock_path);
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let ledger = Ledger::new(&path);
+                let _ = tx.send(ledger.record(&row()));
+            }
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("record() must give up on the ledger lock, not block for ever");
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        drop(holder);
+
+        let error = result.expect_err("record() must fail when the lock budget expires");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("timed out after 1s waiting for the ledger lock at"),
+            "the deadline error must name the timeout, the budget and the lock path: {message}"
+        );
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "the deadline error must name the lock path: {message}"
+        );
+        assert!(
+            message.contains("another process holds it"),
+            "the deadline error must say the lock is held elsewhere: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "record() took {elapsed:?}, not bounded by its 1 s budget"
+        );
+        assert!(
+            !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
+            "a failed acquisition must not write a ledger row"
+        );
+    }
+
+    /// The bound must not cost anything in the common case: an uncontended
+    /// lock is taken on the first `try_lock_exclusive`, with no backoff
+    /// sleep at all.
+    #[test]
+    fn an_uncontended_ledger_lock_is_taken_immediately() {
+        let _budget = BudgetGuard::new(30.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let lock_path = ledger.lock_path();
+
+        let started = Instant::now();
+        let lock = ledger_lock(&ledger);
+        lock_exclusive_bounded(&lock, &lock_path).unwrap();
+        let elapsed = started.elapsed();
+        FileExt::unlock(&lock).unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock sidecar is created by the open, as before"
+        );
+    }
+
+    /// `ZODER_LEDGER_LOCK_TIMEOUT_S=0` means unbounded (documented opt-out
+    /// for callers that would rather wait than fail). Pinned with a short
+    /// hold: the acquisition succeeds, so the budget did not fire.
+    #[test]
+    fn a_zero_budget_means_unbounded_and_still_acquires() {
+        let _budget = BudgetGuard::new(0.0);
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let lock_path = ledger.lock_path();
+        let holder = hold_from_another_open(&lock_path);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let lock_path = lock_path.clone();
+            move || {
+                let lock = open_lock_file(&lock_path).unwrap();
+                let result = lock_exclusive_bounded(&lock, &lock_path);
+                if result.is_ok() {
+                    let _ = FileExt::unlock(&lock);
+                }
+                let _ = tx.send(result);
+            }
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "with a zero budget the acquisition must still be waiting on the holder"
+        );
+        drop(holder);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the unbounded acquisition must proceed once the holder releases");
+        result.expect("the unbounded acquisition must succeed after the release");
+        worker.join().unwrap();
+    }
+
+    /// The Drop path must never panic and must never block: an armed
+    /// reservation whose lock is held elsewhere gives up after the budget,
+    /// leaving the row for recovery instead of wedging the process exit.
+    #[test]
+    fn the_drop_guard_gives_up_on_a_contended_lock_without_panicking() {
+        let _budget = BudgetGuard::new(0.3);
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let lock_path = ledger.lock_path();
+        let mut reservation = ledger.reserve_billable().unwrap();
+        reservation.arm_for("test", "test/model").unwrap();
+        let holder = hold_from_another_open(&lock_path);
+
+        let started = Instant::now();
+        drop(reservation);
+        let elapsed = started.elapsed();
+        drop(holder);
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "dropping an armed reservation must be bounded, took {elapsed:?}"
+        );
     }
 }
