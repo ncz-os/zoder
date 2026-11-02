@@ -12560,6 +12560,18 @@ fn goose_provider_env(routed_provider: &Provider) -> anyhow::Result<GooseProvide
     })
 }
 
+/// Whether a pre-side-effect setup error is a daemon session-capacity
+/// refusal (FB110): -32001 / "session limit" past the ACP client's retry
+/// budget. The whole error chain is scanned so a `.context(...)` frame
+/// above the ACP error does not hide it. The -32001 code alone is not
+/// enough (the daemon reuses it for approval denials) — see
+/// `zoder_core::engine_rpc::is_session_limit_message`.
+fn is_capacity_setup_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|c| zoder_core::engine_rpc::is_session_limit_message(&c.to_string()))
+}
+
 pub(crate) async fn agentic_turn(
     cli: &Cli,
     engine_kind: EngineKind,
@@ -13287,6 +13299,21 @@ pub(crate) async fn agentic_turn(
                 break r;
             }
             Err(e) => {
+                // Session-capacity refusal (FB110): the daemon is full,
+                // not the model broken. Every chain link would fail
+                // identically, so neither a breaker strike nor a fallback
+                // is correct — surface it immediately for the caller
+                // (the loop) to classify as `session_limit`.
+                if is_capacity_setup_error(&e) {
+                    if !cli.quiet {
+                        eprintln!(
+                            "[zoder] {model} failed before any output (daemon at session capacity, \
+                             not a model defect; no fallback attempted): {e}"
+                        );
+                    }
+                    save_health(&health);
+                    return Err(e);
+                }
                 // PRE-side-effect failure: feed the breaker so a
                 // broken alias/model is not selected again, then fall
                 // back to the next chain model if one remains.
@@ -18993,6 +19020,30 @@ mod probe_skip_class_tests {
         let p = mk_provider("enterprise-gateway", &["enterprise/"]);
         let targets = probe_targets_for_unbuilt_provider(&p, &corpus);
         assert_eq!(targets.len(), PROBE_MAX_MODELS_PER_PROVIDER);
+    }
+
+    /// FB110: only a daemon capacity refusal skips the breaker and the
+    /// chain fallback. The -32001 code alone is not enough (approval
+    /// denials reuse it), and unrelated setup errors still trip the
+    /// breaker as before.
+    #[test]
+    fn capacity_setup_error_matches_only_session_limit_text() {
+        let terminal: anyhow::Error = anyhow::anyhow!(
+            "session_limit: daemon session capacity reached after 6 tries \
+             (session/new answered Session limit reached (code -32001))"
+        );
+        assert!(is_capacity_setup_error(&terminal));
+        let raw: anyhow::Error =
+            anyhow::anyhow!("session/new resume failed: Session limit reached (code -32001)");
+        assert!(is_capacity_setup_error(&raw));
+        // A context frame above the ACP error must not hide it.
+        let wrapped = raw.context("agentic setup/turn failed");
+        assert!(is_capacity_setup_error(&wrapped));
+        // The approval-denial reuse of -32001 is not capacity.
+        let denial: anyhow::Error = anyhow::anyhow!("user denied approval (code -32001)");
+        assert!(!is_capacity_setup_error(&denial));
+        let other: anyhow::Error = anyhow::anyhow!("connecting to engine: refused");
+        assert!(!is_capacity_setup_error(&other));
     }
 
     /// HP1 payoff: before the fix, a provider whose prober could not be
