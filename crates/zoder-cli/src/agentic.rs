@@ -602,6 +602,13 @@ enum ReviewerError {
         message: String,
         kind: zoder_core::ErrKind,
         status: Option<u16>,
+        /// `Retry-After` the provider asked for (429/503), carried so the
+        /// health store can record WHEN to come back instead of only that
+        /// the call failed (F2.4).
+        retry_after: Option<Duration>,
+        /// The exhausted MiniMax Token Plan window's reset, when the
+        /// provider observed one.
+        token_plan_resets_at: Option<DateTime<Utc>>,
     },
     /// Streamed output already seen OR a non-recoverable structural problem
     /// (policy rejection, missing provider config, ledger reservation
@@ -621,6 +628,8 @@ impl ReviewerError {
             message: e.message,
             kind: e.kind,
             status: e.status,
+            retry_after: e.retry_after,
+            token_plan_resets_at: e.token_plan_resets_at,
         }
     }
     fn fatal<S: Into<String>>(msg: S) -> Self {
@@ -628,6 +637,31 @@ impl ReviewerError {
             message: msg.into(),
         }
     }
+}
+
+/// The reset wall to persist for a reviewer/provider failure, in Unix seconds.
+///
+/// F2.4: an explicit plan reset or a provider's `Retry-After` is the operator's
+/// answer to "when can I dial this again", and it exists for every provider —
+/// not only MiniMax. Only when neither is present do we fall back to the
+/// MiniMax state observation a 429 may have refreshed.
+fn fallback_reset_wall_from(
+    status: Option<u16>,
+    retry_after: Option<Duration>,
+    token_plan_resets_at: Option<DateTime<Utc>>,
+    provider_id: &str,
+    now: DateTime<Utc>,
+) -> Option<i64> {
+    if let Some(reset) = token_plan_resets_at {
+        return Some(reset.timestamp());
+    }
+    if let Some(after) = retry_after {
+        return Some((now + chrono::Duration::from_std(after).unwrap_or_default()).timestamp());
+    }
+    status
+        .and_then(|st| (st == 429).then(|| zoder_core::minimax::observed_reset_at(provider_id)))
+        .flatten()
+        .map(|t| t.timestamp())
 }
 
 fn provider_error_mentions_model_unavailable(message: &str) -> bool {
@@ -910,6 +944,8 @@ async fn complete_once_tracked(
                 message,
                 kind,
                 status,
+                retry_after,
+                token_plan_resets_at,
             }) => {
                 // Y-8: route the failure through the same classify + record
                 // path the author chain uses, so a reviewer call that hits
@@ -976,12 +1012,13 @@ async fn complete_once_tracked(
                 // this provider (either not a MiniMax wall, or the
                 // state was pruned), in which case the generic
                 // `record_classified_failure` path below is enough.
-                let wall = status
-                    .and_then(|st| {
-                        (st == 429).then(|| zoder_core::minimax::observed_reset_at(&provider_id))
-                    })
-                    .flatten()
-                    .map(|t| t.timestamp());
+                let wall = fallback_reset_wall_from(
+                    status,
+                    retry_after,
+                    token_plan_resets_at,
+                    &provider_id,
+                    Utc::now(),
+                );
                 let _ = HealthStore::mutate_locked(&eng.cfg.health_path, |h| {
                     h.record_classified_failure_with_wall(model, &message, &provider_id, cls, wall);
                 });
@@ -2312,6 +2349,8 @@ async fn dispatch_reviewer_for_model(
                 message: format!("reviewer {model}: {e}"),
                 kind: zoder_core::ErrKind::RateLimit,
                 status: None,
+                retry_after: None,
+                token_plan_resets_at: None,
             })
         }
     };
@@ -2336,6 +2375,8 @@ async fn dispatch_reviewer_for_model(
                     message: format!("reviewer {model}: {e}"),
                     kind: zoder_core::ErrKind::RateLimit,
                     status: None,
+                    retry_after: None,
+                    token_plan_resets_at: None,
                 })
             }
         }
@@ -2355,6 +2396,8 @@ async fn dispatch_reviewer_for_model(
             message: format!("reviewer {model}: {e}"),
             kind: zoder_core::ErrKind::RateLimit,
             status: None,
+            retry_after: None,
+            token_plan_resets_at: None,
         });
     }
 
@@ -19800,6 +19843,79 @@ mod reviewer_chain_dispatch_tests {
             .skipped
             .iter()
             .any(|s| { s.model == "broken-model/reviewer" && s.reason == "invalid_verdict" }));
+    }
+
+    /// F2.4: the reset hint must survive the reviewer fallback. `FallbackWorthy`
+    /// used to carry only message/kind/status, so a 429 from any non-MiniMax
+    /// provider reached the health store with no reset time and other workers
+    /// kept re-dialling an endpoint that was still rate-limited.
+    #[test]
+    fn fallback_worthy_keeps_reset_hint() {
+        let resets_at: DateTime<Utc> = "2026-11-02T05:00:00Z".parse().unwrap();
+        let err = zoder_core::ProviderError {
+            message: "provider HTTP 429: too many requests".into(),
+            kind: zoder_core::ErrKind::RateLimit,
+            status: Some(429),
+            retry_after: Some(Duration::from_secs(45)),
+            token_plan_resets_at: Some(resets_at),
+            ..Default::default()
+        };
+        match ReviewerError::fallback_worthy_from(err) {
+            ReviewerError::FallbackWorthy {
+                retry_after,
+                token_plan_resets_at,
+                ..
+            } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(45)));
+                assert_eq!(token_plan_resets_at, Some(resets_at));
+            }
+            other => panic!("a provider error must stay fallback-worthy, got {other:?}"),
+        }
+    }
+
+    /// F2.4: for a provider that is not MiniMax there is no plan observation to
+    /// read, so the wall has to come from the error itself.
+    #[test]
+    fn fallback_reset_wall_uses_retry_after_for_non_minimax_providers() {
+        let now: DateTime<Utc> = "2026-11-02T04:00:00Z".parse().unwrap();
+        assert_eq!(
+            fallback_reset_wall_from(
+                Some(429),
+                Some(Duration::from_secs(45)),
+                None,
+                "openai-direct",
+                now
+            ),
+            Some((now + chrono::Duration::seconds(45)).timestamp())
+        );
+        // A status-less failure (Anthropic's SSE overload, a bare 400) still
+        // gets the Retry-After the transport carried.
+        assert_eq!(
+            fallback_reset_wall_from(None, Some(Duration::from_secs(30)), None, "gw", now),
+            Some((now + chrono::Duration::seconds(30)).timestamp())
+        );
+    }
+
+    /// F2.4: an explicit plan reset beats an inferred Retry-After, and neither
+    /// present leaves the old behaviour (MiniMax observation on a 429) intact.
+    #[test]
+    fn fallback_reset_wall_prefers_plan_reset_and_keeps_no_wall_without_a_hint() {
+        let now: DateTime<Utc> = "2026-11-02T04:00:00Z".parse().unwrap();
+        let plan_reset: DateTime<Utc> = "2026-11-02T06:00:00Z".parse().unwrap();
+        assert_eq!(
+            fallback_reset_wall_from(
+                Some(429),
+                Some(Duration::from_secs(45)),
+                Some(plan_reset),
+                "minimax",
+                now
+            ),
+            Some(plan_reset.timestamp())
+        );
+        assert_eq!(
+            fallback_reset_wall_from(Some(500), None, None, "no-state-provider", now),
+            None
+        );
     }
 
     #[test]
