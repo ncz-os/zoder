@@ -3824,39 +3824,25 @@ mod tests {
 mod lock_deadline_tests {
     use super::*;
     use std::sync::mpsc;
-    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
     /// Serializes tests that set `ZODER_LEDGER_LOCK_TIMEOUT_S`.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Set the lock budget for the duration of a test, restoring the prior
-    /// value (unless it was already set, in which case the test is the only
-    /// writer because it holds `env_lock`).
-    struct BudgetGuard {
-        _env: MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl BudgetGuard {
-        fn new(seconds: f64) -> Self {
-            let env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-            let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
-            std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", format!("{seconds}"));
-            Self {
-                _env: env,
-                previous,
-            }
+    /// Run `body` with `ZODER_LEDGER_LOCK_TIMEOUT_S` set to `seconds`, then
+    /// restore the previous value. Holding the `ENV_LOCK` guard for the
+    /// duration of `body` (rather than storing it in a struct) keeps the
+    /// guard's lifetime tied to the call, not to `'static`.
+    fn with_budget<T>(seconds: f64, body: impl FnOnce() -> T) -> T {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
+        std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", format!("{seconds}"));
+        let result = body();
+        match previous {
+            Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
+            None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
         }
-    }
-
-    impl Drop for BudgetGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
-                None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
-            }
-        }
+        result
     }
 
     /// One valid metered row, timestamped now.
@@ -3898,52 +3884,53 @@ mod lock_deadline_tests {
     /// 10 s `recv_timeout` below is what ends the test.
     #[test]
     fn a_contended_ledger_lock_fails_within_the_deadline_instead_of_hanging() {
-        let _budget = BudgetGuard::new(1.0);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.jsonl");
-        let ledger = Ledger::new(&path);
-        let lock_path = ledger.lock_path();
-        let holder = hold_from_another_open(&lock_path);
+        with_budget(1.0, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.jsonl");
+            let ledger = Ledger::new(&path);
+            let lock_path = ledger.lock_path();
+            let holder = hold_from_another_open(&lock_path);
 
-        let (tx, rx) = mpsc::channel();
-        let started = Instant::now();
-        let worker = std::thread::spawn({
-            let path = path.clone();
-            move || {
-                let ledger = Ledger::new(&path);
-                let _ = tx.send(ledger.record(&row()));
-            }
+            let (tx, rx) = mpsc::channel();
+            let started = Instant::now();
+            let worker = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    let ledger = Ledger::new(&path);
+                    let _ = tx.send(ledger.record(&row()));
+                }
+            });
+
+            let result = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("record() must give up on the ledger lock, not block for ever");
+            let elapsed = started.elapsed();
+            worker.join().unwrap();
+            drop(holder);
+
+            let error = result.expect_err("record() must fail when the lock budget expires");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("timed out after 1s waiting for the ledger lock at"),
+                "the deadline error must name the timeout, the budget and the lock path: {message}"
+            );
+            assert!(
+                message.contains(&lock_path.display().to_string()),
+                "the deadline error must name the lock path: {message}"
+            );
+            assert!(
+                message.contains("another process holds it"),
+                "the deadline error must say the lock is held elsewhere: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "record() took {elapsed:?}, not bounded by its 1 s budget"
+            );
+            assert!(
+                !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
+                "a failed acquisition must not write a ledger row"
+            );
         });
-
-        let result = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("record() must give up on the ledger lock, not block for ever");
-        let elapsed = started.elapsed();
-        worker.join().unwrap();
-        drop(holder);
-
-        let error = result.expect_err("record() must fail when the lock budget expires");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("timed out after 1s waiting for the ledger lock at"),
-            "the deadline error must name the timeout, the budget and the lock path: {message}"
-        );
-        assert!(
-            message.contains(&lock_path.display().to_string()),
-            "the deadline error must name the lock path: {message}"
-        );
-        assert!(
-            message.contains("another process holds it"),
-            "the deadline error must say the lock is held elsewhere: {message}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "record() took {elapsed:?}, not bounded by its 1 s budget"
-        );
-        assert!(
-            !path.exists() || std::fs::metadata(&path).unwrap().len() == 0,
-            "a failed acquisition must not write a ledger row"
-        );
     }
 
     /// REGRESSION: the routing snapshot's SHARED read hung the same way.
@@ -3953,40 +3940,41 @@ mod lock_deadline_tests {
     /// as unbounded as `lock_exclusive`. Bounded like the writers.
     #[test]
     fn a_contended_shared_read_fails_within_the_deadline_instead_of_hanging() {
-        let _budget = BudgetGuard::new(1.0);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.jsonl");
-        let ledger = Ledger::new(&path);
-        ledger.record(&row()).unwrap();
-        let holder = hold_from_another_open(&ledger.lock_path());
+        with_budget(1.0, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.jsonl");
+            let ledger = Ledger::new(&path);
+            ledger.record(&row()).unwrap();
+            let holder = hold_from_another_open(&ledger.lock_path());
 
-        let (tx, rx) = mpsc::channel();
-        let started = Instant::now();
-        let worker = std::thread::spawn({
-            let path = path.clone();
-            move || {
-                let _ = tx.send(Ledger::new(&path).entries_strict_shared());
-            }
+            let (tx, rx) = mpsc::channel();
+            let started = Instant::now();
+            let worker = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    let _ = tx.send(Ledger::new(&path).entries_strict_shared());
+                }
+            });
+
+            let result = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the shared read must give up on the ledger lock, not block for ever");
+            let elapsed = started.elapsed();
+            worker.join().unwrap();
+            drop(holder);
+
+            let error = result.expect_err("the shared read must fail when the lock budget expires");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("timed out after 1s waiting for the ledger lock at")
+                    && message.contains("(shared lock"),
+                "the deadline error must name the timeout and the shared lock: {message}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "the shared read took {elapsed:?}, not bounded by its 1 s budget"
+            );
         });
-
-        let result = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the shared read must give up on the ledger lock, not block for ever");
-        let elapsed = started.elapsed();
-        worker.join().unwrap();
-        drop(holder);
-
-        let error = result.expect_err("the shared read must fail when the lock budget expires");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("timed out after 1s waiting for the ledger lock at")
-                && message.contains("(shared lock"),
-            "the deadline error must name the timeout and the shared lock: {message}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "the shared read took {elapsed:?}, not bounded by its 1 s budget"
-        );
     }
 
     /// The bound must not cost anything in the common case: an uncontended
@@ -3994,26 +3982,27 @@ mod lock_deadline_tests {
     /// sleep at all.
     #[test]
     fn an_uncontended_ledger_lock_is_taken_immediately() {
-        let _budget = BudgetGuard::new(30.0);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.jsonl");
-        let ledger = Ledger::new(&path);
-        let lock_path = ledger.lock_path();
+        with_budget(30.0, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.jsonl");
+            let ledger = Ledger::new(&path);
+            let lock_path = ledger.lock_path();
 
-        let started = Instant::now();
-        let lock = ledger_lock(&ledger);
-        lock_exclusive_bounded(&lock, &lock_path).unwrap();
-        let elapsed = started.elapsed();
-        FileExt::unlock(&lock).unwrap();
+            let started = Instant::now();
+            let lock = ledger_lock(&ledger);
+            lock_exclusive_bounded(&lock, &lock_path).unwrap();
+            let elapsed = started.elapsed();
+            FileExt::unlock(&lock).unwrap();
 
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
-        );
-        assert!(
-            lock_path.exists(),
-            "the lock sidecar is created by the open, as before"
-        );
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
+            );
+            assert!(
+                lock_path.exists(),
+                "the lock sidecar is created by the open, as before"
+            );
+        });
     }
 
     /// `ZODER_LEDGER_LOCK_TIMEOUT_S=0` means unbounded (documented opt-out
@@ -4021,34 +4010,35 @@ mod lock_deadline_tests {
     /// hold: the acquisition succeeds, so the budget did not fire.
     #[test]
     fn a_zero_budget_means_unbounded_and_still_acquires() {
-        let _budget = BudgetGuard::new(0.0);
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
-        let lock_path = ledger.lock_path();
-        let holder = hold_from_another_open(&lock_path);
+        with_budget(0.0, || {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+            let lock_path = ledger.lock_path();
+            let holder = hold_from_another_open(&lock_path);
 
-        let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn({
-            let lock_path = lock_path.clone();
-            move || {
-                let lock = open_lock_file(&lock_path).unwrap();
-                let result = lock_exclusive_bounded(&lock, &lock_path);
-                if result.is_ok() {
-                    let _ = FileExt::unlock(&lock);
+            let (tx, rx) = mpsc::channel();
+            let worker = std::thread::spawn({
+                let lock_path = lock_path.clone();
+                move || {
+                    let lock = open_lock_file(&lock_path).unwrap();
+                    let result = lock_exclusive_bounded(&lock, &lock_path);
+                    if result.is_ok() {
+                        let _ = FileExt::unlock(&lock);
+                    }
+                    let _ = tx.send(result);
                 }
-                let _ = tx.send(result);
-            }
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "with a zero budget the acquisition must still be waiting on the holder"
+            );
+            drop(holder);
+            let result = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the unbounded acquisition must proceed once the holder releases");
+            result.expect("the unbounded acquisition must succeed after the release");
+            worker.join().unwrap();
         });
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "with a zero budget the acquisition must still be waiting on the holder"
-        );
-        drop(holder);
-        let result = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the unbounded acquisition must proceed once the holder releases");
-        result.expect("the unbounded acquisition must succeed after the release");
-        worker.join().unwrap();
     }
 
     /// The Drop path must never panic and must never block: an armed
@@ -4056,22 +4046,23 @@ mod lock_deadline_tests {
     /// leaving the row for recovery instead of wedging the process exit.
     #[test]
     fn the_drop_guard_gives_up_on_a_contended_lock_without_panicking() {
-        let _budget = BudgetGuard::new(0.3);
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
-        let lock_path = ledger.lock_path();
-        let mut reservation = ledger.reserve_billable().unwrap();
-        reservation.arm_for("test", "test/model").unwrap();
-        let holder = hold_from_another_open(&lock_path);
+        with_budget(0.3, || {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+            let lock_path = ledger.lock_path();
+            let mut reservation = ledger.reserve_billable().unwrap();
+            reservation.arm_for("test", "test/model").unwrap();
+            let holder = hold_from_another_open(&lock_path);
 
-        let started = Instant::now();
-        drop(reservation);
-        let elapsed = started.elapsed();
-        drop(holder);
+            let started = Instant::now();
+            drop(reservation);
+            let elapsed = started.elapsed();
+            drop(holder);
 
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "dropping an armed reservation must be bounded, took {elapsed:?}"
-        );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "dropping an armed reservation must be bounded, took {elapsed:?}"
+            );
+        });
     }
 }

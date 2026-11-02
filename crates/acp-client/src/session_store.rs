@@ -865,33 +865,20 @@ mod tests {
     /// Serializes tests that set `ACP_SESSION_LOCK_TIMEOUT_S`.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Set the session lock budget for the duration of a test, restoring the
-    /// prior value on drop. The holder of the returned guard is the only
-    /// writer of the variable, so no other test in this module sees it.
-    struct BudgetGuard {
-        _env: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl BudgetGuard {
-        fn new(seconds: f64) -> Self {
-            let env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-            let previous = std::env::var_os("ACP_SESSION_LOCK_TIMEOUT_S");
-            std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", format!("{seconds}"));
-            Self {
-                _env: env,
-                previous,
-            }
+    /// Run `body` with `ACP_SESSION_LOCK_TIMEOUT_S` set to `seconds`, then
+    /// restore the previous value. Holding the `ENV_LOCK` guard for the
+    /// duration of `body` (rather than storing it in a struct) keeps the
+    /// guard's lifetime tied to the call, not to `'static`.
+    fn with_budget<T>(seconds: f64, body: impl FnOnce() -> T) -> T {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = std::env::var_os("ACP_SESSION_LOCK_TIMEOUT_S");
+        std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", format!("{seconds}"));
+        let result = body();
+        match previous {
+            Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
+            None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
         }
-    }
-
-    impl Drop for BudgetGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
-                None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
-            }
-        }
+        result
     }
 
     /// REGRESSION: `LockGuard::acquire` waited on `lock_exclusive` for ever,
@@ -902,51 +889,51 @@ mod tests {
     /// never returns and the 10 s `recv_timeout` below is what ends the test.
     #[test]
     fn a_contended_session_store_lock_fails_instead_of_hanging() {
-        let _budget = BudgetGuard::new(1.0);
+        with_budget(1.0, || {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("engine_sessions.json");
+            let lock_path = lock_path_for(&path);
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("engine_sessions.json");
-        let lock_path = lock_path_for(&path);
+            // A second open file description holds the exclusive flock, exactly
+            // as another zoder process would.
+            let held = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open lockfile");
+            held.lock_exclusive().expect("take flock(2)");
 
-        // A second open file description holds the exclusive flock, exactly
-        // as another zoder process would.
-        let held = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lockfile");
-        held.lock_exclusive().expect("take flock(2)");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            let worker = std::thread::spawn(move || {
+                let result = LockGuard::acquire(&path).map(|_guard| ());
+                let _ = tx.send(result);
+            });
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let started = std::time::Instant::now();
-        let worker = std::thread::spawn(move || {
-            let result = LockGuard::acquire(&path).map(|_guard| ());
-            let _ = tx.send(result);
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("LockGuard::acquire must give up, not block for ever");
+            let elapsed = started.elapsed();
+            worker.join().unwrap();
+            drop(held);
+
+            let error = result.expect_err("acquire must fail when the lock budget expires");
+            let message = error.to_string();
+            assert!(
+                message.contains("timed out after 1s waiting for the engine-session store lock at"),
+                "the deadline error must name the timeout, budget and lock path: {message}"
+            );
+            assert!(
+                message.contains(&lock_path.display().to_string()),
+                "the deadline error must name the lock path: {message}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "acquire took {elapsed:?}, not bounded by its 1 s budget"
+            );
         });
-
-        let result = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("LockGuard::acquire must give up, not block for ever");
-        let elapsed = started.elapsed();
-        worker.join().unwrap();
-        drop(held);
-
-        let error = result.expect_err("acquire must fail when the lock budget expires");
-        let message = error.to_string();
-        assert!(
-            message.contains("timed out after 1s waiting for the engine-session store lock at"),
-            "the deadline error must name the timeout, budget and lock path: {message}"
-        );
-        assert!(
-            message.contains(&lock_path.display().to_string()),
-            "the deadline error must name the lock path: {message}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "acquire took {elapsed:?}, not bounded by its 1 s budget"
-        );
     }
 
     /// The bound costs nothing in the common case: an uncontended lock is
