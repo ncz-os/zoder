@@ -177,6 +177,11 @@ fn read_cooldown_at_with(
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Not UTF-8 (binary garbage, a half-written file, something else's
+        // file at this path): corrupt, so INERT, not fatal — same fail-open
+        // arm as malformed JSON below. Propagating `InvalidData` here would
+        // make a stray binary file park or crash every worker on the host.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(None),
         Err(e) => {
             return Err(anyhow::Error::new(e)
                 .context(format!("reading host cooldown marker {}", path.display())))
@@ -438,6 +443,29 @@ mod tests {
         assert!(
             read_cooldown(&ledger).unwrap().is_none(),
             "a corrupt marker must never park a host"
+        );
+    }
+
+    /// A marker that is not even valid UTF-8 (binary garbage, a truncated
+    /// write, an unrelated file at that path) must ALSO read as absent. The
+    /// read used `read_to_string`, whose `InvalidData` error was propagated,
+    /// so a stray binary file returned `Err` instead of `Ok(None)` — breaking
+    /// the documented fail-open contract and failing every worker on the host.
+    #[test]
+    fn non_utf8_marker_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        // Valid JSON prefix followed by a lone 0xFF: parses as bytes, not UTF-8.
+        std::fs::write(
+            cooldown_path_for(&ledger),
+            b"{\"version\":1,\"reason\":\"\xff\xfe\"}",
+        )
+        .unwrap();
+        assert!(
+            read_cooldown(&ledger)
+                .expect("a non-UTF8 marker must be INERT, not an error")
+                .is_none(),
+            "a non-UTF8 marker must never park or fail a host"
         );
     }
 
