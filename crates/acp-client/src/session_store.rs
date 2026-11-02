@@ -652,7 +652,12 @@ fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> 
     let Some(budget) = lock_budget() else {
         return file.lock_exclusive();
     };
-    let deadline = std::time::Instant::now() + budget;
+    // `checked_add` rather than `+`: a representable but absurd budget must
+    // degrade to unbounded, not overflow-panic on a platform whose Instant
+    // is narrower than the Duration.
+    let Some(deadline) = std::time::Instant::now().checked_add(budget) else {
+        return file.lock_exclusive();
+    };
     let mut wait = LOCK_BACKOFF_START;
     loop {
         match file.try_lock_exclusive() {
@@ -898,8 +903,8 @@ mod tests {
     /// guard's lifetime tied to the call, not to `'static`.
     fn with_budget<T>(seconds: f64, body: impl FnOnce() -> T) -> T {
         let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        let previous = std::env::var_os("ACP_SESSION_LOCK_TIMEOUT_S");
-        std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", format!("{seconds}"));
+        let previous = std::env::var_os(LOCK_TIMEOUT_ENV);
+        std::env::set_var(LOCK_TIMEOUT_ENV, format!("{seconds}"));
         // Restore on the way out of the scope even if `body` panics (an
         // assertion failure in a test does), so a failed test cannot leak
         // its budget into the ones that run after it.
@@ -907,8 +912,8 @@ mod tests {
         impl Drop for Restore {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
-                    None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
+                    Some(value) => std::env::set_var(LOCK_TIMEOUT_ENV, value),
+                    None => std::env::remove_var(LOCK_TIMEOUT_ENV),
                 }
             }
         }

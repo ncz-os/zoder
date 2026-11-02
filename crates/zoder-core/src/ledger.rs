@@ -1086,7 +1086,17 @@ fn lock_bounded(file: &File, path: &Path, mode: LockMode) -> anyhow::Result<()> 
         }
         .with_context(|| format!("locking ledger at {}", path.display()));
     };
-    let deadline = std::time::Instant::now() + budget;
+    // `checked_add` rather than `+`: a representable but absurd budget must
+    // degrade to unbounded, not overflow-panic on a platform whose Instant
+    // is narrower than the Duration. The parsers already reject values the
+    // Duration cannot hold; this closes the last way a typo could abort.
+    let Some(deadline) = std::time::Instant::now().checked_add(budget) else {
+        return match mode {
+            LockMode::Exclusive => FileExt::lock_exclusive(file),
+            LockMode::Shared => FileExt::lock_shared(file),
+        }
+        .with_context(|| format!("locking ledger at {}", path.display()));
+    };
     let mut wait = LOCK_BACKOFF_START;
     let mut attempt: u64 = 0;
     loop {
@@ -3864,7 +3874,7 @@ mod lock_deadline_tests {
     fn with_budget<T>(seconds: f64, body: impl FnOnce() -> T) -> T {
         let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
-        std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", format!("{seconds}"));
+        std::env::set_var(LEDGER_LOCK_TIMEOUT_ENV, format!("{seconds}"));
         // Restore on the way out of the scope even if `body` panics (an
         // assertion failure in a test does), so a failed test cannot leak
         // its budget into the ones that run after it.
@@ -3872,8 +3882,8 @@ mod lock_deadline_tests {
         impl Drop for Restore {
             fn drop(&mut self) {
                 match self.0.take() {
-                    Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
-                    None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
+                    Some(value) => std::env::set_var(LEDGER_LOCK_TIMEOUT_ENV, value),
+                    None => std::env::remove_var(LEDGER_LOCK_TIMEOUT_ENV),
                 }
             }
         }
@@ -4036,6 +4046,27 @@ mod lock_deadline_tests {
             ledger
                 .record(&row())
                 .expect("a fallback budget must still record");
+        });
+    }
+
+    /// A budget that is a VALID `Duration` but far too large to add to an
+    /// `Instant` must degrade to unbounded rather than overflow-panic. Pins
+    /// the `checked_add` guard around the deadline computation.
+    #[test]
+    fn an_absurd_but_representable_budget_does_not_overflow_the_deadline() {
+        with_budget(1e18, || {
+            let budget = ledger_lock_budget().expect("a huge budget must not mean unbounded");
+            assert!(
+                std::time::Instant::now().checked_add(budget).is_some(),
+                "the platform Instant must tolerate this budget, so the guard is never hit \
+                 here; the assertion documents the real limit"
+            );
+            // And an uncontended ledger still acquires under it, no panic.
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+            ledger
+                .record(&row())
+                .expect("an absurd budget must still record");
         });
     }
 
