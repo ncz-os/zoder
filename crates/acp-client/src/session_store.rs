@@ -612,9 +612,18 @@ fn lock_budget() -> Option<std::time::Duration> {
         Ok(secs) if secs.is_finite() && secs > 0.0 => {
             Some(std::time::Duration::from_secs_f64(secs))
         }
-        _ => Some(std::time::Duration::from_secs_f64(
-            DEFAULT_LOCK_TIMEOUT_SECS,
-        )),
+        _ => {
+            // A typo must not silently disable the bound, and must not be
+            // silent either: say which value was rejected, as the ledger
+            // side does for ZODER_LEDGER_LOCK_TIMEOUT_S.
+            eprintln!(
+                "zoder: warning: {LOCK_TIMEOUT_ENV}={raw:?} is not a valid number of \
+                 seconds; using the default {DEFAULT_LOCK_TIMEOUT_SECS}s (0 means unbounded)"
+            );
+            Some(std::time::Duration::from_secs_f64(
+                DEFAULT_LOCK_TIMEOUT_SECS,
+            ))
+        }
     }
 }
 

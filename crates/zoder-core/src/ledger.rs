@@ -889,12 +889,13 @@ impl BillableReservation {
 /// past the budget:
 ///
 /// - an ARMED, unreconciled reservation (the call reached the provider, so
-///   its cost is real) sets `reconciled` even when the write failed, because
-///   the on-disk row stays the armed reservation row. A later writer's
-///   recovery scan (`recover_abandoned_prepared` + the stale-armed pass)
-///   finds that row once this process's owner lock is gone and reconciles
-///   it into an unknown-cost row. Retrying here would only extend a hang
-///   that has already blocked for the whole budget.
+///   its cost is real) leaves `reconciled` false when the write fails, so
+///   the in-memory state stays honest: nothing was written. The on-disk row
+///   stays the armed reservation row, and a later writer's recovery scan
+///   (`recover_abandoned_prepared` + the stale-armed pass) finds it once
+///   this process's owner lock is gone and reconciles it into an
+///   unknown-cost row. Retrying here would only extend a hang that has
+///   already blocked for the whole budget.
 /// - an UNARMED reservation (nothing was dispatched) leaves its prepared row
 ///   for the same recovery scan, which blanks it because the owner lock is
 ///   released by the code that follows.
@@ -1015,7 +1016,10 @@ fn ledger_lock_budget() -> Option<Duration> {
 fn format_budget(budget: Duration) -> String {
     let secs = budget.as_secs_f64();
     if secs.fract() == 0.0 {
-        format!("{}", secs as u64)
+        // `as u64` would saturate for an absurdly large configured budget
+        // (e.g. 1e30 s), printing a number the operator never set. Render
+        // the f64 integral value exactly instead.
+        format!("{secs:.0}")
     } else {
         format!("{secs}")
     }
