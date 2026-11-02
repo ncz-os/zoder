@@ -13690,7 +13690,10 @@ pub(crate) async fn cmd_exec_agentic(
 /// `budget_exceeded` class AND the reset timestamp. Otherwise the error is
 /// the ordinary reported turn error and the class is inferred from the
 /// message by the dispatcher.
-fn turn_failure_error(outcome: &str, detail: Option<&str>) -> anyhow::Error {
+fn turn_failure_error(
+    outcome: &zoder_core::AgentOutcome,
+    detail: Option<&str>,
+) -> anyhow::Error {
     let summary = turn_failure_summary(outcome, detail);
     // Look at the engine's OWN detail first: it is the text that carries the
     // `budget_exceeded:` marker. The summary is the fallback.
