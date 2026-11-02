@@ -687,7 +687,7 @@ fn format_budget(budget: std::time::Duration) -> String {
         // `as u64` saturates for an absurdly large budget and would print a
         // number the operator never set. The Duration is an exact whole
         // number of seconds here, so render that.
-        format!("{:?}", budget.as_secs())
+        format!("{}", budget.as_secs())
     } else {
         format!("{secs}")
     }

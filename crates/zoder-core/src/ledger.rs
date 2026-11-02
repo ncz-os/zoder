@@ -1043,7 +1043,7 @@ fn format_budget(budget: Duration) -> String {
         // `as u64` would saturate for an absurdly large configured budget
         // (e.g. 1e30 s), printing a number the operator never set. The
         // Duration is an exact whole number of seconds here, so render that.
-        format!("{:?}", budget.as_secs())
+        format!("{}", budget.as_secs())
     } else {
         format!("{secs}")
     }
