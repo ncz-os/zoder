@@ -575,6 +575,97 @@ fn mutate_locked(
     // `_guard` drops here, unlocking + unlinking the lockfile.
 }
 
+/// Environment variable naming the engine-session store lock budget in
+/// seconds.
+///
+/// Deliberately separate from zoder-core's `ZODER_LEDGER_LOCK_TIMEOUT_S`:
+/// this crate is engine-agnostic and must not depend on the ledger's
+/// constants, and an operator tuning one lock's budget need not move the
+/// other's.
+///
+/// - unset or empty: [`DEFAULT_LOCK_TIMEOUT_SECS`] (30 s);
+/// - a positive number: that many seconds (fractions allowed);
+/// - `0`: UNBOUNDED — the documented opt-out that restores the old
+///   wait-for-ever behaviour;
+/// - anything else: the default (a typo must not silently disable the
+///   bound).
+pub const LOCK_TIMEOUT_ENV: &str = "ACP_SESSION_LOCK_TIMEOUT_S";
+
+/// Default engine-session store lock budget: 30 s.
+pub const DEFAULT_LOCK_TIMEOUT_SECS: f64 = 30.0;
+
+/// First backoff step: 5 ms, doubling to a 100 ms ceiling.
+const LOCK_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(5);
+const LOCK_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The configured lock budget. `None` means unbounded.
+fn lock_budget() -> Option<std::time::Duration> {
+    let raw = std::env::var(LOCK_TIMEOUT_ENV).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Some(std::time::Duration::from_secs_f64(
+            DEFAULT_LOCK_TIMEOUT_SECS,
+        ));
+    }
+    match raw.parse::<f64>() {
+        Ok(secs) if secs == 0.0 => None,
+        Ok(secs) if secs.is_finite() && secs > 0.0 => {
+            Some(std::time::Duration::from_secs_f64(secs))
+        }
+        _ => Some(std::time::Duration::from_secs_f64(
+            DEFAULT_LOCK_TIMEOUT_SECS,
+        )),
+    }
+}
+
+/// Take the exclusive `flock(2)` on `file`, polling `try_lock_exclusive`
+/// with a 5 ms backoff that doubles to a 100 ms ceiling and giving up when
+/// the budget from [`LOCK_TIMEOUT_ENV`] expires.
+///
+/// `flock(2)` has no timeout, so the only way to stop waiting is to not
+/// wait indefinitely in the first place. The first attempt is immediate, so
+/// an uncontended lock costs nothing. A timeout is reported as a
+/// `TimedOut` `io::Error` that names the budget and the lockfile.
+fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> {
+    let Some(budget) = lock_budget() else {
+        return file.lock_exclusive();
+    };
+    let deadline = std::time::Instant::now() + budget;
+    let mut wait = LOCK_BACKOFF_START;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out after {}s waiting for the engine-session store lock at {} \
+                     (another process holds it; set {LOCK_TIMEOUT_ENV} to a larger number of \
+                     seconds, or 0 to wait indefinitely)",
+                    format_budget(budget),
+                    lock_path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(wait.min(deadline.saturating_duration_since(now)));
+        wait = (wait * 2).min(LOCK_BACKOFF_MAX);
+    }
+}
+
+/// `30` for whole seconds, `0.5` otherwise.
+fn format_budget(budget: std::time::Duration) -> String {
+    let secs = budget.as_secs_f64();
+    if secs.fract() == 0.0 {
+        format!("{}", secs as u64)
+    } else {
+        format!("{secs}")
+    }
+}
+
 /// Sibling lockfile path for the engine-session store at `path`.
 /// Mirrors `crate::utilization::UtilizationStore::lockfile_path` —
 /// appends `.lock` (rather than replacing the extension) so the
@@ -643,13 +734,14 @@ impl LockGuard {
                     ),
                 )
             })?;
-        // `lock_exclusive` blocks until the kernel grants the
-        // `flock(2)`; on process death the FD is closed by the kernel
-        // and the lock is released, so a crashed holder cannot
-        // deadlock the next caller. Wrap the error with the lockfile
-        // path so the caller sees "which lock" and not a bare OS
-        // errno.
-        file.lock_exclusive().map_err(|e| {
+        // Take the `flock(2)` with a deadline: on process death the FD is
+        // closed by the kernel and the lock is released, so a crashed
+        // holder cannot deadlock the next caller, but a WEDGED holder (or a
+        // live one that keeps re-taking the lock) used to block here for
+        // ever and hang the whole session before any provider call. Wrap the
+        // error with the lockfile path so the caller sees "which lock" and
+        // not a bare OS errno.
+        lock_exclusive_bounded(&file, &lock_path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -769,6 +861,109 @@ fn evict_in_place(map: &mut BTreeMap<String, EngineSessionRecord>, cfg: &StoreCo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that set `ACP_SESSION_LOCK_TIMEOUT_S`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set the session lock budget for the duration of a test, restoring the
+    /// prior value on drop. The holder of the returned guard is the only
+    /// writer of the variable, so no other test in this module sees it.
+    struct BudgetGuard {
+        _env: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl BudgetGuard {
+        fn new(seconds: f64) -> Self {
+            let env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+            let previous = std::env::var_os("ACP_SESSION_LOCK_TIMEOUT_S");
+            std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", format!("{seconds}"));
+            Self {
+                _env: env,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for BudgetGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
+                None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
+            }
+        }
+    }
+
+    /// REGRESSION: `LockGuard::acquire` waited on `lock_exclusive` for ever,
+    /// so one wedged writer of this store hung every later writer — and with
+    /// it the zoder session that was about to run — before it reached any
+    /// provider. With a 1 s budget the acquisition must FAIL within the
+    /// budget instead of blocking. On the unbounded implementation the worker
+    /// never returns and the 10 s `recv_timeout` below is what ends the test.
+    #[test]
+    fn a_contended_session_store_lock_fails_instead_of_hanging() {
+        let _budget = BudgetGuard::new(1.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let lock_path = lock_path_for(&path);
+
+        // A second open file description holds the exclusive flock, exactly
+        // as another zoder process would.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lockfile");
+        held.lock_exclusive().expect("take flock(2)");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let result = LockGuard::acquire(&path).map(|_guard| ());
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("LockGuard::acquire must give up, not block for ever");
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+        drop(held);
+
+        let error = result.expect_err("acquire must fail when the lock budget expires");
+        let message = error.to_string();
+        assert!(
+            message.contains("timed out after 1s waiting for the engine-session store lock at"),
+            "the deadline error must name the timeout, budget and lock path: {message}"
+        );
+        assert!(
+            message.contains(&lock_path.display().to_string()),
+            "the deadline error must name the lock path: {message}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "acquire took {elapsed:?}, not bounded by its 1 s budget"
+        );
+    }
+
+    /// The bound costs nothing in the common case: an uncontended lock is
+    /// taken on the first attempt, with no backoff sleep.
+    #[test]
+    fn an_uncontended_session_store_lock_is_taken_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine_sessions.json");
+        let started = std::time::Instant::now();
+        let guard = LockGuard::acquire(&path).expect("acquire an uncontended lock");
+        let elapsed = started.elapsed();
+        drop(guard);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "an uncontended lock must be granted on the first attempt, took {elapsed:?}"
+        );
+    }
 
     /// Fresh scope key for `/repo` and the `goose` engine.
     fn scope() -> String {
