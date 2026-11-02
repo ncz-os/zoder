@@ -998,7 +998,7 @@ fn ledger_lock_budget() -> Option<Duration> {
         return Some(Duration::from_secs_f64(DEFAULT_LEDGER_LOCK_TIMEOUT_SECS));
     }
     match raw.parse::<f64>() {
-        Ok(secs) if secs == 0.0 => None,
+        Ok(0.0) => None,
         Ok(secs) if secs.is_finite() && secs > 0.0 => Some(Duration::from_secs_f64(secs)),
         _ => {
             tracing::warn!(

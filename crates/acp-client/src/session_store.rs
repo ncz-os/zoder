@@ -608,7 +608,7 @@ fn lock_budget() -> Option<std::time::Duration> {
         ));
     }
     match raw.parse::<f64>() {
-        Ok(secs) if secs == 0.0 => None,
+        Ok(0.0) => None,
         Ok(secs) if secs.is_finite() && secs > 0.0 => {
             Some(std::time::Duration::from_secs_f64(secs))
         }
