@@ -34,15 +34,16 @@ pub mod gate;
 pub mod gate_bundle;
 pub mod health_probe;
 pub mod host_cooldown;
-pub use host_cooldown::{
-    clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown, read_cooldown_at,
-    trip_monthly_cap_cooldown, write_cooldown, HostCooldown, COOLDOWN_SUFFIX, COOLDOWN_VERSION,
-    REASON_MONTHLY_CAP,
-};
 pub use health_probe::{
     cap_targets, classify_err, classify_err_kind, probe_all, probe_request, Probe, ProbeOutcome,
     ProbePlan, ProbeResolver, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_MAX_TOKENS,
     PROBE_PING_TIMEOUT_SECS, PROBE_PROMPT,
+};
+pub use host_cooldown::{
+    clear_cooldown, cooldown_active, cooldown_path_for, note_budget_decline, read_cooldown,
+    read_cooldown_at, status_line as host_cooldown_status_line, status_view as host_cooldown_view,
+    trip_monthly_cap_cooldown, write_cooldown, HostCooldown, COOLDOWN_SUFFIX, COOLDOWN_VERSION,
+    REASON_MONTHLY_CAP,
 };
 pub use model_health as health;
 pub mod catalog_models;

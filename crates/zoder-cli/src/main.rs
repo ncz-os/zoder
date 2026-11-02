@@ -6881,11 +6881,18 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let budget_confirm = if !cli.allow_paid && !provider_cost_neutral {
         let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
-        let verdict = eng.cfg.budget.evaluate_call(
+        // The cooldown-aware form (D8 step 12): a MONTHLY cap trip also
+        // writes/extends `<ledger path>.cooldown.json`, the host-local signal
+        // a sibling worker reads instead of re-deriving the same refusal.
+        let verdict = eng.cfg.budget.evaluate_call_with_host_cooldown(
+            &eng.cfg.ledger_path,
             &pricing,
             &primary,
-            estimate_tokens(&prompt),
-            u64::from(cli.max_tokens),
+            zoder_core::pricing::CallTokens {
+                tokens_in: estimate_tokens(&prompt),
+                tokens_out: u64::from(cli.max_tokens),
+                cache_hit_tokens: 0,
+            },
             Some(now),
             || {
                 initial_reservation
@@ -11103,11 +11110,19 @@ fn evaluate_default_exec_budget(
     if provider_cost_neutral {
         return BudgetVerdict::WithinBudget;
     }
-    cfg.budget.evaluate_call(
+    // The cooldown-aware form (D8 step 12): a MONTHLY cap trip also writes or
+    // extends the host cooldown marker beside the ledger, so a sibling worker
+    // (and the Hive worker's budget back-off) sees that the month is spent
+    // without re-deriving it. Every other decline leaves the marker alone.
+    cfg.budget.evaluate_call_with_host_cooldown(
+        &cfg.ledger_path,
         pricing,
         model,
-        estimate_tokens(prompt),
-        cfg.budget.est_output_tokens,
+        zoder_core::pricing::CallTokens {
+            tokens_in: estimate_tokens(prompt),
+            tokens_out: cfg.budget.est_output_tokens,
+            cache_hit_tokens: 0,
+        },
         Some(chrono::Utc::now()),
         month_spent,
     )
@@ -13118,6 +13133,19 @@ pub(crate) async fn agentic_turn(
     #[allow(unused_assignments)]
     let mut used_daemon_model = head_daemon_model;
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // HOST COOLDOWN (D8 step 12). A sibling worker on this host tripped the
+    // monthly cap, so the marker beside the ledger is live: metered chain
+    // links are skipped here (exactly like a paid fallback) and the run falls
+    // through to the cost-neutral links. Without this every sibling re-derived
+    // the same refusal — the cap is real, but so is the free route. The read
+    // fails OPEN, so a missing/corrupt marker changes nothing.
+    let host_cooldown = zoder_core::cooldown_active(&eng.cfg.ledger_path);
+    if host_cooldown && !cli.quiet {
+        eprintln!(
+            "[zoder] host cooldown active (monthly spend cap tripped on this host); \
+             skipping metered chain links"
+        );
+    }
     let run = loop {
         // Find the next live candidate — the first chain entry whose
         // id is not in `skipped`. `chain` was dedup'd at function
@@ -13159,6 +13187,21 @@ pub(crate) async fn agentic_turn(
                 gated_reason: Some("unknown model: not in corpus, cannot verify free".into()),
                 ..Default::default()
             });
+        // Host cooldown: a metered link is skipped, the same fail-closed way
+        // a paid fallback is. This is not a per-run condition the user can
+        // override (`--allow-paid` does not clear it): the host already
+        // decided it will not pay this month, so the only correct move is the
+        // cost-neutral route. The LAST live link is never skipped — the run
+        // reports the cap instead of silently doing nothing.
+        if host_cooldown && !link_provider_cost_neutral && !last {
+            if !cli.quiet {
+                eprintln!(
+                    "[zoder] skipping metered chain link {model}: host cooldown (monthly cap)"
+                );
+            }
+            skipped.insert(model);
+            continue;
+        }
         // --require-free gate: skip a non-free link. The last live
         // link failing the gate is fatal (we cannot fall through to
         // anything that satisfies the operator's request).
@@ -13717,10 +13760,7 @@ pub(crate) async fn cmd_exec_agentic(
 /// `budget_exceeded` class AND the reset timestamp. Otherwise the error is
 /// the ordinary reported turn error and the class is inferred from the
 /// message by the dispatcher.
-fn turn_failure_error(
-    outcome: &zoder_core::AgentOutcome,
-    detail: Option<&str>,
-) -> anyhow::Error {
+fn turn_failure_error(outcome: &zoder_core::AgentOutcome, detail: Option<&str>) -> anyhow::Error {
     let summary = turn_failure_summary(outcome, detail);
     // Look at the engine's OWN detail first: it is the text that carries the
     // `budget_exceeded:` marker. The summary is the fallback.

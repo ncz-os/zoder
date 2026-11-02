@@ -4561,20 +4561,8 @@ const COMMENT_MARKERS: &[&str] = &["//", "#", "/*", "*/", "*", "--", "<!--", "\"
 /// as comments classifies a real fix as `CommentOnly`, which the loop then
 /// rejects as comment-only gaming and bills another iteration for (F2.1).
 const CODE_LOOKALIKE_PREFIXES: &[&str] = &[
-    "#define",
-    "#undef",
-    "#include",
-    "#import",
-    "#pragma",
-    "#if",
-    "#ifdef",
-    "#ifndef",
-    "#elif",
-    "#else",
-    "#endif",
-    "#error",
-    "#warning",
-    "#line",
+    "#define", "#undef", "#include", "#import", "#pragma", "#if", "#ifdef", "#ifndef", "#elif",
+    "#else", "#endif", "#error", "#warning", "#line",
     "#!", // Rust inner attribute `#![…]` and a `#!` shebang.
     "#[", // Rust outer attribute `#[…]`.
 ];
@@ -9546,8 +9534,7 @@ fn loop_failure(
     // already took this path; session capacity and every other author-side
     // failure join it here. When the author DID produce a model and the
     // review then failed, the review error still wins as before.
-    let author_failed_before_model =
-        field("author_model").is_none() && author_error.is_some();
+    let author_failed_before_model = field("author_model").is_none() && author_error.is_some();
     let evidence = if author_hit_engine_budget || author_failed_before_model {
         author_error.unwrap_or_default()
     } else {
@@ -10703,35 +10690,35 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             (None, String::new())
         } else {
             match &check {
-            Some(c) => {
-                if !cli.quiet {
-                    eprintln!("[loop] iter {i}: check `{c}`…");
-                }
-                run_state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_phase(LOOP_PHASE_CHECK, i);
-                let t0 = std::time::Instant::now();
-                let (ok, tail) = run_check_watched(
-                    cwd,
-                    c,
-                    loop_timeout_secs,
-                    allow_dangerous_check,
-                    &exec_safety_policy,
-                )
-                .await;
-                if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
-                    check_timed_out = true;
+                Some(c) => {
                     if !cli.quiet {
-                        eprintln!(
-                            "[loop] iter {i}: check wedge killed after {}s (--loop-timeout)",
-                            t0.elapsed().as_secs()
-                        );
+                        eprintln!("[loop] iter {i}: check `{c}`…");
                     }
+                    run_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_phase(LOOP_PHASE_CHECK, i);
+                    let t0 = std::time::Instant::now();
+                    let (ok, tail) = run_check_watched(
+                        cwd,
+                        c,
+                        loop_timeout_secs,
+                        allow_dangerous_check,
+                        &exec_safety_policy,
+                    )
+                    .await;
+                    if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
+                        check_timed_out = true;
+                        if !cli.quiet {
+                            eprintln!(
+                                "[loop] iter {i}: check wedge killed after {}s (--loop-timeout)",
+                                t0.elapsed().as_secs()
+                            );
+                        }
+                    }
+                    (Some(ok), tail)
                 }
-                (Some(ok), tail)
-            }
-            None => (None, String::new()),
+                None => (None, String::new()),
             }
         };
 
@@ -11744,11 +11731,8 @@ where>` and stop; otherwise keep editing until the check passes.\n\n",
         // fleet worker reads the dispatch handle without joining two keys.
         // Additive: `failure.code` / `failure.class` keep their exact
         // previous meaning.
-        payload["failure_class"] = serde_json::Value::String(format!(
-            "{}:{}",
-            f.code.class().as_str(),
-            f.code.code()
-        ));
+        payload["failure_class"] =
+            serde_json::Value::String(format!("{}:{}", f.code.class().as_str(), f.code.code()));
     }
 
     let teardown_reason = loop_teardown_reason(
@@ -12345,11 +12329,44 @@ fn cancel_background_process_group(_meta: &JobMeta) -> anyhow::Result<CancelSign
     Ok(CancelSignalOutcome::Signalled)
 }
 
+/// Tell the operator (and any script reading `status --json`) whether this
+/// HOST is in a spend-cap cooldown.
+///
+/// The marker lives beside the ledger (see `zoder_core::host_cooldown`), not
+/// in the job tree, so it is rendered on every status call — with or without a
+/// job id — before the job rows. A host with no marker prints nothing (the
+/// common case stays quiet); a corrupt or unreadable marker also prints
+/// nothing, because the read path fails open.
+///
+/// Returns `Some(view)` so the JSON form can nest it under `host_cooldown`.
+fn print_host_cooldown(json: bool) -> Option<Value> {
+    let ledger_path = Config::load()
+        .map(|cfg| cfg.ledger_path)
+        .unwrap_or_else(|_| Config::home().join("ledger.jsonl"));
+    let marker = zoder_core::read_cooldown(&ledger_path).ok().flatten()?;
+    let view = zoder_core::host_cooldown_view(&marker);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view).ok()?);
+    } else {
+        println!(
+            "[zoder] {}",
+            zoder_core::host_cooldown_status_line(&ledger_path)?
+        );
+    }
+    Some(view)
+}
+
 pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> anyhow::Result<()> {
+    // A host cooldown is host state, not job state: report it first.
+    let cooldown = print_host_cooldown(false);
     if let Some(want) = &job {
         let m = resolve_job(Some(want), false).ok_or_else(|| anyhow!("no such job: {want}"))?;
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&m)?);
+            let mut payload = serde_json::to_value(&m)?;
+            if let (Some(view), Some(map)) = (cooldown, payload.as_object_mut()) {
+                map.insert("host_cooldown".into(), view);
+            }
+            println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
             println!("{} [{}] {} (pid {})", m.id, m.status, m.kind, m.pid);
             println!("  cwd: {}", m.cwd);
@@ -12369,7 +12386,11 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> a
     // background jobs were actively running (just not in the current repo).
     let jobs = all_jobs();
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&jobs)?);
+        let payload = match cooldown {
+            Some(view) => json!({"host_cooldown": view, "jobs": jobs}),
+            None => serde_json::to_value(&jobs)?,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     if jobs.is_empty() {
@@ -13181,7 +13202,8 @@ mod tests {
 
     #[test]
     fn review_gate_never_reads_conditional_prose_as_approve() {
-        let raw = "I would approve this if the tests passed, but I have concerns about the locking.";
+        let raw =
+            "I would approve this if the tests passed, but I have concerns about the locking.";
         assert_eq!(
             review_gate_parse(raw).verdict,
             "request_changes",
@@ -13193,7 +13215,8 @@ mod tests {
     fn review_gate_keeps_strict_approvals() {
         // The whole reply IS the verdict: bare, fenced, or think-wrapped.
         // All three keep approving through the gate.
-        let bare = "{\"verdict\":\"approve\",\"summary\":\"clean\",\"findings\":[],\"next_steps\":[]}";
+        let bare =
+            "{\"verdict\":\"approve\",\"summary\":\"clean\",\"findings\":[],\"next_steps\":[]}";
         assert_eq!(review_gate_parse(bare).verdict, "approve");
         let fenced = format!("```json\n{bare}\n```");
         assert_eq!(review_gate_parse(&fenced).verdict, "approve");
@@ -15884,9 +15907,7 @@ not run to max_iters"
             "policy_violation"
         );
         assert_eq!(
-            loop_teardown_reason(
-                false, None, true, None, REVIEWER_UNAVAILABLE_VERDICT, false
-            ),
+            loop_teardown_reason(false, None, true, None, REVIEWER_UNAVAILABLE_VERDICT, false),
             "deadline"
         );
         assert_eq!(

@@ -19,6 +19,12 @@
 //!
 //! MARKER FORMAT (stable, documented, shared with the Hive worker)
 //!
+//! WHO WRITES IT: [`crate::budget::Budget::evaluate_call_with_host_cooldown`]
+//! (and its two-number sibling `evaluate_with_host_cooldown`) — the pre-call
+//! budget gate every worker already runs. One tripped worker writes; every
+//! later worker on the host reads it before it routes. `zoder status` reports
+//! it through [`status_line`] / [`status_view`].
+//!
 //! The marker is a single JSON object written to a file whose name is
 //! derived from the ledger path, so it always sits BESIDE the ledger and
 //! moves with it:
@@ -140,6 +146,20 @@ pub fn read_cooldown_at(
     ledger_path: &Path,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<HostCooldown>> {
+    read_cooldown_at_with(ledger_path, now, true)
+}
+
+/// [`read_cooldown_at`], with the expired-marker cleanup optional.
+///
+/// The write path reads WITHOUT cleanup: a writer that is extending a marker
+/// must see the file that is there, not delete it and then re-create a
+/// shorter one (two trips racing would otherwise be able to lose the longer
+/// hold-off). Every read that DECIDES something uses the cleanup form.
+fn read_cooldown_at_with(
+    ledger_path: &Path,
+    now: DateTime<Utc>,
+    remove_expired: bool,
+) -> anyhow::Result<Option<HostCooldown>> {
     let path = cooldown_path_for(ledger_path);
     let metadata = match std::fs::metadata(&path) {
         Ok(m) => m,
@@ -173,7 +193,9 @@ pub fn read_cooldown_at(
     }
     if !marker.is_active_at(now) {
         // Expired: inert. Remove it best-effort.
-        let _ = std::fs::remove_file(&path);
+        if remove_expired {
+            let _ = std::fs::remove_file(&path);
+        }
         return Ok(None);
     }
     Ok(Some(marker))
@@ -202,7 +224,7 @@ pub fn write_cooldown(ledger_path: &Path, marker: &HostCooldown) -> anyhow::Resu
     }
     // Never shorten a live marker: another trip on this host must not cut
     // the existing hold-off short.
-    if let Ok(Some(current)) = read_cooldown(ledger_path) {
+    if let Ok(Some(current)) = read_cooldown_at_with(ledger_path, Utc::now(), false) {
         if current.expires_at > out.expires_at {
             out.expires_at = current.expires_at;
         }
@@ -287,6 +309,75 @@ fn month_end(now: DateTime<Utc>) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(next.0, next.1, 1, 0, 0, 0)
         .single()
         .unwrap_or_else(|| now + Duration::days(1))
+}
+
+/// The host-level back-off hook the budget gate calls after it decides.
+///
+/// This is the ONE function that turns a budget decision into host state, so
+/// every writer of the marker agrees on what "the monthly cap tripped" means:
+///
+/// * a MONTHLY cap trip writes/extend the marker beside `ledger_path` (the
+///   host-wide signal the sibling workers and the Hive worker read);
+/// * any other decline is NOT host-wide and never writes (a per-call cap, an
+///   unpriceable model, an unreadable ledger — D8 step 12 exists to stop the
+///   PHANTOM back-off, so the marker must not be written on a guess).
+///
+/// Returns `Ok(Some(marker))` when the trip left a marker in force, and
+/// `Ok(None)` when the host was not backed off. The call is FAIL-LOUD on I/O
+/// (the caller still has its budget refusal either way) and is silent when
+/// `ledger_path` is `None` (a caller with no ledger has no host to signal).
+pub fn note_budget_decline(
+    ledger_path: Option<&Path>,
+    decline: Option<&crate::budget::BudgetDecline>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<HostCooldown>> {
+    let Some(ledger_path) = ledger_path else {
+        return Ok(None);
+    };
+    let Some(decline) = decline.filter(|d| d.monthly_cap_tripped()) else {
+        return Ok(None);
+    };
+    let limit_usd = decline.limit_usd.unwrap_or_default();
+    let spent_usd = decline.spent_usd.unwrap_or_default();
+    trip_monthly_cap_cooldown(ledger_path, limit_usd, spent_usd, now).map(Some)
+}
+
+/// A live cooldown marker rendered for `zoder status` / `--json`.
+///
+/// Reduces the marker to the fields an operator (or a sibling worker reading
+/// the JSON) needs, and states the ONE consequence in words: metered routes
+/// are off, cost-neutral routes still run.
+pub fn status_view(marker: &HostCooldown) -> serde_json::Value {
+    serde_json::json!({
+        "active": marker.is_active(),
+        "reason": marker.reason,
+        "detail": marker.detail,
+        "limit_usd": marker.limit_usd,
+        "spent_usd": marker.spent_usd,
+        "created_at": marker.created_at.to_rfc3339(),
+        "expires_at": marker.expires_at.to_rfc3339(),
+        "effect": "metered routes skipped; falling through to cost-neutral routes",
+    })
+}
+
+/// One human-readable line for `zoder status`, or `None` when `ledger_path`
+/// has no live marker (or the marker cannot be read — a status command must
+/// never fail because a host-local sidecar is unreadable).
+pub fn status_line(ledger_path: &Path) -> Option<String> {
+    let marker = read_cooldown(ledger_path).ok().flatten()?;
+    let detail = if marker.detail.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", marker.detail)
+    };
+    Some(format!(
+        "host cooldown ACTIVE ({}){}; metered routes skipped until {}, falling through to \
+         cost-neutral routes [{}]",
+        marker.reason,
+        detail,
+        marker.expires_at.to_rfc3339(),
+        cooldown_path_for(ledger_path).display()
+    ))
 }
 
 #[cfg(test)]

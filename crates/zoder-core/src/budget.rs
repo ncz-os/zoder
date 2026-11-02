@@ -5,10 +5,12 @@
 //! spend (from the ledger), and [`Budget::evaluate`] returns a verdict. The CLI
 //! wires it in just after the prompt is read, before the model call.
 
+use crate::host_cooldown::{clear_cooldown, note_budget_decline, HostCooldown};
 use crate::ledger::Ledger;
 use crate::pricing::{CallTokens, CostVerdict, PricingCatalog};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Approximate token count for a piece of text — a deliberately simple
 /// `chars / 4` heuristic (the common English rule of thumb). Good enough for a
@@ -327,7 +329,95 @@ impl Budget {
                 }));
             }
         };
-        Ok(self.evaluate_decline(estimate_usd, month_spent_usd)?)
+        self.evaluate_decline(estimate_usd, month_spent_usd)
+    }
+}
+
+impl Budget {
+    /// [`Budget::evaluate_call`] that ALSO keeps the host cooldown marker in
+    /// step with the verdict (D8 step 12).
+    ///
+    /// Same call, same verdict, same `month_spent` closure; the only extra
+    /// effect is host-local state:
+    ///
+    /// * a MONTHLY cap trip writes/extends `<ledger path>.cooldown.json`, so
+    ///   every sibling worker on the host can see the month is spent without
+    ///   re-deriving it (see [`crate::host_cooldown`] for the format);
+    /// * a call that fits CLEARS a live marker — the cap is by definition not
+    ///   tripped any more, so a stale hold-off must not keep parking the host;
+    /// * a per-call cap trip, an unpriceable model or an unreadable ledger
+    ///   changes nothing: those are per-CALL conditions, and backing the host
+    ///   off on one of them is exactly the phantom back-off this decision
+    ///   exists to prevent.
+    ///
+    /// The marker write is best-effort: a host whose ledger directory is not
+    /// writable still gets its budget refusal (the write error is dropped, not
+    /// fatal). The verdict is the authority; the marker is the host signal.
+    pub fn evaluate_call_with_host_cooldown(
+        &self,
+        ledger_path: &Path,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    ) -> BudgetVerdict {
+        let now = ts.unwrap_or_else(Utc::now);
+        let decline = self
+            .evaluate_call_decline(pricing, model, tokens, ts, month_spent)
+            .ok()
+            .flatten();
+        let _ = self.sync_host_cooldown(ledger_path, decline.as_ref(), now);
+        match decline {
+            Some(decline) => BudgetVerdict::Confirm(decline.message),
+            None => BudgetVerdict::WithinBudget,
+        }
+    }
+
+    /// The pure two-number form of
+    /// [`Budget::evaluate_call_with_host_cooldown`], for callers that have
+    /// already priced the call.
+    pub fn evaluate_with_host_cooldown(
+        &self,
+        ledger_path: &Path,
+        estimate_usd: f64,
+        month_spent_usd: f64,
+        now: DateTime<Utc>,
+    ) -> BudgetVerdict {
+        let decline = self
+            .evaluate_decline(estimate_usd, month_spent_usd)
+            .ok()
+            .flatten();
+        let _ = self.sync_host_cooldown(ledger_path, decline.as_ref(), now);
+        match decline {
+            Some(decline) => BudgetVerdict::Confirm(decline.message),
+            None => BudgetVerdict::WithinBudget,
+        }
+    }
+
+    /// Bring the host cooldown marker in line with ONE decision.
+    ///
+    /// Returns the marker left in force (`Some` only when this decision
+    /// tripped the monthly cap), or `None` when the host is not backed off by
+    /// this decision. See [`note_budget_decline`] and [`clear_cooldown`].
+    pub fn sync_host_cooldown(
+        &self,
+        ledger_path: &Path,
+        decline: Option<&BudgetDecline>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<HostCooldown>> {
+        if decline.is_some_and(BudgetDecline::monthly_cap_tripped) {
+            return note_budget_decline(Some(ledger_path), decline, now);
+        }
+        // Not a host-wide decline: a marker still sitting beside the ledger
+        // is stale (the month rolled over, or the operator raised the cap),
+        // and keeping it would park the host on state nothing re-confirms.
+        // Only a definite "this call fits" clears; a decline for another
+        // reason says nothing about the monthly cap.
+        if decline.is_none() {
+            clear_cooldown(ledger_path)?;
+        }
+        Ok(None)
     }
 }
 
@@ -410,5 +500,217 @@ mod tests {
             }
             _ => panic!("expected Confirm citing both caps"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cap_trip_sets_host_cooldown {
+    //! D8 step 12: a MONTHLY cap trip is a HOST-WIDE event, so the trip must
+    //! leave a marker beside the ledger that every sibling worker can read.
+    //!
+    //! Before this slice `Budget` only answered with a string: nothing outside
+    //! the tripping process could see that the host's month was spent, so N
+    //! siblings each re-derived the same refusal. These tests pin the two
+    //! halves of the contract — the trip writes the marker, and a decline that
+    //! is NOT a monthly cap (a per-call cap, an unpriceable model, an
+    //! unreadable ledger) leaves no marker behind (the phantom back-off).
+
+    use super::*;
+    use crate::host_cooldown::{
+        clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown, REASON_MONTHLY_CAP,
+    };
+    use crate::pricing::ModelPrice;
+
+    fn priced_catalog(model: &str, usd_per_mtok: f64) -> PricingCatalog {
+        let mut pricing = PricingCatalog::default();
+        pricing.models.insert(
+            model.to_string(),
+            ModelPrice {
+                usd_per_mtok,
+                ..Default::default()
+            },
+        );
+        pricing
+    }
+
+    #[test]
+    fn cap_trip_sets_host_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = priced_catalog("paid-model", 100.0);
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        assert!(
+            !cooldown_active(&ledger),
+            "a quiet host starts with no cooldown marker"
+        );
+
+        // $10.00/MTok x (1000 in + 1000 out) = $0.20 on top of $9.90 spent.
+        let verdict = budget.evaluate_call_with_host_cooldown(
+            &ledger,
+            &pricing,
+            "paid-model",
+            CallTokens {
+                tokens_in: 1_000,
+                tokens_out: 1_000,
+                cache_hit_tokens: 0,
+            },
+            None,
+            || Ok(9.90),
+        );
+        match verdict {
+            BudgetVerdict::Confirm(_) => {}
+            other => panic!("expected the monthly cap to trip, got {other:?}"),
+        }
+
+        let marker = read_cooldown(&ledger)
+            .expect("reading the marker must not fail")
+            .expect("a monthly cap trip must leave a host cooldown marker beside the ledger");
+        assert_eq!(marker.reason, REASON_MONTHLY_CAP);
+        assert_eq!(marker.limit_usd, Some(10.0));
+        assert_eq!(marker.spent_usd, Some(9.9));
+        assert!(
+            marker.is_active(),
+            "the marker written by a cap trip must be in force"
+        );
+        assert_eq!(
+            cooldown_path_for(&ledger),
+            dir.path().join("ledger.jsonl.cooldown.json"),
+            "the marker sits BESIDE the ledger so the Hive worker can find it"
+        );
+    }
+
+    #[test]
+    fn per_call_cap_trip_leaves_no_host_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = priced_catalog("paid-model", 100.0);
+        let budget = Budget {
+            max_cost_per_call_usd: Some(0.01),
+            ..Default::default()
+        };
+        let verdict = budget.evaluate_call_with_host_cooldown(
+            &ledger,
+            &pricing,
+            "paid-model",
+            CallTokens {
+                tokens_in: 1_000,
+                tokens_out: 1_000,
+                cache_hit_tokens: 0,
+            },
+            None,
+            || Ok(0.0),
+        );
+        assert!(
+            matches!(verdict, BudgetVerdict::Confirm(_)),
+            "the per-call cap still refuses the call"
+        );
+        assert!(
+            !cooldown_active(&ledger),
+            "a per-call cap is a per-CALL condition: it must not park the host"
+        );
+    }
+
+    #[test]
+    fn unpriceable_model_leaves_no_host_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = PricingCatalog::default();
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let verdict = budget.evaluate_call_with_host_cooldown(
+            &ledger,
+            &pricing,
+            "not-in-catalog",
+            CallTokens {
+                tokens_in: 10,
+                tokens_out: 10,
+                cache_hit_tokens: 0,
+            },
+            None,
+            || Ok(99.0),
+        );
+        assert!(
+            matches!(verdict, BudgetVerdict::Confirm(_)),
+            "an unpriceable model still fails closed"
+        );
+        assert!(
+            !cooldown_active(&ledger),
+            "an unknown cost is not a cap trip: it must not park the host"
+        );
+    }
+
+    #[test]
+    fn unreadable_ledger_leaves_no_host_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = priced_catalog("paid-model", 100.0);
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let verdict = budget.evaluate_call(&pricing, "paid-model", 1_000, 1_000, None, || {
+            Err(anyhow::anyhow!("ledger is unreadable"))
+        });
+        assert!(
+            matches!(verdict, BudgetVerdict::Confirm(_)),
+            "an unreadable ledger still fails closed"
+        );
+        assert!(
+            !cooldown_active(&ledger),
+            "phantom spend: an unreadable ledger must not back the host off"
+        );
+    }
+
+    #[test]
+    fn a_live_marker_clears_when_the_cap_no_longer_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = priced_catalog("paid-model", 100.0);
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let tokens = CallTokens {
+            tokens_in: 1_000,
+            tokens_out: 1_000,
+            cache_hit_tokens: 0,
+        };
+        // Trip it once.
+        assert!(matches!(
+            budget.evaluate_call_with_host_cooldown(
+                &ledger,
+                &pricing,
+                "paid-model",
+                tokens,
+                None,
+                || Ok(9.90)
+            ),
+            BudgetVerdict::Confirm(_)
+        ));
+        assert!(cooldown_active(&ledger));
+
+        // A later call that fits is not a trip, and must clear the stale
+        // marker so the host does not stay parked after the month resets.
+        assert_eq!(
+            budget.evaluate_call_with_host_cooldown(
+                &ledger,
+                &pricing,
+                "paid-model",
+                tokens,
+                None,
+                || Ok(0.10)
+            ),
+            BudgetVerdict::WithinBudget
+        );
+        assert!(
+            !cooldown_active(&ledger),
+            "a call that fits means the cap is not tripped; the marker must be cleared"
+        );
+        clear_cooldown(&ledger).unwrap();
     }
 }

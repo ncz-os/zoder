@@ -3,6 +3,8 @@
 
 use crate::corpus::{Corpus, ModelEntry};
 use crate::health::HealthStore;
+use crate::host_cooldown::cooldown_active;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -38,6 +40,46 @@ pub struct Route {
     pub primary: String,
     pub fallbacks: Vec<String>,
     pub reason: String,
+    /// `true` when the host is in a spend-cap cooldown: METERED candidates in
+    /// [`Route::primary`]/[`Route::fallbacks`] must be skipped in favour of a
+    /// cost-neutral one (see [`Route::allows_metered`]).
+    pub host_cooldown: bool,
+}
+
+impl Route {
+    /// `true` when a candidate `is_cost_neutral` may be used: always, unless
+    /// the host tripped its monthly cap. During a cooldown the auto-pick pool
+    /// (free by construction) is still fully available, so a route is never
+    /// empty just because the cap tripped.
+    pub fn allows_metered(&self, is_cost_neutral: bool) -> bool {
+        is_cost_neutral || !self.host_cooldown
+    }
+
+    /// The route recomputed without its metered candidates, keeping order.
+    ///
+    /// The first cost-neutral candidate becomes the primary; the rest stay as
+    /// fallbacks. When every candidate is metered this returns `None` — the
+    /// honest answer, which the caller reports instead of dispatching a call
+    /// the host has already decided it will not pay for.
+    pub fn prefer_cost_neutral(&self, is_cost_neutral: impl Fn(&str) -> bool) -> Option<Route> {
+        let mut neutral: Vec<String> = Vec::new();
+        for id in std::iter::once(&self.primary).chain(self.fallbacks.iter()) {
+            if is_cost_neutral(id) {
+                neutral.push(id.clone());
+            }
+        }
+        let (primary, fallbacks) = neutral.split_first()?;
+        Some(Route {
+            primary: primary.clone(),
+            fallbacks: fallbacks.to_vec(),
+            reason: format!(
+                "{} | host cooldown: metered candidates skipped, {} cost-neutral route(s) left",
+                self.reason,
+                neutral.len()
+            ),
+            host_cooldown: true,
+        })
+    }
 }
 
 pub struct Router<'a> {
@@ -54,6 +96,14 @@ pub struct Router<'a> {
     /// placeholder default and fail cryptically. `None` = no filter (legacy
     /// behavior for callers without a config in hand).
     backed: Option<std::collections::HashSet<String>>,
+    /// `Some(true)` when this host tripped its monthly spend cap and the
+    /// cooldown marker is live (D8 step 12). The auto-pick pool is the FREE
+    /// pool, which is cost-neutral by construction, so a cooldown never
+    /// narrows it; the flag is carried on the [`Route`] so a caller that is
+    /// about to dispatch a METERED candidate (an operator pin, a chain link
+    /// resolved to a paid provider) can skip it and fall through to a
+    /// cost-neutral one instead of walking into the same cap wall.
+    host_cooldown: bool,
 }
 
 impl<'a> Router<'a> {
@@ -66,6 +116,7 @@ impl<'a> Router<'a> {
             health,
             pinned_primary: None,
             backed: None,
+            host_cooldown: false,
         }
     }
 
@@ -93,6 +144,23 @@ impl<'a> Router<'a> {
         // host fail cleanly instead of auto-picking an example.com-bound model.
         self.backed = backed;
         self
+    }
+
+    /// Record that this host is in a spend-cap cooldown, so the selected
+    /// [`Route`] carries it to the dispatch loop.
+    pub fn with_host_cooldown(mut self, active: bool) -> Self {
+        self.host_cooldown = active;
+        self
+    }
+
+    /// Read the host cooldown marker beside `ledger_path` and apply it.
+    ///
+    /// A missing, expired or corrupt marker reads as "no cooldown" (the read
+    /// path fails OPEN), so a broken sidecar can never park a host; a status
+    /// command uses [`crate::host_cooldown::status_line`] instead, which never
+    /// errors either.
+    pub fn with_ledger_cooldown(self, ledger_path: &Path) -> Self {
+        self.with_host_cooldown(cooldown_active(ledger_path))
     }
 
     fn rank_key(m: &ModelEntry, tier: Tier) -> f64 {
@@ -231,6 +299,7 @@ impl<'a> Router<'a> {
                 primary: pin.clone(),
                 fallbacks,
                 reason,
+                host_cooldown: self.host_cooldown,
             });
         }
 
@@ -336,6 +405,7 @@ impl<'a> Router<'a> {
             primary: primary.id.clone(),
             fallbacks,
             reason,
+            host_cooldown: self.host_cooldown,
         })
     }
 }
@@ -740,5 +810,140 @@ mod tests {
             Router::rank_key(&missing, Tier::Auto) <= Router::rank_key(&measured, Tier::Auto),
             "removing latency evidence must not improve Auto rank"
         );
+    }
+
+    #[cfg(test)]
+    mod sibling_prefers_local_route_during_cooldown {
+        //! D8 step 12: when a sibling worker tripped the host's monthly cap, a
+        //! cooldown marker sits beside the ledger. A worker that starts after
+        //! that must NOT re-derive the refusal on a metered route — it skips
+        //! the metered candidates and falls through to the cost-neutral ones.
+        //!
+        //! The read path fails OPEN, so a missing/expired/corrupt marker leaves
+        //! the route untouched: a broken sidecar can never park a host.
+
+        use super::super::*;
+        use crate::corpus::ModelEntry;
+        use crate::host_cooldown::{clear_cooldown, trip_monthly_cap_cooldown};
+
+        fn is_neutral(id: &str) -> bool {
+            id.starts_with("local-")
+        }
+
+        /// A corpus row that the router will actually consider, with the
+        /// routing flag the test needs (`free` = cost-neutral).
+        fn manifest(id: &str, free: bool) -> ModelEntry {
+            ModelEntry {
+                id: id.into(),
+                free,
+                // `routable()` requires all three, and a positive rank key
+                // needs some capability evidence to sort on.
+                route_candidate: true,
+                kind: "chat".into(),
+                w_swe: Some(0.6),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn sibling_prefers_local_route_during_cooldown() {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = dir.path().join("ledger.jsonl");
+            let corpus = Corpus {
+                models: vec![
+                    manifest("paid-lead", false),
+                    manifest("local-a", true),
+                    manifest("local-b", true),
+                ],
+                ..Default::default()
+            };
+            let health = HealthStore::default();
+
+            // No marker: the normal chain stands, metered lead first, and
+            // the operator pin that produced this chain is honored.
+            let pinned = Router::new(&corpus, &health)
+                .with_primary(Some("paid-lead".to_string()))
+                .with_ledger_cooldown(&ledger);
+            let route = pinned.select(Tier::Auto).unwrap();
+            assert_eq!(route.primary, "paid-lead", "no cooldown: the pin stands");
+            assert!(!route.host_cooldown);
+            assert!(route.allows_metered(is_neutral(&route.primary)));
+
+            // A SIBLING worker trips the monthly cap: the marker is written
+            // by someone else, this router only reads it.
+            trip_monthly_cap_cooldown(&ledger, 10.0, 12.5, chrono::Utc::now()).unwrap();
+
+            let sibling = Router::new(&corpus, &health).with_ledger_cooldown(&ledger);
+            let route = sibling.select(Tier::Auto).unwrap();
+            assert!(
+                route.host_cooldown,
+                "a live cooldown marker must be visible to a sibling worker"
+            );
+            assert!(
+                !route.allows_metered(false),
+                "metered candidates must be skipped during the cooldown"
+            );
+            assert!(
+                route.allows_metered(true),
+                "cost-neutral candidates stay available during the cooldown"
+            );
+
+            let local = route
+                .prefer_cost_neutral(is_neutral)
+                .expect("a cost-neutral fallback exists");
+            assert_eq!(
+                local.primary, "local-a",
+                "the metered lead is skipped; the first cost-neutral link takes over"
+            );
+            assert_eq!(local.fallbacks, vec!["local-b".to_string()]);
+            assert!(local.reason.contains("host cooldown"));
+
+            // The chain the router builds for that pin carries the same
+            // cooldown, so a dispatch loop driving off `select` skips the
+            // metered pin too.
+            let pinned = Router::new(&corpus, &health)
+                .with_primary(Some("paid-lead".to_string()))
+                .with_ledger_cooldown(&ledger);
+            let route = pinned.select(Tier::Auto).unwrap();
+            assert!(route.host_cooldown);
+            assert_eq!(route.primary, "paid-lead", "the pin still leads ...");
+            let local = route
+                .prefer_cost_neutral(is_neutral)
+                .expect("the pinned chain has a cost-neutral link");
+            assert_eq!(
+                local.primary, "local-a",
+                "... but the cooldown routes around it"
+            );
+
+            // The marker is the month's timeout: clearing it (or the month
+            // rolling over) restores the normal chain.
+            clear_cooldown(&ledger).unwrap();
+            let fresh = Router::new(&corpus, &health).with_ledger_cooldown(&ledger);
+            assert!(!fresh.select(Tier::Auto).unwrap().host_cooldown);
+        }
+
+        #[test]
+        fn corrupt_marker_never_parks_the_router() {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = dir.path().join("ledger.jsonl");
+            std::fs::write(
+                crate::host_cooldown::cooldown_path_for(&ledger),
+                b"{not json",
+            )
+            .unwrap();
+            let corpus = Corpus {
+                models: vec![manifest("paid-lead", false), manifest("local-a", true)],
+                ..Default::default()
+            };
+            let health = HealthStore::default();
+            let route = Router::new(&corpus, &health)
+                .with_ledger_cooldown(&ledger)
+                .select(Tier::Auto)
+                .unwrap();
+            assert!(
+                !route.host_cooldown,
+                "a corrupt marker must read as 'no cooldown' (fail open)"
+            );
+        }
     }
 }

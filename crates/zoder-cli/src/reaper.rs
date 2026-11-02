@@ -994,50 +994,50 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
         Err(e) => {
             let outcome = classify_cancel_error(&e);
             match outcome {
-            CancelOutcome::EngineUnreachable => {
-                // No engine, no cancel, and above all no live turn: the
-                // session died with the daemon that owned it. Retire it
-                // so no later pass or teardown round asks again, and so
-                // the reap is free to conclude the workspace is quiet.
-                // Said once — an absent socket is a fact about the run,
-                // not about the attempt.
-                if mark_unreachable(id) {
-                    eprintln!(
-                        "[zoder] session {id} not cancelled: the engine at {} is \
+                CancelOutcome::EngineUnreachable => {
+                    // No engine, no cancel, and above all no live turn: the
+                    // session died with the daemon that owned it. Retire it
+                    // so no later pass or teardown round asks again, and so
+                    // the reap is free to conclude the workspace is quiet.
+                    // Said once — an absent socket is a fact about the run,
+                    // not about the attempt.
+                    if mark_unreachable(id) {
+                        eprintln!(
+                            "[zoder] session {id} not cancelled: the engine at {} is \
                          unreachable ({e:#}); it cannot be cancelled from here and may \
                          still run in a daemon that lost its socket; whatever it \
                          leaves in the workspace is still reaped",
-                        socket.display()
-                    );
+                            socket.display()
+                        );
+                    }
+                }
+                CancelOutcome::NotConfirmed => {
+                    // One attempt is not an answer: the daemon may be slow,
+                    // may have already exited, or the turn may already have
+                    // settled (a settled turn never acknowledges a cancel).
+                    // Retry briefly, then treat it as best-effort and say
+                    // exactly why — never as a reason to stop the run.
+                    //
+                    // The retries share what is LEFT of the phase budget
+                    // rather than a fixed per-attempt cap: this loop is
+                    // itself deadline-bounded, and a retry sequence that
+                    // outlives the deadline is cut off mid-flight, which
+                    // leaves the cancel unsettled — the state this path
+                    // exists to prevent.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let settled = retry_unconfirmed_cancel_within(socket, id, left).await;
+                    settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
+                }
+                // `classify_cancel_error` only ever returns the two failure arms
+                // (it classifies an ERROR, and a confirmed cancel is not an
+                // error). The other two arms are unreachable here, and saying so
+                // is what the exhaustiveness check is for: a future arm cannot be
+                // added to the shared enum without this match noticing.
+                CancelOutcome::Confirmed | CancelOutcome::DeadlineExpired => {
+                    unreachable!("classify_cancel_error never returns {outcome}")
                 }
             }
-            CancelOutcome::NotConfirmed => {
-                // One attempt is not an answer: the daemon may be slow,
-                // may have already exited, or the turn may already have
-                // settled (a settled turn never acknowledges a cancel).
-                // Retry briefly, then treat it as best-effort and say
-                // exactly why — never as a reason to stop the run.
-                //
-                // The retries share what is LEFT of the phase budget
-                // rather than a fixed per-attempt cap: this loop is
-                // itself deadline-bounded, and a retry sequence that
-                // outlives the deadline is cut off mid-flight, which
-                // leaves the cancel unsettled — the state this path
-                // exists to prevent.
-                let left = deadline.saturating_duration_since(Instant::now());
-                let settled = retry_unconfirmed_cancel_within(socket, id, left).await;
-                settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
-            }
-            // `classify_cancel_error` only ever returns the two failure arms
-            // (it classifies an ERROR, and a confirmed cancel is not an
-            // error). The other two arms are unreachable here, and saying so
-            // is what the exhaustiveness check is for: a future arm cannot be
-            // added to the shared enum without this match noticing.
-            CancelOutcome::Confirmed | CancelOutcome::DeadlineExpired => {
-                unreachable!("classify_cancel_error never returns {outcome}")
-            }
-            }
-        },
+        }
     }
 }
 

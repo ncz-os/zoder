@@ -100,6 +100,14 @@ no fleet addresses, no keys.
   ledger), `est_output_tokens` (default 1024)
   (`budget.rs:Budget`). Caps gate paid calls only; `0` or absent
   disables a cap (`config.standalone.toml` budget comment).
+- A trip of `monthly_cap_usd` is a HOST-wide event: it writes the
+  cooldown marker `<ledger path>.cooldown.json` beside the ledger, and
+  every worker on the host then skips metered routes until it expires
+  or a call fits again. No key configures it — the marker is derived
+  from the cap and the ledger path. Format and reader contract:
+  [`HOST_COOLDOWN.md`](HOST_COOLDOWN.md)
+  (`budget.rs:Budget::evaluate_call_with_host_cooldown`,
+  `host_cooldown.rs`).
 - `[review]`: `max_diff_bytes` (CLI `--max-diff-bytes`),
   `max_hunk_bytes` (CLI `--max-hunk-bytes`), `exclude` globs (plus
   `.zoderignore` and `--exclude`), per-route `route_defaults` keyed by
