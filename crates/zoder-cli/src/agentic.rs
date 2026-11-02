@@ -4479,6 +4479,57 @@ pub(crate) fn substance_accept_eligible(s: &DiffSubstance) -> bool {
 /// Order matters only for readability — matching is prefix-based.
 const COMMENT_MARKERS: &[&str] = &["//", "#", "/*", "*/", "*", "--", "<!--", "\"\"\"", "'''"];
 
+/// Code that merely *starts* with a [`COMMENT_MARKERS`] character. `#` also
+/// opens a C preprocessor line, a Rust attribute or a shebang; `*` is a
+/// pointer store (`*p = 1;`); `--` is a pre-decrement (`--i;`). Matching those
+/// as comments classifies a real fix as `CommentOnly`, which the loop then
+/// rejects as comment-only gaming and bills another iteration for (F2.1).
+const CODE_LOOKALIKE_PREFIXES: &[&str] = &[
+    "#define",
+    "#undef",
+    "#include",
+    "#import",
+    "#pragma",
+    "#if",
+    "#ifdef",
+    "#ifndef",
+    "#elif",
+    "#else",
+    "#endif",
+    "#error",
+    "#warning",
+    "#line",
+    "#!", // Rust inner attribute `#![…]` and a `#!` shebang.
+    "#[", // Rust outer attribute `#[…]`.
+];
+
+/// True if `line` is blank or is a comment in one of the languages we see.
+///
+/// A line that starts with a comment-marker *character* is not necessarily a
+/// comment: `#define`, `#[cfg(…)]`, `*p = 0;` and `--i;` are all code, and a
+/// diff of only those lines is a substantive change. Real comment forms stay
+/// comments: `# …`, `//…`, `/* …`, `*/`, `* text`, a bare `*`, `-- text`,
+/// Lua's `--[`, `<!--`, `"""` and `'''`.
+fn is_comment_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let Some(marker) = COMMENT_MARKERS.iter().find(|m| t.starts_with(*m)) else {
+        return false;
+    };
+    match *marker {
+        "#" => !CODE_LOOKALIKE_PREFIXES.iter().any(|p| t.starts_with(p)),
+        // A block-comment body is `* text`, a bare `*`, or `*/` (its own
+        // marker above); `*p = 0;` and `*ptr` are statements.
+        "*" => t == "*" || t.starts_with("* "),
+        // `-- text` is a SQL/Lua comment and `--[[` a Lua block comment;
+        // `--i;` is a statement.
+        "--" => t == "--" || t.starts_with("-- ") || t.starts_with("--["),
+        _ => true,
+    }
+}
+
 /// True if `path` (a file path from a `+++ b/...` or `diff --git` header)
 /// matches the test-file patterns we recognize. A `path` of `/dev/null`
 /// (file deletion / addition outside any tree) is never a test file.
@@ -4489,6 +4540,13 @@ fn is_test_path(path: &str) -> bool {
     let p = path.replace('\\', "/");
     // Path-segment matches anywhere in the path.
     if p.contains("/tests/") || p.contains("/test/") {
+        return true;
+    }
+    // A `tests/` or `test/` tree at the repository root. Diff headers are
+    // stripped to `tests/cli.rs` with no leading separator, so the segment
+    // rule above misses it and a test-only change was labelled `Substantive`
+    // (F2.3).
+    if p.starts_with("tests/") || p.starts_with("test/") {
         return true;
     }
     let basename = std::path::Path::new(p.as_str())
@@ -4612,11 +4670,9 @@ pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
         return DiffSubstance::WhitespaceOnly;
     }
 
-    // Step 2: CommentOnly — every non-blank line starts with a comment marker.
-    let all_comment_or_blank = content_lines.iter().all(|l| {
-        let t = l.trim();
-        t.is_empty() || COMMENT_MARKERS.iter().any(|m| t.starts_with(m))
-    });
+    // Step 2: CommentOnly — every non-blank line is a comment (see
+    // `is_comment_line`, which knows the code that merely looks like one).
+    let all_comment_or_blank = content_lines.iter().all(|l| is_comment_line(l));
     if all_comment_or_blank {
         return DiffSubstance::CommentOnly;
     }
@@ -4625,12 +4681,7 @@ pub(crate) fn classify_diff_substance(diff: &str) -> DiffSubstance {
     // path is a test path. (A diff with no recognizable file headers,
     // e.g. a hand-crafted snippet, is treated as NOT test-only — we can't
     // prove the changed files are tests, so be conservative.)
-    let has_substantive_line = content_lines.iter().any(|l| {
-        !l.trim().is_empty()
-            && !COMMENT_MARKERS
-                .iter()
-                .any(|m| l.trim_start().starts_with(m))
-    });
+    let has_substantive_line = content_lines.iter().any(|l| !is_comment_line(l));
     if has_substantive_line {
         // Filter paths: skip empty / dev/null, then require every remaining
         // path to look like a test file.
@@ -15546,6 +15597,84 @@ not run to max_iters"
                     +# body note\n\
                     +# trailing note\n";
         assert_eq!(classify_diff_substance(diff), DiffSubstance::CommentOnly);
+    }
+
+    /// A C preprocessor directive is code, not a comment. A change to
+    /// `#define` must not be classified `CommentOnly`, which would make the
+    /// loop reject a correct fix as comment-only gaming (finding F2.1).
+    #[test]
+    fn classify_diff_substance_c_define_change_is_substantive() {
+        let diff = "diff --git a/src/limits.h b/src/limits.h\n\
+                    --- a/src/limits.h\n\
+                    +++ b/src/limits.h\n\
+                    @@ -1,2 +1,2 @@\n\
+                    -#define MAX_RETRIES 3\n\
+                    +#define MAX_RETRIES 5\n\
+                    +// raised for the flaky backend\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
+    }
+
+    /// A Rust attribute (`#[cfg(...)]`, `#![allow(...)]`) is code, not a
+    /// Python comment. Finding F2.1.
+    #[test]
+    fn classify_diff_substance_rust_attribute_change_is_substantive() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                    --- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,2 +1,3 @@\n\
+                      #[cfg(test)]\n\
+                    +  #[cfg_attr(feature = \"x\", allow(dead_code))]\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
+    }
+
+    /// A pointer store (`*p = 0;`) and a pre-decrement (`--i;`) start with a
+    /// comment marker character but are statements. Finding F2.1.
+    #[test]
+    fn classify_diff_substance_pointer_store_and_predecrement_are_substantive() {
+        let diff = "diff --git a/src/count.c b/src/count.c\n\
+                    --- a/src/count.c\n\
+                    +++ b/src/count.c\n\
+                    @@ -3,3 +3,4 @@\n\
+                    -*count = 1;\n\
+                    +*count = 0;\n\
+                    +--retries;\n\
+                     return 0;\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::Substantive);
+    }
+
+    /// The guard for the fix above: a real C block-comment body (` * text`,
+    /// a bare `*`, the `*/` terminator) must still classify as `CommentOnly`.
+    #[test]
+    fn classify_diff_substance_block_comment_body_is_comment_only() {
+        let diff = "diff --git a/src/lib.c b/src/lib.c\n\
+                    --- a/src/lib.c\n\
+                    +++ b/src/lib.c\n\
+                    @@ -1,3 +1,5 @@\n\
+                     /*\n\
+                    + * first line of the new explanation\n\
+                    + * second line\n\
+                    +\n\
+                    + */\n\
+                     int x;\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::CommentOnly);
+    }
+
+    /// A `tests/` directory at the repository root is a test path. The diff
+    /// header is stripped to `tests/cli.rs`, with no leading separator, so the
+    /// `/tests/` segment rule misses it and a test-only change is labelled
+    /// `Substantive` (finding F2.3).
+    #[test]
+    fn classify_diff_substance_test_only_in_root_tests_dir() {
+        let diff = "diff --git a/tests/cli.rs b/tests/cli.rs\n\
+                    --- a/tests/cli.rs\n\
+                    +++ b/tests/cli.rs\n\
+                    @@ -1,1 +1,4 @@\n\
+                     fn setup() {}\n\
+                    +#[test]\n\
+                    +fn end_to_end() {\n\
+                    +    assert!(true);\n\
+                    +}\n";
+        assert_eq!(classify_diff_substance(diff), DiffSubstance::TestOnly);
     }
 
     /// A diff with at least one substantive content line, where every
