@@ -7677,6 +7677,67 @@ pub(crate) fn unconfirmed_cancel_abort_threshold(shared_daemon: bool) -> usize {
     }
 }
 
+/// Consecutive author turns whose cancel could not be confirmed.
+///
+/// This is the ONE thing about an unconfirmed cancel that can stop the loop.
+/// On a daemon this loop owns, two in a row means the daemon is not answering
+/// this loop at all; on a SHARED daemon (fleet) the first one already stops it
+/// — see [`unconfirmed_cancel_abort_threshold`]. A single one is a slow daemon,
+/// and cleanup failing must never throw the author's work away.
+///
+/// The state MUST live outside the `for i in 1..=max_iters` loop. When it was
+/// declared inside the loop body it was zero at the top of every iteration, so
+/// `streak >= threshold` could only hold when the threshold is 1 (shared
+/// daemon): on a daemon this loop owns (threshold 2) two consecutive
+/// unconfirmed cancels never aborted, and the loop re-authored against a
+/// daemon that answered none of its cancels until the run deadline or the
+/// worker kill.
+#[derive(Debug, Clone)]
+pub(crate) struct UnconfirmedCancelTracker {
+    threshold: usize,
+    streak: usize,
+}
+
+impl UnconfirmedCancelTracker {
+    /// Build a tracker that aborts once `threshold` consecutive author cancels
+    /// could not be confirmed. A threshold below 1 would never abort; clamp so
+    /// a misconfigured caller cannot silently disable the stop.
+    pub(crate) fn new(threshold: usize) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            streak: 0,
+        }
+    }
+
+    /// The tracker the loop uses: the threshold comes from the deployment
+    /// profile via [`unconfirmed_cancel_abort_threshold`], so the two can
+    /// never drift.
+    pub(crate) fn from_shared_daemon(shared_daemon: bool) -> Self {
+        Self::new(unconfirmed_cancel_abort_threshold(shared_daemon))
+    }
+
+    pub(crate) fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    pub(crate) fn streak(&self) -> usize {
+        self.streak
+    }
+
+    /// Record one iteration's author outcome and report whether the loop must
+    /// abort. `cancel_unconfirmed` is the single bit the loop already derives
+    /// from [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`]; the text matching is NOT
+    /// changed here.
+    pub(crate) fn observe(&mut self, cancel_unconfirmed: bool) -> bool {
+        if cancel_unconfirmed {
+            self.streak = self.streak.saturating_add(1);
+        } else {
+            self.streak = 0;
+        }
+        self.streak >= self.threshold
+    }
+}
+
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
 pub(crate) const AUTHOR_CANCEL_UNCONFIRMED_MARKER: &str = "author cancellation unconfirmed:";
@@ -10014,6 +10075,13 @@ async fn cmd_loop_run(
     // Every model that has actually authored a turn in this loop. Reviewer
     // candidates from these models' families are excluded on every review.
     let mut author_models: Vec<String> = Vec::new();
+    // Consecutive author turns whose cancel could not be confirmed — hoisted
+    // ABOVE the iteration loop on purpose. Declared inside it, the counter was
+    // zero at the top of every iteration and `streak >= threshold` could only
+    // hold when the threshold is 1 (shared daemon), so on a daemon this loop
+    // owns (threshold 2) two consecutive unconfirmed cancels never aborted.
+    // See [`UnconfirmedCancelTracker`].
+    let mut unconfirmed_cancel_streak = UnconfirmedCancelTracker::from_shared_daemon(shared_daemon);
     for i in 1..=max_iters {
         // Whole-run deadline, checked BEFORE a new iteration starts: an
         // iteration begun with no time left would spend another full phase
@@ -10096,8 +10164,8 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // answering this loop at all; on a SHARED daemon (fleet) the first one
         // already stops it — see `unconfirmed_cancel_abort_threshold`. A single
         // one is a slow daemon, and cleanup failing must never throw the
-        // author's work away (a supervised loop run).
-        let mut unconfirmed_cancel_streak = 0usize;
+        // author's work away (a supervised loop run). The counter itself is
+        // hoisted above the iteration loop — see `unconfirmed_cancel_streak`.
         let engine_kind = crate::resolve_engine_kind(cli)?;
         // Capture the daemon's actual session/new result before prompt
         // dispatch, including first turns and rejected-resume replacements.
@@ -10248,15 +10316,16 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     state.note_provider_error(&msg);
                 }
                 if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
-                    unconfirmed_cancel_streak += 1;
+                    unconfirmed_cancel_streak.observe(true);
                     eprintln!(
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
-                         confirmed ({unconfirmed_cancel_streak}/{cancel_abort_threshold}). \
+                         confirmed ({}/{cancel_abort_threshold}). \
                          The tree is captured and reported as unresolved, and the edits on disk \
-                         are preserved"
+                         are preserved",
+                        unconfirmed_cancel_streak.streak()
                     );
                 } else {
-                    unconfirmed_cancel_streak = 0;
+                    unconfirmed_cancel_streak.observe(false);
                 }
                 let timed_out = msg.contains("timed out") || msg.contains("timeout");
                 if !cli.quiet {
@@ -10370,14 +10439,14 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             author_err.as_deref(),
             Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
         );
-        let aborted_on_unconfirmed_cancel =
-            cancel_unconfirmed && unconfirmed_cancel_streak >= cancel_abort_threshold;
+        let aborted_on_unconfirmed_cancel = cancel_unconfirmed
+            && unconfirmed_cancel_streak.streak() >= unconfirmed_cancel_streak.threshold();
         if aborted_on_unconfirmed_cancel {
             let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
             state.set_phase(LOOP_PHASE_DONE, i);
             state.note_provider_error(&format!(
                 "author cancel unconfirmed {} time(s) in a row",
-                unconfirmed_cancel_streak
+                unconfirmed_cancel_streak.streak()
             ));
         }
 
@@ -10483,9 +10552,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: the daemon did not confirm an author cancel \
-                     {unconfirmed_cancel_streak} time(s) in a row (abort threshold \
+                     {} time(s) in a row (abort threshold \
                      {cancel_abort_threshold}); stopping with this iteration's work preserved \
-                     and reported."
+                     and reported.",
+                    unconfirmed_cancel_streak.streak()
                 );
             }
             iterations.push(json!({
@@ -12243,6 +12313,79 @@ mod tests {
             "a daemon serving this loop alone keeps the two-strike threshold"
         );
         assert_eq!(UNCONFIRMED_CANCEL_ABORT_THRESHOLD, 2);
+    }
+
+    /// REGRESSION (cancel-streak): the streak of consecutive unconfirmed
+    /// author cancels must survive across loop ITERATIONS.
+    ///
+    /// It used to be declared INSIDE `for i in 1..=max_iters`, so it was zero
+    /// at the top of every iteration and `streak >= threshold` could only ever
+    /// hold when the threshold is 1 (a shared daemon). On a daemon this loop
+    /// OWNS (threshold 2) two consecutive unconfirmed cancels never aborted —
+    /// the loop kept re-authoring against a daemon that answers none of its
+    /// cancels until the run deadline or the worker kill.
+    ///
+    /// The decision is driven through [`UnconfirmedCancelTracker`], which is
+    /// the state the loop hoists above the iteration:
+    ///   * threshold 2 aborts on the SECOND consecutive unconfirmed cancel;
+    ///   * a confirmed turn in between resets the count;
+    ///   * threshold 1 (shared daemon) still aborts on the FIRST.
+    #[test]
+    fn unconfirmed_cancel_streak_survives_across_iterations() {
+        // Threshold 2 (daemon this loop owns): the first miss is a slow
+        // daemon, the second is proof. Both are different ITERATIONS.
+        let mut owned = UnconfirmedCancelTracker::new(unconfirmed_cancel_abort_threshold(false));
+        assert_eq!(owned.threshold(), 2, "the standalone threshold is two");
+        assert!(
+            !owned.observe(true),
+            "one unconfirmed cancel must not abort: that is a slow daemon"
+        );
+        assert_eq!(owned.streak(), 1);
+        assert!(
+            owned.observe(true),
+            "the SECOND consecutive unconfirmed cancel must abort the loop \
+             (the streak has to survive the iteration boundary)"
+        );
+        assert_eq!(owned.streak(), 2);
+
+        // A confirmed turn in between resets the count: two misses that are
+        // not CONSECUTIVE are two isolated slow daemons, not proof.
+        let mut reset = UnconfirmedCancelTracker::new(unconfirmed_cancel_abort_threshold(false));
+        assert!(!reset.observe(true), "first miss: continue");
+        assert_eq!(reset.streak(), 1);
+        assert!(!reset.observe(false), "a confirmed turn never aborts");
+        assert_eq!(reset.streak(), 0, "a confirmed turn must reset the streak");
+        assert!(
+            !reset.observe(true),
+            "after a reset this is the FIRST miss again, not the second"
+        );
+        assert_eq!(reset.streak(), 1);
+
+        // Threshold 1 (shared daemon): the FIRST unconfirmed cancel aborts.
+        let mut shared = UnconfirmedCancelTracker::new(unconfirmed_cancel_abort_threshold(true));
+        assert_eq!(shared.threshold(), 1, "a shared daemon stops at one");
+        assert!(
+            shared.observe(true),
+            "a shared daemon must abort on the FIRST unconfirmed cancel"
+        );
+        assert!(!shared.observe(false), "a confirmed turn never aborts");
+        assert_eq!(shared.streak(), 0);
+    }
+
+    /// The tracker derives its threshold from the deployment profile the loop
+    /// already resolves, so the two can never drift: `from_shared_daemon` is
+    /// `unconfirmed_cancel_abort_threshold` and nothing else.
+    #[test]
+    fn unconfirmed_cancel_tracker_threshold_follows_the_deployment_profile() {
+        for shared in [true, false] {
+            let tracker = UnconfirmedCancelTracker::from_shared_daemon(shared);
+            assert_eq!(
+                tracker.threshold(),
+                unconfirmed_cancel_abort_threshold(shared),
+                "shared={shared}: the tracker must use the loop's own threshold"
+            );
+            assert_eq!(tracker.streak(), 0, "a fresh tracker starts at zero");
+        }
     }
 
     /// The three budget sources must compose in the documented order, and the
