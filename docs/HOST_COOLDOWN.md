@@ -118,9 +118,15 @@ def host_cooldown(ledger_path: str) -> dict | None:
 - A monthly cap trip **writes or extends** the marker beside
   `cfg.ledger_path`. A second trip never SHORTENS a live marker, so concurrent
   trips cannot cut each other's hold-off short.
-- A call that **fits** clears a live marker: the cap is by definition not
-  tripped any more, and a stale hold-off must not keep parking the host after
-  the month resets.
+- A **metered** call that **fits** clears a live marker: it read the
+  month-to-date spend, so the cap is by definition not tripped any more, and a
+  stale hold-off must not keep parking the host after the month resets.
+- A **free** call (or a $0 estimate) never touches the marker. It is never
+  gated, so it never reads month-to-date spend — and "I did not look" is not
+  evidence the cap stopped tripping. Clearing on it used to delete a live
+  marker while billed spend was still over the cap, so the next metered
+  sibling re-derived the same refusal: the per-worker loop this feature
+  exists to kill.
 - Any other decline (per-call cap, unpriceable model, unreadable ledger)
   changes nothing.
 - The write is atomic (temp file + `rename`) so a concurrent reader never sees
@@ -130,8 +136,15 @@ def host_cooldown(ledger_path: str) -> dict | None:
 ## Where it shows up
 
 - `zoder status` prints one line when the host is in cooldown (`host cooldown
-  ACTIVE (monthly_cap) … metered routes skipped until …`); `zoder status
-  --json` carries the same object under `host_cooldown`.
+  ACTIVE (monthly_cap) … metered routes skipped until …`). In `--json` mode
+  that line goes to **stderr** and stdout stays the job list.
+- **`zoder status --json` output shape is stable.** Without a job id the
+  top level is ALWAYS the job array — empty, ten entries, or a live cooldown,
+  it is an array. Callers may index it (`json.loads(stdout)[0]`) or iterate
+  it without checking the host's budget state, which is exactly when they
+  must keep working.
+- With a job id, the job object is the top level and the cooldown (when
+  active) appears as a `host_cooldown` member of that object.
 - The agentic chain skips metered links while the marker is live and continues
   with the cost-neutral links (the last live link is never skipped — the run
   reports the cap instead of silently doing nothing).
@@ -146,14 +159,21 @@ rm ~/.zoder/ledger.jsonl.cooldown.json
 
 Safe at any time: the marker only ever *removes* metered routes, never
 adds them, and an expired marker is inert anyway. Raising the cap or starting
-a new month clears it on the next call that fits.
+a new month clears it on the next METERED call that fits (a free call cannot:
+it never reads the spend, so it never clears the marker).
 
 ## Tests
 
 - `cap_trip_sets_host_cooldown` (`crates/zoder-core/src/budget.rs`) — a
   monthly trip writes the marker with the cap and the spend; a per-call trip,
-  an unpriceable model and an unreadable ledger leave none; a call that fits
-  clears a stale one.
+  an unpriceable model and an unreadable ledger leave none; a metered call
+  that fits clears a stale one.
+- `free_call_does_not_clear_a_live_monthly_cooldown` /
+  `zero_estimate_does_not_clear_a_live_monthly_cooldown` (same file) — a free
+  call (or a $0 estimate) is within budget but leaves a live marker alone.
+- `status_json_top_level_shape_does_not_change_with_a_cooldown`
+  (`crates/zoder-cli/tests/status_host_cooldown.rs`) — `status --json` is the
+  job array with and without a marker, and announces the cooldown on stderr.
 - `sibling_prefers_local_route_during_cooldown`
   (`crates/zoder-core/src/router.rs`) — a marker written by one worker sends
   the next one to the cost-neutral route; a corrupt marker changes nothing.

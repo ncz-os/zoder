@@ -12334,32 +12334,36 @@ fn cancel_background_process_group(_meta: &JobMeta) -> anyhow::Result<CancelSign
 ///
 /// The marker lives beside the ledger (see `zoder_core::host_cooldown`), not
 /// in the job tree, so it is rendered on every status call — with or without a
-/// job id — before the job rows. A host with no marker prints nothing (the
-/// common case stays quiet); a corrupt or unreadable marker also prints
-/// nothing, because the read path fails open.
+/// job id. A host with no marker prints nothing (the common case stays quiet);
+/// a corrupt or unreadable marker also prints nothing, because the read path
+/// fails open.
 ///
-/// Returns `Some(view)` so the JSON form can nest it under `host_cooldown`.
+/// The announcement is a HUMAN line, so in `--json` mode it goes to STDERR:
+/// stdout stays the single JSON document the caller parses, and the document's
+/// shape never changes with the host's budget state. (An earlier revision
+/// replaced the top-level job array with `{"host_cooldown":…,"jobs":[…]}` while
+/// the marker was live, so `json.loads(stdout)[0]` broke on exactly the run
+/// that tripped the cap.)
 fn print_host_cooldown(json: bool) -> Option<Value> {
     let ledger_path = Config::load()
         .map(|cfg| cfg.ledger_path)
         .unwrap_or_else(|_| Config::home().join("ledger.jsonl"));
     let marker = zoder_core::read_cooldown(&ledger_path).ok().flatten()?;
     let view = zoder_core::host_cooldown_view(&marker);
-    // In `--json` mode the caller embeds `view` in its own payload; printing
-    // here would put a human line ahead of the JSON and break parsers.
-    if !json {
-        println!(
-            "[zoder] {}",
-            zoder_core::host_cooldown_status_line(&ledger_path)?
-        );
+    let line = zoder_core::host_cooldown_status_line(&ledger_path)?;
+    if json {
+        eprintln!("[zoder] {line}");
+    } else {
+        println!("[zoder] {line}");
     }
     Some(view)
 }
 
 pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> anyhow::Result<()> {
     // A host cooldown is host state, not job state: report it first. In
-    // `--json` mode the view is embedded in the payload instead (no stdout
-    // line, so the output stays parseable), which the branches below do.
+    // `--json` mode the line goes to stderr, so stdout is exactly the payload
+    // the caller parses and the payload keeps ONE shape whichever way the
+    // host's budget state falls.
     let cooldown = print_host_cooldown(cli.json);
     if let Some(want) = &job {
         let m = resolve_job(Some(want), false).ok_or_else(|| anyhow!("no such job: {want}"))?;
@@ -12388,11 +12392,11 @@ pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> a
     // background jobs were actively running (just not in the current repo).
     let jobs = all_jobs();
     if cli.json {
-        let payload = match cooldown {
-            Some(view) => json!({"host_cooldown": view, "jobs": jobs}),
-            None => serde_json::to_value(&jobs)?,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        // ALWAYS the job list, cooldown or not: callers index it (`[0]`) and
+        // iterate it, and a type change on a cap trip would break them exactly
+        // when automation most needs the command to keep working. The cooldown
+        // was already announced on stderr above.
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
     }
     if jobs.is_empty() {

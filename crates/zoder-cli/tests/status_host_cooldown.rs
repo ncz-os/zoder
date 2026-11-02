@@ -4,14 +4,26 @@
 //! operator-visible contract:
 //!
 //!  - with a cooldown marker beside the ledger, `status --json` emits ONE JSON
-//!    document that carries `host_cooldown` — nothing is printed before it, so
-//!    a caller can pipe the output straight into a JSON parser;
-//!  - without `--json` the human status line is printed instead of the JSON.
+//!    document that is still the job LIST — nothing is printed before it, so a
+//!    caller can pipe the output straight into a JSON parser;
+//!  - the TOP-LEVEL type of that document never changes: it is always the job
+//!    list, whether or not the host is in cooldown;
+//!  - the cooldown is still announced — on the human path as a `[zoder]` line
+//!    on stdout, on the JSON path as the same line on STDERR (plus the existing
+//!    `host_cooldown` exit code) — so a human operator loses nothing.
 //!
-//! The bug these guard: `cmd_status` called `print_host_cooldown(false)`
-//! unconditionally, so `--json` mode printed the human `[zoder] ...` line to
-//! stdout FIRST and the JSON payload second. `json.loads(stdout)` then failed
-//! on a document the operator had explicitly asked to be machine-readable.
+//! The bugs these guard:
+//!
+//!  1. `cmd_status` called `print_host_cooldown(false)` unconditionally, so
+//!     `--json` mode printed the human `[zoder] ...` line to stdout FIRST and
+//!     the JSON payload second. `json.loads(stdout)` then failed on a document
+//!     the operator had explicitly asked to be machine-readable.
+//!  2. The cooldown was announced by REPLACING the top-level array with an
+//!     object (`{"host_cooldown":…,"jobs":[…]}`). `jobs = json.loads(stdout)`
+//!     then yielded a list on a quiet host and a dict on exactly the run that
+//!     tripped the cap — the moment automation most needs it to keep working.
+//!     The payload shape is now fixed: the job list is always the top level,
+//!     and the cooldown rides on the exit CODES + STDERR instead.
 
 use std::fs;
 use std::path::Path;
@@ -54,8 +66,58 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// `status --json` must NOT change its top-level type when the host is in
+/// cooldown.
+///
+/// This is the D8 step 12 regression: the payload used to be the job list on a
+/// quiet host and `{"host_cooldown":…,"jobs":[…]}` while the marker was live,
+/// so `jobs = json.loads(stdout); jobs[0]` blew up on exactly the run that
+/// tripped the cap. The document is now ALWAYS the job list.
+#[test]
+fn status_json_top_level_shape_does_not_change_with_a_cooldown() {
+    let quiet = tempfile::tempdir().expect("tempdir");
+    let quiet_home = quiet.path().join("home");
+    fs::create_dir_all(&quiet_home).expect("create home");
+    let quiet_out = status(&quiet_home, &["status", "--json"]);
+    let quiet_parsed: serde_json::Value = serde_json::from_str(&stdout(&quiet_out))
+        .expect("quiet `status --json` is one JSON document");
+    assert!(
+        quiet_parsed.is_array(),
+        "with no marker the payload is the job list: {quiet_parsed}"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    write_marker(&home);
+    let out = status(&home, &["status", "--json"]);
+    let text = stdout(&out);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("an active cooldown must still emit ONE JSON document");
+    assert!(
+        parsed.is_array(),
+        "a live cooldown must not change the top-level type of `status --json`; \
+         a caller doing `json.loads(stdout)[0]` breaks exactly when the cap trips; got:\n{text}"
+    );
+
+    // Announcing the cooldown must not cost an operator the signal, though:
+    // in `--json` mode it goes to stderr (stdout stays pure JSON).
+    let err = stderr(&out);
+    assert!(
+        err.contains("host cooldown"),
+        "the cooldown must still be announced on stderr in --json mode; got:\n{err}"
+    );
+    assert!(
+        !text.contains("[zoder]"),
+        "no human status line may precede the JSON payload; got:\n{text}"
+    );
+}
+
 /// `status --json` with an active marker must produce a single, parseable JSON
-/// document whose `host_cooldown` says the host is backed off. The regression
+/// document (the job list) and announce the cooldown on stderr. The regression
 /// is any non-JSON text ahead of the payload.
 #[test]
 fn status_json_with_active_cooldown_is_one_parseable_document() {
@@ -70,17 +132,18 @@ fn status_json_with_active_cooldown_is_one_parseable_document() {
             "status --json must emit ONE JSON document; parse failed: {e}\n--- stdout ---\n{text}"
         )
     });
-    let cooldown = parsed
-        .get("host_cooldown")
-        .expect("an active cooldown must be exposed under `host_cooldown` in --json mode");
-    assert_eq!(
-        cooldown.get("active").and_then(|v| v.as_bool()),
-        Some(true),
-        "the marker is live, so the reported cooldown must be active: {cooldown}"
+    assert!(
+        parsed.is_array(),
+        "the job list stays the top level of `status --json`: {parsed}"
     );
     assert!(
         !text.contains("[zoder]"),
         "no human status line may precede the JSON payload; got:\n{text}"
+    );
+    assert!(
+        stderr(&out).contains("host cooldown"),
+        "an active cooldown must be reported to the operator; got stderr:\n{}",
+        stderr(&out)
     );
 }
 

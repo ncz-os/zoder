@@ -373,8 +373,15 @@ impl Budget {
     /// * a MONTHLY cap trip writes/extends `<ledger path>.cooldown.json`, so
     ///   every sibling worker on the host can see the month is spent without
     ///   re-deriving it (see [`crate::host_cooldown`] for the format);
-    /// * a call that fits CLEARS a live marker — the cap is by definition not
-    ///   tripped any more, so a stale hold-off must not keep parking the host;
+    /// * a METERED call that fits CLEARS a live marker — it read the
+    ///   month-to-date spend and the cap is by definition not tripped any
+    ///   more, so a stale hold-off must not keep parking the host;
+    /// * a FREE call (`CostVerdict::Free`) leaves the marker ALONE. It never
+    ///   reads month-to-date spend — it does not need to, a $0 call is not
+    ///   gated — so it has no evidence the cap stopped tripping. Clearing on
+    ///   that silence deleted a live marker while billed spend was still over
+    ///   the cap, and the next metered sibling re-derived the same refusal:
+    ///   exactly the per-worker loop this feature exists to kill;
     /// * a per-call cap trip, an unpriceable model or an unreadable ledger
     ///   changes nothing: those are per-CALL conditions, and backing the host
     ///   off on one of them is exactly the phantom back-off this decision
@@ -398,12 +405,31 @@ impl Budget {
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
         let now = ts.unwrap_or_else(Utc::now);
+        // A free model is not gated, and `evaluate_call_decline` short-circuits
+        // it to `Ok(None)` WITHOUT reading month-to-date spend. That `None` is
+        // not evidence the cap stopped tripping, so it must not reach the
+        // marker sync (which would clear a live marker). Classifying here is a
+        // pure catalog lookup; the evaluator below still owns the verdict.
+        let is_free = matches!(
+            pricing.classify_cost_with_cache(
+                model,
+                tokens.tokens_in,
+                tokens.tokens_out,
+                tokens.cache_hit_tokens,
+                ts,
+            ),
+            CostVerdict::Free
+        );
         let verdict =
             decline_to_verdict(self.evaluate_call_decline(pricing, model, tokens, ts, month_spent));
         // Only a real (Ok) decision touches the marker; an evaluation error
         // writes none (an error is not a proven cap trip).
-        if let Some(decline) = verdict.1 {
-            self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now);
+        match verdict.1 {
+            // No decision from a free call means "no spend observed", which
+            // may neither write nor clear.
+            Some(None) if is_free => {}
+            Some(decline) => self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now),
+            None => {}
         }
         verdict.0
     }
@@ -411,6 +437,10 @@ impl Budget {
     /// The pure two-number form of
     /// [`Budget::evaluate_call_with_host_cooldown`], for callers that have
     /// already priced the call.
+    ///
+    /// A non-positive `estimate_usd` is within budget but does NOT clear a
+    /// live marker: it carries no spend evidence (same rule as a free call —
+    /// see [`Budget::evaluate_call_with_host_cooldown`]).
     pub fn evaluate_with_host_cooldown(
         &self,
         ledger_path: &Path,
@@ -419,8 +449,10 @@ impl Budget {
         now: DateTime<Utc>,
     ) -> BudgetVerdict {
         let verdict = decline_to_verdict(self.evaluate_decline(estimate_usd, month_spent_usd));
-        if let Some(decline) = verdict.1 {
-            self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now);
+        match verdict.1 {
+            Some(None) if estimate_usd <= 0.0 => {}
+            Some(decline) => self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now),
+            None => {}
         }
         verdict.0
     }
@@ -453,6 +485,13 @@ impl Budget {
     /// Returns the marker left in force (`Some` only when this decision
     /// tripped the monthly cap), or `None` when the host is not backed off by
     /// this decision. See [`note_budget_decline`] and [`clear_cooldown`].
+    ///
+    /// `Ok(None)` in `decline` means "within budget" and clears a live
+    /// marker, so a caller may only pass it when the decision actually
+    /// OBSERVED month-to-date spend. A free call and a $0 estimate never do;
+    /// their wrappers ([`Budget::evaluate_call_with_host_cooldown`],
+    /// [`Budget::evaluate_with_host_cooldown`]) skip this call for them
+    /// rather than reporting "no spend evidence" as "this call fits".
     pub fn sync_host_cooldown(
         &self,
         ledger_path: &Path,
@@ -570,7 +609,8 @@ mod cap_trip_sets_host_cooldown {
 
     use super::*;
     use crate::host_cooldown::{
-        clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown, REASON_MONTHLY_CAP,
+        clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown,
+        trip_monthly_cap_cooldown, REASON_MONTHLY_CAP,
     };
     use crate::pricing::ModelPrice;
 
@@ -848,5 +888,124 @@ mod cap_trip_sets_host_cooldown {
             "a call that fits means the cap is not tripped; the marker must be cleared"
         );
         clear_cooldown(&ledger).unwrap();
+    }
+
+    /// D8 step 12 follow-up: a FREE call must not clear a LIVE monthly marker.
+    ///
+    /// `evaluate_call_decline` short-circuits a `CostVerdict::Free` call to
+    /// `Ok(None)` WITHOUT reading month spend — correct for the call itself
+    /// (a free call is never gated), but `sync_host_cooldown` read that `None`
+    /// as "this call fits, the cap is not tripped any more" and deleted the
+    /// marker. The very next metered sibling then saw no cooldown and
+    /// re-derived the refusal, which is the per-worker re-derivation loop the
+    /// whole feature exists to kill.
+    #[test]
+    fn free_call_does_not_clear_a_live_monthly_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let mut pricing = priced_catalog("paid-model", 100.0);
+        // A FREE model: present in the catalog at $0, which is what
+        // `classify_cost_with_cache` reports as `CostVerdict::Free` (an ABSENT
+        // model is `Unknown` and fails closed, a different path).
+        pricing.models.insert(
+            "free-model".to_string(),
+            ModelPrice {
+                usd_per_mtok: 0.0,
+                ..Default::default()
+            },
+        );
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let tokens = CallTokens {
+            tokens_in: 1_000,
+            tokens_out: 1_000,
+            cache_hit_tokens: 0,
+        };
+        // Trip the monthly cap so the marker is live.
+        assert!(matches!(
+            budget.evaluate_call_with_host_cooldown(
+                &ledger,
+                &pricing,
+                "paid-model",
+                tokens,
+                None,
+                || Ok(9.90)
+            ),
+            BudgetVerdict::Confirm(_)
+        ));
+        assert!(cooldown_active(&ledger), "the trip leaves a live marker");
+
+        // A free model is not gated...
+        assert_eq!(
+            budget.evaluate_call_with_host_cooldown(
+                &ledger,
+                &pricing,
+                "free-model",
+                tokens,
+                None,
+                || panic!("a free call must not need the month-to-date spend"),
+            ),
+            BudgetVerdict::WithinBudget,
+            "a free call is never gated"
+        );
+        // ...and must NOT clear the marker: it never looked at spend, so it
+        // has no evidence the cap stopped tripping.
+        assert!(
+            cooldown_active(&ledger),
+            "a free call never reads month spend, so it cannot prove the cap \
+             stopped tripping; the live marker must survive"
+        );
+    }
+
+    /// The two-number sibling of the test above: `estimate_usd <= 0` takes the
+    /// same short circuit in `evaluate_decline`, so it must not clear either.
+    #[test]
+    fn zero_estimate_does_not_clear_a_live_monthly_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let now = Utc::now();
+        // Trip the cap directly.
+        trip_monthly_cap_cooldown(&ledger, 10.0, 12.0, now).unwrap();
+        assert!(cooldown_active(&ledger));
+
+        assert_eq!(
+            budget.evaluate_with_host_cooldown(&ledger, 0.0, 0.0, now),
+            BudgetVerdict::WithinBudget,
+            "a $0 estimate is never gated"
+        );
+        assert!(
+            cooldown_active(&ledger),
+            "a $0 estimate carries no spend evidence: the live marker must survive"
+        );
+    }
+
+    /// A REAL metered call that fits still clears the marker — the free-path
+    /// carve-out must not turn into "a marker can never be cleared".
+    #[test]
+    fn a_metered_call_that_fits_still_clears_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        let now = Utc::now();
+        trip_monthly_cap_cooldown(&ledger, 10.0, 12.0, now).unwrap();
+        assert!(cooldown_active(&ledger));
+
+        assert_eq!(
+            budget.evaluate_with_host_cooldown(&ledger, 0.25, 1.0, now),
+            BudgetVerdict::WithinBudget
+        );
+        assert!(
+            !cooldown_active(&ledger),
+            "a priced call read the spend and fits: the stale marker must go"
+        );
     }
 }
