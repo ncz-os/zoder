@@ -1042,6 +1042,10 @@ fn ledger_lock_budget() -> Option<Duration> {
 
 /// Human-readable budget for the timeout message: `30` for whole seconds,
 /// `0.5` otherwise.
+///
+/// TWIN: `acp-client/src/session_store.rs` has an identical helper. The two
+/// are deliberate copies (neither crate depends on the other for this), so a
+/// change here must be mirrored there and vice versa.
 fn format_budget(budget: Duration) -> String {
     let secs = budget.as_secs_f64();
     // Test the Duration itself for whole seconds rather than `secs.fract()`:

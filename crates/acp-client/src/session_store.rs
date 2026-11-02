@@ -684,6 +684,9 @@ fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> 
 }
 
 /// `30` for whole seconds, `0.5` otherwise.
+/// TWIN: `zoder-core/src/ledger.rs` has an identical helper. The two are
+/// deliberate copies (this crate does not depend on zoder-core for it), so a
+/// change here must be mirrored there and vice versa.
 fn format_budget(budget: std::time::Duration) -> String {
     let secs = budget.as_secs_f64();
     // Test the Duration itself for whole seconds, matching the ledger-side
