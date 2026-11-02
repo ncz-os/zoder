@@ -364,6 +364,7 @@ fn decline_to_verdict(
 }
 
 impl Budget {
+    /// [`Budget::evaluate_call`] that ALSO keeps the host cooldown marker in
     /// step with the verdict (D8 step 12).
     ///
     /// Same call, same verdict, same `month_spent` closure; the only extra

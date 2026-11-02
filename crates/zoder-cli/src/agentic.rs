@@ -12345,9 +12345,9 @@ fn print_host_cooldown(json: bool) -> Option<Value> {
         .unwrap_or_else(|_| Config::home().join("ledger.jsonl"));
     let marker = zoder_core::read_cooldown(&ledger_path).ok().flatten()?;
     let view = zoder_core::host_cooldown_view(&marker);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view).ok()?);
-    } else {
+    // In `--json` mode the caller embeds `view` in its own payload; printing
+    // here would put a human line ahead of the JSON and break parsers.
+    if !json {
         println!(
             "[zoder] {}",
             zoder_core::host_cooldown_status_line(&ledger_path)?
@@ -12357,8 +12357,10 @@ fn print_host_cooldown(json: bool) -> Option<Value> {
 }
 
 pub(crate) fn cmd_status(cli: &crate::Cli, job: Option<String>, _all: bool) -> anyhow::Result<()> {
-    // A host cooldown is host state, not job state: report it first.
-    let cooldown = print_host_cooldown(false);
+    // A host cooldown is host state, not job state: report it first. In
+    // `--json` mode the view is embedded in the payload instead (no stdout
+    // line, so the output stays parseable), which the branches below do.
+    let cooldown = print_host_cooldown(cli.json);
     if let Some(want) = &job {
         let m = resolve_job(Some(want), false).ok_or_else(|| anyhow!("no such job: {want}"))?;
         if cli.json {
