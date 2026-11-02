@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-01",
+  "generated": "2026-11-02",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "abliteration/abliterated-model": {
@@ -5878,11 +5878,11 @@
       }
     },
     "deepseek/deepseek-v4.1-flash-1017": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6,
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2,
       "off_peak": {
-        "input_usd_per_mtok": 0.075,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.6,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -8525,8 +8525,8 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.0675,
-      "output_usd_per_mtok": 0.22499999999999998
+      "input_usd_per_mtok": 0.079,
+      "output_usd_per_mtok": 0.238
     },
     "google/gemma-4-26b-a4b-it:free": {
       "input_usd_per_mtok": 0.0,
@@ -10173,8 +10173,8 @@
       "output_usd_per_mtok": 0.201
     },
     "meta-llama/llama-3.2-3b-instruct": {
-      "input_usd_per_mtok": 0.049999999999999996,
-      "output_usd_per_mtok": 0.33
+      "input_usd_per_mtok": 0.0509,
+      "output_usd_per_mtok": 0.335
     },
     "meta-llama/llama-3.3-70b-instruct": {
       "input_usd_per_mtok": 0.09999999999999999,
@@ -12772,8 +12772,8 @@
       "output_usd_per_mtok": 30.0
     },
     "openai/gpt-oss-120b": {
-      "input_usd_per_mtok": 0.024,
-      "output_usd_per_mtok": 0.09
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.6
     },
     "openai/gpt-oss-120b:batch": {
       "input_usd_per_mtok": 0.0296,
@@ -17162,8 +17162,8 @@
       "output_usd_per_mtok": 6.8
     },
     "z-ai/glm-5.3": {
-      "input_usd_per_mtok": 0.0699,
-      "output_usd_per_mtok": 1.4
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 3.5999999999999996
     },
     "z-ai/glm-5.3-flash": {
       "input_usd_per_mtok": 0.0285,
@@ -17389,10 +17389,10 @@
       "output_usd_per_mtok": 8.0
     },
     "~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.0434,
+      "input_usd_per_mtok": 0.059,
       "output_usd_per_mtok": 0.3,
       "off_peak": {
-        "input_usd_per_mtok": 0.0217,
+        "input_usd_per_mtok": 0.0295,
         "output_usd_per_mtok": 0.15,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
