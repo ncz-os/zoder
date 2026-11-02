@@ -154,6 +154,21 @@ no fleet addresses, no keys.
   (`main.rs:effective_request_timeout_s_for_model`).
 - `ZODER_QUEUE_TIMEOUT_S`: bound on waiting for a provider turn
   (`config.rs:Provider` queue docs).
+- `ZODER_LEDGER_LOCK_TIMEOUT_S`: bound, in seconds, on waiting for the
+  ledger's `ledger.jsonl.lock` advisory lock (`flock(2)`, which has no
+  timeout of its own). Refuses to wait for ever for an exclusive or
+  shared lock: the acquisition polls every 5 ms, backing off to 100 ms,
+  and fails with `timed out after Ns waiting for the ledger lock at
+  <path> ...` instead of hanging. Unset or empty: 30 s default. `0`:
+  unbounded — wait indefinitely, the pre-2026-11 behaviour. A value that
+  is not a number of seconds falls back to the 30 s default with a
+  warning. An uncontended lock is still taken on the first attempt, so
+  the bound costs nothing in the normal case
+  (`ledger.rs:LEDGER_LOCK_TIMEOUT_ENV`, `lock_bounded`).
+- `ACP_SESSION_LOCK_TIMEOUT_S`: the same bound for the engine-session
+  store's `engine_sessions.json.lock` (`session_store.rs:LOCK_TIMEOUT_ENV`,
+  `lock_exclusive_bounded` — `acp-client` is engine-agnostic, so it keeps
+  its own variable). Default 30 s; `0` is unbounded.
 - `ZODER_PRICING_SOURCE=file`: installed pricing files are
   authoritative, never re-pulled (`config.rs:Config::pricing`,
   `PricingConfig`).
