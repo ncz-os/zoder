@@ -609,9 +609,22 @@ fn lock_budget() -> Option<std::time::Duration> {
     }
     match raw.parse::<f64>() {
         Ok(0.0) => None,
-        Ok(secs) if secs.is_finite() && secs > 0.0 => {
-            Some(std::time::Duration::from_secs_f64(secs))
-        }
+        // `Duration::from_secs_f64` PANICS for a value it cannot represent
+        // (e.g. 1e300), so a typo priced in the wrong unit would abort the
+        // process instead of falling back. Only a value the duration can
+        // actually hold counts as valid.
+        Ok(secs) if secs > 0.0 => match std::time::Duration::try_from_secs_f64(secs) {
+            Ok(budget) => Some(budget),
+            Err(_) => {
+                eprintln!(
+                    "zoder: warning: {LOCK_TIMEOUT_ENV}={raw:?} is too large to be a lock \
+                     budget; using the default {DEFAULT_LOCK_TIMEOUT_SECS}s"
+                );
+                Some(std::time::Duration::from_secs_f64(
+                    DEFAULT_LOCK_TIMEOUT_SECS,
+                ))
+            }
+        },
         _ => {
             // A typo must not silently disable the bound, and must not be
             // silent either: say which value was rejected, as the ledger
@@ -669,7 +682,10 @@ fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> 
 fn format_budget(budget: std::time::Duration) -> String {
     let secs = budget.as_secs_f64();
     if secs.fract() == 0.0 {
-        format!("{}", secs as u64)
+        // `as u64` saturates for an absurdly large budget and would print a
+        // number the operator never set. Render the integral f64 exactly,
+        // matching the ledger-side helper.
+        format!("{secs:.0}")
     } else {
         format!("{secs}")
     }
@@ -882,12 +898,20 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let previous = std::env::var_os("ACP_SESSION_LOCK_TIMEOUT_S");
         std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", format!("{seconds}"));
-        let result = body();
-        match previous {
-            Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
-            None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
+        // Restore on the way out of the scope even if `body` panics (an
+        // assertion failure in a test does), so a failed test cannot leak
+        // its budget into the ones that run after it.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("ACP_SESSION_LOCK_TIMEOUT_S", value),
+                    None => std::env::remove_var("ACP_SESSION_LOCK_TIMEOUT_S"),
+                }
+            }
         }
-        result
+        let _restore = Restore(previous);
+        body()
     }
 
     /// REGRESSION: `LockGuard::acquire` waited on `lock_exclusive` for ever,

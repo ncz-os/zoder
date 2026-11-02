@@ -1000,7 +1000,20 @@ fn ledger_lock_budget() -> Option<Duration> {
     }
     match raw.parse::<f64>() {
         Ok(0.0) => None,
-        Ok(secs) if secs.is_finite() && secs > 0.0 => Some(Duration::from_secs_f64(secs)),
+        // `Duration::from_secs_f64` PANICS for a value it cannot represent
+        // (e.g. 1e300), so a typo priced in the wrong unit would abort the
+        // process instead of falling back. Only a value the duration can
+        // actually hold counts as valid.
+        Ok(secs) if secs > 0.0 => match Duration::try_from_secs_f64(secs) {
+            Ok(budget) => Some(budget),
+            Err(_) => {
+                tracing::warn!(
+                    "{LEDGER_LOCK_TIMEOUT_ENV}={raw:?} is too large to be a lock budget; \
+                     using the {DEFAULT_LEDGER_LOCK_TIMEOUT_SECS} s default"
+                );
+                Some(Duration::from_secs_f64(DEFAULT_LEDGER_LOCK_TIMEOUT_SECS))
+            }
+        },
         _ => {
             tracing::warn!(
                 "{LEDGER_LOCK_TIMEOUT_ENV}={raw:?} is not a number of seconds (or 0 for \
@@ -3841,12 +3854,20 @@ mod lock_deadline_tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let previous = std::env::var_os("ZODER_LEDGER_LOCK_TIMEOUT_S");
         std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", format!("{seconds}"));
-        let result = body();
-        match previous {
-            Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
-            None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
+        // Restore on the way out of the scope even if `body` panics (an
+        // assertion failure in a test does), so a failed test cannot leak
+        // its budget into the ones that run after it.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("ZODER_LEDGER_LOCK_TIMEOUT_S", value),
+                    None => std::env::remove_var("ZODER_LEDGER_LOCK_TIMEOUT_S"),
+                }
+            }
         }
-        result
+        let _restore = Restore(previous);
+        body()
     }
 
     /// One valid metered row, timestamped now.
@@ -3978,6 +3999,28 @@ mod lock_deadline_tests {
                 elapsed < Duration::from_secs(10),
                 "the shared read took {elapsed:?}, not bounded by its 1 s budget"
             );
+        });
+    }
+
+    /// A budget too large for a `Duration` must fall back to the default
+    /// instead of panicking: `Duration::from_secs_f64` aborts on values it
+    /// cannot represent, so a typo priced in the wrong unit would have
+    /// blown up the process rather than taking the documented fallback.
+    #[test]
+    fn an_unrepresentable_budget_falls_back_instead_of_panicking() {
+        with_budget(1e300, || {
+            let budget = ledger_lock_budget().expect("a huge budget must not mean unbounded");
+            assert_eq!(
+                budget,
+                Duration::from_secs_f64(DEFAULT_LEDGER_LOCK_TIMEOUT_SECS),
+                "an unrepresentable budget must fall back to the default"
+            );
+            // And the ledger still works under the fallback, rather than aborting.
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = Ledger::new(&dir.path().join("ledger.jsonl"));
+            ledger
+                .record(&row())
+                .expect("a fallback budget must still record");
         });
     }
 
