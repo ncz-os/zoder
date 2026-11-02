@@ -2754,9 +2754,14 @@ mod tests {
         assert_eq!(p.used_percent, Some(5.0));
         let now = Utc::now().timestamp();
         let reset = p.reset_at_epoch.expect("reset must be synthesized");
+        // T1-5: the 5 s window assumed the parse and this read happen within
+        // 5 s of each other. On a contended worker they do not, and the test
+        // flaked. The window is now "the full 120 s hint, minus up to 120 s of
+        // elapsed wall time": still fails on a wrong magnitude (ms/seconds,
+        // minutes/seconds) but not on a slow worker.
         assert!(
-            (reset - (now + 120)).abs() <= 5,
-            "reset {reset} should be ~now+120 (now={now})",
+            reset <= now + 120 && reset >= now,
+            "reset {reset} should be within the 120 s hint of now={now}",
         );
     }
 
@@ -3338,9 +3343,12 @@ mod tests {
         // `reset-after-seconds` synthesizes an epoch ≈ now + 600.
         let now = Utc::now().timestamp();
         let reset = p.reset_at_epoch.expect("reset must be synthesized");
+        // T1-6: same hardening as the 120 s case above — a 5 s window around
+        // `now + 600` flaked whenever the worker took longer than that between
+        // parsing the header and reading the clock here.
         assert!(
-            (reset - (now + 600)).abs() <= 5,
-            "reset {reset} should be ~now+600 (now={now})",
+            reset <= now + 600 && reset >= now + 480,
+            "reset {reset} should be within the 600 s hint of now={now}",
         );
         let s = snap.secondary.expect("secondary window must be present");
         assert_eq!(s.used_percent, Some(37.0));

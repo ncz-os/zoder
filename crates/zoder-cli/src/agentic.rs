@@ -19817,6 +19817,17 @@ mod reviewer_chain_dispatch_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn high_risk_glob_requires_a_second_non_local_reviewer() {
+        // F3.1: reaching the local mock while classifying as HOSTED needs the
+        // IPv4-mapped IPv6 literal below — `is_local_route` treats all of
+        // 127/8 as local, so no plain IPv4 address can stand in. A runner
+        // without IPv6 sockets cannot run this test at all, so skip instead
+        // of turning the whole suite red there.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            eprintln!(
+                "skipping high_risk_glob_requires_a_second_non_local_reviewer: no IPv6 on this host"
+            );
+            return;
+        }
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
         let _guard = HomeGuard::new(home);
@@ -20689,6 +20700,11 @@ mod reviewer_chain_dispatch_tests {
         // 429: exactly one chat attempt (no in-process retry), breaker open
         // for at least Retry-After, review served by the fallback.
         let before = chat_hits.load(Ordering::SeqCst);
+        // T1-4: Retry-After is 45 s, and the breaker is stamped `now + 45` when
+        // the 429 arrives. Compare against the moment BEFORE the request, not
+        // against a fresh `now` after it: a slow or contended worker spends
+        // seconds between the two and the old `now + 40` edge flaked.
+        let request_started_at = chrono::Utc::now().timestamp();
         let third = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
             .await
             .unwrap();
@@ -20700,7 +20716,10 @@ mod reviewer_chain_dispatch_tests {
         );
         let gate = gate_of(home, "gated-model/reviewer").expect("breaker opened");
         assert_eq!(gate.open_count, 1);
-        assert!(gate.retry_not_before_unix.unwrap() >= chrono::Utc::now().timestamp() + 40);
+        assert!(
+            gate.retry_not_before_unix.unwrap() >= request_started_at + 45,
+            "the breaker must stay open for the full Retry-After"
+        );
 
         // Next run: skipped without any gated request, reported, never a pass.
         let (m0, c0) = (
