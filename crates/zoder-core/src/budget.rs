@@ -333,8 +333,37 @@ impl Budget {
     }
 }
 
+/// Map ONE evaluation result to its verdict, and hand back the decline so the
+/// caller can sync the host marker.
+///
+/// FAIL CLOSED: `Err` becomes `Confirm`, never `WithinBudget`. The earlier
+/// `.ok().flatten()` shape turned any error into `None`, which read as "within
+/// budget" — a silent fail-open on an unreadable ledger or a broken pricing
+/// catalog. The declined-value arm is `None` on an error because an error is
+/// not a proven cap trip, so no marker may be written from it.
+fn decline_to_verdict(
+    result: anyhow::Result<Option<BudgetDecline>>,
+) -> (BudgetVerdict, Option<Option<BudgetDecline>>) {
+    match result {
+        Ok(decline) => {
+            let verdict = match &decline {
+                Some(d) => BudgetVerdict::Confirm(d.message.clone()),
+                None => BudgetVerdict::WithinBudget,
+            };
+            // `Some(decline)` = "a real decision was made, sync the marker".
+            (verdict, Some(decline))
+        }
+        Err(e) => (
+            BudgetVerdict::Confirm(format!(
+                "BUDGET: could not evaluate the pre-call budget ({e:#}); confirm to proceed"
+            )),
+            // `None` = no real decision, so no marker write.
+            None,
+        ),
+    }
+}
+
 impl Budget {
-    /// [`Budget::evaluate_call`] that ALSO keeps the host cooldown marker in
     /// step with the verdict (D8 step 12).
     ///
     /// Same call, same verdict, same `month_spent` closure; the only extra
@@ -353,6 +382,11 @@ impl Budget {
     /// The marker write is best-effort: a host whose ledger directory is not
     /// writable still gets its budget refusal (the write error is dropped, not
     /// fatal). The verdict is the authority; the marker is the host signal.
+    ///
+    /// An ERROR from the evaluation itself is NOT dropped: it fails closed to
+    /// `Confirm` with the error text. Mapping it to `None` would report
+    /// `WithinBudget` on an unreadable ledger or unpriceable model — exactly
+    /// the fail-open the gate exists to prevent.
     pub fn evaluate_call_with_host_cooldown(
         &self,
         ledger_path: &Path,
@@ -363,15 +397,14 @@ impl Budget {
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
         let now = ts.unwrap_or_else(Utc::now);
-        let decline = self
-            .evaluate_call_decline(pricing, model, tokens, ts, month_spent)
-            .ok()
-            .flatten();
-        let _ = self.sync_host_cooldown(ledger_path, decline.as_ref(), now);
-        match decline {
-            Some(decline) => BudgetVerdict::Confirm(decline.message),
-            None => BudgetVerdict::WithinBudget,
+        let verdict =
+            decline_to_verdict(self.evaluate_call_decline(pricing, model, tokens, ts, month_spent));
+        // Only a real (Ok) decision touches the marker; an evaluation error
+        // writes none (an error is not a proven cap trip).
+        if let Some(decline) = verdict.1 {
+            self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now);
         }
+        verdict.0
     }
 
     /// The pure two-number form of
@@ -384,14 +417,33 @@ impl Budget {
         month_spent_usd: f64,
         now: DateTime<Utc>,
     ) -> BudgetVerdict {
-        let decline = self
-            .evaluate_decline(estimate_usd, month_spent_usd)
-            .ok()
-            .flatten();
-        let _ = self.sync_host_cooldown(ledger_path, decline.as_ref(), now);
-        match decline {
-            Some(decline) => BudgetVerdict::Confirm(decline.message),
-            None => BudgetVerdict::WithinBudget,
+        let verdict = decline_to_verdict(self.evaluate_decline(estimate_usd, month_spent_usd));
+        if let Some(decline) = verdict.1 {
+            self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now);
+        }
+        verdict.0
+    }
+
+    /// [`Budget::sync_host_cooldown`], but never fatal: the marker is an
+    /// ADVISORY host signal, while the budget verdict is the authority. A
+    /// read-only ledger directory must not fail the gate, so a write error is
+    /// reported on stderr and the call proceeds with its verdict.
+    ///
+    /// It is NOT silently dropped: a marker that cannot be cleared would keep
+    /// parking the host on state nothing re-confirms, and that has to be
+    /// visible to whoever owns the host.
+    fn sync_host_cooldown_or_warn(
+        &self,
+        ledger_path: &Path,
+        decline: Option<&BudgetDecline>,
+        now: DateTime<Utc>,
+    ) {
+        if let Err(e) = self.sync_host_cooldown(ledger_path, decline, now) {
+            eprintln!(
+                "[zoder] warning: could not update the host cooldown marker beside {} \
+                 ({e:#}); the budget verdict stands",
+                ledger_path.display()
+            );
         }
     }
 
@@ -663,6 +715,89 @@ mod cap_trip_sets_host_cooldown {
         assert!(
             !cooldown_active(&ledger),
             "phantom spend: an unreadable ledger must not back the host off"
+        );
+    }
+
+    /// The `Err` arm of [`decline_to_verdict`], tested directly: an error must
+    /// map to `Confirm`, and it must report "no real decision" so the caller
+    /// writes no marker. This is the unit that the old `.ok().flatten()`
+    /// silently got wrong — `.ok()` discarded the error and `.flatten()` made
+    /// it `None`, i.e. `WithinBudget`.
+    #[test]
+    fn a_failed_evaluation_maps_to_confirm_and_no_marker() {
+        let (verdict, sync) = decline_to_verdict(Err(anyhow::anyhow!("ledger is unreadable")));
+        match verdict {
+            BudgetVerdict::Confirm(msg) => assert!(
+                msg.contains("could not evaluate") && msg.contains("ledger is unreadable"),
+                "the refusal must name the error, got {msg:?}"
+            ),
+            other => panic!("an evaluation error must fail closed, got {other:?}"),
+        }
+        assert!(
+            sync.is_none(),
+            "an error is not a proven cap trip: the caller must not write a marker"
+        );
+    }
+
+    /// The happy arms keep their exact meaning: a decline is `Confirm` with
+    /// its own text, and "no decline" is `WithinBudget` with a live sync.
+    #[test]
+    fn an_ok_evaluation_keeps_its_verdict() {
+        let (within, sync) = decline_to_verdict(Ok(None));
+        assert_eq!(within, BudgetVerdict::WithinBudget);
+        assert_eq!(
+            sync,
+            Some(None),
+            "a fit call still syncs (it may clear a marker)"
+        );
+
+        let decline = BudgetDecline {
+            message: "over the monthly cap".into(),
+            tripped: Some(TrippedCap::Monthly),
+            limit_usd: Some(10.0),
+            spent_usd: Some(12.0),
+        };
+        let (confirm, sync) = decline_to_verdict(Ok(Some(decline)));
+        assert_eq!(
+            confirm,
+            BudgetVerdict::Confirm("over the monthly cap".into())
+        );
+        assert!(
+            sync.flatten().is_some_and(|d| d.monthly_cap_tripped()),
+            "the monthly-trip decline must reach the marker sync"
+        );
+    }
+
+    #[test]
+    fn an_evaluation_error_is_a_refusal_never_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let pricing = priced_catalog("paid-model", 100.0);
+        let budget = Budget {
+            monthly_cap_usd: Some(10.0),
+            ..Default::default()
+        };
+        // The cooldown-aware form must agree with the plain form on the
+        // fail-closed contract: an unreadable ledger is a refusal here too.
+        let verdict = budget.evaluate_call_with_host_cooldown(
+            &ledger,
+            &pricing,
+            "paid-model",
+            CallTokens {
+                tokens_in: 1_000,
+                tokens_out: 1_000,
+                cache_hit_tokens: 0,
+            },
+            None,
+            || Err(anyhow::anyhow!("ledger is unreadable")),
+        );
+        match verdict {
+            BudgetVerdict::Confirm(_) => {}
+            other => panic!("an evaluation error must fail closed, got {other:?}"),
+        }
+        assert!(
+            !cooldown_active(&ledger),
+            "an error is not a proven monthly trip: it must not park the host"
         );
     }
 
