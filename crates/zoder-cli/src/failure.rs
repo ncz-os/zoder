@@ -93,6 +93,12 @@ pub(crate) enum FailureClass {
     /// Nothing is broken; the review completed and refused the change.
     /// Exit `10`.
     Blocked,
+    /// The daemon is at session capacity (`session_limit`, exit `60`). The
+    /// same invocation may succeed once a slot frees, but the in-client
+    /// backoff already spent the fast retries, so a caller must back off at
+    /// the fleet level (cooldown, no retry-budget charge) instead of
+    /// hot-looping the same invocation.
+    Infrastructure,
 }
 
 impl FailureClass {
@@ -104,6 +110,7 @@ impl FailureClass {
             FailureClass::Config => "config",
             FailureClass::Budget => "budget",
             FailureClass::Blocked => "blocked",
+            FailureClass::Infrastructure => "infrastructure",
         }
     }
 
@@ -120,6 +127,7 @@ impl FailureClass {
             FailureClass::Budget => EXIT_BUDGET,
             FailureClass::Config => EXIT_CONFIG,
             FailureClass::Permanent => EXIT_INTERNAL,
+            FailureClass::Infrastructure => EXIT_INFRASTRUCTURE,
         }
     }
 
@@ -131,6 +139,7 @@ impl FailureClass {
         FailureClass::Config,
         FailureClass::Budget,
         FailureClass::Blocked,
+        FailureClass::Infrastructure,
     ];
 
     /// Parse a class string back into a class (inverse of [`Self::as_str`]).
@@ -158,6 +167,9 @@ pub(crate) const EXIT_BUDGET: i32 = 30;
 pub(crate) const EXIT_CONFIG: i32 = 40;
 /// Internal: a bug, or a failure the contract does not classify yet.
 pub(crate) const EXIT_INTERNAL: i32 = 50;
+/// Infrastructure: the daemon is at session capacity. Distinct rung (not
+/// transient) so a fleet worker can cool down instead of hot-looping.
+pub(crate) const EXIT_INFRASTRUCTURE: i32 = 60;
 /// Reserved: the oneshot refusal band. Never assigned to a review/loop code.
 ///
 /// Test-only: the constant exists so the invariant "no failure code ever exits
@@ -212,6 +224,10 @@ pub(crate) enum FailureCode {
     EngineBudgetExceeded,
     /// The engine could not be reached at all.
     EngineUnreachable,
+    /// The daemon answered `session/new` with -32001 / "session limit"
+    /// past the in-client retry budget: it is at session capacity.
+    /// Infrastructure class (exit 60), never a model defect.
+    SessionLimit,
     /// A cancel was never confirmed by the engine; the worktree is tainted.
     CancelUnconfirmed,
     /// The worktree was left in an unknown state (see `cancel_unconfirmed`).
@@ -243,6 +259,7 @@ impl FailureCode {
             FailureCode::PolicyViolation => "policy_violation",
             FailureCode::EngineBudgetExceeded => "engine_budget_exceeded",
             FailureCode::EngineUnreachable => "engine_unreachable",
+            FailureCode::SessionLimit => "session_limit",
             FailureCode::CancelUnconfirmed => "cancel_unconfirmed",
             FailureCode::WorktreeTainted => "worktree_tainted",
             FailureCode::ConfigError => "config",
@@ -259,6 +276,7 @@ impl FailureCode {
     pub(crate) const fn class(self) -> FailureClass {
         match self {
             FailureCode::ReviewBlocked => FailureClass::Blocked,
+            FailureCode::SessionLimit => FailureClass::Infrastructure,
             FailureCode::EngineBudgetExceeded => FailureClass::Budget,
             FailureCode::ReviewersUnavailable
             | FailureCode::AuthorFailed
@@ -303,6 +321,7 @@ impl FailureCode {
         FailureCode::PolicyViolation,
         FailureCode::EngineBudgetExceeded,
         FailureCode::EngineUnreachable,
+        FailureCode::SessionLimit,
         FailureCode::CancelUnconfirmed,
         FailureCode::WorktreeTainted,
         FailureCode::ConfigError,
@@ -711,6 +730,17 @@ fn classify_message_code(lower: &str) -> Option<FailureCode> {
         return Some(FailureCode::EngineBudgetExceeded);
     }
 
+    // The daemon is at session capacity. Recognised SECOND (right after the
+    // budget refusal): the marker the ACP client emits (`session_limit:`)
+    // or the raw daemon shape (`Session limit reached (code -32001)`). The
+    // -32001 code alone is NOT matched — the daemon reuses it for unrelated
+    // replies such as approval denials (see `is_session_limit_message`).
+    if has_word(lower, "session_limit")
+        || (has_word(lower, "session limit") && has_word(lower, "32001"))
+    {
+        return Some(FailureCode::SessionLimit);
+    }
+
     // The diff was cut off during acquisition, so the tail was never seen.
     if has_word(lower, "review diff was truncated during acquisition")
         || has_word(lower, DIFF_TRUNCATED_MARKER)
@@ -975,10 +1005,11 @@ mod tests {
                 "reviewer_budget_exhausted",
                 "author_failed",
                 "author_timeout",
-                "policy_violation",
-                "engine_budget_exceeded",
-                "engine_unreachable",
-                "cancel_unconfirmed",
+            "policy_violation",
+            "engine_budget_exceeded",
+            "engine_unreachable",
+            "session_limit",
+            "cancel_unconfirmed",
                 "worktree_tainted",
                 "config",
                 "usage",
@@ -1006,11 +1037,18 @@ mod tests {
     }
 
     #[test]
-    fn the_five_classes_are_the_documented_five() {
+    fn the_six_classes_are_the_documented_six() {
         let classes: Vec<&str> = FailureClass::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(
             classes,
-            vec!["transient", "permanent", "config", "budget", "blocked"]
+            vec![
+                "transient",
+                "permanent",
+                "config",
+                "budget",
+                "blocked",
+                "infrastructure"
+            ]
         );
         for c in FailureClass::ALL {
             assert_eq!(FailureClass::from_str_exact(c.as_str()), Some(*c));
@@ -1028,6 +1066,10 @@ mod tests {
         // to retry, so it shares 50 with `internal` and the unclassified
         // fallback.
         assert_eq!(FailureClass::Permanent.exit_code(), 50);
+        // Session capacity is its own rung: a fleet worker cools down on 60
+        // instead of hot-looping a transient retry or charging a budget.
+        assert_eq!(FailureClass::Infrastructure.exit_code(), 60);
+        assert_eq!(EXIT_INFRASTRUCTURE, 60);
         // 0 and 75 are outside the class ladder: 0 is success and 75 is
         // reserved for the oneshot refusal band, never a review/loop class.
         for c in FailureClass::ALL {
@@ -1037,7 +1079,13 @@ mod tests {
         // Every ladder rung below 75 has exactly one class that uses it, with
         // one deliberate exception: 50 is the `permanent`/`internal` band, so
         // `Permanent` shares it with the unclassified fallback by design.
-        for n in [EXIT_BLOCKED, EXIT_TRANSIENT, EXIT_BUDGET, EXIT_CONFIG] {
+        for n in [
+            EXIT_BLOCKED,
+            EXIT_TRANSIENT,
+            EXIT_BUDGET,
+            EXIT_CONFIG,
+            EXIT_INFRASTRUCTURE,
+        ] {
             let users: Vec<&str> = FailureClass::ALL
                 .iter()
                 .filter(|c| c.exit_code() == n)
@@ -1122,8 +1170,8 @@ mod tests {
     /// The `expected` list is the contract. It must stay exhaustive over
     /// [`FailureCode::ALL`] — the trailing assertion fails when a code is
     /// added without a documented class and exit code, so the table cannot
-    /// silently drift from the enum (decision D3: codes 0/10/20/30/40/50/75,
-    /// classes transient/permanent/config/budget/blocked).
+    /// silently drift from the enum (decision D3: codes 0/10/20/30/40/50/60/75,
+    /// classes transient/permanent/config/budget/blocked/infrastructure).
     #[test]
     fn each_named_code_carries_its_documented_class_and_exit_code() {
         let expected = [
@@ -1148,6 +1196,7 @@ mod tests {
             (FailureCode::PolicyViolation, FailureClass::Config, 40),
             (FailureCode::EngineBudgetExceeded, FailureClass::Budget, 30),
             (FailureCode::EngineUnreachable, FailureClass::Transient, 20),
+            (FailureCode::SessionLimit, FailureClass::Infrastructure, 60),
             (FailureCode::CancelUnconfirmed, FailureClass::Transient, 20),
             (FailureCode::WorktreeTainted, FailureClass::Transient, 20),
             (FailureCode::ConfigError, FailureClass::Config, 40),
@@ -1488,6 +1537,26 @@ mod tests {
         assert!(classify_message("something entirely unexpected happened").is_none());
     }
 
+    /// FB110: the daemon reuses -32001 for unrelated replies (approval
+    /// denials), so the code alone never classifies session capacity.
+    #[test]
+    fn approval_denial_32001_is_not_session_capacity() {
+        assert!(classify_message("user denied approval (code -32001)").is_none());
+        assert!(classify_message("session limit reached").is_none());
+    }
+
+    /// FB110: the new code round-trips through the envelope with its own
+    /// class and rung.
+    #[test]
+    fn session_limit_envelope_carries_infrastructure_class_and_exit_60() {
+        let f = ClassifiedFailure::new(FailureCode::SessionLimit, "session_limit: full");
+        assert_eq!(f.class(), FailureClass::Infrastructure);
+        assert_eq!(f.exit_code(), 60);
+        let env = error_envelope(&f);
+        assert_eq!(env["error"]["code"], "session_limit");
+        assert_eq!(env["error"]["class"], "infrastructure");
+    }
+
     #[test]
     fn the_recognized_markers_land_on_their_codes() {
         let cases = [
@@ -1544,6 +1613,16 @@ mod tests {
             (
                 "connecting to engine at /run/x.sock: No such file or directory",
                 FailureCode::EngineUnreachable,
+            ),
+            (
+                "session_limit: daemon session capacity reached after 6 tries \
+                 (session/new answered Session limit reached (code -32001)); \
+                 not retrying further",
+                FailureCode::SessionLimit,
+            ),
+            (
+                "session/new resume failed: Session limit reached (code -32001)",
+                FailureCode::SessionLimit,
             ),
         ];
         for (msg, want) in cases {
@@ -1662,7 +1741,7 @@ mod tests {
         for c in FailureClass::ALL {
             assert!(doc.contains(c.as_str()), "docs must document class {c}");
         }
-        for n in [0, 10, 20, 30, 40, 50, 75] {
+        for n in [0, 10, 20, 30, 40, 50, 60, 75] {
             assert!(doc.contains(&n.to_string()), "docs must document exit {n}");
         }
     }

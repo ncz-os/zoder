@@ -34,24 +34,29 @@ function it comes from.
 - `code` is the SPECIFIC failure (`FailureCode`, the frozen list below). It is
   what a caller dispatches on, and it never changes meaning.
 - `class` is the RETRY POLICY the caller applies (`FailureClass`): one of
-  transient, permanent, config, budget or blocked — see the class table below.
+  transient, permanent, config, budget, blocked or infrastructure — see the
+  class table below.
 
 Several codes share a class, and the class fixes the exit code.
 
-## The five classes
+## The six classes
 
-| Class       | Exit | Retryable | Meaning                                                                                     |
-| ----------- | ---- | --------- | ------------------------------------------------------------------------------------------- |
-| `transient` | 20   | yes       | The same invocation may succeed later: the provider was down, the engine was unreachable.    |
-| `permanent` | 50   | no        | The same invocation fails identically and nothing is misconfigured. Nothing to fix, nothing to retry. |
-| `config`    | 40   | no        | An operator must change something: a bad config, a bad `--reviewer` pin, the reviewer's output budget. |
-| `budget`    | 30   | no        | A budget window is exhausted. Wait for `retry_after_s` / `resets_at` before retrying.       |
-| `blocked`   | 10   | no        | Nothing is broken: the review completed and refused the change.                              |
+| Class            | Exit | Retryable | Meaning                                                                                     |
+| ---------------- | ---- | --------- | ------------------------------------------------------------------------------------------- |
+| `transient`      | 20   | yes       | The same invocation may succeed later: the provider was down, the engine was unreachable.    |
+| `permanent`      | 50   | no        | The same invocation fails identically and nothing is misconfigured. Nothing to fix, nothing to retry. |
+| `config`         | 40   | no        | An operator must change something: a bad config, a bad `--reviewer` pin, the reviewer's output budget. |
+| `budget`         | 30   | no        | A budget window is exhausted. Wait for `retry_after_s` / `resets_at` before retrying.       |
+| `blocked`        | 10   | no        | Nothing is broken: the review completed and refused the change.                              |
+| `infrastructure` | 60   | no        | The daemon is at session capacity (`session_limit`). Back off at fleet level instead of hot-looping. |
 
 `retryable` answers exactly one question: "is this the same request failing,
 or is something in the environment broken?" It is a hint, not a guarantee. A
 `budget` failure becomes retryable once its window resets, which the envelope
-says with `retry_after_s`.
+says with `retry_after_s`. An `infrastructure` failure is NOT marked
+retryable even though a slot may free: the client already spent the fast
+retries (2 s doubling to 30 s, 6 tries) before reporting it, so an immediate
+caller-side retry just hot-loops a full daemon — cool down first.
 
 ## The named codes
 
@@ -73,6 +78,7 @@ different failure.
 | `policy_violation`          | `config`    | 40   | The run was refused by policy (for example the free-only policy).                                          |
 | `engine_budget_exceeded`    | `budget`    | 30   | The EXTERNAL engine refused for budget; `detail.resets_at` when known.                                     |
 | `engine_unreachable`        | `transient` | 20   | The agent engine (the `zeroclaw` daemon) could not be reached at all.                                      |
+| `session_limit`             | `infrastructure` | 60 | The daemon answered `session/new` with -32001 / "session limit" past the in-client retry budget: it is at capacity. Not a model defect; no breaker trip, no chain fallback. |
 | `cancel_unconfirmed`        | `transient` | 20   | A cancel was never confirmed by the engine; the worktree is tainted.                                       |
 | `worktree_tainted`          | `transient` | 20   | The worktree was left in an unknown state (see `cancel_unconfirmed`).                                      |
 | `config`                    | `config`    | 40   | An environment / config problem: an unreadable or invalid config, a bad `--engine` value.                  |
@@ -103,6 +109,8 @@ internal-class outcome: nothing to fix, nothing to retry).
 - `40` — config: an operator has to change something.
 - `50` — internal / permanent: a bug, an identical repeat failure, or an
   unclassified error.
+- `60` — infrastructure: the daemon is at session capacity. Cool down at
+  fleet level (no retry-budget charge); do not hot-loop the invocation.
 - `75` — reserved for the oneshot refusal band. Never assigned to a review /
   loop code.
 - `78` — a zoder budget-cap decline on the oneshot (`exec`) path
@@ -159,7 +167,29 @@ parses.
 
 The `zoder loop` payload carries the same `failure` object next to its
 `kind`, `resolved`, `iterations` and `log` fields, plus the loop's
-`teardown.reason`.
+`teardown.reason` and a `failure_class` convenience string — the combined
+`class:code` handle (for example `infrastructure:session_limit`) — so a
+fleet worker reads the dispatch handle without joining two keys:
+
+```json
+{
+  "kind": "loop",
+  "resolved": false,
+  "final_verdict": "reviewer_unavailable",
+  "failure": {
+    "code": "session_limit",
+    "class": "infrastructure",
+    "detail": { "message": "session_limit: daemon session capacity reached after 6 tries ..." }
+  },
+  "failure_class": "infrastructure:session_limit",
+  "teardown": { "reason": "session_limit", "resolved": false, "iterations": 1 }
+}
+```
+
+`failure_class` is present exactly when `failure` is present. Note the
+teardown `reason`: when the author failed (here: no session was ever
+obtained), the reason names the author-side failure code, never
+`reviewer_unavailable` with a null reviewer.
 
 ### The command produced no result
 
@@ -229,6 +259,29 @@ and extracts the reset timestamp when one is present. The recognition runs:
 The reset timestamp is carried verbatim. It is never invented, and it is
 absent when the engine did not report one.
 
+## Daemon session capacity
+
+The `zeroclaw` daemon answers `session/new` with JSON-RPC -32001 /
+"Session limit reached" when no session slot is free. The ACP client
+(`crates/acp-client/src/lib.rs`: `session_new_with_limit_retry`) retries
+that answer in-client — 6 tries, 2 s doubling to a 30 s cap, plus jitter —
+and only then fails. The -32001 code alone is NOT matched: the daemon
+reuses it for unrelated replies (for example "user denied approval" on
+approve ids), so code AND the "session limit" message text are required,
+and the retry applies only to `session/new` responses.
+
+After the budget the failure is infrastructure, not a model defect, so:
+
+- the chain fallback does NOT record a breaker strike and does NOT try the
+  next model (`main.rs`: every link would fail identically into a full
+  daemon);
+- the loop records the refusal and stops before check, review and commit —
+  the engine never obtained a session, so nothing was authored and the
+  worktree is untouched;
+- the result carries `session_limit` / `infrastructure` (exit 60) with
+  `failure_class: "infrastructure:session_limit"`, and the teardown
+  `reason` is `session_limit`, never `reviewer_unavailable`.
+
 ## How the codes are assigned
 
 | Failure site                                                                 | Code                        |
@@ -246,8 +299,9 @@ absent when the engine did not report one.
 | `cmd_loop`: the loop ended unresolved                                        | `loop_exhausted`            |
 | `review_diff`: the diff is above the byte / hunk / chunk budget              | `diff_too_large`            |
 | `review_diff`: the diff was truncated during acquisition                     | `diff_truncated`            |
-| `main`: the engine config could not be loaded                                | `config`                    |
-| `main`: the agent engine could not be reached                                | `engine_unreachable`        |
+| `main`: the engine config could not be loaded                                | `config`                    || `main`: the agent engine could not be reached                                | `engine_unreachable`       |
+| ACP client: `session/new` refused with -32001 past the retry budget         | `session_limit`            |
+| `cmd_loop`: the author turn never obtained a session (session capacity)     | `session_limit` (teardown `reason: session_limit`, never `reviewer_unavailable`) |
 | `main`: the engine's `budget_exceeded:` refusal                              | `engine_budget_exceeded`    |
 | `main`: the invocation was used incorrectly                                  | `usage`                     |
 
@@ -266,6 +320,7 @@ case "$rc" in
   30) echo "budget exhausted — wait for resets_at" ;;
   40) echo "config — an operator must fix something" ;;
   50) echo "permanent / internal — do not retry, report it" ;;
+  60) echo "infrastructure — daemon at session capacity, cool down, do not charge the retry budget" ;;
   *)  echo "failed (rc=$rc)" ;;
 esac
 ```
