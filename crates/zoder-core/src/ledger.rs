@@ -903,6 +903,14 @@ impl BillableReservation {
 /// `Drop` cannot report an error (it runs on unwinding and at scope exit),
 /// so `tracing::warn!` names the lock and the budget: that is the only
 /// signal the operator gets that the ledger lock is stuck.
+///
+/// Note that `Drop` uses the SAME budget as every other site: a drop that
+/// meets a held lock waits up to the configured budget before giving up.
+/// That is deliberate. Giving up on the first `try_lock` would skip the
+/// cancel/reconcile of the common case — a peer releasing the lock moments
+/// later — and leave rows to the recovery scan that this code can settle
+/// now. The budget is what bounds the wait; `ZODER_LEDGER_LOCK_TIMEOUT_S`
+/// lowers it for a process that must never stall on exit.
 impl Drop for BillableReservation {
     fn drop(&mut self) {
         if self.armed && !self.reconciled {
@@ -3948,7 +3956,9 @@ mod lock_deadline_tests {
                 "the deadline error must say the lock is held elsewhere: {message}"
             );
             assert!(
-                elapsed < Duration::from_secs(10),
+                // Bound close to the 1 s budget: a 10 s bound would pass even
+                // if the deadline arithmetic or backoff were wrong.
+                elapsed < Duration::from_secs(3),
                 "record() took {elapsed:?}, not bounded by its 1 s budget"
             );
             assert!(
@@ -3996,7 +4006,9 @@ mod lock_deadline_tests {
                 "the deadline error must name the timeout and the shared lock: {message}"
             );
             assert!(
-                elapsed < Duration::from_secs(10),
+                // Bound close to the 1 s budget: a 10 s bound would pass even
+                // if the deadline arithmetic or backoff were wrong.
+                elapsed < Duration::from_secs(3),
                 "the shared read took {elapsed:?}, not bounded by its 1 s budget"
             );
         });

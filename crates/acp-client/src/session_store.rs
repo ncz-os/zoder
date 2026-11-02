@@ -963,7 +963,9 @@ mod tests {
                 "the deadline error must name the lock path: {message}"
             );
             assert!(
-                elapsed < std::time::Duration::from_secs(10),
+                // Bound close to the 1 s budget: a 10 s bound would pass even
+                // if the deadline arithmetic or backoff were wrong.
+                elapsed < std::time::Duration::from_secs(3),
                 "acquire took {elapsed:?}, not bounded by its 1 s budget"
             );
         });
