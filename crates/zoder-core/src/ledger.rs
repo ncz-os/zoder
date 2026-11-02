@@ -896,9 +896,12 @@ impl BillableReservation {
 ///   reporting "unknown cost" instead of silently dropping the spend. The
 ///   row is settled later by the stale-armed pass in
 ///   `recover_abandoned_prepared`, which requires STALE_RESERVATION_TRIM_S
-///   of age because a fresh armed row may still belong to a live owner; the
-///   owner lock this impl releases is that pass's precondition. Retrying
-///   here would only extend a hang that has already blocked for the budget.
+///   of age because a fresh armed row may still belong to a live owner.
+///   The owner sidecar lock released at the END of this impl is that pass's
+///   precondition, so the row only becomes eligible once the drop returns —
+///   the warning below is a heads-up, not a signal to scan immediately.
+///   Retrying here would only extend a hang that has already blocked for
+///   the budget.
 /// - an UNARMED reservation (nothing was dispatched) leaves its prepared row
 ///   for the same scan, which closes prepared rows once the owner lock is
 ///   gone — released at the end of this impl.
@@ -1125,7 +1128,7 @@ fn lock_bounded(file: &File, path: &Path, mode: LockMode, holder: &str) -> anyho
         if now >= deadline {
             anyhow::bail!(
                 "timed out after {}s waiting for the ledger lock at {} ({} lock; {holder}; \
-                 waited {attempt} time(s) up to this budget — set \
+                 {attempt} attempt(s) up to this budget — set \
                  {LEDGER_LOCK_TIMEOUT_ENV} to a larger number of seconds, or 0 to wait \
                  indefinitely)",
                 format_budget(budget),
