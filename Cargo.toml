@@ -7,6 +7,7 @@ members = [
     "crates/zoder-core",
     "crates/zoder-cli",
     "crates/zoder-mcp-server",
+    "crates/test-support",
 ]
 
 [workspace.package]

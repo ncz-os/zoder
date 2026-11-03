@@ -32,6 +32,8 @@ libc = "0.2"
 
 [dev-dependencies]
 wiremock.workspace = true
+# Shared env lock / env guard / isolated home for hermetic tests.
+zoder-test-support = { path = "../test-support" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 

@@ -1,0 +1,13 @@
+[package]
+name = "zoder-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Test-only helpers for the zoder workspace: one process-wide env lock, an RAII env guard, an isolated home, and git fixture hardening. Used only as a dev-dependency."
+
+[dependencies]
+tempfile.workspace = true
