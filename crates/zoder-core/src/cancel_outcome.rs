@@ -201,10 +201,7 @@ mod tests {
     #[test]
     fn a_message_mentioning_a_missing_path_is_not_proof() {
         let error = anyhow::anyhow!("connecting to engine at /tmp/gone.sock failed");
-        assert_eq!(
-            classify_cancel_error(&error),
-            CancelOutcome::NotConfirmed
-        );
+        assert_eq!(classify_cancel_error(&error), CancelOutcome::NotConfirmed);
     }
 
     /// Only the "reached the daemon but it stayed silent" arm may be retried:

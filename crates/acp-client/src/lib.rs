@@ -4965,8 +4965,7 @@ where
     // budget is the time LEFT on it, recomputed for every attempt, and a
     // goose session/new timeout still surfaces the clean error below — no
     // session id was ever issued, so no `session/cancel` may be sent.
-    let goose_timeout_msg =
-        || format!("goose session/new timed out after {:?}", opts.timeout);
+    let goose_timeout_msg = || format!("goose session/new timed out after {:?}", opts.timeout);
     let goose_read_budget = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let new_res = match session_new_with_limit_retry(
         reader,
@@ -5850,8 +5849,6 @@ fn is_session_limit_error(error: &RpcError) -> bool {
         && error.message.to_ascii_lowercase().contains("session limit")
 }
 
-
-
 /// Attempt budget for a daemon session-capacity refusal: 1 initial try plus
 /// one retry per schedule entry (6 tries total).
 pub(crate) const SESSION_LIMIT_MAX_ATTEMPTS: u32 = 6;
@@ -5862,7 +5859,10 @@ pub(crate) const SESSION_LIMIT_MAX_ATTEMPTS: u32 = 6;
 /// The caller adds jitter (see [`session_limit_jitter`]); this schedule is
 /// pure so tests pin it exactly.
 fn session_limit_retry_delay(attempt: u32) -> Duration {
-    Duration::from_secs(2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4)).min(30))
+    Duration::from_secs(
+        2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4))
+            .min(30),
+    )
 }
 
 /// Uplift `base` by 0..25% using a time-seeded xorshift: enough to spread a
@@ -14071,7 +14071,9 @@ mod mr1_reliability_regression {
     /// turn against a full daemon; one that shrinks it hot-loops the daemon.
     #[test]
     fn session_limit_retry_schedule_is_2s_doubling_capped_at_30s() {
-        let got: Vec<Duration> = (1..=SESSION_LIMIT_MAX_ATTEMPTS).map(session_limit_retry_delay).collect();
+        let got: Vec<Duration> = (1..=SESSION_LIMIT_MAX_ATTEMPTS)
+            .map(session_limit_retry_delay)
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -14130,12 +14132,18 @@ mod mr1_reliability_regression {
         assert!(!is_session_limit_error(&wrong_code));
         // Message-level predicate: the terminal marker and the raw daemon
         // shape match; the approval denial does not.
-        assert!(is_session_limit_message("session_limit: daemon session capacity reached"));
+        assert!(is_session_limit_message(
+            "session_limit: daemon session capacity reached"
+        ));
         assert!(is_session_limit_message(
             "session/new resume failed: Session limit reached (code -32001)"
         ));
-        assert!(!is_session_limit_message("user denied approval (code -32001)"));
-        assert!(!is_session_limit_message("Session limit reached (code -32000)"));
+        assert!(!is_session_limit_message(
+            "user denied approval (code -32001)"
+        ));
+        assert!(!is_session_limit_message(
+            "Session limit reached (code -32000)"
+        ));
     }
 
     /// Drive one `session/new` exchange against a fake server over a duplex
@@ -14170,7 +14178,10 @@ mod mr1_reliability_regression {
                     }
                 };
                 let s = serde_json::to_string(&reply).unwrap();
-                server_w.write_all(format!("{s}\n").as_bytes()).await.unwrap();
+                server_w
+                    .write_all(format!("{s}\n").as_bytes())
+                    .await
+                    .unwrap();
                 server_w.flush().await.unwrap();
             }
             attempts
@@ -14221,9 +14232,11 @@ mod mr1_reliability_regression {
     async fn session_new_reports_session_limit_past_the_budget() {
         let script: Vec<Result<&'static str, (i64, &'static str)>> =
             vec![Err((-32001, "Session limit reached")); 10];
-        let (res, attempts) =
-            drive_session_new_script(script, &[Duration::from_millis(10), Duration::from_millis(10)])
-                .await;
+        let (res, attempts) = drive_session_new_script(
+            script,
+            &[Duration::from_millis(10), Duration::from_millis(10)],
+        )
+        .await;
         // The budget-exhausted path is a fatal outer error (not an RpcError
         // for the resume-reject path): nothing is resumable about a full
         // daemon.
@@ -14233,7 +14246,10 @@ mod mr1_reliability_regression {
             is_session_limit_message(&text),
             "terminal error must carry the session_limit marker; got: {text}"
         );
-        assert!(text.contains("3 tries"), "error must state the attempt count; got: {text}");
+        assert!(
+            text.contains("3 tries"),
+            "error must state the attempt count; got: {text}"
+        );
         assert_eq!(attempts, 3, "2 delays means 3 attempts, then stop");
     }
 
@@ -14246,7 +14262,9 @@ mod mr1_reliability_regression {
             &[Duration::from_millis(10)],
         )
         .await;
-        let rpc = res.unwrap().expect_err("non-limit error returns as RpcError");
+        let rpc = res
+            .unwrap()
+            .expect_err("non-limit error returns as RpcError");
         assert_eq!(rpc.code, -32000);
         assert_eq!(attempts, 1, "no retry on a non-limit error");
     }
@@ -14356,7 +14374,11 @@ mod mr1_reliability_regression {
             .iter()
             .filter(|f| f["method"] == "session/new")
             .collect();
-        assert_eq!(news.len(), 2, "exactly one retry after the refusal: {frames:?}");
+        assert_eq!(
+            news.len(),
+            2,
+            "exactly one retry after the refusal: {frames:?}"
+        );
         drop(dir);
     }
 
