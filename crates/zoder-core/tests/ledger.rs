@@ -24,6 +24,7 @@ fn entry(t: &str, model: &str, cost: f64, tin: u64, tout: u64) -> Entry {
         violation: None,
         tags: FinOpsTags::default(),
         billing: None,
+        estimated_cost_usd: None,
     }
 }
 

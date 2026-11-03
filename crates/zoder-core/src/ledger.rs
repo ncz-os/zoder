@@ -202,10 +202,7 @@ impl Entry {
     /// history. Every unrecognised value is also treated as metered, so a
     /// future posture can never silently stop counting toward the cap.
     pub fn is_metered(&self) -> bool {
-        match self.billing.as_deref() {
-            Some("free") | Some("subscription") => false,
-            _ => true,
-        }
+        !matches!(self.billing.as_deref(), Some("free") | Some("subscription"))
     }
 }
 
