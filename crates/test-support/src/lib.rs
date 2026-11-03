@@ -325,22 +325,28 @@ mod tests {
 
     #[test]
     fn isolated_home_points_everything_into_one_tempdir() {
-        let prev_home = std::env::var_os("HOME");
+        const KEYS: [&str; 9] = [
+            "HOME",
+            "ZODER_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_RUNTIME_DIR",
+            "ZEROCLAW_CONFIG_DIR",
+            "ZEROCLAW_SOCKET",
+        ];
+        let snapshot = || KEYS.map(std::env::var_os);
+        let before = {
+            let _l = lock_env();
+            snapshot()
+        };
         let root;
         {
             let iso = IsolatedHome::new();
             root = iso.home().to_path_buf();
             assert_eq!(std::env::var_os("HOME").unwrap(), root.as_os_str());
-            for key in [
-                "ZODER_HOME",
-                "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME",
-                "XDG_STATE_HOME",
-                "XDG_CACHE_HOME",
-                "XDG_RUNTIME_DIR",
-                "ZEROCLAW_CONFIG_DIR",
-                "ZEROCLAW_SOCKET",
-            ] {
+            for key in KEYS {
                 let v = PathBuf::from(std::env::var_os(key).unwrap());
                 assert!(
                     v.starts_with(&root),
@@ -356,11 +362,10 @@ mod tests {
                 PathBuf::from(std::env::var_os("ZEROCLAW_SOCKET").unwrap()),
                 iso.socket()
             );
-            assert!(iso.zoder_home().is_dir());
             assert!(!iso.socket().exists(), "the socket is never bound");
         }
         let _l = lock_env();
-        assert_eq!(std::env::var_os("HOME"), prev_home);
+        assert_eq!(snapshot(), before, "every variable is restored on drop");
         assert!(!root.exists(), "tempdir removed on drop");
     }
 

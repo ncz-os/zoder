@@ -3264,8 +3264,10 @@ mod tests {
     /// never asked ("cancel budget exhausted with N session(s) left"): a
     /// session nobody asked is a session still editing the tree while the
     /// workspace is torn down under it.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
+    // Pinned to a current-thread runtime: the std mutex guard is held across
+    // the await (see the_async_cancel_phase_retires_an_unreachable_session).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn every_recorded_session_is_asked_at_least_once() {
         // Held for the WHOLE test: ATTEMPT_COUNTER and SESSIONS are process
         // globals, and a sibling's reset or extra session between our
@@ -3297,8 +3299,10 @@ mod tests {
     /// Two live sessions each get their own full settle window: the phase
     /// covers both instead of spending the first session's attempt on the
     /// whole fleet. With a phase-wide budget only the first would be asked.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
+    // Pinned to a current-thread runtime: the std mutex guard is held across
+    // the await (see the_async_cancel_phase_retires_an_unreachable_session).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn fleet_budget_covers_two_sessions() {
         // Held for the WHOLE test: ATTEMPT_COUNTER and SESSIONS are process
         // globals, and a sibling's reset or extra session between our
@@ -3329,8 +3333,10 @@ mod tests {
     /// The phase ceiling is checked BETWEEN passes, so it can never cost a
     /// session its first ask: one pass over three silent sessions asks all
     /// three even when the whole cap is far shorter than three windows.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
+    // Pinned to a current-thread runtime: the std mutex guard is held across
+    // the await (see the_async_cancel_phase_retires_an_unreachable_session).
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn cancel_phase_cap_does_not_truncate_the_first_pass() {
         // Held for the WHOLE test (see every_recorded_session_is_asked_at_least_once).
         let _lock = reap_test_lock();
