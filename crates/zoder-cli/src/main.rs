@@ -9769,15 +9769,16 @@ pub(crate) fn agentic_cost_verdict(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod test_env {
-    use std::sync::Mutex;
-
     /// Process-wide mutex around every test that mutates `ZODER_HOME`.
     /// Shared by ALL test modules in this binary (`health_install_tests`,
     /// `reviewer_chain_dispatch_tests`, and any future module that needs
     /// to redirect `$ZODER_HOME` to a tempdir). Tests acquire it via
     /// [`super::with_fake_home`] (sync) or [`super::test_env::EnvGuard`]
     /// (async) — never via `std::env::set_var` directly.
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+    ///
+    /// Re-exported from `zoder-test-support` so the crate-local guards below
+    /// and `zoder_test_support::EnvGuard` serialize on the SAME mutex.
+    pub(crate) use zoder_test_support::ENV_LOCK;
 
     /// RAII guard for async tests: sets `ZODER_HOME` to `home` and holds
     /// the shared `ENV_LOCK` for the guard's lifetime. Pairs with
@@ -10536,11 +10537,11 @@ mod oneshot_ledger_billing_tests {
     fn oneshot_free_route_with_catalog_price_records_zero_known() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
-        let _g = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("ZODER_HOME").ok();
-        std::env::set_var("ZODER_HOME", home);
+        // One guard: ZODER_HOME is restored BEFORE ENV_LOCK is released, so a
+        // test waiting on the lock can never have its own ZODER_HOME
+        // clobbered by this test's restore.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10591,11 +10592,7 @@ mod oneshot_ledger_billing_tests {
                     assert_eq!(row.violation, None, "a free route trips no guard");
                 });
         }));
-        drop(_g);
-        match prev {
-            Some(v) => std::env::set_var("ZODER_HOME", v),
-            None => std::env::remove_var("ZODER_HOME"),
-        }
+        drop(env);
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
@@ -10608,11 +10605,11 @@ mod oneshot_ledger_billing_tests {
     fn oneshot_unpriced_metered_model_is_unknown_not_known_zero() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
-        let _g = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("ZODER_HOME").ok();
-        std::env::set_var("ZODER_HOME", home);
+        // One guard: ZODER_HOME is restored BEFORE ENV_LOCK is released, so a
+        // test waiting on the lock can never have its own ZODER_HOME
+        // clobbered by this test's restore.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10663,11 +10660,7 @@ mod oneshot_ledger_billing_tests {
                     );
                 });
         }));
-        drop(_g);
-        match prev {
-            Some(v) => std::env::set_var("ZODER_HOME", v),
-            None => std::env::remove_var("ZODER_HOME"),
-        }
+        drop(env);
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
@@ -10682,11 +10675,11 @@ mod oneshot_ledger_billing_tests {
     fn oneshot_metered_stream_without_usage_is_unknown_not_known_zero() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
-        let _g = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("ZODER_HOME").ok();
-        std::env::set_var("ZODER_HOME", home);
+        // One guard: ZODER_HOME is restored BEFORE ENV_LOCK is released, so a
+        // test waiting on the lock can never have its own ZODER_HOME
+        // clobbered by this test's restore.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10771,11 +10764,7 @@ mod oneshot_ledger_billing_tests {
                     assert_eq!(row.billing.as_deref(), Some("metered"));
                 });
         }));
-        drop(_g);
-        match prev {
-            Some(v) => std::env::set_var("ZODER_HOME", v),
-            None => std::env::remove_var("ZODER_HOME"),
-        }
+        drop(env);
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
@@ -10833,11 +10822,11 @@ mod oneshot_ledger_billing_tests {
         const MODEL: &str = "deepseek-flash";
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
-        let _g = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("ZODER_HOME").ok();
-        std::env::set_var("ZODER_HOME", home);
+        // One guard: ZODER_HOME is restored BEFORE ENV_LOCK is released, so a
+        // test waiting on the lock can never have its own ZODER_HOME
+        // clobbered by this test's restore.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10912,11 +10901,7 @@ mod oneshot_ledger_billing_tests {
                     assert_eq!(row.violation, None, "no guard trips on a priced call");
                 });
         }));
-        drop(_g);
-        match prev {
-            Some(v) => std::env::set_var("ZODER_HOME", v),
-            None => std::env::remove_var("ZODER_HOME"),
-        }
+        drop(env);
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
@@ -10930,11 +10915,11 @@ mod oneshot_ledger_billing_tests {
     fn oneshot_free_route_with_positive_telemetry_records_the_charge_and_fires_the_paid_guard() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path();
-        let _g = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("ZODER_HOME").ok();
-        std::env::set_var("ZODER_HOME", home);
+        // One guard: ZODER_HOME is restored BEFORE ENV_LOCK is released, so a
+        // test waiting on the lock can never have its own ZODER_HOME
+        // clobbered by this test's restore.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -11008,11 +10993,7 @@ mod oneshot_ledger_billing_tests {
                     assert_eq!(row.billing.as_deref(), Some("free"));
                 });
         }));
-        drop(_g);
-        match prev {
-            Some(v) => std::env::set_var("ZODER_HOME", v),
-            None => std::env::remove_var("ZODER_HOME"),
-        }
+        drop(env);
         if let Err(e) = outcome {
             std::panic::resume_unwind(e);
         }
@@ -26610,11 +26591,16 @@ data: [DONE]
             .mount(&server)
             .await;
         write_home(home, &server.uri(), models_json);
-        let _guard = crate::test_env::EnvGuard::new(home);
-        let _socket = std::env::var("ZEROCLAW_SOCKET").ok();
+        // ONE guard for all three variables: each is restored when the guard
+        // drops (at the end of this helper), and only then is ENV_LOCK
+        // released. Setting ZEROCLAW_SOCKET / ZEROCLAW_CONFIG_DIR without a
+        // restore left every later test in the binary pointed at this
+        // test's deleted tempdir.
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.set("ZODER_HOME", home);
         // No engine daemon socket in the temp home: the oneshot path must
         // not need one, and a stale host socket must not leak in.
-        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
+        env.set("ZEROCLAW_SOCKET", home.join("daemon.sock"));
         // Engine config: a real file in a temp config dir, so the
         // production `Engine::load` path picks it up without touching
         // $ZEROCLAW_CONFIG_DIR on the host.
@@ -26623,7 +26609,7 @@ data: [DONE]
         if let Some(engine) = engine {
             std::fs::write(cfg_path.join("config.toml"), engine).unwrap();
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+        env.set("ZEROCLAW_CONFIG_DIR", &cfg_path);
 
         let mut argv = vec![
             "zoder",
@@ -26742,6 +26728,41 @@ model = "m"
                 .and_then(|v| v.as_bool()),
             Some(true),
             "the zoder model entry must win over the engine profile: {body}"
+        );
+    }
+
+    /// S2 regression: `run_oneshot` must hand the engine variables back.
+    /// It used to set `ZEROCLAW_SOCKET` and `ZEROCLAW_CONFIG_DIR` and never
+    /// restore them, so every later test in the binary resolved the engine
+    /// socket and config to this test's deleted tempdir.
+    #[tokio::test]
+    async fn run_oneshot_restores_the_engine_environment() {
+        let snapshot = || {
+            let _l = crate::test_env::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            (
+                std::env::var_os("ZODER_HOME"),
+                std::env::var_os("ZEROCLAW_SOCKET"),
+                std::env::var_os("ZEROCLAW_CONFIG_DIR"),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let before = snapshot();
+        let (_server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
+        result.expect("oneshot call succeeds");
+        let after = snapshot();
+        assert_eq!(
+            after, before,
+            "ZODER_HOME / ZEROCLAW_SOCKET / ZEROCLAW_CONFIG_DIR must be restored"
+        );
+        let leaked = |v: &Option<std::ffi::OsString>| {
+            v.as_ref()
+                .is_some_and(|p| std::path::Path::new(p).starts_with(dir.path()))
+        };
+        assert!(
+            !leaked(&after.0) && !leaked(&after.1) && !leaked(&after.2),
+            "no engine variable may still point into the test's tempdir: {after:?}"
         );
     }
 }
