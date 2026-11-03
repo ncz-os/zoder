@@ -130,8 +130,10 @@ impl Drop for EnvGuard {
     }
 }
 
-/// A throwaway home directory with every host-identity variable pointed into
-/// it, held under [`ENV_LOCK`] for the value's lifetime.
+/// A throwaway home directory with the home, XDG and engine variables
+/// pointed into it, held under [`ENV_LOCK`] for the value's lifetime.
+/// `TMPDIR` is left alone: tests that need a private temp root set it through
+/// [`IsolatedHome::env`].
 ///
 /// Sets (and creates) `HOME`, `ZODER_HOME` (`<dir>/.zoder`), `XDG_CONFIG_HOME`,
 /// `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`,

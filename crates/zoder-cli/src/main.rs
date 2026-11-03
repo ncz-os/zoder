@@ -26745,10 +26745,11 @@ model = "m"
         let dir = tempfile::tempdir().unwrap();
         let (_server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
         result.expect("oneshot call succeeds");
+        // run_oneshot's guard is a local of that helper and has dropped by
+        // now; lock_env() panics (rather than deadlocking) if that ever
+        // stops being true.
         let after = {
-            let _l = crate::test_env::ENV_LOCK
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _l = zoder_test_support::lock_env();
             [
                 ("ZODER_HOME", std::env::var_os("ZODER_HOME")),
                 ("ZEROCLAW_SOCKET", std::env::var_os("ZEROCLAW_SOCKET")),

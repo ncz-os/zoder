@@ -2555,12 +2555,14 @@ mod tests {
     static REAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Holds [`REAP_TEST_LOCK`] and owns the reaper's process-global session
-    /// registries for one test: they are cleared when the lock is taken and
-    /// again when the guard drops (including on panic, before the lock is
-    /// released). A test therefore never sees a session another test (or a
-    /// test in another module that drove a session through the installed
-    /// session observer) left behind, which is what made the teardown tests
-    /// order-dependent under `--shuffle`.
+    /// registries for one reaper test: they are cleared when the lock is taken
+    /// and again when the guard drops (including on panic, before the lock is
+    /// released). A reaper test therefore never starts from a session an
+    /// EARLIER test left behind, which is what made the teardown tests
+    /// order-dependent under `--shuffle`. This serializes reaper-module tests
+    /// only: a test in another module that drives a session through the
+    /// installed session observer does not take this lock, so a session it
+    /// notes WHILE a reaper test runs is not excluded.
     struct ReapTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
