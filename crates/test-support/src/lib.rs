@@ -71,14 +71,16 @@ pub fn lock_env() -> EnvLock {
 /// Holds [`ENV_LOCK`] from construction until drop. Every variable passed to
 /// [`EnvGuard::set`] or [`EnvGuard::unset`] is saved the first time it is
 /// touched and restored, in reverse order, when the guard drops; the lock is
-/// released only after that restore (struct fields drop after `Drop::drop`).
+/// released only after that restore.
 ///
 /// Constructing a second guard while one is alive on the same thread panics
 /// (see [`lock_env`]).
 #[must_use = "dropping the guard immediately restores the environment"]
 pub struct EnvGuard {
     saved: Vec<(OsString, Option<OsString>)>,
-    _lock: EnvLock,
+    /// Always `Some` until `Drop`, which restores the environment and only
+    /// then releases the lock explicitly (no reliance on field drop order).
+    lock: Option<EnvLock>,
 }
 
 impl EnvGuard {
@@ -86,7 +88,7 @@ impl EnvGuard {
     pub fn new() -> Self {
         Self {
             saved: Vec::new(),
-            _lock: lock_env(),
+            lock: Some(lock_env()),
         }
     }
 
@@ -126,7 +128,8 @@ impl Drop for EnvGuard {
                 None => std::env::remove_var(&key),
             }
         }
-        // `_lock` drops after this body returns: restore, then unlock.
+        // Restore first (above), THEN unlock.
+        drop(self.lock.take());
     }
 }
 
@@ -254,7 +257,7 @@ pub mod git {
     pub fn harden_fixture_repo(repo: &Path) {
         assert!(
             repo.join(".git").exists(),
-            "harden_fixture_repo({}): not a git repository; call it right after `git init`",
+            "harden_fixture_repo({}): no .git entry; call it right after `git init`",
             repo.display()
         );
         for (key, value) in FIXTURE_CONFIG {
