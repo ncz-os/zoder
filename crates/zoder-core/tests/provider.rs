@@ -2000,9 +2000,6 @@ fn azure_req(model: &str, stream: bool) -> ChatRequest {
 /// documented in the `body()` helper).
 #[tokio::test]
 async fn azure_request_hits_deployment_route_with_api_key_header_and_chat_body() {
-    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER", "raw-azure-key");
-    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
-
     // Start the mock server first (no env-var dependency), then
     // build the provider under the lock so a parallel test can't
     // flip the env var between our `set_var` and the constructor's
@@ -2016,6 +2013,8 @@ async fn azure_request_hits_deployment_route_with_api_key_header_and_chat_body()
         let _guard = AZURE_INTEG_API_VERSION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER", "raw-azure-key");
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
         azure_provider(
             &format!("{}/openai/deployments/gpt4o", server.uri()),
             Auth::ApiKeyHeader {
@@ -2059,8 +2058,13 @@ async fn azure_request_hits_deployment_route_with_api_key_header_and_chat_body()
         .await
         .unwrap();
     assert_eq!(res.content, "ok");
-    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER");
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER");
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
 }
 
 /// Task-pinned test (item Azure-1b): `Provider::azure_api_version`
@@ -2075,12 +2079,12 @@ async fn azure_provider_field_api_version_overrides_env_var() {
     // (no env-var dependency), then build the provider under the
     // lock — clippy's `await_holding_lock` lint correctly flags a
     // sync mutex held across an await point.
-    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-08-01");
     let server = MockServer::start().await;
     let p = {
         let _guard = AZURE_INTEG_API_VERSION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-08-01");
         azure_provider(
             &format!("{}/openai/deployments/gpt4o", server.uri()),
             Auth::None,
@@ -2103,7 +2107,12 @@ async fn azure_provider_field_api_version_overrides_env_var() {
         .await
         .unwrap();
     assert_eq!(res.content, "ok");
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
 }
 
 /// Task-pinned test (item Azure-1c): the openai-chat path must remain
@@ -2115,7 +2124,12 @@ async fn azure_provider_field_api_version_overrides_env_var() {
 /// matched the openai-chat shape, not the Azure branch.
 #[tokio::test]
 async fn openai_chat_path_remains_byte_identical_after_azure_fork() {
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -2179,13 +2193,13 @@ async fn openai_chat_path_remains_byte_identical_after_azure_fork() {
 /// Azure-specific branch.
 #[tokio::test]
 async fn azure_non_streaming_response_is_parsed() {
-    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_2", "azure-key");
-    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
     let server = MockServer::start().await;
     let p = {
         let _guard = AZURE_INTEG_API_VERSION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_2", "azure-key");
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
         azure_provider(
             &format!("{}/openai/deployments/gpt4o", server.uri()),
             Auth::ApiKeyHeader {
@@ -2218,8 +2232,13 @@ async fn azure_non_streaming_response_is_parsed() {
     assert_eq!(res.content, "Hello from Azure");
     assert_eq!(res.prompt_tokens, Some(7));
     assert_eq!(res.completion_tokens, Some(4));
-    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_2");
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_2");
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
 }
 
 /// Task-pinned test (item Azure-1e): the Azure branch's streaming SSE
@@ -2230,13 +2249,13 @@ async fn azure_non_streaming_response_is_parsed() {
 /// content + a final usage chunk.
 #[tokio::test]
 async fn azure_streaming_sse_is_assembled() {
-    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_3", "azure-key");
-    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
     let server = MockServer::start().await;
     let p = {
         let _guard = AZURE_INTEG_API_VERSION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_3", "azure-key");
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
         azure_provider(
             &format!("{}/openai/deployments/gpt4o", server.uri()),
             Auth::ApiKeyHeader {
@@ -2267,8 +2286,13 @@ async fn azure_streaming_sse_is_assembled() {
     assert_eq!(res.content, "Hello");
     assert_eq!(res.completion_tokens, Some(2));
     assert_eq!(res.prompt_tokens, Some(3));
-    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_3");
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_3");
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
 }
 
 /// Typed Azure error envelope on a 401 must surface as ErrKind::Http
@@ -2281,13 +2305,13 @@ async fn azure_streaming_sse_is_assembled() {
 /// documentation covers the no-new-classification-code contract.
 #[tokio::test]
 async fn azure_401_with_openai_error_envelope_is_classified_as_http() {
-    std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_4", "bogus");
-    std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
     let server = MockServer::start().await;
     let p = {
         let _guard = AZURE_INTEG_API_VERSION_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZODER_TEST_AZURE_API_KEY_HEADER_4", "bogus");
+        std::env::set_var("AZURE_OPENAI_API_VERSION", "2024-10-21");
         azure_provider(
             &format!("{}/openai/deployments/gpt4o", server.uri()),
             Auth::ApiKeyHeader {
@@ -2318,8 +2342,13 @@ async fn azure_401_with_openai_error_envelope_is_classified_as_http() {
         err.message.contains("invalid subscription key"),
         "got: {err}"
     );
-    std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_4");
-    std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    {
+        let _guard = AZURE_INTEG_API_VERSION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ZODER_TEST_AZURE_API_KEY_HEADER_4");
+        std::env::remove_var("AZURE_OPENAI_API_VERSION");
+    }
 }
 
 /// Y-19: `kind == "azure-openai"` providers short-circuit on
