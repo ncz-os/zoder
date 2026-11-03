@@ -2554,6 +2554,45 @@ mod tests {
     /// this lock one test's reap scope would select another test's fixture.
     static REAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Holds [`REAP_TEST_LOCK`] and owns the reaper's process-global session
+    /// registries for one test: they are cleared when the lock is taken and
+    /// again when the guard drops (including on panic, before the lock is
+    /// released). A test therefore never sees a session another test (or a
+    /// test in another module that drove a session through the installed
+    /// session observer) left behind, which is what made the teardown tests
+    /// order-dependent under `--shuffle`.
+    struct ReapTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ReapTestGuard {
+        fn drop(&mut self) {
+            reset_reaper_globals();
+        }
+    }
+
+    fn reap_test_lock() -> ReapTestGuard {
+        let lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_reaper_globals();
+        ReapTestGuard { _lock: lock }
+    }
+
+    /// Clear every session registry and the attempt counter. Only call with
+    /// [`REAP_TEST_LOCK`] held (via [`reap_test_lock`]).
+    fn reset_reaper_globals() {
+        SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        CANCELLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        UNIDENTIFIED_DAEMON
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[test]
     fn fleet_cancel_budget_is_the_unchanged_constant_and_standalone_is_longer() {
         use zoder_core::config::DeploymentMode;
@@ -2798,7 +2837,7 @@ mod tests {
     /// killed it) and GONE once the loop's reap scope closes.
     #[test]
     fn fake_agent_detached_child_in_cd_is_reaped_and_would_otherwise_leak() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         assert!(guard.armed(), "Linux plan should be armed");
@@ -2852,7 +2891,7 @@ mod tests {
     /// it got there: another agent's session, an editor, a shell on this host.
     #[test]
     fn process_outside_the_cd_is_never_touched() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let outsider = spawn_sleeper(&ws.outside());
@@ -2873,7 +2912,7 @@ mod tests {
     /// even with its cwd inside the workspace.
     #[test]
     fn process_started_before_the_loop_is_never_touched() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let predates = spawn_sleeper(&ws.cd);
         wait_until(|| alive(predates), "the pre-loop fixture to be running");
@@ -2901,7 +2940,7 @@ mod tests {
     /// there too.
     #[test]
     fn process_in_this_runs_scratch_dir_is_reaped() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let scratch = guard
@@ -2928,7 +2967,7 @@ mod tests {
     /// would make "someone else's build" a kill candidate.
     #[test]
     fn a_process_in_the_shared_temp_root_is_not_reaped() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let bystander = spawn_sleeper(&ws.tmp_root);
@@ -2948,7 +2987,7 @@ mod tests {
     /// SIGTERM is a request. A process that traps it must still die.
     #[test]
     fn sigterm_ignoring_process_is_escalated_to_sigkill() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let plan = ReapPlan::new(
             &ws.cd,
@@ -2994,7 +3033,7 @@ mod tests {
     /// `--no-reap` is a real opt-out, not a no-op flag.
     #[test]
     fn no_reap_leaves_the_agent_children_running() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ReapGuard::begin_with(
             &ws.cd,
@@ -3017,7 +3056,7 @@ mod tests {
     /// panic unwinding out of the loop body.
     #[test]
     fn dropping_the_guard_reaps_without_an_explicit_finish() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let leaked = {
             let _guard = ws.begin();
@@ -3036,7 +3075,7 @@ mod tests {
     /// workspace. zoder and every ancestor must be excluded outright.
     #[test]
     fn scan_never_selects_zoder_itself_or_its_ancestors() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
@@ -3092,7 +3131,7 @@ mod tests {
     /// between the scan and the signal is SKIPPED, never signalled.
     #[test]
     fn a_recycled_pid_is_skipped_instead_of_signalled() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let bystander = spawn_sleeper(&ws.cd);
         wait_until(|| alive(bystander), "the fixture to be running");
@@ -3138,7 +3177,7 @@ mod tests {
     /// system temp root.
     #[test]
     fn the_scratch_dir_is_removed_when_the_scope_closes() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let scratch = {
             let mut guard = ws.begin();
@@ -3165,7 +3204,7 @@ mod tests {
     /// a workspace root, and only this run's scratch dir remains in scope.
     #[test]
     fn a_workspace_that_is_the_shared_temp_root_is_refused() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let bystander = spawn_sleeper(&ws.tmp_root);
         wait_until(|| alive(bystander), "the bystander fixture to be running");
@@ -3224,16 +3263,17 @@ mod tests {
     /// session nobody asked is a session still editing the tree while the
     /// workspace is torn down under it.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
     async fn every_recorded_session_is_asked_at_least_once() {
+        // Held for the WHOLE test: ATTEMPT_COUNTER and SESSIONS are process
+        // globals, and a sibling's reset or extra session between our
+        // note_session and the count corrupts the assertion.
+        let _lock = reap_test_lock();
         let ids = ["asked-once-a", "asked-once-b", "asked-once-c"];
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = silent_daemon(dir.path());
-        ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
-        {
-            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            for id in ids {
-                note_session(id);
-            }
+        for id in ids {
+            note_session(id);
         }
         let recorded = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert!(
@@ -3249,35 +3289,24 @@ mod tests {
             "every recorded session must be asked at least once: {attempts} attempt(s) for {} sessions",
             ids.len()
         );
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        SESSIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        UNREACHABLE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        CANCELLED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
+        // The registries are reset by the guard's Drop (also on panic).
     }
 
     /// Two live sessions each get their own full settle window: the phase
     /// covers both instead of spending the first session's attempt on the
     /// whole fleet. With a phase-wide budget only the first would be asked.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
     async fn fleet_budget_covers_two_sessions() {
+        // Held for the WHOLE test: ATTEMPT_COUNTER and SESSIONS are process
+        // globals, and a sibling's reset or extra session between our
+        // note_session and the count corrupts the assertion.
+        let _lock = reap_test_lock();
         let ids = ["fleet-budget-1", "fleet-budget-2"];
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = silent_daemon(dir.path());
-        ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
-        {
-            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            for id in ids {
-                note_session(id);
-            }
+        for id in ids {
+            note_session(id);
         }
         let started = Instant::now();
         cancel_recorded_sessions(&socket, Duration::from_millis(40)).await;
@@ -3292,35 +3321,22 @@ mod tests {
             elapsed >= Duration::from_millis(40),
             "the phase must give the second session its own window, not stop after the first"
         );
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        SESSIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        UNREACHABLE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        CANCELLED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
+        // The registries are reset by the guard's Drop (also on panic).
     }
 
     /// The phase ceiling is checked BETWEEN passes, so it can never cost a
     /// session its first ask: one pass over three silent sessions asks all
     /// three even when the whole cap is far shorter than three windows.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // current-thread runtime; see the_async_cancel_phase_retires_an_unreachable_session
     async fn cancel_phase_cap_does_not_truncate_the_first_pass() {
+        // Held for the WHOLE test (see every_recorded_session_is_asked_at_least_once).
+        let _lock = reap_test_lock();
         let ids = ["capped-a", "capped-b", "capped-c"];
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = silent_daemon(dir.path());
-        {
-            let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
-            for id in ids {
-                note_session(id);
-            }
+        for id in ids {
+            note_session(id);
         }
         cancel_recorded_sessions(&socket, Duration::from_millis(10)).await;
         let attempts = ATTEMPT_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
@@ -3330,26 +3346,14 @@ mod tests {
              only {attempts} attempt(s) were made",
             ids.len()
         );
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        SESSIONS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        UNREACHABLE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
-        CANCELLED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|s| !ids.contains(&s.as_str()));
+        // The registries are reset by the guard's Drop (also on panic).
     }
 
     /// The panic-unwind and signal teardown use this list to send blocking
     /// cancels. A pass limit must not silently become a session limit.
     #[test]
     fn pending_sessions_includes_every_uncancelled_session() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ids: Vec<String> = (0..65).map(|i| format!("pending-cap-probe-{i}")).collect();
         for id in &ids {
             note_session(id);
@@ -3369,7 +3373,7 @@ mod tests {
     /// and it is the half of the granularity problem that can be decided.
     #[test]
     fn a_process_from_an_earlier_tick_is_never_a_candidate() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let older = spawn_sleeper(&ws.cd);
         wait_until(|| alive(older), "the fixture to be running");
@@ -3403,7 +3407,7 @@ mod tests {
     /// makes "check identity then signal" atomic instead of merely adjacent.
     #[test]
     fn a_pinned_target_reports_its_own_lifecycle() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         // Spawned by a shell that exits, so the fixture is reparented to init:
         // when it dies it disappears instead of waiting as a zombie for this
@@ -3479,7 +3483,7 @@ mod tests {
     #[allow(clippy::zombie_processes)]
     #[test]
     fn a_descendant_forked_during_the_reap_is_still_reaped() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let plan = ReapPlan::new(
             &ws.cd,
@@ -3571,7 +3575,7 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let listener = UnixListener::bind(&socket).expect("bind fake daemon");
@@ -3704,7 +3708,7 @@ mod tests {
     /// possibly running, whichever phase found it.
     #[test]
     fn a_session_the_async_phase_retired_still_keeps_the_reap_running() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
@@ -3741,7 +3745,7 @@ mod tests {
     /// be running in a daemon that lost its socket.
     #[test]
     fn a_missing_engine_socket_is_not_retried_but_keeps_the_reap_running() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
@@ -3791,7 +3795,7 @@ mod tests {
     /// that run carried the same session line once per round.)
     #[test]
     fn an_unreachable_session_is_said_once_no_matter_how_often_it_is_asked() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
         note_session("unreachable-once-probe");
@@ -3830,7 +3834,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn the_async_cancel_phase_retires_an_unreachable_session() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
         note_session("async-unreachable-probe");
@@ -4023,7 +4027,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn an_unidentified_daemon_is_retired_but_not_counted_as_handled() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let (server, _attempts) =
@@ -4102,7 +4106,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn the_retry_sequence_fits_the_phase_budget_it_is_given() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let (server, _attempts) =
@@ -4187,7 +4191,7 @@ mod tests {
     /// signal cannot take a stranger down with it.
     #[test]
     fn a_recycled_pid_is_never_signalled() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let bystander = spawn_sleeper(dir.path());
         let real = crate::reaper::live_start_ticks(bystander).expect("the fixture is live");
@@ -4401,7 +4405,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn an_unconfirmed_cancel_is_retried_then_settled_best_effort() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let (server, attempts) =
@@ -4481,7 +4485,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn a_slow_daemon_is_confirmed_on_a_bounded_retry() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         // First retry silent, second retry acks: exactly the "daemon was busy"
@@ -4534,7 +4538,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn a_daemon_that_exited_during_the_retries_is_reported_as_gone() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let (server, attempts) =
@@ -4601,7 +4605,7 @@ mod tests {
     // is gone by the time the pid is checked.
     #[allow(clippy::zombie_processes)]
     async fn a_silent_daemon_is_stopped_by_exact_pid_as_the_last_resort() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
 
@@ -4684,7 +4688,7 @@ mod tests {
     // of the test: the point of the test is that the REAPER leaves it alone.
     #[allow(clippy::zombie_processes)]
     async fn a_daemon_no_client_can_prove_is_alone_is_left_running() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
 
@@ -4735,7 +4739,7 @@ mod tests {
     /// dangerous direction, so it is pinned separately.
     #[test]
     fn a_stale_daemon_record_stops_no_process() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let bystander = spawn_sleeper(dir.path());
@@ -4769,7 +4773,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn a_stale_daemon_record_is_reported_as_stale_not_absent() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         let bystander = spawn_sleeper(dir.path());
@@ -4825,7 +4829,7 @@ mod tests {
     // between threads, so the lock is sound here.
     #[allow(clippy::await_holding_lock)]
     async fn an_absent_daemon_record_is_reported_as_absent() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
         note_session("absent-record-probe");
@@ -4902,7 +4906,7 @@ mod tests {
     /// teardown is untouched by the change.
     #[test]
     fn a_teardown_with_a_leftover_still_reaps_it_and_converges_in_one_round() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = absent_socket(&dir, "engine.sock");
@@ -4939,7 +4943,7 @@ mod tests {
     /// must not get a surprise `session/cancel` on the way out.
     #[test]
     fn no_reap_sends_no_cancel_on_drop() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("engine.sock");
@@ -5038,7 +5042,7 @@ mod tests {
     /// run that cleaned up after itself.
     #[test]
     fn a_clean_run_reaps_nothing() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let plan = ReapPlan::new(
             &ws.cd,
@@ -5069,7 +5073,7 @@ mod tests {
     /// place.
     #[test]
     fn a_shared_daemon_in_the_workspace_is_spared_and_an_ordinary_leftover_is_still_reaped() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
@@ -5128,7 +5132,7 @@ mod tests {
     /// in a signal teardown.
     #[test]
     fn the_pid_this_zoder_spawned_is_spared_whatever_its_executable_is() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
@@ -5172,7 +5176,7 @@ mod tests {
     /// the record is involved here — the fixture's executable is `sleep`.
     #[test]
     fn the_daemon_recorded_for_the_socket_is_spared_in_another_zoder_process() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
         // Scope FIRST, daemon second — twice over: `plan` reads the record
@@ -5226,7 +5230,7 @@ mod tests {
     /// identity-based exemption must never do.
     #[test]
     fn a_stale_daemon_record_spares_nobody_after_the_pid_is_reused() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
         // The scope opens FIRST: a process that already existed when it did
@@ -5265,7 +5269,7 @@ mod tests {
     /// reason a stale one is — it cannot be checked against anything.
     #[test]
     fn a_garbage_daemon_record_spares_nobody() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let pidfile = ws.root().join("daemon.pid");
         // Scope first, fixture second, so the fixture is reapable for the
@@ -5321,7 +5325,7 @@ mod tests {
     /// while fixing this.
     #[test]
     fn the_shared_daemons_own_children_in_the_workspace_are_still_reaped() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
@@ -5384,7 +5388,7 @@ mod tests {
     /// whole subtree as fair game because of this fix.
     #[test]
     fn a_leftover_of_another_session_served_by_the_same_daemon_is_untouched() {
-        let _lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = reap_test_lock();
         let ws = Workspace::new();
         let mut guard = ws.begin();
         let plan = guard.plan.clone().expect("armed guard has a plan");
