@@ -5627,12 +5627,14 @@ mod tests {
     fn knemon_capture_rate_limit_snapshot_threads_account_id_through() {
         use crate::utilization::{Provider as UtilProv, UtilizationStore};
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("utilization.json");
-        // The capture helper writes to `default_store_path()` —
-        // override `ZODER_HOME` so the test doesn't touch
-        // `~/.zoder/utilization.json`.
-        std::env::set_var("ZODER_HOME", dir.path());
+        // The capture helper writes to `default_store_path()`, which
+        // resolves `ZODER_HOME`: point it (and HOME) at a throwaway dir
+        // under the shared env lock so the test can neither touch
+        // `~/.zoder/utilization.json` nor race another test's
+        // `ZODER_HOME`. The guard restores the previous values on drop,
+        // including on panic.
+        let iso = zoder_test_support::IsolatedHome::new();
+        let path = iso.zoder_home().join("utilization.json");
 
         // Real Codex `x-codex-*` headers — `from_headers` needs at
         // least one of the family to detect the vendor.
@@ -5674,8 +5676,7 @@ mod tests {
         assert_eq!(t.account_id, "team");
         assert_eq!(p.primary.as_ref().unwrap().used_percent, Some(60.0));
         assert_eq!(t.primary.as_ref().unwrap().used_percent, Some(60.0));
-
-        std::env::remove_var("ZODER_HOME");
+        drop(iso);
     }
 
     fn sampling_req(top_p: Option<f32>, kwargs: Option<serde_json::Value>) -> ChatRequest {

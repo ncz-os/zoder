@@ -426,6 +426,15 @@ mod tests {
         dir
     }
 
+    /// Clear `ZODER_NO_UPDATE_CHECK` for the test's lifetime under the shared
+    /// env lock. The tests below exercise the check itself, so a host (or CI
+    /// worker) that exports the opt-out must not turn them into no-ops.
+    fn update_check_enabled() -> zoder_test_support::EnvGuard {
+        let mut env = zoder_test_support::EnvGuard::new();
+        env.unset("ZODER_NO_UPDATE_CHECK");
+        env
+    }
+
     fn failure_marker(home: &std::path::Path) -> Option<FailureFile> {
         let txt = std::fs::read_to_string(home.join(FAILURE_FILE)).ok()?;
         serde_json::from_str(&txt).ok()
@@ -435,6 +444,7 @@ mod tests {
     /// the retry interval does not touch the network again.
     #[tokio::test]
     async fn failed_check_is_cached_and_not_retried_within_the_interval() {
+        let _env = update_check_enabled();
         let home = temp_home("negative");
         let endpoint = unreachable_endpoint();
         let ttl = Duration::from_secs(86_400);
@@ -473,6 +483,7 @@ mod tests {
     /// the detached thread so the next run stays offline.
     #[test]
     fn background_check_is_bounded_and_records_its_failure() {
+        let _env = update_check_enabled();
         let home = temp_home("bounded");
         let endpoint = unreachable_endpoint();
         let ttl = Duration::from_secs(86_400);
@@ -503,6 +514,7 @@ mod tests {
     /// and no thread, and `spawn_background_at` short-circuits on it.
     #[test]
     fn fresh_cache_is_served_without_a_check() {
+        let _env = update_check_enabled();
         let home = temp_home("fresh");
         let ttl = Duration::from_secs(86_400);
         let json = serde_json::to_string(&CacheFile {
