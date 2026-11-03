@@ -13560,22 +13560,56 @@ pub(crate) async fn agentic_turn(
         .unwrap_or_else(|| routed_provider.id.clone());
     if run.succeeded() && policy_violation.is_none() && model_mismatch.is_none() {
         health.record_success(&model_used, elapsed_ms);
-    } else {
-        let reason = if let Some(v) = &model_mismatch {
-            format!("model selection violation: {v}")
-        } else if let Some(v) = &policy_violation {
-            format!("policy violation: {v}")
-        } else {
-            format!("turn did not complete: {}", run.outcome)
-        };
+        save_health(&health);
+    } else if let Some(v) = &model_mismatch {
         health.record_classified_failure(
             &model_used,
-            &reason,
+            &format!("model selection violation: {v}"),
             &provider_id_for_record,
             Classification::Error,
         );
+        save_health(&health);
+    } else if let Some(v) = &policy_violation {
+        health.record_classified_failure(
+            &model_used,
+            &format!("policy violation: {v}"),
+            &provider_id_for_record,
+            Classification::Error,
+        );
+        save_health(&health);
+    } else {
+        // Audit F5.1: a mid-turn turn end whose terminal detail is a daemon
+        // session-capacity refusal (`AgentRun::failure_detail` carries the
+        // daemon's own diagnosis — the setup path above already skips these
+        // via `is_capacity_setup_error`, but once a frame was emitted the
+        // driver returns Ok(AgentRun), so the same refusal can resurface
+        // here). The health file is SHARED fleet-wide, so a strike — or even
+        // a skip-class mark stamped because a LOCAL daemon was full — would
+        // take the route out of rotation on every host. Record nothing and
+        // do not save: the store on disk must not change hands for this
+        // outcome. A genuine model failure keeps the classified Error
+        // strike exactly as before.
+        match turn_failure_health(&run.outcome, run.failure_detail.as_deref()) {
+            TurnFailureHealth::SkipCapacity => {
+                if !cli.quiet {
+                    eprintln!(
+                        "[zoder] {} did not complete: daemon at session capacity, \
+                         not a model defect; no breaker strike recorded",
+                        model_used
+                    );
+                }
+            }
+            TurnFailureHealth::Record { reason } => {
+                health.record_classified_failure(
+                    &model_used,
+                    &reason,
+                    &provider_id_for_record,
+                    Classification::Error,
+                );
+                save_health(&health);
+            }
+        }
     }
-    save_health(&health);
 
     if let Some(mismatch) = model_mismatch {
         anyhow::bail!(mismatch);
@@ -13771,6 +13805,40 @@ fn turn_failure_error(outcome: &zoder_core::AgentOutcome, detail: Option<&str>) 
         }
     }
     anyhow::Error::new(ReportedTurnError(summary))
+}
+
+/// The health-store action for a non-completed agentic turn (audit F5.1).
+///
+/// The post-run decision no longer assumes a failed turn is a model defect:
+/// when the engine's terminal detail carries the daemon session-capacity
+/// marker (`zoder_core::engine_rpc::is_session_limit_message` — the same
+/// predicate FB110 trusts for the setup path), the failure is the LOCAL
+/// daemon being full. Nothing is recorded and the shared health file is
+/// not saved; every other non-completed outcome keeps its classified
+/// `Error` strike with a reason that names the engine's own diagnosis.
+#[derive(Debug, PartialEq, Eq)]
+enum TurnFailureHealth {
+    /// Record a genuine model/turn failure under `Classification::Error`.
+    Record {
+        /// Human-readable reason persisted as the store's `last_error`.
+        reason: String,
+    },
+    /// Daemon session-capacity refusal: do not mutate the shared store.
+    SkipCapacity,
+}
+
+fn turn_failure_health(
+    outcome: &zoder_core::AgentOutcome,
+    detail: Option<&str>,
+) -> TurnFailureHealth {
+    if detail.is_some_and(zoder_core::engine_rpc::is_session_limit_message) {
+        return TurnFailureHealth::SkipCapacity;
+    }
+    let reason = match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => format!("turn did not complete: {d}"),
+        _ => format!("turn did not complete: {outcome}"),
+    };
+    TurnFailureHealth::Record { reason }
 }
 
 /// A turn failure whose result (including `--json` output) was already
@@ -19084,6 +19152,117 @@ mod probe_skip_class_tests {
         assert!(!is_capacity_setup_error(&denial));
         let other: anyhow::Error = anyhow::anyhow!("connecting to engine: refused");
         assert!(!is_capacity_setup_error(&other));
+    }
+
+    /// F5.1: once a frame was emitted the driver returns Ok(AgentRun), so
+    /// the same daemon capacity refusal that the setup guard (FB110)
+    /// intercepts can resurface as a failed turn with the marker inside
+    /// `failure_detail`. The helper must skip those and keep recording
+    /// every other non-completed turn.
+    #[test]
+    fn capacity_turn_detail_skips_the_health_strike() {
+        use zoder_core::AgentOutcome;
+        // The helper's terminal shape and the raw daemon shape both skip.
+        for detail in [
+            "turn failed: Session limit reached (code -32001)",
+            "session_limit: daemon session capacity reached after 6 tries",
+        ] {
+            assert_eq!(
+                turn_failure_health(&AgentOutcome::Failed, Some(detail)),
+                TurnFailureHealth::SkipCapacity,
+                "{detail:?} is a daemon-capacity end, not a model defect"
+            );
+        }
+        // The approval-denial reuse of -32001 is not capacity.
+        assert_eq!(
+            turn_failure_health(
+                &AgentOutcome::Failed,
+                Some("user denied approval (code -32001)")
+            ),
+            TurnFailureHealth::Record {
+                reason: "turn did not complete: user denied approval (code -32001)".into()
+            }
+        );
+        // A genuine model failure (with the engine's own diagnosis) records.
+        assert_eq!(
+            turn_failure_health(
+                &AgentOutcome::Failed,
+                Some("turn failed: provider HTTP 404: model does not exist")
+            ),
+            TurnFailureHealth::Record {
+                reason:
+                    "turn did not complete: turn failed: provider HTTP 404: model does not exist"
+                        .into()
+            }
+        );
+        // No detail at all keeps the historical shape.
+        assert_eq!(
+            turn_failure_health(&AgentOutcome::IdleTimeout, None),
+            TurnFailureHealth::Record {
+                reason: "turn did not complete: idle_timeout".into()
+            }
+        );
+    }
+
+    /// F5.1, both directions, at the store level: a daemon-capacity turn
+    /// arm records nothing (no entry, no file), while a genuine failure
+    /// arm still trips the breaker signal.
+    #[test]
+    fn daemon_capacity_turn_never_writes_the_shared_health_file() {
+        use zoder_core::AgentOutcome;
+        let dir = std::env::temp_dir().join(format!(
+            "zoder-fb133-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let health_path = dir.join("health.json");
+
+        // Capacity direction: the arm matches, so neither record_classified
+        // failure nor save_health is called — exactly like the branch.
+        match turn_failure_health(
+            &AgentOutcome::Failed,
+            Some("turn failed: Session limit reached (code -32001)"),
+        ) {
+            TurnFailureHealth::SkipCapacity => {}
+            other => panic!("capacity detail must skip the health write, got {other:?}"),
+        }
+        // Nothing was recorded and nothing was saved: no file at all.
+        assert!(
+            !health_path.exists(),
+            "the shared health file must not be written"
+        );
+        assert_eq!(HealthStore::load(&health_path).models.len(), 0);
+
+        // Genuine direction: the same arm shape records and persists.
+        let mut health = HealthStore::load(&health_path);
+        match turn_failure_health(
+            &AgentOutcome::Failed,
+            Some("turn failed: connecting to engine: connection refused"),
+        ) {
+            TurnFailureHealth::Record { reason } => {
+                health.record_classified_failure(
+                    "some/model",
+                    &reason,
+                    "prov-a",
+                    zoder_core::Classification::Error,
+                );
+                save_health(&health);
+            }
+            other => panic!("genuine failure must record, got {other:?}"),
+        }
+        assert!(
+            health_path.exists(),
+            "a genuine failure persists the strike"
+        );
+        let persisted = HealthStore::load(&health_path);
+        let h = persisted.models.get("some/model").unwrap();
+        assert_eq!(h.failures, 1);
+        assert_eq!(h.consecutive_failures, 1);
+        assert_eq!(h.classification, Some(zoder_core::Classification::Error));
     }
 
     /// HP1 payoff: before the fix, a provider whose prober could not be
