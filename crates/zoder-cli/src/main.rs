@@ -26735,6 +26735,12 @@ model = "m"
     /// It used to set `ZEROCLAW_SOCKET` and `ZEROCLAW_CONFIG_DIR` and never
     /// restore them, so every later test in the binary resolved the engine
     /// socket and config to this test's deleted tempdir.
+    ///
+    /// The snapshots are taken under ENV_LOCK but not across the call (the
+    /// lock is not re-entrant and `run_oneshot` takes it). That is sound
+    /// because every test that sets these variables does so through a guard
+    /// that restores them before it releases the lock, so whenever the lock
+    /// is free the environment is at its baseline.
     #[tokio::test]
     async fn run_oneshot_restores_the_engine_environment() {
         let snapshot = || {

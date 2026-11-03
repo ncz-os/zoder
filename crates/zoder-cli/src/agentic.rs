@@ -26513,7 +26513,6 @@ mod loop_review_base_tests {
 mod reviewer_request_settings_tests {
     use super::*;
     use crate::agentic::tests::test_engine;
-    use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26614,10 +26613,14 @@ model_provider = "custom.reviewer"
             .mount(server)
             .await;
         write_home(home, &server.uri(), models_json);
-        let _guard = EnvGuard::new(home);
-        let _socket = std::env::var("ZEROCLAW_SOCKET").ok();
-        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", home.join("engine-cfg"));
+        // ONE guard restores all three variables (under ENV_LOCK) when it
+        // drops; setting the engine variables bare left every later test
+        // pointed at this test's deleted tempdir.
+        let mut env_guard = zoder_test_support::EnvGuard::new();
+        env_guard
+            .set("ZODER_HOME", home)
+            .set("ZEROCLAW_SOCKET", home.join("daemon.sock"))
+            .set("ZEROCLAW_CONFIG_DIR", home.join("engine-cfg"));
 
         let mut argv = vec!["zoder", "--quiet"];
         argv.extend_from_slice(extra_cli);
@@ -26719,7 +26722,6 @@ model_provider = "custom.reviewer"
 #[cfg(test)]
 mod confirm_author_family_tests {
     use super::*;
-    use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26846,9 +26848,14 @@ model_provider = "custom.reviewer"
             .mount(&server)
             .await;
         write_home(dir.path(), &server.uri());
-        let _guard = EnvGuard::new(dir.path());
-        std::env::set_var("ZEROCLAW_SOCKET", dir.path().join("daemon.sock"));
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", &cfg_path);
+        // ONE guard restores all three variables (under ENV_LOCK) when it
+        // drops; setting the engine variables bare left every later test
+        // pointed at this test's deleted tempdir.
+        let mut env_guard = zoder_test_support::EnvGuard::new();
+        env_guard
+            .set("ZODER_HOME", dir.path())
+            .set("ZEROCLAW_SOCKET", dir.path().join("daemon.sock"))
+            .set("ZEROCLAW_CONFIG_DIR", &cfg_path);
 
         let cli = crate::Cli::try_parse_from(["zoder", "--quiet"]).expect("cli parses");
         let eng = Engine::load().expect("the engine loads");
@@ -26920,7 +26927,6 @@ model_provider = "custom.reviewer"
 #[cfg(test)]
 mod confirm_empty_body_tests {
     use super::*;
-    use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26999,9 +27005,14 @@ model_provider = "custom.reviewer"
             .mount(server)
             .await;
         write_home(home, &server.uri());
-        let _guard = EnvGuard::new(home);
-        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+        // ONE guard restores all three variables (under ENV_LOCK) when it
+        // drops; setting the engine variables bare left every later test
+        // pointed at this test's deleted tempdir.
+        let mut env_guard = zoder_test_support::EnvGuard::new();
+        env_guard
+            .set("ZODER_HOME", home)
+            .set("ZEROCLAW_SOCKET", home.join("daemon.sock"))
+            .set("ZEROCLAW_CONFIG_DIR", cfg_path);
 
         // A 5s request budget: the streaming reader waits for its
         // post-finish grace (bounded by this) before accepting the
@@ -27056,7 +27067,6 @@ model_provider = "custom.reviewer"
 #[cfg(test)]
 mod confirm_e2e_record_tests {
     use super::*;
-    use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -27152,9 +27162,14 @@ model_provider = "custom.reviewer"
             .mount(server)
             .await;
         write_home(home, &server.uri());
-        let _guard = EnvGuard::new(home);
-        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+        // ONE guard restores all three variables (under ENV_LOCK) when it
+        // drops; setting the engine variables bare left every later test
+        // pointed at this test's deleted tempdir.
+        let mut env_guard = zoder_test_support::EnvGuard::new();
+        env_guard
+            .set("ZODER_HOME", home)
+            .set("ZEROCLAW_SOCKET", home.join("daemon.sock"))
+            .set("ZEROCLAW_CONFIG_DIR", cfg_path);
 
         let cli = crate::Cli::try_parse_from(["zoder", "--quiet"]).expect("cli parses");
         let eng = Engine::load().expect("the engine loads");
@@ -27442,7 +27457,6 @@ model_provider = "custom.reviewer"
 #[cfg(test)]
 mod confirm_dispatch_tests {
     use super::*;
-    use crate::test_env::EnvGuard;
     use clap::Parser;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -27530,9 +27544,14 @@ model_provider = "custom.reviewer"
             .mount(server)
             .await;
         write_home(home, &server.uri(), confirm_effort);
-        let _guard = EnvGuard::new(home);
-        std::env::set_var("ZEROCLAW_SOCKET", home.join("daemon.sock"));
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", cfg_path);
+        // ONE guard restores all three variables (under ENV_LOCK) when it
+        // drops; setting the engine variables bare left every later test
+        // pointed at this test's deleted tempdir.
+        let mut env_guard = zoder_test_support::EnvGuard::new();
+        env_guard
+            .set("ZODER_HOME", home)
+            .set("ZEROCLAW_SOCKET", home.join("daemon.sock"))
+            .set("ZEROCLAW_CONFIG_DIR", cfg_path);
 
         // The CLI also asks for "high": a role's declared effort is not the
         // reviewer's to change.
