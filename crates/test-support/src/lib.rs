@@ -279,22 +279,27 @@ mod tests {
 
     #[test]
     fn env_guard_restores_previous_value_and_absence() {
+        // A key no other test touches; the reads between guards still take
+        // the lock so they never observe a sibling's in-flight override.
+        const OWN: &str = "ZODER_TEST_SUPPORT_SELF_TEST_RESTORE";
+        let absent = || {
+            let _l = lock_env();
+            std::env::var_os(OWN).is_none()
+        };
+        assert!(absent(), "fixture: key starts absent");
         {
             let mut g = EnvGuard::new();
-            g.set(KEY, "outer");
+            g.set(OWN, "outer");
         }
-        assert!(
-            std::env::var_os(KEY).is_none(),
-            "absent before -> absent after"
-        );
+        assert!(absent(), "absent before -> absent after");
         {
             let mut g = EnvGuard::new();
-            g.set(KEY, "before");
+            g.set(OWN, "before");
             // Touching the same key twice restores the ORIGINAL value.
-            g.set(KEY, "one").set(KEY, "two");
-            assert_eq!(std::env::var(KEY).unwrap(), "two");
+            g.set(OWN, "one").set(OWN, "two");
+            assert_eq!(std::env::var(OWN).unwrap(), "two");
         }
-        assert!(std::env::var_os(KEY).is_none());
+        assert!(absent());
     }
 
     #[test]
