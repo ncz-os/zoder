@@ -17993,6 +17993,7 @@ mod review_diff_soundness_tests {
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
+                .envs(zoder_test_support::git::ISOLATED_ENV.iter().copied())
                 .output()
                 .unwrap();
             assert!(
@@ -18002,6 +18003,7 @@ mod review_diff_soundness_tests {
             );
         };
         run(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         // Required to run `git commit` in a fresh temp dir without
         // inheriting the host's identity.
         run(&["config", "user.email", "test@example.invalid"]);
@@ -23750,6 +23752,7 @@ data: [DONE]\n\n";
                 .arg("-C")
                 .arg(&cwd)
                 .args(args)
+                .envs(zoder_test_support::git::ISOLATED_ENV.iter().copied())
                 .env("GIT_AUTHOR_NAME", "Loop Test")
                 .env("GIT_AUTHOR_EMAIL", "loop@example.invalid")
                 .env("GIT_COMMITTER_NAME", "Loop Test")
@@ -23764,6 +23767,7 @@ data: [DONE]\n\n";
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git(&["init", "-q", "-b", "main"]);
+        zoder_test_support::git::harden_fixture_repo(&cwd);
         git(&["config", "user.name", "Loop Test"]);
         git(&["config", "user.email", "loop@example.invalid"]);
         std::fs::write(cwd.join("a.txt"), "alpha\n").unwrap();
@@ -24049,6 +24053,7 @@ mod review_refusal_tests {
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
+                .envs(zoder_test_support::git::ISOLATED_ENV.iter().copied())
                 .output()
                 .unwrap();
             assert!(
@@ -24058,6 +24063,7 @@ mod review_refusal_tests {
             );
         };
         run(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&["config", "user.email", "test@example.invalid"]);
         run(&["config", "user.name", "review-refusal-test"]);
         run(&["config", "init.defaultBranch", "main"]);
@@ -24754,6 +24760,7 @@ mod commit_author_enforcement_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         run(&repo, &["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&repo, &["config", "init.defaultBranch", "main"]);
         // Seed the repo with a commit under a deliberately-DIFFERENT
         // identity (so we can test the correction path), then re-set
@@ -24899,6 +24906,7 @@ mod commit_author_enforcement_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         run(&repo, &["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&repo, &["config", "init.defaultBranch", "main"]);
         // Seed the repo with a commit under a known-wrong author so
         // the assertion below has a literal witness to compare
@@ -24978,6 +24986,7 @@ mod commit_author_enforcement_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         run(&repo, &["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&repo, &["config", "user.email", "x@example.invalid"]);
         run(&repo, &["config", "user.name", "X"]);
 
@@ -25291,6 +25300,7 @@ mod patch_journal_tests {
             );
         };
         run(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&["config", "user.email", "test@example.invalid"]);
         run(&["config", "user.name", "patch-journal-test"]);
         run(&["config", "init.defaultBranch", "main"]);
@@ -25821,6 +25831,7 @@ mod completion_integrity_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         run_git(repo, &["init", "-q"]).unwrap();
+        zoder_test_support::git::harden_fixture_repo(repo);
         std::fs::create_dir(repo.join("new")).unwrap();
         std::fs::write(repo.join("new/.gitignore"), "secret.env\n").unwrap();
         std::fs::write(repo.join("new/secret.env"), "SECRET_SHOULD_NOT_APPEAR").unwrap();
@@ -25837,6 +25848,7 @@ mod completion_integrity_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         run_git(repo, &["init", "-q"]).unwrap();
+        zoder_test_support::git::harden_fixture_repo(repo);
         std::fs::create_dir(repo.join("notes")).unwrap();
         std::fs::write(repo.join("notes/existing.md"), "preexisting evidence\n").unwrap();
         let mut journal = PatchJournal::new();
@@ -25855,6 +25867,7 @@ mod completion_integrity_tests {
         let repo = dir.path();
         let git = |args: &[&str]| run_git(repo, args).unwrap();
         git(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(repo);
         std::fs::write(repo.join(".gitignore"), "tracked.rs\n").unwrap();
         std::fs::write(repo.join("tracked.rs"), "fn before() {}\n").unwrap();
         git(&["add", "-f", ".gitignore", "tracked.rs"]);
@@ -25903,6 +25916,7 @@ mod completion_integrity_tests {
         let repo = dir.path();
         let git = |args: &[&str]| run_git(repo, args).unwrap();
         git(&["init", "-q", "-b", "main"]);
+        zoder_test_support::git::harden_fixture_repo(repo);
         git(&["config", "user.name", "Test"]);
         git(&["config", "user.email", "test@example.com"]);
         std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
@@ -25935,6 +25949,7 @@ mod completion_integrity_tests {
         let repo = dir.path();
         let git = |args: &[&str]| run_git(repo, args).unwrap();
         git(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(repo);
         git(&["config", "user.name", "Test"]);
         git(&["config", "user.email", "test@example.com"]);
         std::fs::write(repo.join("old.rs"), "fn old_branch_work() {}\n").unwrap();
@@ -25974,6 +25989,7 @@ mod completion_integrity_tests {
         let repo = dir.path();
         let git = |args: &[&str]| run_git(repo, args).unwrap();
         git(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(repo);
         git(&["config", "user.name", "Test"]);
         git(&["config", "user.email", "test@example.com"]);
         std::fs::write(repo.join("old.rs"), "fn old_branch_work() {}\n").unwrap();
@@ -26067,6 +26083,7 @@ mod loop_review_base_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         git(&repo, &["init", "-q", "-b", "master"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         git(&repo, &["config", "user.email", "test@example.invalid"]);
         git(&repo, &["config", "user.name", "loop-base-test"]);
         std::fs::write(repo.join("app.txt"), "base\n").unwrap();
@@ -26200,6 +26217,7 @@ mod loop_review_base_tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
         git(&repo, &["init", "-q", "-b", "master"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         git(&repo, &["config", "user.email", "test@example.invalid"]);
         git(&repo, &["config", "user.name", "loop-dirty-test"]);
         std::fs::write(repo.join("app.txt"), "seed\n").unwrap();

@@ -1538,6 +1538,7 @@ mod tests {
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
+                .envs(zoder_test_support::git::ISOLATED_ENV.iter().copied())
                 .output()
                 .unwrap();
             assert!(
@@ -1547,6 +1548,7 @@ mod tests {
             );
         };
         run(&["init", "-q"]);
+        zoder_test_support::git::harden_fixture_repo(&repo);
         run(&["config", "user.email", "test@example.invalid"]);
         run(&["config", "user.name", "review-diff-test"]);
         std::fs::write(repo.join(".zoderignore"), "*.tsv\n# comment\n\n").unwrap();
