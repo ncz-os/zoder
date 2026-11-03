@@ -473,6 +473,12 @@ fn spawn_client(
 ///
 /// `bin_dir` is FIRST on `$PATH` so the stand-in `zeroclaw` is the engine
 /// the product starts.
+///
+/// `ZEROCLAW_SOCKET` is pinned to the scratch socket
+/// (`<cfg_dir>/data/daemon.sock`). An exported `ZEROCLAW_SOCKET` wins over
+/// `ZEROCLAW_CONFIG_DIR`, and fleet workers export it, so without the pin
+/// every spawned client would talk to the host's LIVE shared daemon instead
+/// of the stand-in this test starts.
 fn client_env(
     cfg_dir: &Path,
     zoder_home: &Path,
@@ -488,6 +494,14 @@ fn client_env(
         (
             "ZEROCLAW_CONFIG_DIR".to_string(),
             cfg_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "ZEROCLAW_SOCKET".to_string(),
+            cfg_dir
+                .join("data")
+                .join("daemon.sock")
+                .to_string_lossy()
+                .to_string(),
         ),
         (
             "ZODER_HOME".to_string(),
