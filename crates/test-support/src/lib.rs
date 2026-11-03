@@ -27,10 +27,43 @@ use std::sync::{Mutex, MutexGuard};
 /// (and every crate-local re-export of it) shares the same mutex.
 pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+std::thread_local! {
+    /// Whether this thread holds [`ENV_LOCK`] through an [`EnvLock`].
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`ENV_LOCK`] held through this crate. Dropping it releases the lock.
+///
+/// Taking the lock a second time on the same thread (two live guards) would
+/// deadlock silently, because the mutex is not re-entrant; [`lock_env`]
+/// panics with a clear message instead. Code that locks [`ENV_LOCK`] directly
+/// bypasses this check.
+pub struct EnvLock {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        HELD.with(|h| h.set(false));
+    }
+}
+
 /// Take [`ENV_LOCK`], ignoring poison: a test that panicked while holding it
 /// has already restored the environment through its guard's `Drop`.
-pub fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+///
+/// # Panics
+///
+/// If this thread already holds the lock through another [`EnvLock`],
+/// [`EnvGuard`] or [`IsolatedHome`].
+pub fn lock_env() -> EnvLock {
+    assert!(
+        !HELD.with(|h| h.get()),
+        "zoder-test-support: ENV_LOCK is already held on this thread (nested \
+         EnvGuard / IsolatedHome?); the lock is not re-entrant and this would deadlock"
+    );
+    let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    HELD.with(|h| h.set(true));
+    EnvLock { _guard: guard }
 }
 
 /// RAII environment override.
@@ -40,12 +73,12 @@ pub fn lock_env() -> MutexGuard<'static, ()> {
 /// touched and restored, in reverse order, when the guard drops; the lock is
 /// released only after that restore (struct fields drop after `Drop::drop`).
 ///
-/// Never construct a second guard while one is alive on the same thread: the
-/// lock is not re-entrant and that deadlocks.
+/// Constructing a second guard while one is alive on the same thread panics
+/// (see [`lock_env`]).
 #[must_use = "dropping the guard immediately restores the environment"]
 pub struct EnvGuard {
     saved: Vec<(OsString, Option<OsString>)>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: EnvLock,
 }
 
 impl EnvGuard {
@@ -100,7 +133,7 @@ impl Drop for EnvGuard {
 /// A throwaway home directory with every host-identity variable pointed into
 /// it, held under [`ENV_LOCK`] for the value's lifetime.
 ///
-/// Sets `HOME`, `ZODER_HOME` (`<dir>/.zoder`), `XDG_CONFIG_HOME`,
+/// Sets (and creates) `HOME`, `ZODER_HOME` (`<dir>/.zoder`), `XDG_CONFIG_HOME`,
 /// `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`,
 /// `ZEROCLAW_CONFIG_DIR` (`<dir>/.zeroclaw`) and `ZEROCLAW_SOCKET`
 /// (`<dir>/.zeroclaw/data/daemon.sock`). The socket is never bound, so a
@@ -123,7 +156,16 @@ impl IsolatedHome {
         let zoder_home = root.join(".zoder");
         let zeroclaw = root.join(".zeroclaw");
         let runtime = root.join("run");
-        for d in [&zoder_home, &zeroclaw.join("data"), &runtime] {
+        let xdg = [
+            root.join(".config"),
+            root.join(".local").join("share"),
+            root.join(".local").join("state"),
+            root.join(".cache"),
+        ];
+        for d in [&zoder_home, &zeroclaw.join("data"), &runtime]
+            .into_iter()
+            .chain(xdg.iter())
+        {
             std::fs::create_dir_all(d).expect("create isolated home subdir");
         }
         #[cfg(unix)]
@@ -134,10 +176,10 @@ impl IsolatedHome {
         let mut env = EnvGuard::new();
         env.set("HOME", root)
             .set("ZODER_HOME", &zoder_home)
-            .set("XDG_CONFIG_HOME", root.join(".config"))
-            .set("XDG_DATA_HOME", root.join(".local").join("share"))
-            .set("XDG_STATE_HOME", root.join(".local").join("state"))
-            .set("XDG_CACHE_HOME", root.join(".cache"))
+            .set("XDG_CONFIG_HOME", &xdg[0])
+            .set("XDG_DATA_HOME", &xdg[1])
+            .set("XDG_STATE_HOME", &xdg[2])
+            .set("XDG_CACHE_HOME", &xdg[3])
             .set("XDG_RUNTIME_DIR", &runtime)
             .set("ZEROCLAW_CONFIG_DIR", &zeroclaw)
             .set("ZEROCLAW_SOCKET", zeroclaw.join("data").join("daemon.sock"));
@@ -201,7 +243,17 @@ pub mod git {
     /// `git init`. Because the settings are repo-local, they also cover git
     /// commands that production code runs in the fixture without the isolated
     /// environment.
+    ///
+    /// # Panics
+    ///
+    /// If `repo` is not a git work tree yet (called before `git init`), or if
+    /// `git config` fails.
     pub fn harden_fixture_repo(repo: &Path) {
+        assert!(
+            repo.join(".git").exists(),
+            "harden_fixture_repo({}): not a git repository; call it right after `git init`",
+            repo.display()
+        );
         for (key, value) in FIXTURE_CONFIG {
             let mut cmd = Command::new("git");
             cmd.arg("-C").arg(repo).args(["config", key, value]);
@@ -262,6 +314,13 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_guard_panics_instead_of_deadlocking() {
+        let _outer = EnvGuard::new();
+        let nested = std::panic::catch_unwind(EnvGuard::new);
+        assert!(nested.is_err(), "a second guard on one thread must panic");
+    }
+
+    #[test]
     fn isolated_home_points_everything_into_one_tempdir() {
         let prev_home = std::env::var_os("HOME");
         let root;
@@ -286,6 +345,9 @@ mod tests {
                     v.display(),
                     root.display()
                 );
+                if key.starts_with("XDG_") || key == "ZODER_HOME" {
+                    assert!(v.is_dir(), "{key} must exist: {}", v.display());
+                }
             }
             assert_eq!(
                 PathBuf::from(std::env::var_os("ZEROCLAW_SOCKET").unwrap()),
