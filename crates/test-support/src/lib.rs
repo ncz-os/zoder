@@ -186,7 +186,8 @@ impl IsolatedHome {
         Self { env, dir }
     }
 
-    /// The isolated `HOME`.
+    /// The isolated `HOME` (the tempdir root). This is NOT `ZODER_HOME`;
+    /// use [`IsolatedHome::zoder_home`] for that.
     pub fn home(&self) -> &Path {
         self.dir.path()
     }

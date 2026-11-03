@@ -1935,7 +1935,13 @@ async fn responses_401_with_openai_error_envelope_is_classified_as_http() {
 /// races with the other tests in this binary that also flip the same
 /// variable. The integration suite has a tighter set of tests than the
 /// unit-test module so a single lock here is enough.
-static AZURE_INTEG_API_VERSION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// It is the workspace-wide `zoder_test_support::ENV_LOCK`, so these tests
+/// also serialize with any test in this binary that uses the shared
+/// `EnvGuard` / `IsolatedHome`. (The API-version variable is read in
+/// `OpenAiProvider::new`, under the lock; each test's API-key variable has a
+/// unique name, so releasing the lock before the request is safe.)
+use zoder_test_support::ENV_LOCK as AZURE_INTEG_API_VERSION_LOCK;
 
 /// Build an `OpenAiProvider` configured to hit the given base_url with
 /// the Azure OpenAI native wire shape. `auth` exercises every `Auth`

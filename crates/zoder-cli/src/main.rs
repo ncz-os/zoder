@@ -26736,40 +26736,36 @@ model = "m"
     /// restore them, so every later test in the binary resolved the engine
     /// socket and config to this test's deleted tempdir.
     ///
-    /// The snapshots are taken under ENV_LOCK but not across the call (the
-    /// lock is not re-entrant and `run_oneshot` takes it). That is sound
-    /// because every test that sets these variables does so through a guard
-    /// that restores them before it releases the lock, so whenever the lock
-    /// is free the environment is at its baseline.
+    /// The assertion is deliberately the deterministic one: after the call,
+    /// none of the three variables may point into THIS test's tempdir. No
+    /// other test can produce that path, so the check cannot be disturbed by
+    /// a sibling holding ENV_LOCK between the call and the snapshot.
     #[tokio::test]
     async fn run_oneshot_restores_the_engine_environment() {
-        let snapshot = || {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
+        result.expect("oneshot call succeeds");
+        let after = {
             let _l = crate::test_env::ENV_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            (
-                std::env::var_os("ZODER_HOME"),
-                std::env::var_os("ZEROCLAW_SOCKET"),
-                std::env::var_os("ZEROCLAW_CONFIG_DIR"),
-            )
+            [
+                ("ZODER_HOME", std::env::var_os("ZODER_HOME")),
+                ("ZEROCLAW_SOCKET", std::env::var_os("ZEROCLAW_SOCKET")),
+                (
+                    "ZEROCLAW_CONFIG_DIR",
+                    std::env::var_os("ZEROCLAW_CONFIG_DIR"),
+                ),
+            ]
         };
-        let dir = tempfile::tempdir().unwrap();
-        let before = snapshot();
-        let (_server, result) = run_oneshot(&[], Some(&engine_toml()), dir.path(), None).await;
-        result.expect("oneshot call succeeds");
-        let after = snapshot();
-        assert_eq!(
-            after, before,
-            "ZODER_HOME / ZEROCLAW_SOCKET / ZEROCLAW_CONFIG_DIR must be restored"
-        );
-        let leaked = |v: &Option<std::ffi::OsString>| {
-            v.as_ref()
-                .is_some_and(|p| std::path::Path::new(p).starts_with(dir.path()))
-        };
-        assert!(
-            !leaked(&after.0) && !leaked(&after.1) && !leaked(&after.2),
-            "no engine variable may still point into the test's tempdir: {after:?}"
-        );
+        for (key, value) in &after {
+            assert!(
+                !value
+                    .as_ref()
+                    .is_some_and(|p| std::path::Path::new(p).starts_with(dir.path())),
+                "{key} must be restored, but still points into the test's tempdir: {value:?}"
+            );
+        }
     }
 }
 
