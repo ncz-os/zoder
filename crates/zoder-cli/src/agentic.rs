@@ -3141,6 +3141,45 @@ fn fail_closed_review_output(raw: &str) -> ReviewOutput {
     }
 }
 
+/// Why a review was skipped: the author turn produced no changes to review.
+///
+/// Names the author's outcome and tool-call count, plus the engine's own
+/// failure detail when it recorded one, so the iteration record says what
+/// the author did. Dispatching the empty plan instead failed as "no review
+/// chunks were generated", which names neither the author nor the cause.
+fn empty_author_diff_review_skip(
+    author_outcome: &str,
+    tool_calls: u32,
+    author_error: Option<&str>,
+) -> String {
+    let mut detail = format!(
+        "review skipped: the author turn produced no changes to review \
+(outcome: {author_outcome}, tool calls: {tool_calls}); nothing was authored"
+    );
+    if let Some(err) = author_error {
+        detail.push_str(&format!("; author: {err}"));
+    }
+    detail
+}
+
+/// Whether an unusable review ends the loop.
+///
+/// A verdict with no located evidence and a reviewer that produced no verdict
+/// both stop it: another author round cannot repair a review. The one
+/// exception is a review skipped because the author produced no edits: there
+/// was nothing to review, and the next author turn is told exactly that. The
+/// dead-engine streak and the no-progress stall budget bound the repeats.
+fn unresolved_review_stops_loop(
+    verdict: &str,
+    review_skipped_empty_diff: bool,
+    unlocated_no_evidence: bool,
+) -> bool {
+    if unlocated_no_evidence {
+        return true;
+    }
+    verdict == REVIEWER_UNAVAILABLE_VERDICT && !review_skipped_empty_diff
+}
+
 /// The `zoder review` verdict gate (F4/FB111): the structured gate is the
 /// ONLY way to an approve.
 ///
@@ -10994,6 +11033,18 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // Pre-D5.2 each of the three `Engine::load()` calls in this block
         // degraded independently to an empty chain / no `[review]` config.
         let engine_load_error = eng.as_ref().err().map(|e| format!("loading engine: {e}"));
+        // An author turn that left the tree untouched has produced nothing to
+        // review. The chunk planner yields no chunk for an empty diff, and
+        // dispatching that plan fails as "no review chunks were generated":
+        // a planning error that names neither the author nor the cause, and
+        // that used to end the loop before the "you made NO changes" feedback
+        // below could ever reach the author. Skip the reviewer instead,
+        // record the author-side reason, and let the iteration fall through
+        // to the feedback and stall accounting.
+        let review_skipped_empty_diff = engine_load_error.is_none()
+            && !review_unconfirmed_cancel
+            && !author_session_limit
+            && diff.trim().is_empty();
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
             if let Some(detail) = engine_load_error {
                 let detail = format!("review skipped: {detail}");
@@ -11036,6 +11087,30 @@ diff is not a finished turn"
                     .to_string();
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: {detail}; iteration unresolved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if review_skipped_empty_diff {
+                let outcome = match (&turn, &author_err) {
+                    (Some(t), _) => t.run.outcome.as_str().to_string(),
+                    (None, Some(e)) => format!("interrupted: {e}"),
+                    (None, None) => "interrupted".to_string(),
+                };
+                let detail = empty_author_diff_review_skip(
+                    &outcome,
+                    turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                    turn.as_ref()
+                        .and_then(|t| t.run.failure_detail.as_deref())
+                        .or(author_err.as_deref()),
+                );
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}");
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11325,7 +11400,16 @@ or comment together with an explicit statement that no blocking defect exists.\n
         // round cannot repair them. Preserve the iteration and stop unresolved.
         // An INCOMPLETE review (provider error, timeout, unparseable chunk,
         // oversized diff) lands here too: it is never an approve.
-        if review.verdict == REVIEWER_UNAVAILABLE_VERDICT || review_unlocated_no_evidence {
+        // A review skipped because the author produced no edits is the one
+        // unusable review that does NOT stop the loop: there was nothing to
+        // review, and the feedback below tells the author so. The dead-engine
+        // streak and the no-progress stall budget bound how often that can
+        // repeat.
+        if unresolved_review_stops_loop(
+            &review.verdict,
+            review_skipped_empty_diff,
+            review_unlocated_no_evidence,
+        ) {
             if !cli.quiet {
                 eprintln!(
                     "[loop] {}",
@@ -11376,7 +11460,10 @@ or comment together with an explicit statement that no blocking defect exists.\n
         // control flow as a failed check. This closes the gaming surface
         // where an over-eager author could "pass" the loop with whitespace
         // churn or comment-only edits.
-        if (check_green || check_satisfied) && !substance_ok {
+        // An EMPTY diff is not gaming: it skipped the review above and takes
+        // the no-progress path below, whose feedback tells the author that
+        // no edit landed.
+        if (check_green || check_satisfied) && !substance_ok && !review_skipped_empty_diff {
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: REJECTED green — diff is {diff_substance:?}, \
@@ -11502,7 +11589,8 @@ consecutive non-substantive iteration(s); stopping."
             // unchanged, so it is still unaddressed), and an unparseable /
             // unavailable / synthesized-failure sample is a non-approve
             // (fail closed).
-            if !review_ok && stall_streak >= 1 {
+            // No fresh samples of an empty diff: there is nothing to review.
+            if !review_ok && stall_streak >= 1 && !review_skipped_empty_diff {
                 if !cli.quiet {
                     eprintln!(
                         "[loop] iter {i}: unchanged diff with the same blocker; \
@@ -15754,6 +15842,104 @@ not run to max_iters"
         let f = loop_failure(None, None, "comment", 0).expect("unresolved loop has a failure");
         assert_eq!(f.code, crate::failure::FailureCode::EngineUnreachable);
         assert_eq!(f.code.exit_code(), 20);
+    }
+
+    /// The chunk planner yields no chunk for an empty diff, and dispatching
+    /// that plan fails as "no review chunks were generated". That is the
+    /// message an author turn with no edits used to surface as; the loop
+    /// must skip the reviewer before planning instead.
+    #[test]
+    fn empty_author_diff_plans_no_review_chunks() {
+        let caps = crate::review_diff::resolve_review_caps(None, None, None, None);
+        let plan = plan_loop_review(
+            "",
+            "working tree",
+            "Task under review: nothing\n",
+            caps,
+            &[],
+            &[],
+            false,
+            &|_chunk: &str, _budget: usize| String::new(),
+            REVIEW_MIN_MAX_TOKENS,
+        )
+        .expect("an empty diff plans without error");
+        assert!(
+            plan.users.is_empty(),
+            "no chunk is planned for an empty diff"
+        );
+    }
+
+    /// A review skipped for an empty author diff names the author's outcome,
+    /// classifies as `empty_diff`, and is the loop's recorded reason.
+    #[test]
+    fn empty_author_diff_review_skip_names_the_author_and_classifies_as_empty_diff() {
+        let detail = empty_author_diff_review_skip("completed", 0, None);
+        assert!(detail.contains("produced no changes to review"), "{detail}");
+        assert!(detail.contains("outcome: completed"), "{detail}");
+        assert!(detail.contains("tool calls: 0"), "{detail}");
+        assert!(
+            !detail.contains("author:"),
+            "no author error, none reported"
+        );
+        assert_eq!(
+            crate::failure::classify_message(&detail).map(|(code, _)| code),
+            Some(crate::failure::FailureCode::EmptyDiff)
+        );
+        let with_error =
+            empty_author_diff_review_skip("failed", 0, Some("provider HTTP 400: bad request"));
+        assert!(with_error.contains("outcome: failed"), "{with_error}");
+        assert!(
+            with_error.ends_with("author: provider HTTP 400: bad request"),
+            "{with_error}"
+        );
+
+        let last = serde_json::json!({
+            "author_model": "some-model",
+            "author_error": serde_json::Value::Null,
+            "review_error": detail,
+            "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::EmptyDiff);
+        assert!(
+            f.message.starts_with("loop ended unresolved after 1 iteration(s); last recorded reason: review skipped: the author turn produced no changes to review"),
+            "{}",
+            f.message
+        );
+        assert!(
+            !f.message.contains("no review chunks were generated"),
+            "the planner's message must not be the recorded reason: {}",
+            f.message
+        );
+    }
+
+    /// Only a review skipped for an empty author diff lets the loop continue
+    /// to the next author turn; every other unusable review stops it.
+    #[test]
+    fn unresolved_review_stops_loop_truth_table() {
+        assert!(unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            false,
+            false
+        ));
+        assert!(!unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            true,
+            false
+        ));
+        assert!(unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            true,
+            true
+        ));
+        assert!(unresolved_review_stops_loop("request_changes", false, true));
+        assert!(!unresolved_review_stops_loop(
+            "request_changes",
+            false,
+            false
+        ));
+        assert!(!unresolved_review_stops_loop("approve", true, false));
     }
 
     /// A reviewer that never answered is transient, not permanent: the
