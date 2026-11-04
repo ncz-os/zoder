@@ -121,7 +121,34 @@ The other FB80 deliverables (quota.rs `*_at` wrappers + pinned tests + the
 two quota REDs; the pinned `month_to_date_usd_sums_current_month_bucket` and
 `month_to_date_fails_closed_when_current_cost_is_unknown`; PLAN-FB80.md and
 docs/verification/wall-clock-tests-20261101.md) are already present on
-master and untouched. Test counts on the build host (cargo 1.96.1):
-before (d2 tip) 2550 passed / 0 failed / 5 ignored; after (this rework)
-2550 passed / 0 failed / 5 ignored; `-- --ignored` shows exactly the three
-intended FB80 reds failing (ledger, plan_usage, amortized).
+The branch is rebased onto the current master tip (535bb3ea) with the
+conflict resolved as above; no master file is altered by the rework itself.
+
+## Final delivery (2026-11-04)
+
+The d2 tip (776be32c, "WIP: preserve uncommitted work") carried build scratch
+files under `.build/` (quota/ledger snapshots, a review prompt, diff dumps)
+that must not land; they are dropped from the branch history. The landing
+commit on the current master tip adds exactly the remaining FB80 deliverable
+(master was missing it): `ledger::tests::month_to_date_usd_month_boundary_pinned`
+and the `#[ignore]`d `red_month_boundary_through_wall_clock`, plus this note.
+Everything else in the FB80 diff (quota `*_at` wrappers, the two quota pinned
+tests and their two REDs, the pinned `month_to_date_usd_sums_current_month_bucket`,
+the pinned `month_to_date_fails_closed_when_current_cost_is_unknown`, and
+docs/verification/wall-clock-tests-20261101.md) is already on master and is
+unchanged here.
+
+Test counts on the build host (cargo 1.96.1), full workspace suite
+`cargo test --workspace`:
+
+- before (branch at 776be32c, i.e. master + the two preserved WIP commits):
+  2548 passed / 0 failed / 3 ignored
+- after (this landing commit on master):
+  2550 passed / 0 failed / 5 ignored (+2 passed: the two new non-ignored
+  pinned tests — the ledger month-boundary test and the quota calendar-month
+  test; +2 ignored: the two new `#[ignore]`d RED demonstrations — the ledger
+  wall-clock red and the quota plan-usage wall-clock red)
+
+The three intended FB80 RED demonstrations still fail by design under
+`cargo test -p zoder-core -- --ignored` (ledger red, red_plan_usage,
+red_amortized); the pinned boundary tests pass.
