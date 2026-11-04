@@ -1,0 +1,3 @@
+- [severity: low] Inconsistent test count documentation in `PLAN-FB80.md` — evidence: The doc states "after (this landing commit on master): 2550 passed / 0 failed / 4 ignored", but the build host verification facts state "after this diff 2550 passed / 0 failed / 5 ignored". The diff adds 2 new non-ignored tests and 2 new ignored tests, but the documentation in the diff only accounts for the 2 new ledger tests and 1 new ignored test.
+
+VERDICT: APPROVE

@@ -1,0 +1,5 @@
+- [low: doc-vs-code inconsistency] The `PLAN-FB80.md` note states: "The three intended FB80 RED demonstrations still fail by design under `cargo test -p zoder-core -- --ignored` (ledger red, red_plan_usage, red_amortized)". However, the diff only shows two new ignored REDs in `quota.rs` (`red_plan_usage_calendar_month_through_wall_clock` and `red_amortized_per_call_through_wall_clock`). The third RED (`red_month_boundary_through_wall_clock`) is in `ledger.rs`, which is not part of this diff. While the note is technically correct about the total state of the workspace, it is slightly confusing as it mixes the context of the current diff with the global state.
+
+No defects found.
+
+VERDICT: APPROVE
