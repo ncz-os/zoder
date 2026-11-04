@@ -7925,11 +7925,44 @@ pub(crate) const AUTHOR_CANCEL_BEST_EFFORT_MARKER: &str = "author cancel UNCONFI
 /// [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`], so the loop's detectors cannot see
 /// that the turn may still be running. One second of margin covers the socket
 /// teardown.
-pub(crate) const AUTHOR_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
-    (1 + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64) * SETTLE_BUDGET_SECS * 1000
-        + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64) * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
-        + 1000,
-);
+///
+/// The production path computes its deadline per cancel with
+/// [`author_cancel_deadline_for`] (the first attempt may be step-scaled);
+/// this constant is the flat-budget value the tests pin.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AUTHOR_CANCEL_DEADLINE: std::time::Duration =
+    author_cancel_deadline_for(std::time::Duration::from_secs(SETTLE_BUDGET_SECS));
+
+/// The outer deadline for an author-phase cancel whose FIRST attempt is
+/// granted `first_attempt` (the step-scaled budget, see
+/// [`author_cancel_first_budget`]). The retries keep the flat settle budget,
+/// and the one-second margin covers the socket teardown.
+pub(crate) const fn author_cancel_deadline_for(
+    first_attempt: std::time::Duration,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        first_attempt.as_millis() as u64
+            + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64 * SETTLE_BUDGET_SECS * 1000
+            + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64)
+                * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
+            + 1000,
+    )
+}
+
+/// The budget the FIRST author-phase cancel attempt waits for its ack.
+///
+/// The daemon does not interrupt a running tool step: it marks the turn
+/// cancelled and sends `turn_complete` when the step returns. A watchdog that
+/// fires in the middle of a long build therefore has to wait at least as
+/// long as that step has already run, or it reports a silent daemon for a
+/// daemon that is merely busy (the 2026-11-04 fleet runs). With no tool call
+/// in flight the budget is today's flat [`SETTLE_BUDGET_SECS`].
+pub(crate) fn author_cancel_first_budget() -> std::time::Duration {
+    zoder_core::cancel_ack_budget(
+        zoder_core::cancel_budget::active_step_elapsed(),
+        zoder_core::cancel_ack_cap_from_env(),
+    )
+}
 
 /// Retry a failed `session/cancel` a bounded number of times.
 ///
@@ -7995,7 +8028,12 @@ pub(crate) async fn author_cancel_reason(
         // must not carry the unconfirmed marker — that marker is what makes the
         // iteration unreviewable and what counts toward the abort streak. A
         // confirmed retry leaves the loop's normal timed-out-turn path intact.
-        Ok(()) => String::new(),
+        // The exit path is told as well, so it does not ask the daemon to
+        // cancel a turn it has already acknowledged ending.
+        Ok(()) => {
+            crate::reaper::note_session_cancelled(session_id);
+            String::new()
+        }
         Err(reason) => reason,
     }
 }
@@ -8120,7 +8158,13 @@ where
             // captured after this function returns, and a tree captured while
             // the daemon is still writing is the torn-tree bug this wrapper
             // exists to prevent.
-            let cancelled = cancel_under_deadline(AUTHOR_CANCEL_DEADLINE, cancel).await;
+            //
+            // The deadline covers the step-scaled first attempt: a deadline
+            // computed from the flat budget would cut a long wait off
+            // mid-flight and report "deadline expired" for a daemon that was
+            // about to answer.
+            let deadline = author_cancel_deadline_for(author_cancel_first_budget());
+            let cancelled = cancel_under_deadline(deadline, cancel).await;
             settled.await;
             match cancelled {
                 Ok(()) => Err(format!(
@@ -10426,14 +10470,25 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     // is marked unresolved with the precise reason. What the
                     // author already wrote stays on disk, gets captured, and is
                     // reported.
-                    let first = match zoder_core::cancel_session(
-                        &socket,
-                        sid,
-                        std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
-                    )
-                    .await
+                    // The first attempt waits as long as the daemon's
+                    // in-flight tool step has already run (bounded): the
+                    // daemon only acknowledges once that step returns.
+                    let first_budget = author_cancel_first_budget();
+                    if first_budget > std::time::Duration::from_secs(SETTLE_BUDGET_SECS)
+                        && !cli.quiet
                     {
-                        Ok(()) => None,
+                        eprintln!(
+                            "[loop] the daemon is mid tool step; waiting up to {first_budget:?} \
+                             for it to acknowledge the cancel"
+                        );
+                    }
+                    let first = match zoder_core::cancel_session(&socket, sid, first_budget).await {
+                        Ok(()) => {
+                            // Confirmed: the exit path must not cancel this
+                            // session a second time.
+                            crate::reaper::note_session_cancelled(sid);
+                            None
+                        }
                         Err(e) => Some(format!("{e:#}")),
                     };
                     if let Some(first_error) = first {
@@ -14859,6 +14914,16 @@ must reap the direct shell on the timeout branch)"
     /// `confirm` decides which of the two shapes this is: a daemon that
     /// acknowledges the cancel, or one that never answers it.
     fn spawn_cancel_daemon(socket: &std::path::Path, confirm: bool) -> CancelDaemonFixture {
+        spawn_cancel_daemon_acking_after(socket, confirm, std::time::Duration::ZERO)
+    }
+
+    /// The same fake daemon, acknowledging `ack_after` after each cancel: a
+    /// daemon busy in a tool step that only answers once the step returns.
+    fn spawn_cancel_daemon_acking_after(
+        socket: &std::path::Path,
+        confirm: bool,
+        ack_after: std::time::Duration,
+    ) -> CancelDaemonFixture {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -14897,6 +14962,7 @@ must reap the direct shell on the timeout branch)"
                                 );
                                 let _ = writer.flush();
                             } else if method == "session/cancel" && confirm {
+                                std::thread::sleep(ack_after);
                                 let _ = writer.write_all(
                                     b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\"}}\n",
                                 );
@@ -14934,6 +15000,69 @@ must reap the direct shell on the timeout branch)"
                 let _ = handle.join();
             }
         }
+    }
+
+    /// The incident shape: the daemon is mid tool step and acknowledges the
+    /// cancel only when the step returns. The flat settle budget (today's
+    /// first attempt) is shorter than the step and reports a silent daemon;
+    /// the step-scaled budget the loop now grants the first attempt covers
+    /// the step and the SAME daemon confirms. The step length is the one the
+    /// tracker would report for a tool call that has run that long.
+    #[tokio::test]
+    async fn a_daemon_busy_in_a_tool_step_confirms_inside_the_step_scaled_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let step = std::time::Duration::from_millis(400);
+        let _daemon = spawn_cancel_daemon_acking_after(&socket, true, step);
+
+        // Today's first attempt: a flat budget shorter than the step.
+        let flat = std::time::Duration::from_millis(150);
+        let before = zoder_core::cancel_session(&socket, "busy-step", flat).await;
+        assert!(
+            before.is_err(),
+            "the flat budget cannot see an ack that arrives after the step"
+        );
+
+        // The fix: the budget scales with the step the daemon is in. The cap
+        // is the production default; the step is far below it.
+        let scaled =
+            zoder_core::cancel_ack_budget(Some(step * 3), zoder_core::DEFAULT_CANCEL_ACK_CAP);
+        assert!(
+            scaled >= step * 3,
+            "the scaled budget covers the step: {scaled:?}"
+        );
+        // The production floor is seconds; the test only needs a budget that
+        // covers the step, so the wait is bounded by the step itself.
+        let after = zoder_core::cancel_session(&socket, "busy-step", step * 3).await;
+        assert!(
+            after.is_ok(),
+            "the same daemon confirms once the budget covers its step: {after:?}"
+        );
+        // And the outer deadline grows with the first attempt, so the longer
+        // wait is never cut off mid-flight.
+        assert!(
+            author_cancel_deadline_for(scaled)
+                > scaled
+                    + std::time::Duration::from_secs(
+                        SETTLE_BUDGET_SECS * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
+                    ),
+            "the deadline must cover the scaled first attempt plus every retry"
+        );
+    }
+
+    /// With no tool call in flight the first attempt keeps the flat settle
+    /// budget: a healthy run's cancel timing is unchanged.
+    #[test]
+    fn the_first_cancel_budget_is_the_flat_settle_budget_without_a_tool_step() {
+        zoder_core::cancel_budget::turn_started();
+        assert_eq!(
+            author_cancel_first_budget(),
+            std::time::Duration::from_secs(SETTLE_BUDGET_SECS)
+        );
+        assert_eq!(
+            author_cancel_deadline_for(std::time::Duration::from_secs(SETTLE_BUDGET_SECS)),
+            AUTHOR_CANCEL_DEADLINE
+        );
     }
 
     /// `cancel_author_session_best_effort` must NEVER report success for a

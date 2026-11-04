@@ -12578,6 +12578,9 @@ pub(crate) async fn agentic_turn(
 ) -> anyhow::Result<TurnResult> {
     let eng = Engine::load()?;
     let mut health = HealthStore::load(&eng.cfg.health_path);
+    // A fresh turn has no tool step in flight yet (see
+    // `zoder_core::cancel_budget`).
+    zoder_core::cancel_budget::turn_started();
 
     // `-m` may be an overlay alias (`-m codex:sol`). The chain below resolves
     // it, but so must every later check that compares the REQUESTED model
@@ -13279,6 +13282,13 @@ pub(crate) async fn agentic_turn(
 
             if let AgentEvent::Utilization { headers } = &ev {
                 agentic::persist_agentic_utilization(&routed_provider, headers);
+            }
+            // The author-phase cancel scales its ack budget with the tool
+            // step the daemon is in; these two events are the whole record.
+            match &ev {
+                AgentEvent::ToolCall { .. } => zoder_core::cancel_budget::tool_call_started(),
+                AgentEvent::ToolResult { .. } => zoder_core::cancel_budget::tool_result_seen(),
+                _ => {}
             }
             if let AgentEvent::Usage { input_tokens } = &ev {
                 // ACP usage updates are cumulative context totals. Retain the

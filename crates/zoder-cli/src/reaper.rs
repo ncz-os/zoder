@@ -1025,7 +1025,17 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                     // leaves the cancel unsettled — the state this path
                     // exists to prevent.
                     let left = deadline.saturating_duration_since(Instant::now());
-                    let settled = retry_unconfirmed_cancel_within(socket, id, left).await;
+                    let settled = if left < RETRY_ATTEMPT_FLOOR {
+                        // The window is spent. The planner would still grant
+                        // one minimum-length retry, but a 1 ms ask cannot
+                        // reach the wire and the daemon was never asked:
+                        // counting it made the log claim "2 attempt(s)" for
+                        // one real attempt (the 2026-11-04 fleet runs).
+                        // Report the one ask that was made.
+                        UnconfirmedCancelOutcome::NeverAcknowledged(0)
+                    } else {
+                        retry_unconfirmed_cancel_within(socket, id, left).await
+                    };
                     settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
                 }
                 // `classify_cancel_error` only ever returns the two failure arms
@@ -1582,6 +1592,15 @@ fn mark_cancelled(id: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.to_string());
+}
+
+/// The loop's own author-phase cancel for `id` was acknowledged by the
+/// daemon. Record it here so the exit path does not ask again: a second
+/// `session/cancel` for a turn the daemon has already ended is never
+/// acknowledged, so it cost one settle budget per session and printed a
+/// `cancel not confirmed` line for a cancel that had in fact been confirmed.
+pub(crate) fn note_session_cancelled(id: &str) {
+    mark_cancelled(id);
 }
 
 /// Fire-and-forget `session/cancel` over a blocking socket, for the one exit
@@ -4146,6 +4165,53 @@ mod tests {
         );
 
         forget_session("budget-probe");
+        drop(server);
+    }
+
+    /// A cancel the LOOP already had acknowledged is settled for the exit path
+    /// too: the session is retired from the teardown's pending list, so the
+    /// daemon is not asked to cancel a turn it has already ended (which it
+    /// never acknowledges, and which printed a `cancel not confirmed` line
+    /// for a cancel that was in fact confirmed).
+    #[test]
+    fn a_confirmed_loop_cancel_retires_the_session_from_the_exit_path() {
+        let _lock = reap_test_lock();
+        note_session("loop-confirmed");
+        assert!(
+            pending_sessions().iter().any(|id| id == "loop-confirmed"),
+            "a recorded session is pending until something settles it"
+        );
+        note_session_cancelled("loop-confirmed");
+        assert!(
+            !pending_sessions().iter().any(|id| id == "loop-confirmed"),
+            "a session the loop's cancel confirmed must not be asked again at exit"
+        );
+        forget_session("loop-confirmed");
+    }
+
+    /// The fleet log line `cancel not confirmed after 2 attempt(s) (... within
+    /// 4.999999932s)`: the first attempt had burnt the whole per-session
+    /// window, so the "retry" the planner granted was a 1 ms ask that could
+    /// not reach the wire. The daemon is asked ONCE and the record says so.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_spent_cancel_window_counts_one_attempt_not_a_sham_retry() {
+        let _lock = reap_test_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("spent-window");
+        let window = Duration::from_millis(150);
+        cancel_session_with_retries(&socket, "spent-window", Instant::now() + window).await;
+        // Let the daemon thread count the connection(s) it served.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a spent window must not fake a second attempt the daemon could not hear"
+        );
+        forget_session("spent-window");
         drop(server);
     }
 
