@@ -26,10 +26,10 @@ provider, fleet runtime, or historical binary this host cannot stand up).
 
 | # | Claim (doc file:line) | Verdict | Source evidence (file:line, quote) |
 |---|---|---|---|
-| F1 | CONCURRENCY.md:66-67 — the ACP idle-watchdog table pins the **hosted** defaults at 60s / 60s | FALSE | `crates/acp-client/src/lib.rs:843/848`: `pub const HOSTED_AGENT_IDLE_FIRST_EVENT_S: u64 = DEFAULT_AGENT_IDLE_FIRST_EVENT_S;` (=600) and `HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S = DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S` (=180, `acp-client/src/lib.rs:830`). A hosted route gets the **same** 600s/180s pair, not 60s/60s. The doc's own prose at CONCURRENCY.md:120 states this correctly ("…and so does a hosted provider"); the table and its prose contradict each other |
-| F2 | PROFILES.md:56 — "`session/cancel` settle budget \| 1500 ms \| 750 ms \| Wired: `reaper::cancel_budget_for`" | FALSE | `crates/zoder-cli/src/reaper.rs:163-180`: fleet takes `REAP_CANCEL_BUDGET` (= `zoder_core::CANCEL_SETTLE_BUDGET`, **5 s**, `reaper.rs:145`; 5 s confirmed at `config.rs:2459`) unchanged; standalone gets 5 s (**5.75 s total**), because the profile numbers are applied as a *surplus* over the legacy 750 ms: `REAP_CANCEL_BUDGET + profile_ms - 750`. The source comment (reaper.rs:162-163: "'750 ms IS the value that starved every session after the first') says exactly that the 1500/750 values are no longer the wired budget |
-| F3 | PROFILES.md:65-67 — "Accessors for terse I/O, **shared daemon assumption**, and fleet update pulling exist in `ProfileDefaults` for future use but are not yet consulted by any production path" | FALSE (partially) | `shared_daemon` IS consulted: `crates/zoder-cli/src/agentic.rs:7584-7589` reads `config.profile_defaults().shared_daemon()` and `agentic.rs:7672` feeds it to `unconfirmed_cancel_abort_threshold`. TRUE for `terse_io` and `fleet_pull_updates` (no references in `zoder-cli` or `zoder-core` production code; both are marked "Hook only" in `config.rs`) |
-| F4 | EXIT_CODES.md:77 (and the failure-site assignment table) — `worktree_tainted` is a shipped failure code with an emission site | FALSE (vocabulary only) | `worktree_tainted` exists only as vocabulary: the `WorktreeTainted` variant at `failure.rs:218`, its code string at `failure.rs:247`, and its transient class at `failure.rs:268`. A repo-wide grep finds **no** production emission or recognition site for `FailureCode::WorktreeTainted` outside `failure.rs`'s own classification tables. It is a documented-but-unreachable code; the doc presents it the same as reachable codes |
+| F1 | CONCURRENCY.md:66-67 — the ACP idle-watchdog table pins the **hosted** defaults at 60s / 60s | FALSE | `crates/acp-client/src/lib.rs:843/846`: `pub const HOSTED_AGENT_IDLE_FIRST_EVENT_S: u64 = DEFAULT_AGENT_IDLE_FIRST_EVENT_S;` (=600, `acp-client/src/lib.rs:828`) and `HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S = DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S` (=180, `acp-client/src/lib.rs:835`). A hosted route gets the **same** 600s/180s pair, not 60s/60s. The doc's own prose at CONCURRENCY.md:120 states this correctly ("…and so does a hosted provider"); the table and its prose contradict each other |
+| F2 | PROFILES.md:56 — "`session/cancel` settle budget \| 1500 ms \| 750 ms \| Wired: `reaper::cancel_budget_for`" | FALSE | `crates/zoder-cli/src/reaper.rs:166-181`: fleet takes `REAP_CANCEL_BUDGET` (= `zoder_core::CANCEL_SETTLE_BUDGET`, **5 s**, `reaper.rs:148`; 5 s confirmed at `config.rs:2459`) unchanged; standalone gets 5.75 s, because the profile numbers are applied as a *surplus* over the legacy 750 ms: `REAP_CANCEL_BUDGET + profile_ms - 750` (`reaper.rs:174`). The source comment (reaper.rs:158-159: "750 ms IS the value that starved every session after the first") says exactly that the 1500/750 values are no longer the wired budget |
+| F3 | PROFILES.md:65-67 — "Accessors for terse I/O, **shared daemon assumption**, and fleet update pulling exist in `ProfileDefaults` for future use but are not yet consulted by any production path" | FALSE (partially) | `shared_daemon` IS consulted: `crates/zoder-cli/src/agentic.rs:7713-7717` reads `config.profile_defaults().shared_daemon()` and `agentic.rs:7801` feeds it to `unconfirmed_cancel_abort_threshold` (consumed at `agentic.rs:10109`). TRUE for `terse_io` and `fleet_pull_updates` (no references in `zoder-cli` or `zoder-core` production code; both are marked "Hook only" in `config.rs`) |
+| F4 | EXIT_CODES.md:83 (and the failure-site assignment table at EXIT_CODES.md:298) — `worktree_tainted` is a shipped failure code with an emission site | FALSE (vocabulary only) | `worktree_tainted` exists only as vocabulary: the `WorktreeTainted` variant at `failure.rs:234`, its code string at `failure.rs:264`, and its transient class at `failure.rs:286`. A repo-wide grep finds **no** production emission or recognition site for `FailureCode::WorktreeTainted` outside `failure.rs`'s own classification tables and the contract tests (`failure.rs:326`, `:1201`; `tests/failure_contract.rs`). It is a documented-but-unreachable code; the doc presents it the same as reachable codes |
 
 Note: the value `PROBE_PING_TIMEOUT_S` quoted at CONCURRENCY.md:179 is
 stale-but-true: the constant is `PROBE_PING_TIMEOUT_SECS` in
@@ -133,7 +133,7 @@ name correction, not FALSE.
 | Catalog fetches and health probes keep the global budget; probes bounded 20 s (174-179) | probes: `health_probe.rs:56` (`PROBE_PING_TIMEOUT_SECS = 20`), bound asserted `:785-796` |
 | `request_timeout_s = 0` rejected at load (as validation error on config, parse error on engine profile) (176-183) | `config.rs:4891` and `:4895` (zero-budget rejection in `validate`) |
 | zoder-side `models` map: two aliases carrying different budgets for the same model id is a load-time error (181-183) | `config.rs:4904` ("hide the budget another alias declared for the same model. Fail at [load]"), test `:5906` |
-| Ledger: was 64 KiB/call (506 MB / 7,725 calls); now 4 KiB slots; compaction postponed while a legacy-size reservation row younger than an hour exists (192-201) | `ledger.rs:57-75` (comments quote the same 506 MB/7,725 figures), `:64` (`BILLABLE_RESERVATION_BYTES = 4 * 1024`), `:67` (`LEGACY_RESERVATION_BYTES = 64 * 1024`), `:75` (`LEGACY_INFLIGHT_GRACE_S = 3600`), recovery scan postponement `:1202-1239` |
+| Ledger: was 64 KiB/call (506 MB / 7,725 calls); now 4 KiB slots; compaction postponed while a legacy-size reservation row younger than an hour exists (192-201) | `ledger.rs:55-76` (comments quote the same 506 MB/7,725 figures), `:65` (`BILLABLE_RESERVATION_BYTES = 4 * 1024`), `:68` (`LEGACY_RESERVATION_BYTES = 64 * 1024`), `:76` (`LEGACY_INFLIGHT_GRACE_S = 3600`), recovery scan postponement `:1440-1497` (detection), gate at `:1615` |
 | Concurrency limit: env-only (`ZODER_PROVIDER_CONCURRENCY`), `flock`-ed files under `<home>/state/slots/<provider>/`, released when a process dies (218-224) | `provider_slots.rs:10-30`, `config.rs:455` |
 | `ZODER_QUEUE_TIMEOUT_S` default 900 s; a queue timeout is a capacity failure → the reviewer chain moves to the next configured reviewer (224-226) | `provider_slots.rs:158-161`; chain failover `agentic.rs:588-599, 799, 992` |
 | Health gate: opt-in `[health].providers`; before first query and after TTL (default 300 s) or any 429/5xx/timeout, bounded `GET {base}/models` (default 5 s) must list the model; state in `~/.zoder/health.json` (253-270) | `provider_health.rs:15-24` (module docs match line-for-line), `:41-42` (`DEFAULT_TTL_SECS = 300`, `DEFAULT_PROBE_TIMEOUT_MS = 5000`), `:53-65` (env names match) |
@@ -146,9 +146,9 @@ name correction, not FALSE.
 | # | Claim (doc file:line) | Why |
 |---|---|---|
 | U1 | PROVIDER-ROUTING.md:155-157 — "A binary older than this change rejects the whole overlay when it meets an unknown `[model_families]` table" | Needs the historical (pre-change) binary; behavior cannot be reproduced from this tree |
-| U2 | CONCURRENCY.md:135-137 / 192-196 — the measured figures ("review cut twice at 120s on a ~650-line diff on 2026-10-21"; "506 MB / 7,725 calls and 328 MB on two fleet hosts") | Operational measurements; the source's own comments repeat the same numbers (`provider.rs:694`, `ledger.rs:60-61`), which corroborates but does not re-measure them |
+| U2 | CONCURRENCY.md:135-137 / 192-196 — the measured figures ("review cut twice at 120s on a ~650-line diff on 2026-10-21"; "506 MB / 7,725 calls and 328 MB on two fleet hosts") | Operational measurements; the source's own comments repeat the same numbers (`provider.rs:125`, `config.rs:693`, `ledger.rs:60-61`), which corroborates but does not re-measure them |
 | U3 | CONCURRENCY.md:262 — "HTTP 429 on 7.5% of reviewer calls, in bursts, even at one request in flight" | Study run against a live hosted provider |
-| U4 | Concurrency/health runtime behavior end-to-end (breaker soak, mixed-version ledger compaction with a legacy build mid-dispatch) | Structure verified in code (`ledger.rs:1202-1239`); the race itself needs a live mixed-version rollout |
+| U4 | Concurrency/health runtime behavior end-to-end (breaker soak, mixed-version ledger compaction with a legacy build mid-dispatch) | Structure verified in code (`ledger.rs:1440-1497`, gate `:1615`; test `:2870`); the race itself needs a live mixed-version rollout |
 
 ## Re-verification against current master
 
@@ -169,3 +169,17 @@ accurate at `1cbe935` but are superseded on current `master`, which added the
 classes). Those rows should be read against the audit base, not against today's
 `master`; the drift is documentation progress (the doc and the source agree at
 both bases), not a defect this audit should report as FALSE.
+
+### Citation refresh when landing
+
+Every `file:line` citation in the FALSE table above was re-resolved against
+current `master` (`535bb3ea`) when this report was landed, so each one points
+at the line that actually carries the cited token today rather than the line it
+occupied at `1cbe935`. The re-resolved values are `acp-client/src/lib.rs:843/846`
+(hosted aliases; defaults at `:828`/`:835`), `reaper.rs:166-181` (with
+`REAP_CANCEL_BUDGET` at `:148` and the legacy 750 ms baseline at `:174`),
+`agentic.rs:7713-7717`/`:7801`/`:10109`, `failure.rs:234/264/286` against
+`docs/EXIT_CODES.md:83` and the failure-site row at `:298`, and
+`ledger.rs:65/68/76` with the recovery postponement at `:1440-1497`/`:1615`.
+The verdicts did not change — only the line numbers, which moved when later
+work edited the files around them.
