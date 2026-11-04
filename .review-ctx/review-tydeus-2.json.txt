@@ -1,0 +1,41 @@
+```json
+{
+  "verdict": "REQUEST_CHANGES",
+  "findings": [
+    {
+      "severity": "major",
+      "file": "crates/zoder-cli/tests/failure_contract_golden.rs",
+      "line": 318,
+      "claim": "The comment for `empty_diff_review_is_stable` claims 'exit 1' but the assertion uses `EXIT_PERMANENT` (50).",
+      "evidence": "Line 318: `// A clean repo has no diff to review: exit 1, ...` vs Line 335: `assert_eq!(output.status.code(), Some(EXIT_PERMANENT), ...)`",
+      "suggested_fix": "Update the comment to reflect the D3 exit ladder: 'exit 50 (permanent)'."
+    },
+    {
+      "severity": "major",
+      "file": "crates/zoder-cli/tests/failure_contract_golden.rs",
+      "line": 351,
+      "claim": "The comment for `no_reviewer_model_is_stable` claims 'exit 1' but the assertion uses `EXIT_TRANSIENT` (20).",
+      "evidence": "Line 351: `// ... the run fails closed with exit 1, ...` vs Line 358: `assert_eq!(output.status.code(), Some(EXIT_TRANSIENT), ...)`",
+      "suggested_fix": "Update the comment to reflect the D3 exit ladder: 'exit 20 (transient)'."
+    },
+    {
+      "severity": "minor",
+      "file": "crates/zoder-cli/tests/failure_contract_golden.rs",
+      "line": 105,
+      "claim": "The `zoder_binary` logic may fail in standard `cargo test` environments.",
+      "evidence": "Line 105: `let candidate = dep_dir.join("..").join("zoder");` In a standard `cargo test` run, the binary is located in `target/debug/deps/`, so `dep_dir.join("..")` points to `target/debug/`, where `zoder` is not located. It would only work if the binary was manually placed in `target/debug/` or if the test was run via `cargo run --bin zoder-cli-test` from the workspace root. However, the logic attempts to find it in `../zoder`, which assumes the binary is in `target/debug/` and the test is in `target/debug/deps/`. This is correct for the test binary, but the `release` check (Line 108) is also relative to the test's location.",
+      "suggested_fix": "Ensure the documentation or the test setup explicitly states that the `zoder` binary must be present in the `target/debug` or `target/release` directory relative to the test execution context."
+    },
+    {
+      "severity": "minor",
+      "file": "crates/zoder-cli/tests/failure_contract_golden.rs",
+      "line": 543,
+      "claim": "The `unconfirmed_cancel_rescue_is_stable` test relies on a specific environment variable precedence that is potentially fragile.",
+      "evidence": "Line 543: `format!(\"{}:{}\", bin_dir.display(), std::env::var(\"PATH\").unwrap_or_default())` and Line 548: `assert!(stderr.contains(\"rescue ended: failed\"), ...)` The test sets `HOME` to `scratch.path()` and `ZODER_HOME` to `home`. The comment at Line 534 claims the reaper line is Linux-only. If the test is run on macOS, the `cancel_count` check (Line 555) is the only way to verify the daemon received the signal. While the test uses `wait_for_file`, the reliance on `PATH` to find the `zeroclaw` stub is correct but the comment about sibling lookup order (Line 524) is a claim about the `zoder` binary's internal logic which is not explicitly verified here, only the result is.",
+      "suggested_fix": "No code change required, but verify that the `zoder` binary's internal `locate_sibling` logic matches the assumption in the comment to prevent future regression."
+    }
+  ],
+  "confidence": "high",
+  "notes": "The core logic of the golden tests is sound and correctly implements the D3 exit ladder re-pinning described in the PLAN. The primary issues are stale comments in the test file that contradict the actual (and correct) assertions, which could confuse future maintainers. The binary location logic is sensitive to how `cargo test` is invoked but follows standard patterns for integration tests in a workspace."
+}
+```
