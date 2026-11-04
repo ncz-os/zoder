@@ -95,3 +95,33 @@ image builds.
 - `month_to_date_usd_at` is private — test mod is a child module, so access is
   fine, but the pinned ledger test must not leak it in the report as "public API".
 - Cargo build must not fetch new deps (no Cargo.toml change at all).
+
+## Landing note (2026-11-04, rework of freebuff/FB80-20261030-d2)
+
+The d2 branch's tip (`651fbe80`) carried an older, standalone bounded-lock
+rework in `ledger.rs` (unbounded `lock_exclusive` call sites plus a
+self-contained `lock_deadline_tests` module) that predates the bounded-lock
+rewrite that landed on `master` (535bb3ea: `lock_exclusive_bounded` /
+`lock_owner_sidecar_bounded` / `lock_shared_bounded`,
+`ZODER_LEDGER_LOCK_TIMEOUT_S`, and the `lock_deadline_tests` module). Landing
+the d2 ledger.rs wholesale would have REGRESSED master's bounded lock.
+
+Resolution: `ledger.rs` now keeps master's bounded-lock production code and
+test module verbatim, and adds exactly the two FB80 test functions that
+master was missing:
+
+- `month_to_date_usd_month_boundary_pinned` — pins the three-scan-instant
+  bucket behavior across a month roll-over through
+  `Ledger::month_to_date_usd_at`.
+- `red_month_boundary_through_wall_clock` — `#[ignore]`d RED demonstration
+  that the un-injectable `Ledger::month_to_date_usd` cannot reach a
+  two-months-ahead pinned boundary (fails by design under `--ignored`).
+
+The other FB80 deliverables (quota.rs `*_at` wrappers + pinned tests + the
+two quota REDs; the pinned `month_to_date_usd_sums_current_month_bucket` and
+`month_to_date_fails_closed_when_current_cost_is_unknown`; PLAN-FB80.md and
+docs/verification/wall-clock-tests-20261101.md) are already present on
+master and untouched. Test counts on the build host (cargo 1.96.1):
+before (d2 tip) 2550 passed / 0 failed / 5 ignored; after (this rework)
+2550 passed / 0 failed / 5 ignored; `-- --ignored` shows exactly the three
+intended FB80 reds failing (ledger, plan_usage, amortized).
