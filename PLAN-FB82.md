@@ -8,6 +8,9 @@ Fix nothing; list the false ones first."
 
 Base: master `1cbe935`. Branch: freebuff/fb82-20261101. Nothing is modified
 in any doc or source file; the only artifact is the verification report.
+`1cbe935` is the branch point, not today's master: the report is a snapshot
+audit of that tree, and the section "Re-verification against current master"
+records which findings still reproduce on later master.
 
 ## Claim sources (docs/), in priority order
 

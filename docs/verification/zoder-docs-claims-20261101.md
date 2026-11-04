@@ -5,6 +5,14 @@ exit codes, config keys, file paths, budget rules) verified against the Rust
 sources on the same tree (`master` `1cbe935`). README.md is outside `docs/`
 and was not verified (exclusion noted in PLAN-FB82.md).
 
+Base caveat: `1cbe935` was the branch point of `freebuff/fb82-20261101`.
+`master` has since moved on (it gained the `infrastructure` class /
+`session_limit` code and the FB108–FB133 work), so a handful of the TRUE rows
+below — the five-class/five-rung contract in particular — describe the audit
+base rather than today's `master`. The four FALSE findings were re-checked
+against current `master` (`535bb3ea`) and all four still reproduce there; see
+"Re-verification against current master" at the end.
+
 Method: for each concrete claim, `grep -n` the cited token in the cited
 source file(s); record the source line. No doc or source file was modified.
 
@@ -21,7 +29,7 @@ provider, fleet runtime, or historical binary this host cannot stand up).
 | F1 | CONCURRENCY.md:66-67 — the ACP idle-watchdog table pins the **hosted** defaults at 60s / 60s | FALSE | `crates/acp-client/src/lib.rs:843/848`: `pub const HOSTED_AGENT_IDLE_FIRST_EVENT_S: u64 = DEFAULT_AGENT_IDLE_FIRST_EVENT_S;` (=600) and `HOSTED_AGENT_IDLE_BETWEEN_EVENTS_S = DEFAULT_AGENT_IDLE_BETWEEN_EVENTS_S` (=180, `acp-client/src/lib.rs:830`). A hosted route gets the **same** 600s/180s pair, not 60s/60s. The doc's own prose at CONCURRENCY.md:120 states this correctly ("…and so does a hosted provider"); the table and its prose contradict each other |
 | F2 | PROFILES.md:56 — "`session/cancel` settle budget \| 1500 ms \| 750 ms \| Wired: `reaper::cancel_budget_for`" | FALSE | `crates/zoder-cli/src/reaper.rs:163-180`: fleet takes `REAP_CANCEL_BUDGET` (= `zoder_core::CANCEL_SETTLE_BUDGET`, **5 s**, `reaper.rs:145`; 5 s confirmed at `config.rs:2459`) unchanged; standalone gets 5 s (**5.75 s total**), because the profile numbers are applied as a *surplus* over the legacy 750 ms: `REAP_CANCEL_BUDGET + profile_ms - 750`. The source comment (reaper.rs:162-163: "'750 ms IS the value that starved every session after the first') says exactly that the 1500/750 values are no longer the wired budget |
 | F3 | PROFILES.md:65-67 — "Accessors for terse I/O, **shared daemon assumption**, and fleet update pulling exist in `ProfileDefaults` for future use but are not yet consulted by any production path" | FALSE (partially) | `shared_daemon` IS consulted: `crates/zoder-cli/src/agentic.rs:7584-7589` reads `config.profile_defaults().shared_daemon()` and `agentic.rs:7672` feeds it to `unconfirmed_cancel_abort_threshold`. TRUE for `terse_io` and `fleet_pull_updates` (no references in `zoder-cli` or `zoder-core` production code; both are marked "Hook only" in `config.rs`) |
-| F4 | EXIT_CODES.md:77 (and the failure-site assignment table) — `worktree_tainted` is a shipped failure code with an emission site | FALSE (vocabulary only) | `worktree_tainted` exists in the vocabulary (`failure.rs:251`, classed transient/20 at `failure.rs:263`) but a repo-wide grep finds **no** production emission or recognition site for `FailureCode::WorktreeTainted` outside `failure.rs`'s own classification tables. It is a documented-but-unreachable code; the doc presents it the same as reachable codes |
+| F4 | EXIT_CODES.md:77 (and the failure-site assignment table) — `worktree_tainted` is a shipped failure code with an emission site | FALSE (vocabulary only) | `worktree_tainted` exists only as vocabulary: the `WorktreeTainted` variant at `failure.rs:218`, its code string at `failure.rs:247`, and its transient class at `failure.rs:268`. A repo-wide grep finds **no** production emission or recognition site for `FailureCode::WorktreeTainted` outside `failure.rs`'s own classification tables. It is a documented-but-unreachable code; the doc presents it the same as reachable codes |
 
 Note: the value `PROBE_PING_TIMEOUT_S` quoted at CONCURRENCY.md:179 is
 stale-but-true: the constant is `PROBE_PING_TIMEOUT_SECS` in
@@ -141,3 +149,23 @@ name correction, not FALSE.
 | U2 | CONCURRENCY.md:135-137 / 192-196 — the measured figures ("review cut twice at 120s on a ~650-line diff on 2026-10-21"; "506 MB / 7,725 calls and 328 MB on two fleet hosts") | Operational measurements; the source's own comments repeat the same numbers (`provider.rs:694`, `ledger.rs:60-61`), which corroborates but does not re-measure them |
 | U3 | CONCURRENCY.md:262 — "HTTP 429 on 7.5% of reviewer calls, in bursts, even at one request in flight" | Study run against a live hosted provider |
 | U4 | Concurrency/health runtime behavior end-to-end (breaker soak, mixed-version ledger compaction with a legacy build mid-dispatch) | Structure verified in code (`ledger.rs:1202-1239`); the race itself needs a live mixed-version rollout |
+
+## Re-verification against current master
+
+The audit above is pinned to `1cbe935` (the branch point). Before landing, the
+four FALSE findings were re-checked against current `master` (`535bb3ea`); all
+four still reproduce, so none of them has been fixed by later work:
+
+| # | Re-check on current master | Still false? |
+|---|---|---|
+| F1 | `docs/CONCURRENCY.md` still carries the hosted row as 60s/60s, while `crates/acp-client/src/lib.rs` aliases `HOSTED_AGENT_IDLE_*` to the 600s/180s defaults | yes |
+| F2 | `docs/PROFILES.md` still states 1500 ms / 750 ms, while `reaper::cancel_budget_for` returns `REAP_CANCEL_BUDGET` (5 s) for fleet and 5.75 s for standalone | yes |
+| F3 | `docs/PROFILES.md` still claims the shared-daemon assumption is unconsulted, while `agentic.rs` reads `profile_defaults().shared_daemon()` | yes |
+| F4 | `docs/EXIT_CODES.md` still lists `worktree_tainted` beside reachable codes; there is still no production emission site | yes |
+
+Rows the audit records as TRUE for the five-class/18-code contract were
+accurate at `1cbe935` but are superseded on current `master`, which added the
+`infrastructure` class (exit 60) and the `session_limit` code (19 codes, 6
+classes). Those rows should be read against the audit base, not against today's
+`master`; the drift is documentation progress (the doc and the source agree at
+both bases), not a defect this audit should report as FALSE.
