@@ -464,6 +464,26 @@ static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
 static SETTLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// The one spelling of a session id inside this module.
+///
+/// Every session set here (`SESSIONS`, `CANCELLED`, `UNREACHABLE`, `SETTLED`)
+/// keys on the SAME string, and the filters compare a raw id from `SESSIONS`
+/// against the other three. That only works if all four normalise identically,
+/// and they did not: `note_session` and `note_session_settled` trimmed while
+/// `mark_cancelled` and `mark_unreachable` stored the raw id. A padded id then
+/// occupied two entries, and a `contains` against the untrimmed one missed a
+/// session the other set considered settled -- so a turn that had already ended
+/// was asked to cancel anyway and cost the full settle budget, the 2026-11-05
+/// failure reached through a different door.
+///
+/// Normalising at every insert AND every comparison makes the invariant
+/// structural: it no longer depends on a caller having trimmed first, which is
+/// a guarantee no signature states. See [`note_session`] for the trimmed
+/// writer that made `SESSIONS` clean in practice.
+fn session_key(id: &str) -> &str {
+    id.trim()
+}
+
 /// Sessions this process has already found the engine UNREACHABLE for, i.e.
 /// whose cancel failed with ENOENT/ECONNREFUSED rather than going unconfirmed.
 ///
@@ -561,10 +581,15 @@ fn teardown_is_quiet(
 /// unreachable. Returns true the FIRST time, which is the only time the caller
 /// prints: "the engine is gone" is a fact about the run, not about the attempt.
 fn mark_unreachable(id: &str) -> bool {
+    // Same normalisation as `mark_cancelled`; see there.
+    let key = session_key(id);
+    if key.is_empty() {
+        return false;
+    }
     UNREACHABLE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id.to_string())
+        .insert(key.to_string())
 }
 
 /// How many of this run's sessions the engine was found unreachable for,
@@ -599,7 +624,7 @@ fn engine_unreachable(id: &str) -> bool {
 /// observer the moment the engine mints it; the exit path and the signal
 /// handler read it back.
 pub(crate) fn note_session(session_id: &str) {
-    let session_id = session_id.trim();
+    let session_id = session_key(session_id);
     if session_id.is_empty() {
         return;
     }
@@ -996,7 +1021,10 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
             sessions
                 .iter()
                 .filter(|id| {
-                    !cancelled.contains(*id) && !unreachable.contains(*id) && !settled.contains(*id)
+                    // Compare on the normalised key: a padded id in SESSIONS
+                    // must not slip past a set it is a member of.
+                    let key = session_key(id);
+                    !cancelled.contains(key) && !unreachable.contains(key) && !settled.contains(key)
                 })
                 .cloned()
                 .collect()
@@ -1669,17 +1697,26 @@ fn pending_sessions() -> Vec<String> {
         .iter()
         .rev()
         .filter(|id| {
-            !cancelled.contains(*id) && !unreachable.contains(*id) && !settled.contains(*id)
+            // Same normalised comparison as the async filter above; both read
+            // the same raw ids and must agree on what is pending.
+            let key = session_key(id);
+            !cancelled.contains(key) && !unreachable.contains(key) && !settled.contains(key)
         })
         .cloned()
         .collect()
 }
 
 fn mark_cancelled(id: &str) {
+    // `session_key`, not the raw id: `note_session_settled` trims, and the two
+    // sets are read against each other, so they must key identically.
+    let key = session_key(id);
+    if key.is_empty() {
+        return;
+    }
     CANCELLED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id.to_string());
+        .insert(key.to_string());
 }
 
 /// The loop's own author-phase cancel for `id` was acknowledged by the
@@ -1705,26 +1742,26 @@ pub(crate) fn note_session_cancelled(id: &str) {
 /// does not settle: the loop cannot prove the daemon stopped it, which is what
 /// `note_session_cancelled` is for, and its session stays cancellable.
 pub(crate) fn note_session_settled(id: &str) {
-    let id = id.trim();
-    if id.is_empty() {
+    let key = session_key(id);
+    if key.is_empty() {
         return;
     }
     SETTLED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id.to_string());
+        .insert(key.to_string());
 }
 
 /// Has `id`'s turn already ended, so that a cancel would have nothing to stop?
 fn session_settled(id: &str) -> bool {
-    // Normalise the SAME way the recorder does. Without this a caller passing
-    // the id with the padding `note_session_settled` stripped would miss a
-    // session that IS settled, and then ask the daemon to cancel a turn that
-    // already ended -- the exact wait this fix removes.
+    // Normalised on the way IN, so every caller gets the right answer whether
+    // or not it trimmed: this helper is the boundary, and a caller should not
+    // have to know that padding matters.
+    let key = session_key(id);
     SETTLED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(id.trim())
+        .contains(key)
 }
 
 /// Membership test, for the tests that assert a session was retired by an
@@ -6096,5 +6133,118 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove("padded-session");
+    }
+
+    /// Every session filter is defended against a padded id, not just the ones
+    /// fed by `note_session`.
+    ///
+    /// `note_session` trims, so `SESSIONS` holds clean ids today -- but the
+    /// filters compared a raw id against sets whose members come from FOUR
+    /// different recorders, and only some of them normalised. A single recorder
+    /// that stored padding (as `mark_unreachable` and `mark_cancelled` did)
+    /// would make a settled session slip through, be asked to cancel a turn
+    /// that already ended, and spend the full settle budget printing the
+    /// 2026-11-05 line. This pins the invariant at the point of comparison, so
+    /// it holds for a recorder that regresses -- which is what these fields
+    /// are: an internal boundary, not a guarantee the caller can see.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_padded_id_in_the_session_list_is_still_filtered_everywhere() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        let socket = ws.cd.join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+
+        // Bypass `note_session` and plant padding the recorder would strip.
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push("  padded-settled \n".to_string());
+        note_session_settled("padded-settled");
+
+        // 1. The exit-path snapshot.
+        assert!(
+            !pending_sessions()
+                .iter()
+                .any(|id| id.trim() == "padded-settled"),
+            "a settled session must not be pending, whatever padding its id carries"
+        );
+
+        // 2. The whole exit path, which is what the fleet measures.
+        let report = cancel_exit_path(&ws, &socket, REAP_CANCEL_BUDGET).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a settled session must not be asked to cancel, padding or not"
+        );
+        assert!(
+            report.exit_cleanup_silent(),
+            "and it must not turn the cleanup into a failure: {report:?}"
+        );
+
+        SESSIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id| id.trim() != "padded-settled");
+        SETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("padded-settled");
+        drop(server);
+    }
+
+    /// The other three sets normalise on write, so one id has one spelling in
+    /// every set. `mark_cancelled` and `mark_unreachable` stored the raw id
+    /// while `note_session_settled` trimmed: the same session could occupy two
+    /// entries, and a later `contains` against the wrong one would miss.
+    #[test]
+    fn every_session_set_normalises_the_id_the_same_way() {
+        let _lock = reap_test_lock();
+        note_session("  normalise-me \t");
+        note_session_settled("  normalise-me \t");
+        mark_cancelled("  normalise-me \t");
+        assert!(mark_unreachable("  normalise-me \t"));
+
+        let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let unreachable = UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let settled = SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        for (name, set) in [
+            ("CANCELLED", &cancelled),
+            ("UNREACHABLE", &unreachable),
+            ("SETTLED", &settled),
+        ] {
+            assert!(
+                set.contains("normalise-me"),
+                "{name} must hold the trimmed id, not {:?}",
+                set.iter()
+                    .filter(|s| s.contains("normalise"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !set.iter().any(|s| s != s.trim()),
+                "{name} must not hold a padded id"
+            );
+        }
+        assert!(
+            sessions.iter().any(|s| s == "normalise-me"),
+            "SESSIONS must hold the trimmed id"
+        );
+
+        forget_session("normalise-me");
+        CANCELLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("normalise-me");
+        UNREACHABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("normalise-me");
     }
 }
