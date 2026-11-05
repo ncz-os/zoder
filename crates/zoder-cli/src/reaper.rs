@@ -6247,4 +6247,53 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .remove("normalise-me");
     }
+
+    /// The async exit path's own snapshot excludes settled sessions.
+    ///
+    /// `pending_sessions` and the inline filter in
+    /// `cancel_recorded_sessions_with_cleanup` are two separate expressions
+    /// that must agree; a reader auditing only one can conclude the other is
+    /// unfiltered. This drives the real function against a fake daemon that
+    /// answers every cancel and asserts it was never asked about a settled
+    /// session -- the ask is counted at the socket, not inferred from the
+    /// report, so an implementation that sent it and then hid it still fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_async_exit_path_snapshot_excludes_a_settled_session() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        let socket = ws.cd.join("engine.sock");
+        // Ack every attempt: if the settled session were asked, the daemon
+        // would answer and the attempt counter would prove it.
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(vec![true])));
+
+        note_session("settled-only");
+        note_session_settled("settled-only");
+
+        let cleanup = cancel_recorded_sessions_with_cleanup(&socket, REAP_CANCEL_BUDGET).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the async snapshot must filter a settled session before asking the daemon"
+        );
+        assert_eq!(
+            cleanup,
+            ExitCleanup::NothingToDo,
+            "nothing was asked, so nothing was confirmed: {cleanup:?}"
+        );
+        assert!(
+            !engine_cancelled("settled-only"),
+            "a settled session must not be recorded as cancelled"
+        );
+
+        forget_session("settled-only");
+        SETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("settled-only");
+        drop(server);
+    }
 }
