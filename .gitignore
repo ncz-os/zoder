@@ -53,3 +53,7 @@ bench/raw/
 /.build-target/
 /.build-tmp/
 /.scratch/
+
+# Review/harness dump of this branch's own diff. Generated locally for review
+# inspection (2026-11-05); never a source artifact, never committed.
+/.review_diff.txt
