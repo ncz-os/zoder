@@ -510,7 +510,7 @@ static UNREACHABLE: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// The reaper's own [`UnconfirmedCancelOutcome`] stays here: it carries the
 /// ATTEMPT COUNT, which is a fact about this module's retry sequence and has
 /// no meaning in the loop.
-
+///
 /// Sessions whose cancel was never confirmed and whose daemon could not be
 /// identified: the socket answered, but there is no pid record that proves
 /// nothing is still running.
@@ -1624,7 +1624,7 @@ pub(crate) async fn settle_unconfirmed_cancel(
     finish(
         settled,
         format!(
-            "session {id} cancel not confirmed after {attempts} attempt(s) ({first_error}); \
+            "session {id} cancel not acknowledged after {attempts} attempt(s) ({first_error}); \
              {cause}. Treated as best-effort cleanup: the worktree is preserved, not discarded, \
              and whatever the agent left running in the workspace is still reaped"
         ),
@@ -1636,8 +1636,14 @@ pub(crate) async fn settle_unconfirmed_cancel(
 /// Said at WARN level, not as an error. The 2026-11-05 fleet failure was a
 /// finished run whose exit-path cancel went unanswered and whose LAST line --
 /// this one -- the worker read as a job failure. A cancel is cleanup; the run's
-/// result is the loop's, and the wording here says so out loud. The phrases a
-/// log scraper keys on (`cancel not confirmed`, the session id) are unchanged.
+/// result is the loop's, and the wording here says so out loud.
+///
+/// The wording deliberately does NOT contain the phrase `cancel not
+/// confirmed`: `failure::classify_message` maps that exact phrase onto
+/// `FailureCode::CancelUnconfirmed` (exit 20) whenever it finds it in an
+/// error chain, and a cleanup line that reads as a failure code is exactly
+/// how the exit path took over the run's result. Log scrapers key on `cancel
+/// not acknowledged` plus the session id here instead.
 fn finish(mut settled: UnconfirmedCancel, reason: String) -> UnconfirmedCancel {
     settled.reason = reason;
     eprintln!("[zoder] WARNING: {}", settled.reason);
@@ -3976,6 +3982,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+        SETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
         SETTLED.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
@@ -4810,8 +4820,14 @@ mod tests {
         assert!(
             settled
                 .reason
-                .contains("cancel not confirmed after 4 attempt(s)"),
+                .contains("cancel not acknowledged after 4 attempt(s)"),
             "the reason must count the attempts: {}",
+            settled.reason
+        );
+        assert!(
+            !settled.reason.contains("cancel not confirmed"),
+            "a cleanup line must not carry the phrase the exit-code classifier \
+             keys on as a run failure: {}",
             settled.reason
         );
         assert!(
@@ -6030,6 +6046,60 @@ mod tests {
         );
         forget_session("unsettled-silent");
         drop(server);
+    }
+
+    /// The incident's exit-code door: a CLEANUP line reaching the error
+    /// classifier.
+    ///
+    /// The 2026-11-05 exit codes came from the reaper's unconfirmed-cancel
+    /// line being classified as the run's failure. The settled-session path no
+    /// longer prints it, and the unsettled best-effort line no longer carries
+    /// the phrase `classify_message` keys on. Pin BOTH halves against the
+    /// classifier the process exit code is read from, so neither half can
+    /// re-introduce a line that classifies as a run failure:
+    ///
+    /// * the best-effort cleanup line names the unacknowledged cancel but must
+    ///   classify as NOTHING (or at most a code that is not the cleanup's own
+    ///   invention) — it is WARN-level cleanup, not the loop's result;
+    /// * an in-band author cancel that genuinely was never acknowledged (the
+    ///   loop's OWN cancel of a timed-out turn) still classifies as
+    ///   `CancelUnconfirmed`, because THERE it is a fact about the run.
+    #[test]
+    fn a_cleanup_line_never_classifies_as_the_runs_failure_but_an_in_band_cancel_does() {
+        let _lock = reap_test_lock();
+        // The exact line the exit path prints for an unsettled session whose
+        // daemon never acknowledged (see `settle_unconfirmed_cancel`).
+        let cleanup_line = "session aaaa-bbbb cancel not acknowledged after 3 attempt(s) \
+                            (daemon did not acknowledge session/cancel within 4.99s); the \
+                            daemon never acknowledged it (a turn that already settled does not \
+                            ack a cancel, and a slow daemon can outlast every retry) and no \
+                            daemon record exists for this socket, so there is no process to \
+                            stop. Treated as best-effort cleanup: the worktree is preserved, \
+                            not discarded, and whatever the agent left running in the \
+                            workspace is still reaped";
+        assert!(
+            !crate::failure::classify_message(cleanup_line)
+                .is_some_and(|(code, _)| code == crate::failure::FailureCode::CancelUnconfirmed),
+            "a cleanup line must never classify as the run's failure: {cleanup_line}"
+        );
+        // And it must not classify as ANY run failure at all: the cleanup's
+        // job is done by the time the loop's result exists.
+        let cleanup_classification = crate::failure::classify_message(cleanup_line);
+        assert!(
+            cleanup_classification.is_none(),
+            "a cleanup line must not classify as any failure: {cleanup_line:?} -> \
+             {cleanup_classification:?}"
+        );
+
+        // The in-band counterpart, where the unacknowledged cancel IS a fact
+        // about the run: the loop's own watchdog cancel of a timed-out turn.
+        const UNCONFIRMED_MARKER: &str = crate::agentic::AUTHOR_CANCEL_UNCONFIRMED_MARKER;
+        let in_band = format!("{UNCONFIRMED_MARKER}cancellation deadline exceeded");
+        assert_eq!(
+            crate::failure::classify_message(&in_band),
+            Some((crate::failure::FailureCode::CancelUnconfirmed, None)),
+            "the loop's own unconfirmed author cancel must still classify as a run failure"
+        );
     }
 
     /// The cleanup outcome is data, and NOTHING about it may reach the exit
