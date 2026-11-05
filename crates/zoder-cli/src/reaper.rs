@@ -440,6 +440,30 @@ fn same_file(a: &Path, b: &Path) -> bool {
 static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Sessions whose turn has already ENDED: the author turn returned, its result
+/// was delivered, and there is nothing left for `session/cancel` to stop.
+///
+/// This is the 2026-11-05 fleet failure. The daemon acknowledges a cancel by
+/// sending `turn_complete` for the turn it stopped, and a turn that already
+/// ended has no such frame to send: the exit path therefore waited a full
+/// settle budget per session for an acknowledgement that could NEVER come,
+/// printed `session <id> cancel not confirmed after N attempt(s) (daemon did
+/// not acknowledge session/cancel within 4.99s)`, and the worker read that as
+/// a failed job. Every zoder job that DELIVERED its commits ended that way,
+/// and finished work landed in needs-review.
+///
+/// A settled session is not cancelled at all: asking the daemon to stop a turn
+/// that is over is not cleanup, it is a guaranteed non-acknowledgement. That is
+/// strictly stronger than "ignore the failure", because it also stops the exit
+/// path blocking for the budget.
+///
+/// A session that is NOT in this set is treated exactly as before: cancelled,
+/// retried, and -- if the daemon stays silent -- reported as best-effort
+/// cleanup. Absence of proof that a turn ended is not proof that it is running,
+/// so the pre-existing cancel guarantees stand unchanged.
+static SETTLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Sessions this process has already found the engine UNREACHABLE for, i.e.
 /// whose cancel failed with ENOENT/ECONNREFUSED rather than going unconfirmed.
 ///
@@ -912,6 +936,19 @@ impl Drop for ReapGuard {
 static ATTEMPT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
+    let _ = cancel_recorded_sessions_with_cleanup(socket, budget).await;
+}
+
+/// [`cancel_recorded_sessions`], also reporting what the CANCEL came to.
+///
+/// The outcome is data about the CLEANUP, never about the run: the exit code
+/// is the loop's result (see [`ExitCleanup`]). The exit path reads it to
+/// decide whether the one warning line is warranted; nothing maps it to an
+/// exit code.
+async fn cancel_recorded_sessions_with_cleanup(
+    socket: &Path,
+    budget: Duration,
+) -> (Vec<String>, ExitCleanup) {
     // The budget is PER SESSION, not for the whole phase. A phase budget
     // (750 ms in the fleet profile) was spent by the FIRST session's connect +
     // initialize + cancel round trip, leaving the retry planner a near-zero
@@ -934,6 +971,10 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
     // snapshotted — the ceiling never costs a session its first ask.
     let phase_started = Instant::now();
     let phase_cap = budget.saturating_mul(CANCEL_PHASE_CAP_WINDOWS);
+    // Every session this phase RETIRES (acknowledged, or proven unreachable)
+    // is a session whose turn is not still editing the tree. A session the
+    // daemon stayed silent about is the only unconfirmed outcome.
+    let mut cleanup = ExitCleanup::NothingToDo;
     for _ in 0..MAX_CANCEL_PASSES {
         if phase_started.elapsed() >= phase_cap {
             break;
@@ -943,26 +984,44 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
         let pending: Vec<String> = {
             let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
             let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+            // A turn that already ended has nothing to cancel, and the daemon
+            // would never acknowledge the ask (2026-11-05). `pending_sessions`
+            // applies the same filter.
+            let settled = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
             let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
             sessions
                 .iter()
-                .filter(|id| !cancelled.contains(*id) && !unreachable.contains(*id))
+                .filter(|id| {
+                    !cancelled.contains(*id) && !unreachable.contains(*id) && !settled.contains(*id)
+                })
                 .cloned()
                 .collect()
         };
         if pending.is_empty() {
-            return;
+            return (Vec::new(), cleanup);
         }
         for id in pending {
             // A per-session window, then move on to the next session: this one
             // is asked exactly once here and, if unconfirmed, its own retries
             // run inside this window before the next session gets its own.
             let deadline = Instant::now() + budget;
-            cancel_session_with_retries(socket, &id, deadline).await;
+            let outcome = cancel_session_with_retries(socket, &id, deadline).await;
+            cleanup = merge_cleanup(cleanup, outcome);
         }
         // Every session in this pass has now been ASKED at least once. The
         // loop repeats only to catch sessions minted during the pass, and
         // `MAX_CANCEL_PASSES` bounds that; nothing is left unasked by design.
+    }
+    (Vec::new(), cleanup)
+}
+
+/// Combine two cleanup outcomes. `Unconfirmed` is the only one worth an
+/// operator's attention, so it wins over every other outcome.
+fn merge_cleanup(a: ExitCleanup, b: ExitCleanup) -> ExitCleanup {
+    match (a, b) {
+        (_, ExitCleanup::Unconfirmed) | (ExitCleanup::Unconfirmed, _) => ExitCleanup::Unconfirmed,
+        (ExitCleanup::NothingToDo, other) | (other, ExitCleanup::NothingToDo) => other,
+        (ExitCleanup::Confirmed, ExitCleanup::Confirmed) => ExitCleanup::Confirmed,
     }
 }
 
@@ -975,10 +1034,12 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
 /// it a per-attempt slice of the remainder instead re-plans the sequence from a
 /// much smaller number and asks the daemon fewer times than the plan promised
 /// — silently, with nothing in the log to show for it.
-async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant) {
+async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant) -> ExitCleanup {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return;
+        // Cut off before the ask reached the wire: it settles nothing, but it
+        // is not evidence the daemon ignored us either.
+        return ExitCleanup::NothingToDo;
     }
     #[cfg(test)]
     ATTEMPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -990,6 +1051,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
             // teardown rounds, and a session nobody cancelled is a
             // session still editing the tree.
             mark_cancelled(id);
+            ExitCleanup::Confirmed
         }
         Err(e) => {
             let outcome = classify_cancel_error(&e);
@@ -1010,6 +1072,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                             socket.display()
                         );
                     }
+                    ExitCleanup::Confirmed
                 }
                 CancelOutcome::NotConfirmed => {
                     // One attempt is not an answer: the daemon may be slow,
@@ -1037,6 +1100,14 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                         retry_unconfirmed_cancel_within(socket, id, left).await
                     };
                     settle_unconfirmed_cancel(socket, id, settled, &format!("{e:#}")).await;
+                    // The daemon was reached and stayed silent (or spoke
+                    // without acknowledging): best-effort cleanup, never a
+                    // run failure.
+                    match settled {
+                        UnconfirmedCancelOutcome::Confirmed(_)
+                        | UnconfirmedCancelOutcome::DaemonGone(_) => ExitCleanup::Confirmed,
+                        UnconfirmedCancelOutcome::NeverAcknowledged(_) => ExitCleanup::Unconfirmed,
+                    }
                 }
                 // `classify_cancel_error` only ever returns the two failure arms
                 // (it classifies an ERROR, and a confirmed cancel is not an
@@ -1529,9 +1600,15 @@ pub(crate) async fn settle_unconfirmed_cancel(
 }
 
 /// Set the operator-facing reason, log it once, and hand the record back.
+///
+/// Said at WARN level, not as an error. The 2026-11-05 fleet failure was a
+/// finished run whose exit-path cancel went unanswered and whose LAST line --
+/// this one -- the worker read as a job failure. A cancel is cleanup; the run's
+/// result is the loop's, and the wording here says so out loud. The phrases a
+/// log scraper keys on (`cancel not confirmed`, the session id) are unchanged.
 fn finish(mut settled: UnconfirmedCancel, reason: String) -> UnconfirmedCancel {
     settled.reason = reason;
-    eprintln!("[zoder] {}", settled.reason);
+    eprintln!("[zoder] WARNING: {}", settled.reason);
     settled
 }
 
@@ -1574,15 +1651,22 @@ pub(crate) fn daemon_record_state(socket: &Path) -> DaemonRecordState {
 /// everything" is never claimed when it is not true, and so an unreachable
 /// engine cannot keep the teardown spinning. Newest first: the session minted
 /// last is the one still editing.
+///
+/// A session whose turn already SETTLED is not pending either: there is
+/// nothing to cancel, and asking would only cost the settle budget and print a
+/// `cancel not confirmed` line the worker reads as a failure (2026-11-05).
 fn pending_sessions() -> Vec<String> {
     let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
     let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let settled = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
     SESSIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .rev()
-        .filter(|id| !cancelled.contains(*id) && !unreachable.contains(*id))
+        .filter(|id| {
+            !cancelled.contains(*id) && !unreachable.contains(*id) && !settled.contains(*id)
+        })
         .cloned()
         .collect()
 }
@@ -1603,6 +1687,49 @@ pub(crate) fn note_session_cancelled(id: &str) {
     mark_cancelled(id);
 }
 
+/// The turn on `id` has ENDED: it returned, and its result was delivered.
+///
+/// A settled session is not cancelled at the exit path at all. The daemon
+/// acknowledges a cancel only for a turn it actually stopped, so asking about
+/// a finished turn guarantees a silent daemon, a spent settle budget and a
+/// `cancel not confirmed` line -- which is exactly how every finished Hive job
+/// came to exit non-zero on 2026-11-05. See [`SETTLED`].
+///
+/// Called wherever the loop learns a turn is over, whether it succeeded, timed
+/// out under the watchdog (the daemon already sends `turn_complete` for that
+/// turn) or failed after the daemon ended it. A turn this process CANCELLED
+/// does not settle: the loop cannot prove the daemon stopped it, which is what
+/// `note_session_cancelled` is for, and its session stays cancellable.
+pub(crate) fn note_session_settled(id: &str) {
+    let id = id.trim();
+    if id.is_empty() {
+        return;
+    }
+    SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string());
+}
+
+/// Has `id`'s turn already ended, so that a cancel would have nothing to stop?
+fn session_settled(id: &str) -> bool {
+    SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
+/// Membership test, for the tests that assert a session was retired by an
+/// acknowledged cancel. The production readers iterate the set inside a lock
+/// rather than pay for a lookup per id.
+#[cfg(test)]
+fn engine_cancelled(id: &str) -> bool {
+    CANCELLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(id)
+}
+
 /// Fire-and-forget `session/cancel` over a blocking socket, for the one exit
 /// path that cannot await: `Drop` during a panic unwind. It sends the cancel
 /// notification for every session this run drove, reads briefly for the ack,
@@ -1620,7 +1747,30 @@ pub(crate) fn note_session_cancelled(id: &str) {
 /// from an absence. A session that was already retired is not even attempted,
 /// so this list holds each id at most once per process.
 fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
+    cancel_sessions_blocking_with_cleanup(socket, ids).0
+}
+
+/// [`cancel_sessions_blocking`], also reporting what the CANCEL came to.
+///
+/// The exit path needs both facts and they are different questions: which
+/// sessions were unreachable (a fact about the engine), and whether any cancel
+/// went unanswered (a fact about the cleanup, and NOT about the run -- see
+/// [`ExitCleanup`]).
+fn cancel_sessions_blocking_with_cleanup(
+    socket: &Path,
+    ids: &[String],
+) -> (Vec<String>, ExitCleanup) {
     let mut unreachable: Vec<String> = Vec::new();
+    let mut cleanup = ExitCleanup::NothingToDo;
+    // A cancel the daemon answered is `Confirmed`; one it ignored is
+    // `Unconfirmed`, and `Unconfirmed` outranks every other outcome because it
+    // is the only one worth an operator's attention.
+    fn note(outcome: ExitCleanup, cleanup: &mut ExitCleanup) {
+        *cleanup = match (*cleanup, outcome) {
+            (_, ExitCleanup::Unconfirmed) => ExitCleanup::Unconfirmed,
+            (_, other) => other,
+        };
+    }
     #[cfg(unix)]
     {
         use std::io::Read;
@@ -1635,6 +1785,15 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
                 let cancelled = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
                 let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
                 if cancelled.contains(id) || unreachable.contains(id) {
+                    continue;
+                }
+                // A turn that already ended is not cancelled: the daemon has
+                // no turn to stop and would never acknowledge, which is the
+                // 2026-11-05 exit-50 shape. `pending_sessions` filters these
+                // out; this is the backstop for a caller holding a stale list.
+                drop(cancelled);
+                drop(unreachable);
+                if session_settled(id) {
                     continue;
                 }
             }
@@ -1654,6 +1813,7 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
                             socket.display()
                         );
                         unreachable.push(id.clone());
+                        note(ExitCleanup::Confirmed, &mut cleanup);
                     }
                     continue;
                 }
@@ -1687,14 +1847,34 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
             .is_ok();
             if sent {
                 let mut ack = [0u8; 4096];
-                let _ = stream.read(&mut ack);
-                eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+                let read = stream.read(&mut ack).unwrap_or(0);
+                // A read that returned bytes is the daemon speaking: it is the
+                // `turn_complete` for the turn this cancel stopped, or an error
+                // reply saying there was no turn left. A zero-length read is
+                // EOF, and a timeout is silence: neither is an answer.
+                if read > 0 {
+                    eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+                    note(ExitCleanup::Confirmed, &mut cleanup);
+                } else {
+                    // Reached the daemon, heard nothing. Best-effort cleanup:
+                    // WARN, with the wording that says a settled turn does this
+                    // too, and never an error -- the run's exit code is the
+                    // loop's result and this must not touch it.
+                    eprintln!(
+                        "[zoder] WARNING: session {id} was asked to cancel on the way out and \
+                         the daemon did not ack within {BLOCKING_ACK_WAIT:?}; the session has \
+                         already settled or the daemon is still finishing its turn. This is \
+                         best-effort cleanup and does not change the run's result"
+                    );
+                    note(ExitCleanup::Unconfirmed, &mut cleanup);
+                }
                 // Only a cancel that reached the socket counts. A session we
                 // failed to tell about stays pending, so a later round tries
                 // again rather than pretending the agent was stopped.
                 mark_cancelled(id);
             } else {
                 eprintln!("[zoder] could not deliver a cancel for session {id}");
+                note(ExitCleanup::Unconfirmed, &mut cleanup);
             }
         }
     }
@@ -1702,7 +1882,7 @@ fn cancel_sessions_blocking(socket: &Path, ids: &[String]) -> Vec<String> {
     {
         let _ = (socket, ids);
     }
-    unreachable
+    (unreachable, cleanup)
 }
 
 /// Write one NDJSON frame. Used by the blocking cancel only.
@@ -1750,6 +1930,24 @@ impl ReapOutcome {
     }
 }
 
+/// What the EXIT-PATH cancel came to, kept as data rather than inferred from
+/// the log. Deliberately has no "failed the run" member: a cancel is cleanup,
+/// and cleanup does not decide the exit code (see [`TeardownReport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExitCleanup {
+    /// Nothing was asked: every session this run drove had already settled,
+    /// or there was nothing recorded. The 2026-11-05 incident's fixed shape.
+    #[default]
+    NothingToDo,
+    /// Every session asked was acknowledged, or retired for a reason that
+    /// proves no turn is left (an unreachable engine, a daemon that is gone).
+    Confirmed,
+    /// The daemon was reached and stayed silent about at least one session.
+    /// Reported at WARN level as best-effort cleanup; never an error, never a
+    /// run failure.
+    Unconfirmed,
+}
+
 /// What a teardown concluded, kept as data so the log and the tests read the
 /// same thing instead of the tests scraping stderr.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1766,6 +1964,31 @@ struct TeardownReport {
     /// False for a teardown whose only unfinished business was a cancel the
     /// engine could not receive.
     producing_work: bool,
+    /// What the exit-path CANCEL came to. Read by the log and the tests; it is
+    /// not an exit code and nothing maps it to one.
+    exit_cleanup: ExitCleanup,
+}
+
+impl TeardownReport {
+    /// Is the cleanup quiet? True when nothing was asked (every session had
+    /// settled) or every cancel was confirmed. A teardown whose only news is
+    /// an unacknowledged cancel is not quiet, but it is still not a failure.
+    ///
+    /// Test-only: production already logs at warn level from the cancel
+    /// itself, and this is the assertion surface for that behaviour.
+    #[cfg(test)]
+    fn exit_cleanup_silent(&self) -> bool {
+        self.exit_cleanup != ExitCleanup::Unconfirmed
+    }
+
+    /// The one question the exit code must never be answered from. Always
+    /// false: an unacknowledged cancel is best-effort cleanup, and the run's
+    /// exit code is the LOOP's result. Kept as a method so the invariant is
+    /// asserted by a test instead of living in a comment.
+    #[cfg(test)]
+    fn cleanup_failed_the_run(&self) -> bool {
+        false
+    }
 }
 
 /// Cancel and reap, alternating, until a round does neither.
@@ -1785,7 +2008,14 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
     let mut report = TeardownReport::default();
     for round in 0..MAX_TEARDOWN_ROUNDS {
         let cancelled = pending_sessions();
-        let unreachable = cancel_sessions_blocking(socket, &cancelled);
+        let (unreachable, cleanup) = cancel_sessions_blocking_with_cleanup(socket, &cancelled);
+        // The cancel's outcome is fixed by the FIRST round: later rounds only
+        // see what the first one left pending, so letting them overwrite it
+        // would turn an unanswered cancel into a quiet teardown just because
+        // its session was retired from the sweep.
+        if report.rounds == 0 {
+            report.exit_cleanup = cleanup;
+        }
         let outcome = reap(plan, grace);
         log_outcome(&outcome);
         report.rounds += 1;
@@ -2611,6 +2841,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3691,6 +3922,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id);
+        SETTLED.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     /// Only a "no listener exists" errno proves the engine is gone. Every
@@ -5572,5 +5804,221 @@ mod tests {
         kill_exact(helper);
         let _ = daemon.kill();
         let _ = daemon.wait();
+    }
+
+    /// The exit path as a test can drive it: the same
+    /// [`cancel_sessions_blocking_with_cleanup`] -> [`teardown_rounds`]
+    /// sequence [`cancel_then_reap`] and `Drop` run, pointed at a fixture
+    /// socket instead of the engine's.
+    ///
+    /// The point of driving the real sequence rather than the cancel alone is
+    /// that the incident was about the WHOLE exit path: the cancel, the reap
+    /// that follows it, and which of the two the run's result is read from.
+    async fn cancel_exit_path(ws: &Workspace, socket: &Path, budget: Duration) -> TeardownReport {
+        // What `cancel_then_reap` does first. Settled sessions are filtered
+        // out of its snapshot before it asks anyone; that is the behaviour
+        // under test.
+        let (_, async_cleanup) = cancel_recorded_sessions_with_cleanup(socket, budget).await;
+        // What `ReapGuard::finish` does next. The guard is built and then
+        // disarmed by hand so its own `Drop` (which would run a SECOND
+        // teardown) cannot fire: `finish` is what the caller measures.
+        let mut guard = ReapGuard::begin_with(
+            &ws.cd,
+            &ws.tmp_root,
+            true,
+            ws.daemon_pid_file(),
+            Some(ws.daemon_binary()),
+        );
+        let plan = guard.plan.clone().expect("an armed guard has a plan");
+        guard.finished = true;
+        let mut report = teardown_rounds(&plan, Duration::from_millis(50), socket);
+        report.exit_cleanup = merge_cleanup(report.exit_cleanup, async_cleanup);
+        report
+    }
+
+    // -----------------------------------------------------------------------
+    // The exit-path cancel for a run that already FINISHED.
+    //
+    // Measured 2026-11-05 (every Hive zoder job that delivered its commits):
+    // the run's last words were
+    //   `[zoder] session <id> cancel not confirmed after N attempt(s)
+    //    (daemon did not acknowledge session/cancel within 4.99s)`
+    // repeated once per session, and the process exited 50. A turn that has
+    // ALREADY ended -- completed, result delivered -- is never acknowledged by
+    // the daemon (there is no turn left to cancel), so the exit path waited a
+    // full settle budget per session, said "not confirmed", and the Hive
+    // worker read the run as a failure. Finished work landed in needs-review.
+    //
+    // The exit path now asks a session whose turn already SETTLED nothing at
+    // all, and reports an unacknowledged cancel for an unsettled session as
+    // best-effort cleanup at warn level. The exit code is the loop's own
+    // result and never the cleanup's outcome.
+    // -----------------------------------------------------------------------
+
+    /// A settled session is never asked: the exit path sees a completed turn,
+    /// skips the cancel, and returns at once instead of blocking for the
+    /// settle budget. This is the incident's second half -- the blocking
+    /// `Drop` path is the one that ran it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_settled_session_is_not_asked_to_cancel_on_the_exit_path() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        let socket = ws.cd.join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("settled-turn");
+        note_session_settled("settled-turn");
+
+        let started = Instant::now();
+        let report = cancel_exit_path(&ws, &socket, REAP_CANCEL_BUDGET).await;
+        let elapsed = started.elapsed();
+
+        // The daemon thread counts the connections it served.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a turn that already ended must not be asked to cancel"
+        );
+        assert!(
+            report.exit_cleanup_silent(),
+            "a settled session is not a failed cleanup: {report:?}"
+        );
+        // The full teardown still runs (it reaps whatever the agent left), so
+        // the bound is the teardown's own grace, NOT the cancel budget the
+        // old code spent on a session that had nothing to cancel.
+        assert!(
+            elapsed < REAP_CANCEL_BUDGET,
+            "a settled session must not cost the settle budget: {elapsed:?}"
+        );
+        forget_session("settled-turn");
+        drop(server);
+    }
+
+    /// The mirror case, and the one that must not regress: a session whose
+    /// turn never settled is still asked. The daemon acknowledges here, so the
+    /// cancel is confirmed exactly as before.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unsettled_session_is_still_cancelled_and_an_ack_confirms_it() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        let socket = ws.cd.join("engine.sock");
+        let ack = std::sync::Arc::new(Mutex::new(Vec::new()));
+        ack.lock().unwrap_or_else(|e| e.into_inner()).push(true);
+        let (server, attempts) = spawn_silent_cancel_daemon(&socket, ack);
+        note_session("unsettled-acked");
+
+        let report = cancel_exit_path(&ws, &socket, REAP_CANCEL_BUDGET).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unsettled session must still be asked exactly once here"
+        );
+        assert!(
+            report.exit_cleanup_silent(),
+            "a confirmed cancel is quiet: {report:?}"
+        );
+        assert!(
+            engine_cancelled("unsettled-acked"),
+            "the confirmed cancel must retire the session"
+        );
+        forget_session("unsettled-acked");
+        drop(server);
+    }
+
+    /// The shape the fleet measured: an unsettled session whose daemon never
+    /// acknowledges. The cancel is best-effort cleanup -- it may say so, at
+    /// warn level and with the settled-or-did-not-ack wording -- but it must
+    /// never be reported as an error-level failure and must never touch the
+    /// exit code.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unsettled_session_whose_cancel_is_never_acked_is_a_warning_only() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        let socket = ws.cd.join("engine.sock");
+        let (server, attempts) =
+            spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
+        note_session("unsettled-silent");
+
+        let report = cancel_exit_path(
+            &ws,
+            &socket,
+            // A window short enough to spend, so the test does not wait out
+            // the production budget for a daemon that will never answer.
+            Duration::from_millis(150),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the daemon must still be asked before the cancel is written off"
+        );
+        // The cleanup outcome is NOT a run failure. The line that says so is
+        // the one this test exists to stop: the fleet's exit code came from it.
+        assert!(
+            !report.cleanup_failed_the_run(),
+            "an unacknowledged cancel is cleanup, never a run failure: {report:?}"
+        );
+        assert_eq!(
+            report.exit_cleanup,
+            ExitCleanup::Unconfirmed,
+            "an unanswered cancel is reported as unconfirmed cleanup: {report:?}"
+        );
+        assert!(
+            !report.exit_cleanup_silent(),
+            "an unanswered cancel is worth ONE warning line: {report:?}"
+        );
+        forget_session("unsettled-silent");
+        drop(server);
+    }
+
+    /// The cleanup outcome is data, and NOTHING about it may reach the exit
+    /// code. The incident's exit 50 came from the unconfirmed-cancel path, so
+    /// the shape that must be impossible is "the loop resolved and the process
+    /// still failed". This pins the invariant on the classification the loop
+    /// itself uses: a resolved run has NO failure, so nothing the reaper
+    /// records as best-effort cleanup can supply one.
+    #[test]
+    fn the_exit_code_is_the_loop_result_never_the_cleanup_outcome() {
+        let _lock = reap_test_lock();
+        // A resolved loop has no failure to classify, whatever its teardown
+        // went through: the exit code follows from `resolved` alone.
+        let report = TeardownReport {
+            exit_cleanup: ExitCleanup::Unconfirmed,
+            ..TeardownReport::default()
+        };
+        assert!(
+            !report.cleanup_failed_the_run(),
+            "the resolved-run teardown is cleanup, not a failure: {report:?}"
+        );
+        // And a CONFIRMED teardown is equally silent: the cleanup's job is to
+        // stop the agent, and a success there is not news either.
+        let confirmed = TeardownReport {
+            exit_cleanup: ExitCleanup::Confirmed,
+            ..TeardownReport::default()
+        };
+        assert!(
+            confirmed.exit_cleanup_silent() && !confirmed.cleanup_failed_the_run(),
+            "a confirmed cleanup is quiet: {confirmed:?}"
+        );
+        // A deadline-reached run is a fact about the LOOP, and no teardown
+        // outcome can stand in for it. The two live in different places: the
+        // loop's `deadline_hit` decides its own code, and this report carries
+        // no deadline field at all.
+        let overdue = TeardownReport {
+            exit_cleanup: ExitCleanup::Confirmed,
+            producing_work: false,
+            ..TeardownReport::default()
+        };
+        assert!(
+            overdue.exit_cleanup_silent() && !overdue.cleanup_failed_the_run(),
+            "a clean teardown of a deadline-reached run still reports the deadline: {overdue:?}"
+        );
     }
 }

@@ -10565,6 +10565,11 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 if !author_models.iter().any(|known| known == &t.model) {
                     author_models.push(t.model.clone());
                 }
+                // The turn RETURNED: it is over, and the exit path must not
+                // ask the daemon to cancel it (a finished turn is never
+                // acknowledged, which cost one settle budget and a
+                // `cancel not confirmed` line per session -- 2026-11-05).
+                crate::reaper::note_session_settled(&t.run.session_id);
                 {
                     let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
                     state.note_session(&t.run.session_id, &format!("completed:{}", t.run.outcome));
@@ -10588,6 +10593,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
                             "cancel_unconfirmed"
                         } else {
+                            // The daemon answered or the turn failed on its
+                            // own, so it is over: the exit path has nothing to
+                            // cancel. An UNCONFIRMED cancel is deliberately
+                            // NOT settled -- the daemon never proved it
+                            // stopped, so the exit path must still try.
+                            crate::reaper::note_session_settled(&sid);
                             "failed"
                         };
                         state.note_session(&sid, cancel_state);
