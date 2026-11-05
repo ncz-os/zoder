@@ -936,6 +936,8 @@ impl Drop for ReapGuard {
 static ATTEMPT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
+    // The outcome is deliberately dropped here: this path is the in-band
+    // drain, whose job is to stop the agent, not to report on it.
     let _ = cancel_recorded_sessions_with_cleanup(socket, budget).await;
 }
 
@@ -945,10 +947,12 @@ async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
 /// is the loop's result (see [`ExitCleanup`]). The exit path reads it to
 /// decide whether the one warning line is warranted; nothing maps it to an
 /// exit code.
-async fn cancel_recorded_sessions_with_cleanup(
-    socket: &Path,
-    budget: Duration,
-) -> (Vec<String>, ExitCleanup) {
+///
+/// Returns the outcome alone. It used to return a `(Vec<String>, ExitCleanup)`
+/// whose `Vec` was always empty -- this phase resolves each session through the
+/// process-wide `CANCELLED` / `UNREACHABLE` sets rather than handing the caller
+/// a list, so the tuple advertised a result that no caller could ever read.
+async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) -> ExitCleanup {
     // The budget is PER SESSION, not for the whole phase. A phase budget
     // (750 ms in the fleet profile) was spent by the FIRST session's connect +
     // initialize + cancel round trip, leaving the retry planner a near-zero
@@ -998,7 +1002,7 @@ async fn cancel_recorded_sessions_with_cleanup(
                 .collect()
         };
         if pending.is_empty() {
-            return (Vec::new(), cleanup);
+            return cleanup;
         }
         for id in pending {
             // A per-session window, then move on to the next session: this one
@@ -1012,7 +1016,7 @@ async fn cancel_recorded_sessions_with_cleanup(
         // loop repeats only to catch sessions minted during the pass, and
         // `MAX_CANCEL_PASSES` bounds that; nothing is left unasked by design.
     }
-    (Vec::new(), cleanup)
+    cleanup
 }
 
 /// Combine two cleanup outcomes. `Unconfirmed` is the only one worth an
@@ -1713,10 +1717,14 @@ pub(crate) fn note_session_settled(id: &str) {
 
 /// Has `id`'s turn already ended, so that a cancel would have nothing to stop?
 fn session_settled(id: &str) -> bool {
+    // Normalise the SAME way the recorder does. Without this a caller passing
+    // the id with the padding `note_session_settled` stripped would miss a
+    // session that IS settled, and then ask the daemon to cancel a turn that
+    // already ended -- the exact wait this fix removes.
     SETTLED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(id)
+        .contains(id.trim())
 }
 
 /// Membership test, for the tests that assert a session was retired by an
@@ -1765,11 +1773,13 @@ fn cancel_sessions_blocking_with_cleanup(
     // A cancel the daemon answered is `Confirmed`; one it ignored is
     // `Unconfirmed`, and `Unconfirmed` outranks every other outcome because it
     // is the only one worth an operator's attention.
+    //
+    // `NothingToDo` ranks BELOW `Confirmed`: it means "this step sent nothing",
+    // so it must never overwrite a real result from an earlier session. Both
+    // arguments are read -- an earlier version ignored its first, which is how
+    // a connect failure came to be reported as a confirmed cancel.
     fn note(outcome: ExitCleanup, cleanup: &mut ExitCleanup) {
-        *cleanup = match (*cleanup, outcome) {
-            (_, ExitCleanup::Unconfirmed) => ExitCleanup::Unconfirmed,
-            (_, other) => other,
-        };
+        *cleanup = merge_cleanup(*cleanup, outcome);
     }
     #[cfg(unix)]
     {
@@ -1813,7 +1823,14 @@ fn cancel_sessions_blocking_with_cleanup(
                             socket.display()
                         );
                         unreachable.push(id.clone());
-                        note(ExitCleanup::Confirmed, &mut cleanup);
+                        // NOT `Confirmed`: the connect never reached the
+                        // daemon, so no cancel was put on the wire and
+                        // nothing was acknowledged. The session is retired
+                        // from later rounds because there is no daemon left
+                        // to ask -- but retiring it is not the same as
+                        // cancelling it, and claiming a confirmation here
+                        // would report a cleanup success that never happened.
+                        note(ExitCleanup::NothingToDo, &mut cleanup);
                     }
                     continue;
                 }
@@ -5818,7 +5835,7 @@ mod tests {
         // What `cancel_then_reap` does first. Settled sessions are filtered
         // out of its snapshot before it asks anyone; that is the behaviour
         // under test.
-        let (_, async_cleanup) = cancel_recorded_sessions_with_cleanup(socket, budget).await;
+        let async_cleanup = cancel_recorded_sessions_with_cleanup(socket, budget).await;
         // What `ReapGuard::finish` does next. The guard is built and then
         // disarmed by hand so its own `Drop` (which would run a SECOND
         // teardown) cannot fire: `finish` is what the caller measures.
@@ -6020,5 +6037,64 @@ mod tests {
             overdue.exit_cleanup_silent() && !overdue.cleanup_failed_the_run(),
             "a clean teardown of a deadline-reached run still reports the deadline: {overdue:?}"
         );
+    }
+
+    /// A connect failure is NOT a confirmed cancel.
+    ///
+    /// The engine being UNREACHABLE retires the session from later rounds --
+    /// there is no daemon left to ask -- but it proves nothing was cancelled.
+    /// Recording `Confirmed` there told the report that a cancel had been
+    /// acknowledged when none was ever put on the wire: a silent lie in the
+    /// only field the exit-path log reads. `NothingToDo` is the honest value:
+    /// no cancel was sent, so the cleanup has nothing to report.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unreachable_engine_does_not_report_a_confirmed_cancel() {
+        let _lock = reap_test_lock();
+        let ws = Workspace::new();
+        // No listener is ever bound here, so `connect` fails with ENOENT --
+        // the errno that PROVES no daemon is listening.
+        let socket = ws.cd.join("no-such-engine.sock");
+        note_session("unreachable-session");
+
+        let (_, cleanup) =
+            cancel_sessions_blocking_with_cleanup(&socket, &["unreachable-session".into()]);
+
+        assert_eq!(
+            cleanup,
+            ExitCleanup::NothingToDo,
+            "an unreachable engine sent no cancel, so nothing was confirmed: {cleanup:?}"
+        );
+        assert!(
+            !engine_cancelled("unreachable-session"),
+            "a session we never reached must not be recorded as cancelled"
+        );
+        forget_session("unreachable-session");
+    }
+
+    /// The settled lookup accepts the same spellings the recorder does.
+    ///
+    /// `note_session_settled` trims before it inserts; `session_settled` read
+    /// the raw string. A caller that passed the id with the whitespace the
+    /// recorder stripped would miss a session that IS settled -- and then ask
+    /// the daemon to cancel a turn that already ended, which is the very
+    /// 2026-11-05 wait this fix exists to remove. One normalisation, applied
+    /// on both sides.
+    #[test]
+    fn a_settled_lookup_tolerates_the_same_whitespace_the_recorder_trims() {
+        let _lock = reap_test_lock();
+        note_session_settled("  padded-session \n");
+        assert!(
+            session_settled("padded-session"),
+            "an id recorded with padding must be found by its clean spelling"
+        );
+        assert!(
+            session_settled("  padded-session \n"),
+            "and by the padded spelling, since the lookup normalises too"
+        );
+        SETTLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("padded-session");
     }
 }
