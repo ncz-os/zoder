@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-05",
-  "generated": "2026-11-05",
-  "count": 3741,
-  "routable": 76,
-  "scored": 2451,
+  "arena_date": "2026-11-06",
+  "generated": "2026-11-06",
+  "count": 3753,
+  "routable": 75,
+  "scored": 2456,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -30236,6 +30236,36 @@
       }
     },
     {
+      "id": "databricks/databricks-kimi-k3-1-pro",
+      "host": "databricks",
+      "leaf": "databricks-kimi-k3-1-pro",
+      "family": "databricks",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.99997,
+        "output_usd_per_mtok": 9.99999,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.19999
+      },
+      "agentic_score": 0.6,
+      "w_swe": 0.6,
+      "capability": {
+        "swe_verified": {
+          "acc": 60.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.8,
+        "grind": 0.52
+      }
+    },
+    {
       "id": "databricks/databricks-llama-4-maverick",
       "host": "databricks",
       "leaf": "databricks-llama-4-maverick",
@@ -35424,8 +35454,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.103,
-        "output_usd_per_mtok": 4.109999999999999,
+        "input_usd_per_mtok": 0.1165,
+        "output_usd_per_mtok": 4.66,
         "source": "openrouter"
       },
       "agentic_score": 0.602,
@@ -35473,8 +35503,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.045,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.051,
+        "output_usd_per_mtok": 0.5670000000000001,
         "source": "openrouter"
       },
       "agentic_score": 0.71,
@@ -36516,6 +36546,51 @@
           "rating": 1656.4,
           "source": "arena.ai",
           "votes": 21281
+        }
+      }
+    },
+    {
+      "id": "empiriolabs/kimi-k3-1-pro",
+      "host": "empiriolabs",
+      "leaf": "kimi-k3-1-pro",
+      "family": "empiriolabs",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 1.7999999999999998
+      },
+      "agentic_score": 0.792,
+      "w_swe": 0.995,
+      "capability": {
+        "swe_verified": {
+          "acc": 60.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.8,
+        "grind": 0.52
+      },
+      "arena_coding_elo": 1694.6,
+      "arena_webdev_elo": 1694.6,
+      "preference": {
+        "arena_agent": {
+          "rank": 14,
+          "score": 0.0529,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 9,
+          "rating": 1694.6,
+          "source": "arena.ai",
+          "votes": 2671
         }
       }
     },
@@ -38288,7 +38363,7 @@
         "input_usd_per_mtok": 1.0,
         "output_usd_per_mtok": 2.7,
         "source": "litellm",
-        "cache_read_usd_per_mtok": 0.049999999999999996
+        "cache_read_usd_per_mtok": 0.09999999999999999
       },
       "agentic_score": 0.561,
       "arena_coding_elo": 1571.0,
@@ -48523,6 +48598,22 @@
       }
     },
     {
+      "id": "gemini/gemini-omni-1.2-flash",
+      "host": "gemini",
+      "leaf": "gemini-omni-1.2-flash",
+      "family": "gemini",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 9.0,
+        "source": "litellm"
+      }
+    },
+    {
       "id": "gemini/gemini-omni-flash-preview",
       "host": "gemini",
       "leaf": "gemini-omni-flash-preview",
@@ -51743,6 +51834,74 @@
       "w_swe": 0.87
     },
     {
+      "id": "gmi/XiaomiMiMo/MiMo-V2.6-Flash",
+      "host": "gmi",
+      "leaf": "XiaomiMiMo/MiMo-V2.6-Flash",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.112,
+        "output_usd_per_mtok": 0.224,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.0022400000000000002
+      },
+      "agentic_score": 0.643,
+      "arena_coding_elo": 1637.2,
+      "arena_webdev_elo": 1637.2,
+      "preference": {
+        "arena_agent": {
+          "rank": 31,
+          "score": 0.002,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 22,
+          "rating": 1637.2,
+          "source": "arena.ai",
+          "votes": 7068
+        }
+      },
+      "w_swe": 0.948
+    },
+    {
+      "id": "gmi/XiaomiMiMo/MiMo-V2.6-Pro",
+      "host": "gmi",
+      "leaf": "XiaomiMiMo/MiMo-V2.6-Pro",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.348,
+        "output_usd_per_mtok": 0.696,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.00288
+      },
+      "agentic_score": 0.668,
+      "arena_coding_elo": 1625.4,
+      "arena_webdev_elo": 1625.4,
+      "preference": {
+        "arena_agent": {
+          "rank": 16,
+          "score": 0.0268,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 25,
+          "rating": 1625.4,
+          "source": "arena.ai",
+          "votes": 6820
+        }
+      },
+      "w_swe": 0.938
+    },
+    {
       "id": "gmi/anthropic/claude-opus-4",
       "host": "gmi",
       "leaf": "anthropic/claude-opus-4",
@@ -52440,6 +52599,51 @@
       }
     },
     {
+      "id": "gmi/deepseek-ai/DeepSeek-V4.1-Flash",
+      "host": "gmi",
+      "leaf": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.18,
+        "output_usd_per_mtok": 0.72,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.0036
+      },
+      "agentic_score": 0.71,
+      "w_swe": 0.971,
+      "capability": {
+        "swe_verified": {
+          "acc": 70.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "arena_coding_elo": 1665.0,
+      "arena_webdev_elo": 1665.0,
+      "preference": {
+        "arena_agent": {
+          "rank": 22,
+          "score": 0.0237,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 16,
+          "rating": 1665.0,
+          "source": "arena.ai",
+          "votes": 7842
+        }
+      }
+    },
+    {
       "id": "gmi/deepseek-ai/deepseek-v4-flash-vision-exp",
       "host": "gmi",
       "leaf": "deepseek-ai/deepseek-v4-flash-vision-exp",
@@ -52467,6 +52671,68 @@
       "workflows": {
         "single_pass": 0.9,
         "grind": 0.85
+      }
+    },
+    {
+      "id": "gmi/deepseek-ai/deepseek-v4.1-flash-1017",
+      "host": "gmi",
+      "leaf": "deepseek-ai/deepseek-v4.1-flash-1017",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.18,
+        "output_usd_per_mtok": 0.72,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.0036
+      },
+      "agentic_score": 0.71,
+      "w_swe": 0.971,
+      "capability": {
+        "swe_verified": {
+          "acc": 70.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "arena_coding_elo": 1665.0,
+      "arena_webdev_elo": 1665.0,
+      "preference": {
+        "arena_agent": {
+          "rank": 22,
+          "score": 0.0237,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 16,
+          "rating": 1665.0,
+          "source": "arena.ai",
+          "votes": 7842
+        }
+      }
+    },
+    {
+      "id": "gmi/gmicloud/Ripple-65B-Preview",
+      "host": "gmi",
+      "leaf": "gmicloud/Ripple-65B-Preview",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.19999999999999998,
+        "output_usd_per_mtok": 0.6,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.049999999999999996
       }
     },
     {
@@ -54114,6 +54380,35 @@
       }
     },
     {
+      "id": "gmi/openai/gpt-oss-20b",
+      "host": "gmi",
+      "leaf": "openai/gpt-oss-20b",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.04,
+        "output_usd_per_mtok": 0.15,
+        "source": "litellm"
+      },
+      "agentic_score": 0.5,
+      "w_swe": 0.5,
+      "capability": {
+        "swe_verified": {
+          "acc": 50.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.66,
+        "grind": 0.42
+      }
+    },
+    {
       "id": "gmi/stepfun-ai/Step-3.7-Flash",
       "host": "gmi",
       "leaf": "stepfun-ai/Step-3.7-Flash",
@@ -54247,6 +54542,40 @@
         }
       },
       "w_swe": 0.838
+    },
+    {
+      "id": "gmi/tencent/hy4",
+      "host": "gmi",
+      "leaf": "tencent/hy4",
+      "family": "gmi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.417,
+        "output_usd_per_mtok": 1.2505,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.020999999999999998
+      },
+      "agentic_score": 0.718,
+      "arena_coding_elo": 1631.1,
+      "arena_webdev_elo": 1631.1,
+      "preference": {
+        "arena_agent": {
+          "rank": 13,
+          "score": 0.0539,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 23,
+          "rating": 1631.1,
+          "source": "arena.ai",
+          "votes": 4765
+        }
+      },
+      "w_swe": 0.943
     },
     {
       "id": "gmi/tencent/hy4-preview",
@@ -55595,6 +55924,38 @@
       }
     },
     {
+      "id": "google/gemini-omni-1.1-flash",
+      "host": "google",
+      "leaf": "gemini-omni-1.1-flash",
+      "family": "google",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 9.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "google/gemini-omni-1.2-flash",
+      "host": "google",
+      "leaf": "gemini-omni-1.2-flash",
+      "family": "google",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 9.0,
+        "source": "openrouter"
+      }
+    },
+    {
       "id": "google/gemma-2-27b-it",
       "host": "google",
       "leaf": "gemma-2-27b-it",
@@ -55678,8 +56039,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.058,
-        "output_usd_per_mtok": 0.174,
+        "input_usd_per_mtok": 0.09,
+        "output_usd_per_mtok": 0.3,
         "source": "openrouter"
       },
       "agentic_score": 0.431,
@@ -57527,6 +57888,23 @@
         "output_usd_per_mtok": 50.0,
         "source": "litellm",
         "cache_read_usd_per_mtok": 1.0
+      }
+    },
+    {
+      "id": "gpt-6-cyber",
+      "host": "",
+      "leaf": "gpt-6-cyber",
+      "family": "gpt-6-cyber",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 20.0,
+        "output_usd_per_mtok": 100.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 2.0
       }
     },
     {
@@ -65162,8 +65540,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.19999999999999998,
-        "output_usd_per_mtok": 0.52,
+        "input_usd_per_mtok": 0.59,
+        "output_usd_per_mtok": 0.7899999999999999,
         "source": "openrouter"
       }
     },
@@ -66111,35 +66489,6 @@
       }
     },
     {
-      "id": "minimax/minimax-01",
-      "host": "minimax",
-      "leaf": "minimax-01",
-      "family": "minimax",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.19999999999999998,
-        "output_usd_per_mtok": 1.1,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.56,
-      "w_swe": 0.56,
-      "capability": {
-        "swe_verified": {
-          "acc": 56.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.74,
-        "grind": 0.58
-      }
-    },
-    {
       "id": "minimax/minimax-m1",
       "host": "minimax",
       "leaf": "minimax-m1",
@@ -66166,114 +66515,6 @@
       "workflows": {
         "single_pass": 0.74,
         "grind": 0.58
-      }
-    },
-    {
-      "id": "minimax/minimax-m2",
-      "host": "minimax",
-      "leaf": "minimax-m2",
-      "family": "minimax",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.255,
-        "output_usd_per_mtok": 1.02,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.328,
-      "w_swe": 0.664,
-      "capability": {
-        "swe_verified": {
-          "acc": 56.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.74,
-        "grind": 0.58
-      },
-      "arena_coding_elo": 1297.1,
-      "arena_webdev_elo": 1297.1,
-      "preference": {
-        "arena_webdev": {
-          "rank": 132,
-          "rating": 1297.1,
-          "source": "arena.ai",
-          "votes": 6683
-        }
-      }
-    },
-    {
-      "id": "minimax/minimax-m2-her",
-      "host": "minimax",
-      "leaf": "minimax-m2-her",
-      "family": "minimax",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.56,
-      "w_swe": 0.56,
-      "capability": {
-        "swe_verified": {
-          "acc": 56.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.74,
-        "grind": 0.58
-      }
-    },
-    {
-      "id": "minimax/minimax-m2.1",
-      "host": "minimax",
-      "leaf": "minimax-m2.1",
-      "family": "minimax",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.672,
-      "w_swe": 0.874,
-      "capability": {
-        "swe_verified": {
-          "acc": 74.8,
-          "cost_per_test": 0.439,
-          "latency_s": 386.3,
-          "source": "vals.ai"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.74,
-        "grind": 0.58
-      },
-      "arena_coding_elo": 1384.0,
-      "arena_webdev_elo": 1384.0,
-      "preference": {
-        "arena_webdev": {
-          "rank": 110,
-          "rating": 1384.0,
-          "source": "arena.ai",
-          "votes": 7573
-        }
       }
     },
     {
@@ -66331,8 +66572,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.21,
+        "output_usd_per_mtok": 0.84,
         "source": "openrouter"
       },
       "agentic_score": 0.671,
@@ -70784,6 +71025,51 @@
           "rating": 1656.4,
           "source": "arena.ai",
           "votes": 21281
+        }
+      }
+    },
+    {
+      "id": "nebius/moonshotai/Kimi-K3.1-Pro",
+      "host": "nebius",
+      "leaf": "moonshotai/Kimi-K3.1-Pro",
+      "family": "nebius",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.19999999999999998
+      },
+      "agentic_score": 0.792,
+      "w_swe": 0.995,
+      "capability": {
+        "swe_verified": {
+          "acc": 60.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.8,
+        "grind": 0.52
+      },
+      "arena_coding_elo": 1694.6,
+      "arena_webdev_elo": 1694.6,
+      "preference": {
+        "arena_agent": {
+          "rank": 14,
+          "score": 0.0529,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 9,
+          "rating": 1694.6,
+          "source": "arena.ai",
+          "votes": 2671
         }
       }
     },
@@ -75866,35 +76152,6 @@
       }
     },
     {
-      "id": "nvidia/nemotron-3.5-content-safety:free",
-      "host": "nvidia",
-      "leaf": "nemotron-3.5-content-safety:free",
-      "family": "nvidia",
-      "kind": "chat",
-      "route_candidate": true,
-      "free": true,
-      "paid": false,
-      "gated_reason": null,
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.58,
-      "w_swe": 0.58,
-      "capability": {
-        "swe_verified": {
-          "acc": 58.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.74,
-        "grind": 0.56
-      }
-    },
-    {
       "id": "nvidia/nemotron-3.5-lightning",
       "host": "nvidia",
       "leaf": "nemotron-3.5-lightning",
@@ -80520,8 +80777,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.02,
-        "output_usd_per_mtok": 0.07300000000000001,
+        "input_usd_per_mtok": 0.016,
+        "output_usd_per_mtok": 0.06,
         "source": "openrouter"
       },
       "agentic_score": 0.377,
@@ -81872,6 +82129,22 @@
       "id": "openrouter/auto-beta",
       "host": "openrouter",
       "leaf": "auto-beta",
+      "family": "openrouter",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": -1000000.0,
+        "output_usd_per_mtok": -1000000.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "openrouter/auto-code",
+      "host": "openrouter",
+      "leaf": "auto-code",
       "family": "openrouter",
       "kind": "chat",
       "route_candidate": false,
@@ -86091,7 +86364,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.25,
+        "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.0,
         "source": "openrouter"
       },
@@ -94470,6 +94743,36 @@
       }
     },
     {
+      "id": "us-gov.xai.grok-4.7",
+      "host": "",
+      "leaf": "us-gov.xai.grok-4.7",
+      "family": "us-gov.xai.grok-4.7",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.64,
+        "output_usd_per_mtok": 7.920000000000001,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.66
+      },
+      "agentic_score": 0.6,
+      "w_swe": 0.6,
+      "capability": {
+        "swe_verified": {
+          "acc": 60.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.78,
+        "grind": 0.62
+      }
+    },
+    {
       "id": "us.amazon.nova-2-lite-v1:0",
       "host": "",
       "leaf": "us.amazon.nova-2-lite-v1:0",
@@ -100295,6 +100598,22 @@
       "id": "vertex_ai/gemini-omni-1.1-flash-preview",
       "host": "vertex_ai",
       "leaf": "gemini-omni-1.1-flash-preview",
+      "family": "vertex_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 9.0,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "vertex_ai/gemini-omni-1.2-flash",
+      "host": "vertex_ai",
+      "leaf": "gemini-omni-1.2-flash",
       "family": "vertex_ai",
       "kind": "chat",
       "route_candidate": false,
@@ -107706,7 +108025,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0927,
+        "input_usd_per_mtok": 0.0999,
         "output_usd_per_mtok": 8.0,
         "source": "openrouter"
       },
@@ -107816,8 +108135,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.1643,
-        "output_usd_per_mtok": 10.551,
+        "input_usd_per_mtok": 0.15389999999999998,
+        "output_usd_per_mtok": 9.338799999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -107970,7 +108289,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0285,
+        "input_usd_per_mtok": 0.028399999999999998,
         "output_usd_per_mtok": 0.0923,
         "source": "openrouter"
       },
