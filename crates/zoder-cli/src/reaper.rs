@@ -2942,7 +2942,7 @@ mod tests {
     /// only: a test in another module that drives a session through the
     /// installed session observer does not take this lock, so a session it
     /// notes WHILE a reaper test runs is not excluded.
-    struct ReapTestGuard {
+    pub(super) struct ReapTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2952,7 +2952,7 @@ mod tests {
         }
     }
 
-    fn reap_test_lock() -> ReapTestGuard {
+    pub(super) fn reap_test_lock() -> ReapTestGuard {
         let lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_reaper_globals();
         ReapTestGuard { _lock: lock }
@@ -6430,3 +6430,8 @@ mod tests {
         drop(server);
     }
 }
+
+// Fault-injection harness (ZD-20); it shares the test lock above.
+#[cfg(test)]
+#[path = "reaper_fault_tests.rs"]
+mod fault_tests;
