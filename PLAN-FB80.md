@@ -121,6 +121,8 @@ The other FB80 deliverables (quota.rs `*_at` wrappers + pinned tests + the
 two quota REDs; the pinned `month_to_date_usd_sums_current_month_bucket` and
 `month_to_date_fails_closed_when_current_cost_is_unknown`; PLAN-FB80.md and
 docs/verification/wall-clock-tests-20261101.md) are already present on
+master and untouched here.
+
 The branch is rebased onto the current master tip (535bb3ea) with the
 conflict resolved as above; no master file is altered by the rework itself.
 
@@ -139,7 +141,7 @@ docs/verification/wall-clock-tests-20261101.md) is already on master and is
 unchanged here.
 
 Test counts on the build host (cargo 1.96.1), full workspace suite
-`cargo test --workspace`:
+`cargo test --workspace --all-features --no-fail-fast`:
 
 - before (branch at 776be32c, i.e. master + the two preserved WIP commits):
   2548 passed / 0 failed / 3 ignored
@@ -152,3 +154,38 @@ Test counts on the build host (cargo 1.96.1), full workspace suite
 The three intended FB80 RED demonstrations still fail by design under
 `cargo test -p zoder-core -- --ignored` (ledger red, red_plan_usage,
 red_amortized); the pinned boundary tests pass.
+
+## Refresh onto master 6b457a9b (2026-11-06)
+
+Master moved on after the review and the branch was no longer a
+fast-forward (`merge-base 535bb3ea`). `origin/master` was merged into the
+branch: **no conflicts**. Master's 18-commit delta touches none of the FB80
+files — `crates/zoder-core/src/ledger.rs`, `crates/zoder-core/src/quota.rs`
+and `PLAN-FB80.md` are untouched by `535bb3ea..6b457a9b` — so the FB80
+change merges as the branch intended, and every newer master file is kept
+as-is. The full diff of the branch against `6b457a9b` is exactly the FB80
+deliverable:
+
+- `PLAN-FB80.md`, `docs/verification/wall-clock-tests-20261101.md`
+- `crates/zoder-core/src/ledger.rs` (+95)
+- `crates/zoder-core/src/quota.rs` (+285/-3)
+
+Also dropped in this refresh: the nine `.build/` scratch files (quota/ledger
+snapshots, review prompts, diff dumps) that early WIP commits had tracked.
+They are not source artifacts; `/.build/` is now in `.gitignore` so a future
+unfinished run cannot commit them again.
+
+Test counts on the refreshed tree, `cargo test --workspace --all-features
+--no-fail-fast` (40 suites, same suite count as before):
+
+- master 6b457a9b alone: 2699 passed / 1 failed / 2 ignored
+- this branch after the merge: 2701 passed / 2 failed / 5 ignored
+
+The one stable failure on both trees is master's own
+`provider::choice_without_delta_is_decode_error` (regressed by master's
+`25e1b10d`, not by FB80). The second failure in a parallel run is the
+`provider` suite's local-mock port race (`Network` instead of `Decode` on
+`127.0.0.1`): it appears identically on master when the suite is re-run —
+master alternates 76/1 and 75/2 across three consecutive runs, and this
+branch does the same. Run serially, both trees report 76 passed / 1 failed.
+Failures therefore did not grow versus the target.
