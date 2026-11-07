@@ -623,11 +623,25 @@ fn engine_unreachable(id: &str) -> bool {
 /// Record a session id the agent is driving. Fed by the acp-client session
 /// observer the moment the engine mints it; the exit path and the signal
 /// handler read it back.
+///
+/// The observer fires once per `session/new`, so seeing an id again means a
+/// NEW turn is starting on a resumed session. Any `SETTLED` or `CANCELLED`
+/// mark it carries described the turn before this one, so both are cleared
+/// here: otherwise the exit path would skip a turn that is still running
+/// (ZD-16). Each set is locked on its own, never together with `SESSIONS`.
 pub(crate) fn note_session(session_id: &str) {
     let session_id = session_key(session_id);
     if session_id.is_empty() {
         return;
     }
+    SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
+    CANCELLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
     let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     if seen.iter().any(|s| s == session_id) {
         return;
