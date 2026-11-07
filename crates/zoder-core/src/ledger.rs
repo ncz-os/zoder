@@ -501,6 +501,64 @@ fn checkpoint_path_for(ledger_path: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The parsed settled prefix of a ledger, kept in memory by
+/// [`Ledger::entries_strict_shared`] so a repeated routing read parses only the
+/// rows after it.
+///
+/// It is trusted on exactly the terms of the on-disk [`LedgerCheckpoint`]:
+/// the same file (inode and device), at least `offset` bytes long, and the
+/// same first and last [`CHECKPOINT_FINGERPRINT_BYTES`] before `offset`.
+/// Rotation, compaction (an atomic rename) and truncation all fail that test,
+/// and the read then starts over from byte 0.
+#[derive(Clone)]
+struct SettledPrefix {
+    inode: u64,
+    device: u64,
+    offset: u64,
+    lines: usize,
+    head_fingerprint: u64,
+    tail_fingerprint: u64,
+    entries: std::sync::Arc<Vec<Entry>>,
+}
+
+impl SettledPrefix {
+    /// Describe the first `offset` bytes of `file`, which hold `entries`.
+    fn stamp(file: &mut File, offset: u64, lines: usize, entries: Vec<Entry>) -> Option<Self> {
+        let (inode, device) = file_identity(&file.metadata().ok()?);
+        let (head_fingerprint, tail_fingerprint) = prefix_fingerprints(file, offset).ok()?;
+        Some(Self {
+            inode,
+            device,
+            offset,
+            lines,
+            head_fingerprint,
+            tail_fingerprint,
+            entries: std::sync::Arc::new(entries),
+        })
+    }
+
+    /// True when `file` still holds this prefix.
+    fn is_current_for(&self, file: &mut File) -> bool {
+        let Ok(meta) = file.metadata() else {
+            return false;
+        };
+        if file_identity(&meta) != (self.inode, self.device) || meta.len() < self.offset {
+            return false;
+        }
+        prefix_fingerprints(file, self.offset).ok()
+            == Some((self.head_fingerprint, self.tail_fingerprint))
+    }
+}
+
+/// One settled prefix per ledger path, for the life of the process.
+fn settled_prefixes() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, SettledPrefix>>
+{
+    static PREFIXES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, SettledPrefix>>,
+    > = std::sync::OnceLock::new();
+    PREFIXES.get_or_init(Default::default)
+}
+
 /// Result of a strict read that starts from a checkpoint.
 struct Fold {
     /// Per-month totals of every valid row in the file, prefix included.
@@ -1832,24 +1890,97 @@ impl Ledger {
     /// unknown-cost rows of the reservation pseudo-provider, which no quota
     /// window counts -- the same rows dry-run routing
     /// ([`Self::entries_readonly`]) has always seen.
+    ///
+    /// A review routes every dispatch, repair and fallback, so this read runs
+    /// many times per process. Rows before the first unsettled one (the
+    /// same rule as the sidecar checkpoint: no prepared or armed reservation,
+    /// malformed or unterminated row) are never rewritten in place, so the
+    /// parsed settled prefix is kept in memory and a repeated read parses
+    /// only what follows it. The prefix is reused only while the file's
+    /// identity and prefix fingerprints match (see [`SettledPrefix`]); the
+    /// result is the same, row for row and error for error, as a full parse.
     pub fn entries_strict_shared(&self) -> anyhow::Result<Vec<Entry>> {
-        let Some((_lock, mut file)) = self.open_shared()? else {
-            return Ok(Vec::new());
-        };
-        self.entries_strict_from_file(&mut file)
+        Ok(self.entries_strict_shared_counted()?.0)
     }
 
     /// [`Self::entries_strict_shared`], also returning how many ledger lines
-    /// the read parsed.
-    #[cfg(test)]
+    /// the read parsed (the settled prefix it reused is not counted).
     fn entries_strict_shared_counted(&self) -> anyhow::Result<(Vec<Entry>, usize)> {
         let Some((_lock, mut file)) = self.open_shared()? else {
             return Ok((Vec::new(), 0));
         };
-        let entries = self.entries_strict_from_file(&mut file)?;
-        // The read parses every line of the file.
-        let lines = LedgerLines::new(&mut file, &self.path, 0, 0)?.count();
-        Ok((entries, lines))
+        let cached = settled_prefixes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&self.path)
+            .cloned()
+            .filter(|prefix| prefix.is_current_for(&mut file));
+        let (start, lines_before, mut entries) = match &cached {
+            Some(prefix) => (prefix.offset, prefix.lines, prefix.entries.as_ref().clone()),
+            None => (0, 0, Vec::new()),
+        };
+        let mut settled = true;
+        let mut settled_offset = start;
+        let mut settled_lines = lines_before;
+        let mut settled_rows = entries.len();
+        let mut lines_read = 0usize;
+        let mut malformed = Vec::new();
+        let lines = LedgerLines::new(&mut file, &self.path, start, lines_before)
+            .with_context(|| format!("reading ledger from {}", self.path.display()))?;
+        for line in lines {
+            let line =
+                line.with_context(|| format!("reading ledger from {}", self.path.display()))?;
+            lines_read += 1;
+            settled &= line.terminated;
+            let end = line.start.saturating_add(line.raw_len as u64);
+            if line.payload.iter().all(u8::is_ascii_whitespace) {
+                if settled {
+                    settled_offset = end;
+                    settled_lines = line.line_no;
+                }
+                continue;
+            }
+            match serde_json::from_slice::<Entry>(&line.payload) {
+                Ok(entry) if entry_numbers_valid(&entry) => {
+                    settled &= !is_unsettled_reservation(&entry);
+                    entries.push(entry);
+                    if settled {
+                        settled_offset = end;
+                        settled_lines = line.line_no;
+                        settled_rows = entries.len();
+                    }
+                }
+                _ => {
+                    malformed.push(line.line_no);
+                    settled = false;
+                }
+            }
+        }
+        if !malformed.is_empty() {
+            anyhow::bail!(
+                "cannot establish ledger integrity: {} contains malformed non-empty row(s) at line(s) {}",
+                self.path.display(),
+                malformed
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if cached.as_ref().map(|prefix| prefix.offset) != Some(settled_offset) {
+            if let Some(prefix) = SettledPrefix::stamp(
+                &mut file,
+                settled_offset,
+                settled_lines,
+                entries[..settled_rows].to_vec(),
+            ) {
+                settled_prefixes()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(self.path.clone(), prefix);
+            }
+        }
+        Ok((entries, lines_read))
     }
 
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
@@ -4026,6 +4157,40 @@ mod tests {
         assert_eq!(lines, 1, "only the appended row is parsed");
         assert_eq!(
             json_rows(&grown),
+            json_rows(&full_strict_read(&ledger).unwrap())
+        );
+    }
+
+    /// A reservation rewritten in place far from both ends of a large ledger,
+    /// where the prefix fingerprints cannot see it, must still be read as it
+    /// is now: an unsettled row is never part of the reused prefix.
+    #[test]
+    fn in_place_reconcile_deep_in_a_large_ledger_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let bulk = |n: usize| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|_| row_line(&entry(&now_ts(), "vendor/bulk", 0.01, 1, 1, 1)))
+                .collect()
+        };
+        append_lines(&path, &bulk(2_000));
+        let ledger = Ledger::new(&path);
+        let mut reservation = ledger.reserve_billable().unwrap();
+        reservation.arm_for("p1", "vendor/m").unwrap();
+        // Well over CHECKPOINT_FINGERPRINT_BYTES after the armed row.
+        append_lines(&path, &bulk(2_000));
+        ledger.entries_strict_shared().unwrap();
+        let mut done = entry(&now_ts(), "vendor/m", 0.75, 5, 5, 1);
+        done.provider = "p1".into();
+        reservation.reconcile(&done).unwrap();
+        let got = ledger.entries_strict_shared().unwrap();
+        assert!(
+            got.iter()
+                .any(|row| row.provider == "p1" && row.cost_usd == 0.75),
+            "the reconciled row is missing from the routing read"
+        );
+        assert_eq!(
+            json_rows(&got),
             json_rows(&full_strict_read(&ledger).unwrap())
         );
     }
