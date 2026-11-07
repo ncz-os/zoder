@@ -62,6 +62,31 @@ check(
     0,
 )
 
+check(
+    "a paren inside a comment argument does not end the call",
+    'eprintln!("[loop] {}", /* ) */ x);',
+    'crate::oplog!("loop", "[loop] {}", /* ) */ x);',
+    1,
+)
+check(
+    "line comment inside a multi-line call",
+    'eprintln!(\n    "[loop] {}", // ) not the end\n    x\n);',
+    'crate::oplog!(\n    "loop", "[loop] {}", // ) not the end\n    x\n);',
+    1,
+)
+check(
+    "block comment and doc comment left alone",
+    '/* eprintln!("[loop] a"); */\n/// eprintln!("[loop] b");\n//! eprintln!("[loop] c");',
+    '/* eprintln!("[loop] a"); */\n/// eprintln!("[loop] b");\n//! eprintln!("[loop] c");',
+    0,
+)
+check(
+    "text inside a string literal left alone",
+    'let s = "eprintln!(\\"[loop] x\\")"; let r = r#"eprintln!("[loop] y")"#;',
+    'let s = "eprintln!(\\"[loop] x\\")"; let r = r#"eprintln!("[loop] y")"#;',
+    0,
+)
+
 if FAILURES:
     print("\n".join(FAILURES))
     sys.exit(1)
