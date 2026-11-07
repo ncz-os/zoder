@@ -5961,6 +5961,17 @@ fn print_review_dry_run(
 // Signature grows with review options; the size/exclusion knobs are bundled
 // into `ReviewSizeOptions`, so the arg count stays close to the historical one.
 #[allow(clippy::too_many_arguments)]
+/// Start a command's structured telemetry from empty buffers.
+///
+/// The per-call context records and the provider-health skip list are
+/// process-global; the payloads read them back at the end of a command.
+/// Clearing them at the start means a command never reports calls or skips
+/// from anything that ran earlier in the same process (ZD-15, F2.6).
+pub(crate) fn begin_command_telemetry() {
+    crate::context_opt::reset();
+    crate::provider_health::reset_skipped();
+}
+
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
     base: Option<String>,
@@ -5971,6 +5982,7 @@ pub(crate) async fn cmd_review(
     focus: &[String],
     opts: ReviewSizeOptions,
 ) -> anyhow::Result<()> {
+    begin_command_telemetry();
     let cwd = crate::agentic_cwd(cli)?;
 
     // Background: re-exec self detached, then return the job id.
@@ -10316,6 +10328,7 @@ async fn cmd_loop_run(
     require_approval: bool,
     cwd: &Path,
 ) -> anyhow::Result<()> {
+    begin_command_telemetry();
     // Read the operator's exec-safety policy (the OS-level sandbox backend
     // selection — see `zoder_core::ExecSafetyConfig`). Default = `None`
     // preserves the pre-sandbox byte-for-byte behavior. We do this once at
