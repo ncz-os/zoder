@@ -132,9 +132,11 @@ Key the runner on `error.class == "infrastructure"` (with
 so the decision survives a future code joining the class.
 
 **Strongest argument against:** the class is a string, and a runner that
-parses model-visible JSON is coupled to prose — if `class` were ever renamed,
-the runner silently falls back to today's failing behaviour, which a numeric
-exit code would not do.
+parses model-visible JSON is coupled to prose — a renamed `class` value would
+be caught by the zoder test that pins it
+(`each_named_code_carries_its_documented_class_and_exit_code`,
+`failure.rs:1176`), but the runner would not: it would silently fall back to
+today's failing behaviour, which a numeric exit code would not do.
 
 ## 5. IMPLEMENTATION PLAN
 
