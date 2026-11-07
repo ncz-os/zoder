@@ -87,6 +87,19 @@ check(
     0,
 )
 
+check(
+    "a raw string argument with parens and quotes",
+    'eprintln!("[loop] {}", r#"f(") (x"#);',
+    'crate::oplog!("loop", "[loop] {}", r#"f(") (x"#);',
+    1,
+)
+check(
+    "a // inside an earlier string on the same line is not a comment",
+    'let u = "http://x"; eprintln!("[loop] {u}");',
+    'let u = "http://x"; crate::oplog!("loop", "[loop] {u}");',
+    1,
+)
+
 if FAILURES:
     print("\n".join(FAILURES))
     sys.exit(1)
