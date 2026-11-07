@@ -1839,6 +1839,19 @@ impl Ledger {
         self.entries_strict_from_file(&mut file)
     }
 
+    /// [`Self::entries_strict_shared`], also returning how many ledger lines
+    /// the read parsed.
+    #[cfg(test)]
+    fn entries_strict_shared_counted(&self) -> anyhow::Result<(Vec<Entry>, usize)> {
+        let Some((_lock, mut file)) = self.open_shared()? else {
+            return Ok((Vec::new(), 0));
+        };
+        let entries = self.entries_strict_from_file(&mut file)?;
+        // The read parses every line of the file.
+        let lines = LedgerLines::new(&mut file, &self.path, 0, 0)?.count();
+        Ok((entries, lines))
+    }
+
     /// Parse all entries, invoking `on_malformed(line_no, raw_line)` for every
     /// non-empty line that fails to parse. A single mangled/half-written line
     /// (e.g. from an interrupted append) is skipped rather than aborting the
@@ -3967,6 +3980,231 @@ mod tests {
             (got - 0.60).abs() < 1e-9,
             "pre-FB80 this only held while the wall clock sat inside month M+2 of the fixtures; got {got}. The un-injectable scan cannot reach a pinned two-months-ahead boundary",
         );
+    }
+
+    // ---- routing read: settled-prefix reuse (ZD-09) ------------------------
+
+    fn json_rows(entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect()
+    }
+
+    /// The oracle for the routing read: a fresh strict parse of the whole
+    /// file, with no recovery and nothing reused.
+    fn full_strict_read(ledger: &Ledger) -> anyhow::Result<Vec<Entry>> {
+        match File::open(&ledger.path) {
+            Ok(mut file) => ledger.entries_strict_from_file(&mut file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A review routes every dispatch, every repair and every fallback, and
+    /// each routing decision read the whole ledger again (157 ms per read on
+    /// a 100k-row ledger, ~16 per review). Settled rows are never rewritten
+    /// in place, so a repeated read needs to parse only what follows them.
+    #[test]
+    fn repeated_routing_read_parses_only_rows_after_the_settled_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let rows: Vec<_> = (0..50)
+            .map(|_| row_line(&entry(&now_ts(), "m", 0.5, 1, 1, 1)))
+            .collect();
+        append_lines(&path, &rows);
+        let ledger = Ledger::new(&path);
+        let (first, lines) = ledger.entries_strict_shared_counted().unwrap();
+        assert_eq!((first.len(), lines), (50, 50));
+
+        let (again, lines) = ledger.entries_strict_shared_counted().unwrap();
+        assert_eq!(lines, 0, "an unchanged ledger is not parsed again");
+        assert_eq!(json_rows(&again), json_rows(&first));
+
+        append_lines(&path, &[row_line(&entry(&now_ts(), "m2", 0.25, 1, 1, 1))]);
+        let (grown, lines) = ledger.entries_strict_shared_counted().unwrap();
+        assert_eq!(lines, 1, "only the appended row is parsed");
+        assert_eq!(
+            json_rows(&grown),
+            json_rows(&full_strict_read(&ledger).unwrap())
+        );
+    }
+
+    /// Property test: under a random mix of appends, blank rows, live, armed,
+    /// abandoned and reconciled reservations, in-place cancels, recovery,
+    /// compaction, rotation, truncation and malformed rows, the routing read
+    /// returns exactly what a fresh full strict parse returns, row for row and
+    /// error for error. `ZODER_LEDGER_SEED` replays another seed.
+    #[test]
+    fn routing_read_matches_a_full_parse_under_random_operations() {
+        use rand::{Rng, SeedableRng};
+        let seed = std::env::var("ZODER_LEDGER_SEED")
+            .ok()
+            .and_then(|seed| seed.parse().ok())
+            .unwrap_or(0x2d09_0000_5eed_0001_u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let ledger = Ledger::new(&path);
+        let mut live: Vec<BillableReservation> = Vec::new();
+        let mut armed: Vec<BillableReservation> = Vec::new();
+        let mut reused = 0usize;
+        for step in 0..400 {
+            let op = rng.gen_range(0..100);
+            match op {
+                0..=39 => {
+                    let mut row = entry(&now_ts(), "vendor/m", 0.0, 1, 1, 1);
+                    row.provider = format!("p{}", rng.gen_range(0..4));
+                    row.cost_usd = rng.gen_range(0.0..1.0);
+                    let line = if rng.gen_bool(0.2) {
+                        slot_line(&row, BILLABLE_RESERVATION_BYTES)
+                    } else {
+                        row_line(&row)
+                    };
+                    append_lines(&path, &[line]);
+                }
+                40..=44 => append_lines(&path, &[b"\n".to_vec()]),
+                45..=52 => live.push(ledger.reserve_billable().unwrap()),
+                53..=60 => {
+                    let mut reservation = ledger.reserve_billable().unwrap();
+                    reservation.arm_for("p1", "vendor/m").unwrap();
+                    armed.push(reservation);
+                }
+                61..=66 => {
+                    if let Some(reservation) = armed.pop() {
+                        let mut done = entry(&now_ts(), "vendor/m", 0.0, 5, 5, 1);
+                        done.provider = "p1".into();
+                        done.cost_usd = rng.gen_range(0.0..2.0);
+                        reservation.reconcile(&done).unwrap();
+                    }
+                }
+                67..=70 => {
+                    // Dropped unarmed: cancelled in place.
+                    live.pop();
+                }
+                71..=73 => {
+                    // Dropped armed: reconciled in place as unknown cost.
+                    armed.pop();
+                }
+                74..=76 => {
+                    let mut abandoned = ledger.reserve_billable().unwrap();
+                    drop(abandoned.owner_lock.take());
+                    std::mem::forget(abandoned);
+                }
+                77..=81 => {
+                    // Recovery (and compaction when the file is mostly
+                    // padding) under the exclusive lock.
+                    let _ = ledger.month_to_date_usd();
+                }
+                82..=84 => {
+                    // Rotation: the same rows in a new file.
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let tmp = dir.path().join("rotated");
+                    std::fs::write(&tmp, &bytes).unwrap();
+                    std::fs::rename(&tmp, &path).unwrap();
+                    live.clear();
+                    armed.clear();
+                }
+                85..=87 => {
+                    // Truncate at a random row boundary.
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let ends: Vec<usize> = bytes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| **b == b'\n')
+                        .map(|(i, _)| i + 1)
+                        .collect();
+                    if !ends.is_empty() {
+                        let keep = ends[rng.gen_range(0..ends.len())];
+                        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        file.set_len(keep as u64).unwrap();
+                        live.clear();
+                        armed.clear();
+                    }
+                }
+                88..=89 => {
+                    // A malformed row, then removed again by truncation.
+                    let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+                    append_lines(&path, &[b"{not json\n".to_vec()]);
+                    let got = ledger.entries_strict_shared().map(|e| json_rows(&e));
+                    let want = full_strict_read(&ledger).map(|e| json_rows(&e));
+                    assert_eq!(
+                        got.map_err(|e| e.to_string()),
+                        want.map_err(|e| e.to_string()),
+                        "seed {seed:#x} step {step}: malformed row"
+                    );
+                    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    file.set_len(len).unwrap();
+                }
+                _ => {
+                    // An unterminated tail row, completed later by an append.
+                    let row = entry(&now_ts(), "vendor/tail", 0.1, 1, 1, 1);
+                    append_lines(&path, &[serde_json::to_vec(&row).unwrap()]);
+                    let got = ledger.entries_strict_shared().unwrap();
+                    assert_eq!(
+                        json_rows(&got),
+                        json_rows(&full_strict_read(&ledger).unwrap()),
+                        "seed {seed:#x} step {step}: unterminated row"
+                    );
+                    append_lines(&path, &[b"\n".to_vec()]);
+                }
+            }
+            let (got, lines) = ledger.entries_strict_shared_counted().unwrap();
+            let total = std::fs::read(&path)
+                .unwrap_or_default()
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count();
+            if lines < total {
+                reused += 1;
+            }
+            assert_eq!(
+                json_rows(&got),
+                json_rows(&full_strict_read(&ledger).unwrap()),
+                "seed {seed:#x} step {step} (op {op})"
+            );
+        }
+        assert!(
+            reused > 100,
+            "the settled prefix was reused on only {reused} of 400 reads"
+        );
+    }
+
+    /// Timing for the routing read on a 100k-row ledger (ZD-09 / P9): the
+    /// first read parses everything, repeated reads reuse the settled prefix.
+    /// Run with `cargo test -p zoder-core --release -- --ignored
+    /// routing_read_timing_100k --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, run by hand"]
+    fn routing_read_timing_100k() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let rows: Vec<_> = (0..100_000)
+            .map(|i| {
+                let mut row = entry(&now_ts(), "vendor/model", 0.001, 1000, 200, 1);
+                row.provider = format!("p{}", i % 7);
+                row.billing = Some("metered".into());
+                row_line(&row)
+            })
+            .collect();
+        append_lines(&path, &rows);
+        let ledger = Ledger::new(&path);
+        let time = |label: &str| {
+            let start = std::time::Instant::now();
+            let (entries, lines) = ledger.entries_strict_shared_counted().unwrap();
+            eprintln!(
+                "{label}: {:?} ({} entries, {lines} lines parsed)",
+                start.elapsed(),
+                entries.len()
+            );
+        };
+        time("first read");
+        for i in 0..5 {
+            time(&format!("repeat {i}"));
+        }
+        append_lines(&path, &[row_line(&entry(&now_ts(), "m", 0.5, 1, 1, 1))]);
+        time("after one append");
+        time("repeat after append");
     }
 }
 
