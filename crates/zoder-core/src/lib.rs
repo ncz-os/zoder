@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 pub mod budget;
+pub mod cancel_budget;
 pub mod cancel_outcome;
 pub mod config;
 pub mod consultant;
@@ -117,6 +118,9 @@ pub fn agent_idle_between_events_s_from_env() -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 pub use budget::{estimate_tokens, Budget, BudgetDecline, BudgetVerdict, TrippedCap};
+pub use cancel_budget::{
+    cancel_ack_budget, cancel_ack_cap_from_env, CANCEL_ACK_CAP_ENV, DEFAULT_CANCEL_ACK_CAP,
+};
 pub use cancel_outcome::{classify_cancel_error, io_error_proves_no_listener, CancelOutcome};
 pub use catalog_models::{
     fetch_catalog_models, merge_into_corpus, merge_or_degrade, CatalogModel, CatalogResponse,
