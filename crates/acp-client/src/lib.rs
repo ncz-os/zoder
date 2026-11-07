@@ -2361,6 +2361,14 @@ pub async fn cancel_session(
                 let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
+                // A daemon that answers the cancel with "there is no turn to
+                // cancel" has settled it: the session is unknown, finished,
+                // or already cancelled, so nothing of it can still be
+                // editing. Waiting for a `turn_complete` that will never be
+                // sent would report a silent daemon when the daemon spoke.
+                if cancel_reply_proves_no_turn(&frame) {
+                    return Ok(());
+                }
                 if frame.get("method").and_then(Value::as_str) == Some("session/update") {
                     let kind = frame
                         .pointer("/params/type")
@@ -2412,6 +2420,39 @@ pub async fn cancel_session(
             }
         }
     }
+}
+
+/// Does this frame, read after our `session/cancel`, say there is no turn
+/// left to cancel?
+///
+/// Only a JSON-RPC `error` reply counts, and only one whose message says the
+/// session is unknown, finished or already cancelled. The cancel is sent on
+/// a fresh connection that carried nothing but `initialize` (already
+/// consumed) and the cancel itself, so an error read here can only be the
+/// daemon's answer to that cancel. A `turn_complete` is still the ordinary
+/// acknowledgement; this is the "already settled" one, which a daemon sends
+/// when a retry lands after the turn has already ended.
+fn cancel_reply_proves_no_turn(frame: &Value) -> bool {
+    let Some(error) = frame.get("error") else {
+        return false;
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const SETTLED_MARKERS: [&str; 9] = [
+        "unknown session",
+        "session not found",
+        "no such session",
+        "no active turn",
+        "no turn",
+        "not running",
+        "nothing to cancel",
+        "already cancelled",
+        "already completed",
+    ];
+    SETTLED_MARKERS.iter().any(|m| message.contains(m))
 }
 
 /// Call one JSON-RPC method on the local zeroclaw daemon and return its result.
@@ -11681,6 +11722,135 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "cancel_session must fail fast on connect errors; took {elapsed:?}"
+        );
+    }
+
+    /// A scripted cancel daemon: acks `initialize`, then on `session/cancel`
+    /// waits `ack_after` and writes `turn_complete` `acks` times, or answers
+    /// with the JSON-RPC error `error_reply` instead. Models the daemon that
+    /// is busy in a tool step (late ack), one that acks twice, and one that
+    /// says the session is already gone.
+    async fn spawn_scripted_cancel_daemon(
+        ack_after: Duration,
+        acks: usize,
+        error_reply: Option<&'static str>,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let init_ack = serde_json::json!({
+                    "jsonrpc": "2.0", "id": "init", "result": { "protocolVersion": 1 }
+                });
+                let _ = write_half
+                    .write_all(format!("{init_ack}\n").as_bytes())
+                    .await;
+                let _ = write_half.flush().await;
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+                tokio::time::sleep(ack_after).await;
+                if let Some(message) = error_reply {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0", "id": null,
+                        "error": { "code": -32602, "message": message }
+                    });
+                    let _ = write_half.write_all(format!("{err}\n").as_bytes()).await;
+                } else {
+                    for _ in 0..acks {
+                        let complete = serde_json::json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": { "type": "turn_complete", "outcome": "cancelled" }
+                        });
+                        let _ = write_half
+                            .write_all(format!("{complete}\n").as_bytes())
+                            .await;
+                    }
+                }
+                let _ = write_half.flush().await;
+                // Keep the connection open until the client hangs up, as the
+                // real daemon does.
+                line.clear();
+                let _ = reader.read_line(&mut line).await;
+            }
+        });
+        dir
+    }
+
+    /// The incident: the daemon is mid tool step and acknowledges only when
+    /// the step returns. A budget shorter than the step (the flat 5 s in
+    /// production) misses the ack and reports a silent daemon; a budget that
+    /// covers the step sees the SAME ack and settles. The fix scales the
+    /// budget with the step (`zoder_core::cancel_ack_budget`); this pins the
+    /// wire side of that argument.
+    #[tokio::test]
+    async fn cancel_session_misses_a_late_ack_under_the_flat_budget_and_sees_it_when_scaled() {
+        let step = Duration::from_millis(400);
+        let dir = spawn_scripted_cancel_daemon(step, 1, None).await;
+        let socket = dir.path().join("daemon.sock");
+        let flat = Duration::from_millis(150);
+        let res = cancel_session(&socket, "busy-step", flat).await;
+        let err = format!(
+            "{:#}",
+            res.expect_err("a budget shorter than the step cannot see the ack")
+        );
+        assert!(
+            err.contains("did not acknowledge session/cancel"),
+            "the flat budget reports a silent daemon: {err}"
+        );
+        let scaled = step * 3;
+        cancel_session(&socket, "busy-step", scaled)
+            .await
+            .expect("a budget that covers the step sees the ack");
+    }
+
+    /// A daemon that acknowledges twice (the ack of a first cancel and the
+    /// ack of a retry) settles on the first and never hangs on the second.
+    #[tokio::test]
+    async fn cancel_session_settles_on_the_first_of_two_acks() {
+        let dir = spawn_scripted_cancel_daemon(Duration::ZERO, 2, None).await;
+        let socket = dir.path().join("daemon.sock");
+        let start = std::time::Instant::now();
+        cancel_session(&socket, "acked-twice", Duration::from_secs(2))
+            .await
+            .expect("the first turn_complete settles the cancel");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A daemon that answers "unknown session" (the turn already ended, or a
+    /// retry landed after the first cancel settled it) has nothing left to
+    /// cancel: that reply is a settled cancel, not a silent daemon.
+    #[tokio::test]
+    async fn cancel_session_treats_an_unknown_session_reply_as_settled() {
+        let dir =
+            spawn_scripted_cancel_daemon(Duration::ZERO, 0, Some("Unknown session: already-done"))
+                .await;
+        let socket = dir.path().join("daemon.sock");
+        let start = std::time::Instant::now();
+        cancel_session(&socket, "already-done", Duration::from_secs(2))
+            .await
+            .expect("an unknown-session reply proves there is no turn to cancel");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the reply must settle the cancel before the budget elapses"
+        );
+    }
+
+    /// Any other error reply is NOT an acknowledgement: the daemon may still
+    /// be running the turn, so the budget elapses and the cancel is reported
+    /// unconfirmed exactly as before.
+    #[tokio::test]
+    async fn cancel_session_does_not_settle_on_an_unrelated_error_reply() {
+        let dir = spawn_scripted_cancel_daemon(Duration::ZERO, 0, Some("internal error")).await;
+        let socket = dir.path().join("daemon.sock");
+        let res = cancel_session(&socket, "still-running", Duration::from_millis(200)).await;
+        assert!(
+            res.is_err(),
+            "an unrelated error must not confirm the cancel"
         );
     }
 

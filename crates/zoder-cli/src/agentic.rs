@@ -414,6 +414,37 @@ mod agentic_utilization_tests {
         );
     }
 
+    /// FB120 (F5.4): a fallback turn's tokens must land in the ANSWERING
+    /// route's counter bucket, never the chain head's. This pins the store
+    /// end-state the `serving_provider` wiring in `agentic_turn` produces:
+    /// the winner's provider is passed to `persist_agentic_counter_at`, so
+    /// the head bucket stays empty while the fallback bucket accrues.
+    #[test]
+    fn fallback_turn_tokens_accrue_only_to_answering_provider_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let now = Utc::now();
+        let head = test_provider();
+        let fallback = minimax_counter_provider();
+        // The answering route's provider is what the fixed call site passes.
+        assert!(persist_agentic_counter_at(&fallback, 90, &path, now));
+
+        let store = UtilizationStore::open_unlocked(&path).unwrap();
+        let (fallback_provider, fallback_plan) = utilization_key(&fallback);
+        let counter = store
+            .get_counter(fallback_provider, "default", &fallback_plan, "monthly")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 90.0);
+        // The chain head accrued nothing: no cross-route contamination.
+        let (head_provider, head_plan) = utilization_key(&head);
+        assert!(
+            store
+                .get_counter(head_provider, "default", &head_plan, "monthly")
+                .is_none(),
+            "head-route bucket must stay empty when the fallback answered"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn real_zeroclaw_dispatch_context_usage_does_not_create_quota_telemetry() {
@@ -3139,6 +3170,45 @@ fn fail_closed_review_output(raw: &str) -> ReviewOutput {
         next_steps: vec![],
         ..Default::default()
     }
+}
+
+/// Why a review was skipped: the author turn produced no changes to review.
+///
+/// Names the author's outcome and tool-call count, plus the engine's own
+/// failure detail when it recorded one, so the iteration record says what
+/// the author did. Dispatching the empty plan instead failed as "no review
+/// chunks were generated", which names neither the author nor the cause.
+fn empty_author_diff_review_skip(
+    author_outcome: &str,
+    tool_calls: u32,
+    author_error: Option<&str>,
+) -> String {
+    let mut detail = format!(
+        "review skipped: the author turn produced no changes to review \
+(outcome: {author_outcome}, tool calls: {tool_calls}); nothing was authored"
+    );
+    if let Some(err) = author_error {
+        detail.push_str(&format!("; author: {err}"));
+    }
+    detail
+}
+
+/// Whether an unusable review ends the loop.
+///
+/// A verdict with no located evidence and a reviewer that produced no verdict
+/// both stop it: another author round cannot repair a review. The one
+/// exception is a review skipped because the author produced no edits: there
+/// was nothing to review, and the next author turn is told exactly that. The
+/// dead-engine streak and the no-progress stall budget bound the repeats.
+fn unresolved_review_stops_loop(
+    verdict: &str,
+    review_skipped_empty_diff: bool,
+    unlocated_no_evidence: bool,
+) -> bool {
+    if unlocated_no_evidence {
+        return true;
+    }
+    verdict == REVIEWER_UNAVAILABLE_VERDICT && !review_skipped_empty_diff
 }
 
 /// The `zoder review` verdict gate (F4/FB111): the structured gate is the
@@ -7886,11 +7956,44 @@ pub(crate) const AUTHOR_CANCEL_BEST_EFFORT_MARKER: &str = "author cancel UNCONFI
 /// [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`], so the loop's detectors cannot see
 /// that the turn may still be running. One second of margin covers the socket
 /// teardown.
-pub(crate) const AUTHOR_CANCEL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(
-    (1 + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64) * SETTLE_BUDGET_SECS * 1000
-        + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64) * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
-        + 1000,
-);
+///
+/// The production path computes its deadline per cancel with
+/// [`author_cancel_deadline_for`] (the first attempt may be step-scaled);
+/// this constant is the flat-budget value the tests pin.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AUTHOR_CANCEL_DEADLINE: std::time::Duration =
+    author_cancel_deadline_for(std::time::Duration::from_secs(SETTLE_BUDGET_SECS));
+
+/// The outer deadline for an author-phase cancel whose FIRST attempt is
+/// granted `first_attempt` (the step-scaled budget, see
+/// [`author_cancel_first_budget`]). The retries keep the flat settle budget,
+/// and the one-second margin covers the socket teardown.
+pub(crate) const fn author_cancel_deadline_for(
+    first_attempt: std::time::Duration,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        first_attempt.as_millis() as u64
+            + AUTHOR_CANCEL_RETRY_ATTEMPTS as u64 * SETTLE_BUDGET_SECS * 1000
+            + (AUTHOR_CANCEL_RETRY_BACKOFF.as_millis() as u64)
+                * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
+            + 1000,
+    )
+}
+
+/// The budget the FIRST author-phase cancel attempt waits for its ack.
+///
+/// The daemon does not interrupt a running tool step: it marks the turn
+/// cancelled and sends `turn_complete` when the step returns. A watchdog that
+/// fires in the middle of a long build therefore has to wait at least as
+/// long as that step has already run, or it reports a silent daemon for a
+/// daemon that is merely busy (the 2026-11-04 fleet runs). With no tool call
+/// in flight the budget is today's flat [`SETTLE_BUDGET_SECS`].
+pub(crate) fn author_cancel_first_budget() -> std::time::Duration {
+    zoder_core::cancel_ack_budget(
+        zoder_core::cancel_budget::active_step_elapsed(),
+        zoder_core::cancel_ack_cap_from_env(),
+    )
+}
 
 /// Retry a failed `session/cancel` a bounded number of times.
 ///
@@ -7956,7 +8059,12 @@ pub(crate) async fn author_cancel_reason(
         // must not carry the unconfirmed marker — that marker is what makes the
         // iteration unreviewable and what counts toward the abort streak. A
         // confirmed retry leaves the loop's normal timed-out-turn path intact.
-        Ok(()) => String::new(),
+        // The exit path is told as well, so it does not ask the daemon to
+        // cancel a turn it has already acknowledged ending.
+        Ok(()) => {
+            crate::reaper::note_session_cancelled(session_id);
+            String::new()
+        }
         Err(reason) => reason,
     }
 }
@@ -8081,7 +8189,13 @@ where
             // captured after this function returns, and a tree captured while
             // the daemon is still writing is the torn-tree bug this wrapper
             // exists to prevent.
-            let cancelled = cancel_under_deadline(AUTHOR_CANCEL_DEADLINE, cancel).await;
+            //
+            // The deadline covers the step-scaled first attempt: a deadline
+            // computed from the flat budget would cut a long wait off
+            // mid-flight and report "deadline expired" for a daemon that was
+            // about to answer.
+            let deadline = author_cancel_deadline_for(author_cancel_first_budget());
+            let cancelled = cancel_under_deadline(deadline, cancel).await;
             settled.await;
             match cancelled {
                 Ok(()) => Err(format!(
@@ -10387,14 +10501,25 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     // is marked unresolved with the precise reason. What the
                     // author already wrote stays on disk, gets captured, and is
                     // reported.
-                    let first = match zoder_core::cancel_session(
-                        &socket,
-                        sid,
-                        std::time::Duration::from_secs(SETTLE_BUDGET_SECS),
-                    )
-                    .await
+                    // The first attempt waits as long as the daemon's
+                    // in-flight tool step has already run (bounded): the
+                    // daemon only acknowledges once that step returns.
+                    let first_budget = author_cancel_first_budget();
+                    if first_budget > std::time::Duration::from_secs(SETTLE_BUDGET_SECS)
+                        && !cli.quiet
                     {
-                        Ok(()) => None,
+                        eprintln!(
+                            "[loop] the daemon is mid tool step; waiting up to {first_budget:?} \
+                             for it to acknowledge the cancel"
+                        );
+                    }
+                    let first = match zoder_core::cancel_session(&socket, sid, first_budget).await {
+                        Ok(()) => {
+                            // Confirmed: the exit path must not cancel this
+                            // session a second time.
+                            crate::reaper::note_session_cancelled(sid);
+                            None
+                        }
                         Err(e) => Some(format!("{e:#}")),
                     };
                     if let Some(first_error) = first {
@@ -10471,6 +10596,11 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 if !author_models.iter().any(|known| known == &t.model) {
                     author_models.push(t.model.clone());
                 }
+                // The turn RETURNED: it is over, and the exit path must not
+                // ask the daemon to cancel it (a finished turn is never
+                // acknowledged, which cost one settle budget and a
+                // `cancel not confirmed` line per session -- 2026-11-05).
+                crate::reaper::note_session_settled(&t.run.session_id);
                 {
                     let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
                     state.note_session(&t.run.session_id, &format!("completed:{}", t.run.outcome));
@@ -10494,6 +10624,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
                             "cancel_unconfirmed"
                         } else {
+                            // The daemon answered or the turn failed on its
+                            // own, so it is over: the exit path has nothing to
+                            // cancel. An UNCONFIRMED cancel is deliberately
+                            // NOT settled -- the daemon never proved it
+                            // stopped, so the exit path must still try.
+                            crate::reaper::note_session_settled(&sid);
                             "failed"
                         };
                         state.note_session(&sid, cancel_state);
@@ -10994,6 +11130,18 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // Pre-D5.2 each of the three `Engine::load()` calls in this block
         // degraded independently to an empty chain / no `[review]` config.
         let engine_load_error = eng.as_ref().err().map(|e| format!("loading engine: {e}"));
+        // An author turn that left the tree untouched has produced nothing to
+        // review. The chunk planner yields no chunk for an empty diff, and
+        // dispatching that plan fails as "no review chunks were generated":
+        // a planning error that names neither the author nor the cause, and
+        // that used to end the loop before the "you made NO changes" feedback
+        // below could ever reach the author. Skip the reviewer instead,
+        // record the author-side reason, and let the iteration fall through
+        // to the feedback and stall accounting.
+        let review_skipped_empty_diff = engine_load_error.is_none()
+            && !review_unconfirmed_cancel
+            && !author_session_limit
+            && diff.trim().is_empty();
         let (mut review, mut reviewer_model, review_cost, mut review_chunks, mut reviewer_verdicts) =
             if let Some(detail) = engine_load_error {
                 let detail = format!("review skipped: {detail}");
@@ -11036,6 +11184,30 @@ diff is not a finished turn"
                     .to_string();
                 if !cli.quiet {
                     eprintln!("[loop] iter {i}: {detail}; iteration unresolved");
+                }
+                review_error = Some(detail.clone());
+                (
+                    synthesize_reviewer_unavailable(&detail),
+                    None,
+                    0.0,
+                    0,
+                    Vec::new(),
+                )
+            } else if review_skipped_empty_diff {
+                let outcome = match (&turn, &author_err) {
+                    (Some(t), _) => t.run.outcome.as_str().to_string(),
+                    (None, Some(e)) => format!("interrupted: {e}"),
+                    (None, None) => "interrupted".to_string(),
+                };
+                let detail = empty_author_diff_review_skip(
+                    &outcome,
+                    turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
+                    turn.as_ref()
+                        .and_then(|t| t.run.failure_detail.as_deref())
+                        .or(author_err.as_deref()),
+                );
+                if !cli.quiet {
+                    eprintln!("[loop] iter {i}: {detail}");
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11325,7 +11497,16 @@ or comment together with an explicit statement that no blocking defect exists.\n
         // round cannot repair them. Preserve the iteration and stop unresolved.
         // An INCOMPLETE review (provider error, timeout, unparseable chunk,
         // oversized diff) lands here too: it is never an approve.
-        if review.verdict == REVIEWER_UNAVAILABLE_VERDICT || review_unlocated_no_evidence {
+        // A review skipped because the author produced no edits is the one
+        // unusable review that does NOT stop the loop: there was nothing to
+        // review, and the feedback below tells the author so. The dead-engine
+        // streak and the no-progress stall budget bound how often that can
+        // repeat.
+        if unresolved_review_stops_loop(
+            &review.verdict,
+            review_skipped_empty_diff,
+            review_unlocated_no_evidence,
+        ) {
             if !cli.quiet {
                 eprintln!(
                     "[loop] {}",
@@ -11376,7 +11557,10 @@ or comment together with an explicit statement that no blocking defect exists.\n
         // control flow as a failed check. This closes the gaming surface
         // where an over-eager author could "pass" the loop with whitespace
         // churn or comment-only edits.
-        if (check_green || check_satisfied) && !substance_ok {
+        // An EMPTY diff is not gaming: it skipped the review above and takes
+        // the no-progress path below, whose feedback tells the author that
+        // no edit landed.
+        if (check_green || check_satisfied) && !substance_ok && !review_skipped_empty_diff {
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}: REJECTED green — diff is {diff_substance:?}, \
@@ -11502,7 +11686,8 @@ consecutive non-substantive iteration(s); stopping."
             // unchanged, so it is still unaddressed), and an unparseable /
             // unavailable / synthesized-failure sample is a non-approve
             // (fail closed).
-            if !review_ok && stall_streak >= 1 {
+            // No fresh samples of an empty diff: there is nothing to review.
+            if !review_ok && stall_streak >= 1 && !review_skipped_empty_diff {
                 if !cli.quiet {
                     eprintln!(
                         "[loop] iter {i}: unchanged diff with the same blocker; \
@@ -14771,6 +14956,16 @@ must reap the direct shell on the timeout branch)"
     /// `confirm` decides which of the two shapes this is: a daemon that
     /// acknowledges the cancel, or one that never answers it.
     fn spawn_cancel_daemon(socket: &std::path::Path, confirm: bool) -> CancelDaemonFixture {
+        spawn_cancel_daemon_acking_after(socket, confirm, std::time::Duration::ZERO)
+    }
+
+    /// The same fake daemon, acknowledging `ack_after` after each cancel: a
+    /// daemon busy in a tool step that only answers once the step returns.
+    fn spawn_cancel_daemon_acking_after(
+        socket: &std::path::Path,
+        confirm: bool,
+        ack_after: std::time::Duration,
+    ) -> CancelDaemonFixture {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -14809,6 +15004,7 @@ must reap the direct shell on the timeout branch)"
                                 );
                                 let _ = writer.flush();
                             } else if method == "session/cancel" && confirm {
+                                std::thread::sleep(ack_after);
                                 let _ = writer.write_all(
                                     b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"type\":\"turn_complete\"}}\n",
                                 );
@@ -14846,6 +15042,69 @@ must reap the direct shell on the timeout branch)"
                 let _ = handle.join();
             }
         }
+    }
+
+    /// The incident shape: the daemon is mid tool step and acknowledges the
+    /// cancel only when the step returns. The flat settle budget (today's
+    /// first attempt) is shorter than the step and reports a silent daemon;
+    /// the step-scaled budget the loop now grants the first attempt covers
+    /// the step and the SAME daemon confirms. The step length is the one the
+    /// tracker would report for a tool call that has run that long.
+    #[tokio::test]
+    async fn a_daemon_busy_in_a_tool_step_confirms_inside_the_step_scaled_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let step = std::time::Duration::from_millis(400);
+        let _daemon = spawn_cancel_daemon_acking_after(&socket, true, step);
+
+        // Today's first attempt: a flat budget shorter than the step.
+        let flat = std::time::Duration::from_millis(150);
+        let before = zoder_core::cancel_session(&socket, "busy-step", flat).await;
+        assert!(
+            before.is_err(),
+            "the flat budget cannot see an ack that arrives after the step"
+        );
+
+        // The fix: the budget scales with the step the daemon is in. The cap
+        // is the production default; the step is far below it.
+        let scaled =
+            zoder_core::cancel_ack_budget(Some(step * 3), zoder_core::DEFAULT_CANCEL_ACK_CAP);
+        assert!(
+            scaled >= step * 3,
+            "the scaled budget covers the step: {scaled:?}"
+        );
+        // The production floor is seconds; the test only needs a budget that
+        // covers the step, so the wait is bounded by the step itself.
+        let after = zoder_core::cancel_session(&socket, "busy-step", step * 3).await;
+        assert!(
+            after.is_ok(),
+            "the same daemon confirms once the budget covers its step: {after:?}"
+        );
+        // And the outer deadline grows with the first attempt, so the longer
+        // wait is never cut off mid-flight.
+        assert!(
+            author_cancel_deadline_for(scaled)
+                > scaled
+                    + std::time::Duration::from_secs(
+                        SETTLE_BUDGET_SECS * AUTHOR_CANCEL_RETRY_ATTEMPTS as u64
+                    ),
+            "the deadline must cover the scaled first attempt plus every retry"
+        );
+    }
+
+    /// With no tool call in flight the first attempt keeps the flat settle
+    /// budget: a healthy run's cancel timing is unchanged.
+    #[test]
+    fn the_first_cancel_budget_is_the_flat_settle_budget_without_a_tool_step() {
+        zoder_core::cancel_budget::turn_started();
+        assert_eq!(
+            author_cancel_first_budget(),
+            std::time::Duration::from_secs(SETTLE_BUDGET_SECS)
+        );
+        assert_eq!(
+            author_cancel_deadline_for(std::time::Duration::from_secs(SETTLE_BUDGET_SECS)),
+            AUTHOR_CANCEL_DEADLINE
+        );
     }
 
     /// `cancel_author_session_best_effort` must NEVER report success for a
@@ -15754,6 +16013,104 @@ not run to max_iters"
         let f = loop_failure(None, None, "comment", 0).expect("unresolved loop has a failure");
         assert_eq!(f.code, crate::failure::FailureCode::EngineUnreachable);
         assert_eq!(f.code.exit_code(), 20);
+    }
+
+    /// The chunk planner yields no chunk for an empty diff, and dispatching
+    /// that plan fails as "no review chunks were generated". That is the
+    /// message an author turn with no edits used to surface as; the loop
+    /// must skip the reviewer before planning instead.
+    #[test]
+    fn empty_author_diff_plans_no_review_chunks() {
+        let caps = crate::review_diff::resolve_review_caps(None, None, None, None);
+        let plan = plan_loop_review(
+            "",
+            "working tree",
+            "Task under review: nothing\n",
+            caps,
+            &[],
+            &[],
+            false,
+            &|_chunk: &str, _budget: usize| String::new(),
+            REVIEW_MIN_MAX_TOKENS,
+        )
+        .expect("an empty diff plans without error");
+        assert!(
+            plan.users.is_empty(),
+            "no chunk is planned for an empty diff"
+        );
+    }
+
+    /// A review skipped for an empty author diff names the author's outcome,
+    /// classifies as `empty_diff`, and is the loop's recorded reason.
+    #[test]
+    fn empty_author_diff_review_skip_names_the_author_and_classifies_as_empty_diff() {
+        let detail = empty_author_diff_review_skip("completed", 0, None);
+        assert!(detail.contains("produced no changes to review"), "{detail}");
+        assert!(detail.contains("outcome: completed"), "{detail}");
+        assert!(detail.contains("tool calls: 0"), "{detail}");
+        assert!(
+            !detail.contains("author:"),
+            "no author error, none reported"
+        );
+        assert_eq!(
+            crate::failure::classify_message(&detail).map(|(code, _)| code),
+            Some(crate::failure::FailureCode::EmptyDiff)
+        );
+        let with_error =
+            empty_author_diff_review_skip("failed", 0, Some("provider HTTP 400: bad request"));
+        assert!(with_error.contains("outcome: failed"), "{with_error}");
+        assert!(
+            with_error.ends_with("author: provider HTTP 400: bad request"),
+            "{with_error}"
+        );
+
+        let last = serde_json::json!({
+            "author_model": "some-model",
+            "author_error": serde_json::Value::Null,
+            "review_error": detail,
+            "verdict": REVIEWER_UNAVAILABLE_VERDICT,
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::EmptyDiff);
+        assert!(
+            f.message.starts_with("loop ended unresolved after 1 iteration(s); last recorded reason: review skipped: the author turn produced no changes to review"),
+            "{}",
+            f.message
+        );
+        assert!(
+            !f.message.contains("no review chunks were generated"),
+            "the planner's message must not be the recorded reason: {}",
+            f.message
+        );
+    }
+
+    /// Only a review skipped for an empty author diff lets the loop continue
+    /// to the next author turn; every other unusable review stops it.
+    #[test]
+    fn unresolved_review_stops_loop_truth_table() {
+        assert!(unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            false,
+            false
+        ));
+        assert!(!unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            true,
+            false
+        ));
+        assert!(unresolved_review_stops_loop(
+            REVIEWER_UNAVAILABLE_VERDICT,
+            true,
+            true
+        ));
+        assert!(unresolved_review_stops_loop("request_changes", false, true));
+        assert!(!unresolved_review_stops_loop(
+            "request_changes",
+            false,
+            false
+        ));
+        assert!(!unresolved_review_stops_loop("approve", true, false));
     }
 
     /// A reviewer that never answered is transient, not permanent: the

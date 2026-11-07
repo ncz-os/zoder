@@ -1037,16 +1037,27 @@ impl Usage {
     }
 }
 
+/// One SSE frame of an OpenAI-style chat stream. `choices` and `delta` are
+/// optional on the wire: a usage-only frame may omit `choices` entirely
+/// (not just send `[]`), and a terminal `finish_reason` frame may omit
+/// `delta`. Both shapes are served by OpenAI-compatible gateways in the
+/// wild; rejecting them at deserialization failed the whole call (or, after
+/// `finish_reason`, silently dropped the usage). The frame-level guard below
+/// (`choices.is_empty() && !usage.is_meaningful()`) still rejects `{}` and
+/// other inert frames, and the end-of-stream checks still require a choice
+/// with content.
 #[derive(Deserialize)]
 struct StreamChunk {
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     usage: Option<Usage>,
 }
 #[derive(Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: Delta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -2612,6 +2623,14 @@ the model spent the whole {}-token budget before producing any content",
                 }
                 None => (None, None, None, None),
             };
+        // No usage block (or an empty one): the answer stands, the counts are
+        // unknown and the ledger records the call as cost-unknown. Say so.
+        if prompt_tokens.is_none() && completion_tokens.is_none() {
+            tracing::warn!(
+                model = %req.model,
+                "chat completion carried no usage block; token counts unknown, cost recorded as unknown"
+            );
+        }
         let tokens_out = completion_tokens.unwrap_or(0);
         Ok(ChatResult {
             content,
@@ -3102,11 +3121,12 @@ the model spent the whole {}-token budget before producing any content",
                 }
                 // Every successful frame must advance one of the two pieces of
                 // stream state we understand: completion choices, or concrete
-                // usage telemetry. Requiring `choices` and each choice's
-                // `delta` at deserialization rejects `{}` and
-                // `{"choices":[{}]}`; this check also rejects inert frames such
-                // as `{"choices":[],"usage":{}}` while preserving the standard
-                // final usage-only frame (`choices: []` plus token counts).
+                // usage telemetry. `choices` and `delta` default when absent,
+                // so this check is what rejects `{}` and inert frames such as
+                // `{"choices":[],"usage":{}}`, while accepting a usage-only
+                // frame whether it spells `choices: []` or omits the key. A
+                // `{"choices":[{}]}` placeholder passes here and is rejected
+                // at the end of the stream (no content delta).
                 if parsed.choices.is_empty()
                     && !parsed.usage.as_ref().is_some_and(Usage::is_meaningful)
                 {
@@ -3268,6 +3288,17 @@ the model spent the whole {}-token budget before producing any content",
             ));
         }
         // Prefer authoritative usage; fall back to the streamed-chunk count.
+        // A stream that never carried a usage frame is still a complete
+        // answer: the token counts stay `None` (the ledger records the call
+        // as cost-unknown) and the gap is logged so a $0 row is never read
+        // as a free call.
+        if prompt_tokens.is_none() && completion_tokens.is_none() {
+            tracing::warn!(
+                model = %req.model,
+                chunks = chunk_count,
+                "stream ended without a usage frame; token counts unknown, cost recorded as unknown"
+            );
+        }
         let tokens_out = completion_tokens.unwrap_or(chunk_count);
         Ok(ChatResult {
             content,
@@ -5779,5 +5810,226 @@ mod tests {
             body.get("response_format").is_none(),
             "response_format must be absent, not null"
         );
+    }
+}
+
+/// Streams that carry their usage telemetry differently from the reference
+/// OpenAI wire (or not at all) must still yield their content; only the
+/// token counts may be unknown. Each test serves one canned SSE body from a
+/// local socket so the exact frame layout is under the test's control.
+#[cfg(test)]
+mod usage_frame_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve `body` as one `text/event-stream` (or JSON) response to the
+    /// first request, then close the connection.
+    async fn serve_once(body: &str, content_type: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_owned();
+        let content_type = content_type.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+        (uri, task)
+    }
+
+    fn provider_at(uri: &str) -> OpenAiProvider {
+        let config = Provider {
+            model_aliases: Vec::new(),
+            id: "usage-frame-test".into(),
+            engine_provider_ref: None,
+            base_url: uri.into(),
+            kind: "openai-chat".into(),
+            auth: Auth::None,
+            paid: false,
+            billing: crate::BillingMode::Metered,
+            subscription: None,
+            serves: vec![],
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        };
+        let mut p = OpenAiProvider::new(&config).unwrap();
+        p.request_timeout = Duration::from_secs(5);
+        p.idle_timeout = Duration::from_secs(2);
+        p
+    }
+
+    fn request(stream: bool) -> ChatRequest {
+        ChatRequest {
+            model: "model".into(),
+            messages: vec![crate::Message::new("user", "hi")],
+            max_tokens: 32,
+            temperature: None,
+            stream,
+            show_reasoning: false,
+            reasoning_effort: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            chat_template_kwargs: None,
+            response_format: None,
+        }
+    }
+
+    fn sse(frames: &[&str]) -> String {
+        frames
+            .iter()
+            .map(|f| format!("data: {f}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n"
+    }
+
+    const CONTENT: &str = r#"{"id":"c1","model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}],"usage":null}"#;
+    const FINISH: &str = r#"{"id":"c1","model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#;
+    const USAGE_EMPTY_CHOICES: &str = r#"{"id":"c1","model":"model","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":7,"total_tokens":107}}"#;
+    const USAGE_NO_CHOICES_KEY: &str = r#"{"id":"c1","model":"model","usage":{"prompt_tokens":100,"completion_tokens":7,"total_tokens":107}}"#;
+
+    async fn run_stream(frames: &[&str]) -> Result<ChatResult, ProviderError> {
+        let (uri, task) = serve_once(&sse(frames), "text/event-stream").await;
+        let result = provider_at(&uri).stream_chat(&request(true), None).await;
+        task.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn stream_without_usage_frame_keeps_its_content() {
+        let result = run_stream(&[CONTENT, FINISH]).await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(
+            result.prompt_tokens, None,
+            "no usage frame: prompt count unknown"
+        );
+        assert_eq!(
+            result.completion_tokens, None,
+            "no usage frame: completion count unknown"
+        );
+        assert_eq!(
+            result.tokens_out, 1,
+            "falls back to the streamed chunk count"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_usage_only_chunk_with_empty_choices_is_consumed() {
+        let result = run_stream(&[CONTENT, FINISH, USAGE_EMPTY_CHOICES])
+            .await
+            .unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, Some(100));
+        assert_eq!(result.completion_tokens, Some(7));
+        assert_eq!(
+            result.tokens_out, 7,
+            "authoritative usage wins over the chunk count"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_usage_only_chunk_without_choices_key_is_consumed() {
+        let result = run_stream(&[CONTENT, FINISH, USAGE_NO_CHOICES_KEY])
+            .await
+            .unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, Some(100));
+        assert_eq!(result.completion_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn usage_only_chunk_without_choices_key_before_done_is_consumed() {
+        // No `finish_reason` chunk at all: content, then the usage frame,
+        // then `[DONE]`.
+        let result = run_stream(&[CONTENT, USAGE_NO_CHOICES_KEY]).await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, Some(100));
+        assert_eq!(result.completion_tokens, Some(7));
+    }
+
+    #[tokio::test]
+    async fn finish_chunk_without_delta_ends_the_stream_cleanly() {
+        let finish =
+            r#"{"id":"c1","model":"model","choices":[{"index":0,"finish_reason":"stop"}]}"#;
+        let result = run_stream(&[CONTENT, finish]).await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn inert_frames_are_still_rejected() {
+        // `{}` carries neither a choice nor usage: still malformed.
+        let error = run_stream(&[CONTENT, "{}"]).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Decode);
+        // An empty usage object is not meaningful usage either.
+        let error = run_stream(&[CONTENT, r#"{"choices":[],"usage":{}}"#])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrKind::Decode);
+    }
+
+    #[tokio::test]
+    async fn stream_with_only_an_empty_choice_is_still_rejected() {
+        let error = run_stream(&[r#"{"choices":[{}]}"#]).await.unwrap_err();
+        assert_eq!(error.kind, ErrKind::Decode);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_body_without_usage_keeps_its_content() {
+        let body = r#"{"id":"c1","model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
+        let (uri, task) = serve_once(body, "application/json").await;
+        let result = provider_at(&uri)
+            .stream_chat(&request(false), None)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, None);
+        assert_eq!(result.completion_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_body_with_null_usage_keeps_its_content() {
+        let body = r#"{"id":"c1","model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":null}"#;
+        let (uri, task) = serve_once(body, "application/json").await;
+        let result = provider_at(&uri)
+            .stream_chat(&request(false), None)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(result.content, "hello");
+        assert_eq!(result.prompt_tokens, None);
     }
 }
