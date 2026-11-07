@@ -124,6 +124,7 @@ corpus-tests:
     - python3 scripts/tests/bench-fetchers-tests.py
     - python3 scripts/tests/pricing-conformance-tests.py
     - python3 scripts/tests/corpus-sync-alert-tests.py
+    - python3 scripts/tests/convert-oplog-tests.py
     - python3 scripts/tests/rsc-util-tests.py
     - python3 scripts/tests/single-shot-fetch-retry-tests.py
   rules:

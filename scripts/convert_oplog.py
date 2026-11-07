@@ -86,6 +86,8 @@ def convert(src):
     for match in CALL.finditer(src):
         if match.start() < pos:
             continue
+        if src[:match.start()].endswith("::"):
+            continue  # path-qualified (std::/crate::eprintln!): left alone
         line_start = src.rfind("\n", 0, match.start()) + 1
         if "//" in src[line_start:match.start()]:
             continue  # a comment or doc example, not a call
