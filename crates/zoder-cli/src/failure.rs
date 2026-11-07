@@ -1545,6 +1545,32 @@ mod tests {
         assert!(classify_message("session limit reached").is_none());
     }
 
+    /// Refresh (2026-11-07): the exit-path cleanup wording
+    /// (`hv/zoder-exitpath-cancel-20261105-r1`) deliberately says
+    /// `cancel not acknowledged`, not `cancel not confirmed`. Pin the
+    /// integration: the new cleanup wording must NOT classify as a run
+    /// failure, while the genuine unconfirmed-cancel marker still does.
+    #[test]
+    fn the_exit_path_cleanup_wording_does_not_read_as_a_cancel_failure() {
+        // The reaper's settle line (reaper.rs, `finish`): a cleanup warning
+        // for a turn that already ended. It must stay unclassified.
+        let cleanup = "session aaaa-bbbb cancel not acknowledged after 4 attempt(s) \
+                       (daemon did not acknowledge session/cancel within 4.99s); \
+                       the engine never acknowledged. Treated as best-effort \
+                       cleanup: the worktree is preserved, not discarded";
+        assert!(
+            classify_message(cleanup).is_none(),
+            "a cleanup line must not carry the phrase the exit-code classifier \
+             keys on as a run failure: {cleanup:?}"
+        );
+
+        // The genuine marker the classifier is built around still lands.
+        let (code, _) = classify_message("cancel not confirmed").expect(
+            "the classifier's own marker must still be recognized",
+        );
+        assert_eq!(code, FailureCode::CancelUnconfirmed);
+    }
+
     /// FB110: the new code round-trips through the envelope with its own
     /// class and rung.
     #[test]
