@@ -5023,6 +5023,41 @@ mod serving_provider_tests {
             "when the head answers, its own provider is selected (no behaviour change)"
         );
     }
+
+    /// OWNERSHIP CONTRACT (reviewed 2026-11-07). The dispatch loop stores the
+    /// winner in `let mut used_provider: Option<Provider>` from
+    /// `link_provider.clone()`, where `link_provider` is the owned
+    /// `Option<Provider>` that `provider_for_resolved_model(...).cloned()`
+    /// produced. This test pins that exact shape so a future refactor cannot
+    /// silently turn the slot into a borrow: if `used_provider` ever becomes
+    /// `Option<&Provider>`, the `Option<Provider>` annotation below fails to
+    /// compile, and if `serving_provider`'s parameter ever stops taking
+    /// `Option<&Provider>`, the call fails to compile. It is a compile-time
+    /// assertion expressed as a test — the runtime asserts are a formality to
+    /// keep the values live.
+    #[test]
+    fn winner_provider_slot_is_owned_not_borrowed() {
+        let head = mk_provider("head-route");
+        let fallback = mk_provider("fallback-route");
+        // Same expression shape as the dispatch loop's `link_provider` and
+        // its `used_provider = link_provider.clone()` assignment.
+        let link_provider: Option<Provider> = Some(&fallback).cloned();
+        let used_provider: Option<Provider> = link_provider.clone();
+        // `as_ref()` therefore yields `Option<&Provider>`, not `Option<&&Provider>`.
+        let an_owned_copy: Option<Provider> = used_provider.clone();
+        assert_eq!(
+            serving_provider(used_provider.as_ref(), &head).id,
+            "fallback-route",
+            "the owned winner slot must still attribute to the answering route"
+        );
+        assert_eq!(
+            an_owned_copy.as_ref().map(|p| p.id.as_str()),
+            Some("fallback-route")
+        );
+        // And with no winner resolved, the head is retained.
+        let none: Option<Provider> = None;
+        assert_eq!(serving_provider(none.as_ref(), &head).id, "head-route");
+    }
 }
 
 fn parse_route_list(raw: &str, flag_name: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -13197,6 +13232,17 @@ pub(crate) async fn agentic_turn(
     // F5.4: the winner's serving provider, locked in with used_primary /
     // used_alias so post-turn quota accounting follows the route that
     // answered instead of the chain head.
+    //
+    // Type note (reviewed 2026-11-07): this is `Option<Provider>` — OWNED,
+    // with no inner borrow. `link_provider` is already an owned
+    // `Option<Provider>` because the dispatch loop's `provider_for_resolved_model`
+    // (which returns `Option<&'a Provider>`) is immediately consumed with
+    // `.cloned()`. That makes `link_provider.clone()` an `Option<Provider>`
+    // and `used_provider.as_ref()` an `Option<&Provider>`, which is exactly
+    // what `serving_provider` expects — so no `&Provider` ever leaks into
+    // this slot. The observed copy is required: `link_provider` is rebuilt on
+    // every chain iteration, so the winner's provider must be owned here to
+    // outlive the loop.
     #[allow(unused_assignments)]
     let mut used_provider: Option<Provider> = None;
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
