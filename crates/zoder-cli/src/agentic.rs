@@ -16284,6 +16284,59 @@ not run to max_iters"
         assert_eq!(f.code, crate::failure::FailureCode::ReviewersUnavailable);
     }
 
+    /// ZD-08: a watchdog timeout before the author produced a model is the
+    /// author's failure. Its text ("author phase timed out after ...") matches
+    /// no message marker, so on master the run was filed as
+    /// `reviewer_unavailable`, blaming a reviewer that reviewed nothing. The
+    /// record's typed `author_error_kind` decides it instead.
+    #[test]
+    fn loop_failure_files_a_watchdog_author_timeout_as_author_timeout() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "author phase timed out after 900s (killed, daemon cancel issued)",
+            "author_error_kind": "timed_out",
+            "review_error": "review skipped: the author turn failed and left no edits",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::AuthorTimeout);
+        assert!(
+            f.message.contains("author phase timed out"),
+            "{}",
+            f.message
+        );
+    }
+
+    /// ZD-08: an author turn that failed with engine text no marker knows is
+    /// `author_failed`, not `reviewer_unavailable`.
+    #[test]
+    fn loop_failure_files_an_unrecognised_author_error_as_author_failed() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "turn failed: the engine closed the stream",
+            "author_error_kind": "failed",
+            "review_error": "review skipped: the author turn failed and left no edits",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::AuthorFailed);
+    }
+
+    /// ZD-08: a more specific engine code in the author's text still wins
+    /// over the generic `failed` kind (session limit, budget refusal).
+    #[test]
+    fn loop_failure_keeps_a_specific_engine_code_over_the_failed_kind() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "session/new failed: Session limit reached (code -32001)",
+            "author_error_kind": "failed",
+            "review_error": "review skipped",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::SessionLimit);
+    }
+
     /// FB110 (audit F2): the teardown names the author-side failure code
     /// and never `reviewer_unavailable` when the author failed. A genuinely
     /// unanswered review (author fine) still reports `reviewer_unavailable`.
