@@ -181,6 +181,14 @@ pub(crate) fn cancel_budget_for(mode: zoder_core::config::DeploymentMode) -> Dur
 }
 /// Same, on the signal path (see `SIGNAL_REAP_GRACE`).
 const SIGNAL_CANCEL_BUDGET: Duration = Duration::from_millis(500);
+
+/// Per-session window for the exit-path `session/close` (connect, initialize,
+/// close, reply). A settled session closes in milliseconds; an unanswered one
+/// is left to the daemon's idle reaper rather than holding the exit.
+const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Same, on the signal path.
+const SIGNAL_CLOSE_BUDGET: Duration = Duration::from_millis(500);
 /// Settle time between productive reap passes. A pass that killed something
 /// has no reason to believe the work is finished: a shell that backgrounded a
 /// child may fork the next one a moment later. Without this, the reap converges
@@ -463,6 +471,12 @@ static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// cleanup. Absence of proof that a turn ended is not proof that it is running,
 /// so the pre-existing cancel guarantees stand unchanged.
 static SETTLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Sessions the daemon has answered a `session/close` for. See
+/// [`close_recorded_sessions`]; membership keeps a second exit-path pass (the
+/// signal handler after the normal return, or the reverse) from asking again.
+static CLOSED: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// The one spelling of a session id inside this module.
@@ -892,6 +906,7 @@ impl ReapGuard {
         }
         cancel_recorded_sessions(&crate::engine_socket_path(), budget).await;
         self.finish();
+        close_recorded_sessions(&crate::engine_socket_path(), CLOSE_BUDGET).await;
     }
 
     /// Reap now. Idempotent, and called from `Drop` so an unwinding panic
@@ -1131,6 +1146,77 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
         // `MAX_CANCEL_PASSES` bounds that; nothing is left unasked by design.
     }
     cleanup
+}
+
+/// Release, in the shared daemon, every engine session this run drove.
+///
+/// S1 (2026-11-07): the daemon keeps a session live across client
+/// disconnects, and before this the exit path only ever CANCELLED turns. Every
+/// zoder run therefore left its sessions holding slots in the daemon's
+/// session map; on a busy host the map filled within ~80 minutes and every
+/// `session/new` failed with `Session limit reached (-32001)` until the
+/// daemon was restarted.
+///
+/// Runs after the cancel and the reap, so a turn has already been told to
+/// stop. `session/close` drops only the live incarnation; the durable
+/// transcript stays, so a later `--session` resume still works. Each session
+/// gets its own `per_session` window and is asked at most once per process.
+/// Best-effort and silent by design: the exit code is the loop's, a printed
+/// line would be read by workers as a failure (see the 2026-11-05 note on
+/// [`SETTLED`]), and anything left unconfirmed (no reply, absent engine,
+/// SIGKILL before this point) is released by the daemon's idle reaper.
+/// Returns how many sessions the daemon confirmed closed.
+async fn close_recorded_sessions(socket: &Path, per_session: Duration) -> usize {
+    let pending: Vec<String> = {
+        let closed = CLOSED.lock().unwrap_or_else(|e| e.into_inner());
+        let unreachable = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .filter(|id| {
+                let key = session_key(id);
+                !closed.contains(key) && !unreachable.contains(key)
+            })
+            .cloned()
+            .collect()
+    };
+    let mut confirmed = 0;
+    for id in pending {
+        let close = zoder_core::engine_rpc::call_rpc(
+            socket,
+            "session/close",
+            serde_json::json!({ "session_id": id }),
+        );
+        match tokio::time::timeout(per_session, close).await {
+            Ok(Ok(_)) => {
+                confirmed += 1;
+                CLOSED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_key(&id).to_string());
+            }
+            // The daemon answered with an error (typically "Session not
+            // found": it is already gone). Nothing more to ask for.
+            Ok(Err(error)) if is_daemon_reply_error(&error) => {
+                CLOSED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_key(&id).to_string());
+            }
+            // Transport failure or no reply within the window: leave it to
+            // the daemon's idle reaper.
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    confirmed
+}
+
+/// Whether a `call_rpc` error is the daemon's own JSON-RPC error reply to the
+/// close (it read the request and answered), as opposed to a transport
+/// failure, an early EOF, or an `initialize` refusal. `call_rpc` reports a
+/// reply error as `engine error on rpc-call: ...`.
+fn is_daemon_reply_error(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with("engine error on rpc-call")
 }
 
 /// Combine two cleanup outcomes. `Unconfirmed` is the only one worth an
@@ -2567,6 +2653,7 @@ fn install_signal_handler(plan: ReapPlan) {
         // teardown: the engine can mint a session while the reap is running.
         cancel_recorded_sessions(&crate::engine_socket_path(), SIGNAL_CANCEL_BUDGET).await;
         teardown_rounds(&plan, SIGNAL_REAP_GRACE, &crate::engine_socket_path());
+        close_recorded_sessions(&crate::engine_socket_path(), SIGNAL_CLOSE_BUDGET).await;
         std::process::exit(code);
     });
 }
@@ -3016,6 +3103,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        CLOSED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         ATTEMPT_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -6537,6 +6625,139 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .remove("settled-only");
         drop(server);
+    }
+
+    // -----------------------------------------------------------------------
+    // S1 (2026-11-07): the shared daemon's session map filled up because no
+    // zoder run ever CLOSED its sessions. The exit path cancelled unsettled
+    // turns but left every session live in the daemon, which keeps sessions
+    // across disconnects; after ~80 min on a 12-worker host every
+    // `session/new` failed with `Session limit reached (-32001)`.
+    // -----------------------------------------------------------------------
+
+    /// A fixture daemon that answers `initialize`, records the next request
+    /// on each connection, and replies `{closed: true}` unless `silent`.
+    fn spawn_close_daemon(
+        socket: &Path,
+        connections: usize,
+        silent: bool,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(socket).expect("bind close daemon");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut writer = stream.try_clone().expect("clone stream");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                for _ in 0..2 {
+                    line.clear();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    let frame: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("client sends JSON");
+                    let id = frame["id"].clone();
+                    if frame["method"] == "initialize" {
+                        let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                        continue;
+                    }
+                    let session = frame["params"]["session_id"].clone();
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(frame);
+                    if !silent {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"session_id": session, "closed": true},
+                        });
+                        let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                    }
+                }
+                if silent {
+                    // Hold the connection open past the client's budget.
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+            }
+        });
+        (server, seen)
+    }
+
+    /// Every session the run drove is released in the daemon on the exit
+    /// path: settled turns, cancelled turns, all of them, each exactly once.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_exit_path_closes_every_session_it_drove() {
+        let _lock = reap_test_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, seen) = spawn_close_daemon(&socket, 2, false);
+        note_session("finished-turn");
+        note_session_settled("finished-turn");
+        note_session("cancelled-turn");
+        mark_cancelled("cancelled-turn");
+
+        let closed = close_recorded_sessions(&socket, Duration::from_secs(5)).await;
+        server.join().expect("close daemon thread");
+        assert_eq!(closed, 2, "both sessions must be confirmed closed");
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut asked: Vec<&str> = seen
+            .iter()
+            .map(|f| {
+                assert_eq!(f["method"], "session/close", "{f}");
+                f["params"]["session_id"].as_str().expect("session id")
+            })
+            .collect();
+        asked.sort_unstable();
+        assert_eq!(asked, vec!["cancelled-turn", "finished-turn"]);
+        drop(seen);
+
+        // A second exit-path pass (signal handler after the normal path, or
+        // the other way round) must not ask again.
+        let again = close_recorded_sessions(&socket, Duration::from_millis(200)).await;
+        assert_eq!(again, 0);
+    }
+
+    /// The close is best-effort and bounded: a daemon that never answers
+    /// costs at most the per-session budget, and an absent engine socket
+    /// costs nothing. Neither prints or fails the run; the daemon's idle
+    /// reaper releases whatever was not confirmed.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_exit_path_close_is_bounded_and_quiet_when_unanswered() {
+        let _lock = reap_test_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("engine.sock");
+        let (server, seen) = spawn_close_daemon(&socket, 1, true);
+        note_session("silent-close");
+
+        let started = Instant::now();
+        let closed = close_recorded_sessions(&socket, Duration::from_millis(300)).await;
+        assert_eq!(closed, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an unanswered close must not hold the exit path: {:?}",
+            started.elapsed()
+        );
+        server.join().expect("close daemon thread");
+        assert_eq!(seen.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+
+        let missing = dir.path().join("absent.sock");
+        note_session("no-engine");
+        let started = Instant::now();
+        assert_eq!(
+            close_recorded_sessions(&missing, Duration::from_secs(5)).await,
+            0
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 
