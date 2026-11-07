@@ -28530,3 +28530,45 @@ mod check_phase_gate_tests {
         assert!(check_phase_runs(false, false, false));
     }
 }
+
+/// ZD-15 (F2.6): the per-call context telemetry and the provider-health skip
+/// list are process-global. `zoder` runs one command per process today, but
+/// a command must not inherit the records of anything that ran before it in
+/// the same process: `cmd_review` and `cmd_loop_run` start from empty
+/// buffers.
+#[cfg(test)]
+mod command_telemetry_reset_tests {
+    #[test]
+    fn begin_command_telemetry_drops_the_previous_runs_records_and_skips() {
+        let home = tempfile::tempdir().unwrap();
+        // ENV_LOCK serialises this with every test that records or drains
+        // these buffers (they all hold a home guard).
+        let _guard = crate::test_env::EnvGuard::new(home.path());
+        let res = zoder_core::provider::ChatResult {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(2),
+            ..Default::default()
+        };
+        let segments = crate::context_opt::segments_for("sys", "user");
+        crate::context_opt::record_call("review", &segments, &res);
+        crate::provider_health::note_skip_for_test("stale-model", "stale-provider");
+        assert!(!crate::context_opt::records().is_empty());
+
+        super::begin_command_telemetry();
+
+        assert!(
+            crate::context_opt::records().is_empty(),
+            "a new command must not report an earlier run's calls"
+        );
+        assert!(
+            crate::provider_health::take_skipped().is_empty(),
+            "a new command must not report an earlier run's skips"
+        );
+        // Turn numbering restarts with the buffer.
+        crate::context_opt::record_call("review", &segments, &res);
+        let records = crate::context_opt::records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn, 1, "{records:?}");
+        super::begin_command_telemetry();
+    }
+}
