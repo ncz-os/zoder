@@ -414,6 +414,37 @@ mod agentic_utilization_tests {
         );
     }
 
+    /// FB120 (F5.4): a fallback turn's tokens must land in the ANSWERING
+    /// route's counter bucket, never the chain head's. This pins the store
+    /// end-state the `serving_provider` wiring in `agentic_turn` produces:
+    /// the winner's provider is passed to `persist_agentic_counter_at`, so
+    /// the head bucket stays empty while the fallback bucket accrues.
+    #[test]
+    fn fallback_turn_tokens_accrue_only_to_answering_provider_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utilization.json");
+        let now = Utc::now();
+        let head = test_provider();
+        let fallback = minimax_counter_provider();
+        // The answering route's provider is what the fixed call site passes.
+        assert!(persist_agentic_counter_at(&fallback, 90, &path, now));
+
+        let store = UtilizationStore::open_unlocked(&path).unwrap();
+        let (fallback_provider, fallback_plan) = utilization_key(&fallback);
+        let counter = store
+            .get_counter(fallback_provider, "default", &fallback_plan, "monthly")
+            .unwrap();
+        assert_eq!(counter.used_tokens, 90.0);
+        // The chain head accrued nothing: no cross-route contamination.
+        let (head_provider, head_plan) = utilization_key(&head);
+        assert!(
+            store
+                .get_counter(head_provider, "default", &head_plan, "monthly")
+                .is_none(),
+            "head-route bucket must stay empty when the fallback answered"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn real_zeroclaw_dispatch_context_usage_does_not_create_quota_telemetry() {

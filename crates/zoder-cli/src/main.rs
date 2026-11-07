@@ -4950,6 +4950,81 @@ fn provider_for_resolved_model<'a>(
     }
 }
 
+/// F5.4: quota/utilization telemetry belongs to the route that answered the
+/// turn, not the head of the chain. The dispatch loop resolves the serving
+/// provider per candidate (`link_provider`); the winner's entry is the only
+/// one whose telemetry may be persisted. A candidate with no resolved
+/// provider falls back to the head's (pre-existing behaviour).
+fn serving_provider<'a>(
+    link_provider: Option<&'a Provider>,
+    routed_provider: &'a Provider,
+) -> &'a Provider {
+    link_provider.unwrap_or(routed_provider)
+}
+
+#[cfg(test)]
+mod serving_provider_tests {
+    // FB120 (F5.4): when a fallback route answers, spend/telemetry must be
+    // recorded against the model/route that actually answered, never the
+    // chain head. `serving_provider` is the single decision point both the
+    // utilization callback and the MiniMax counter call route through.
+    use super::*;
+
+    fn mk_provider(id: &str) -> Provider {
+        Provider {
+            model_aliases: Vec::new(),
+            id: id.into(),
+            engine_provider_ref: None,
+            base_url: "https://gw.example/v1".into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Subscription,
+            subscription: None,
+            serves: vec!["test/".to_string()],
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        }
+    }
+
+    #[test]
+    fn fallback_link_provider_wins_over_chain_head() {
+        let head = mk_provider("head-route");
+        let fallback = mk_provider("fallback-route");
+        assert_eq!(
+            serving_provider(Some(&fallback), &head).id,
+            "fallback-route",
+            "telemetry for a turn the fallback answered must name the fallback, not the head"
+        );
+    }
+
+    #[test]
+    fn missing_link_provider_falls_back_to_chain_head() {
+        let head = mk_provider("head-route");
+        assert_eq!(
+            serving_provider(None, &head).id,
+            "head-route",
+            "a candidate with no resolved provider keeps the pre-existing head attribution"
+        );
+    }
+
+    #[test]
+    fn head_link_provider_selects_the_head() {
+        let head = mk_provider("head-route");
+        assert_eq!(
+            serving_provider(Some(&head), &head).id,
+            "head-route",
+            "when the head answers, its own provider is selected (no behaviour change)"
+        );
+    }
+}
+
 fn parse_route_list(raw: &str, flag_name: &str) -> anyhow::Result<Vec<(String, String)>> {
     let mut routes = Vec::new();
     for entry in raw.split(',') {
@@ -12770,10 +12845,12 @@ pub(crate) async fn agentic_turn(
     // The chain dispatch below resolves the per-candidate alias fresh; the
     // head's alias is used here only for the cost-scope directory (which
     // we open once before the loop). On a fallback to a different alias
-    // the cost scope path won't match the engine's records — we accept
-    // that minor accounting miss in exchange for keeping the scope open
-    // for the entire chain (the pre-scope path is not the failure mode
-    // this slice is closing).
+    // the cost scope path won't match the engine's records — that can only
+    // false-positive the overlap detector (cost-unknown, fail-safe), never
+    // misattribute spend: the engine query, ledger row, utilization and
+    // counter all resolve the WINNING route (FB120/F5.4). We keep one scope
+    // for the entire chain because the pre-scope path is not the failure
+    // mode this slice is closing).
     // Resolved the same way as the executing alias below. This runs before the
     // daemon socket is created, so ask an ALREADY-RUNNING daemon without
     // spawning one; if none is up the set is empty and this degrades to the old
@@ -13096,8 +13173,9 @@ pub(crate) async fn agentic_turn(
     // `health.record_classified_failure` so a broken alias/model is
     // not re-selected by future routing decisions.
     //
-    // `used_primary` / `used_alias` are populated ONLY by the winning
-    // `Ok(run)` arm below — the loop unconditionally overwrites them.
+    // `used_primary` / `used_alias` / `used_provider` are populated ONLY by
+    // the winning `Ok(run)` arm below — the loop unconditionally overwrites
+    // them.
     // They start as `String::new()` so the type is well-formed even on
     // a path that should be unreachable (the loop either returns
     // `Ok(run)` with the variables populated, or returns `Err`).
@@ -13116,6 +13194,11 @@ pub(crate) async fn agentic_turn(
     let mut used_alias = head_alias.clone();
     #[allow(unused_assignments)]
     let mut used_daemon_model = head_daemon_model;
+    // F5.4: the winner's serving provider, locked in with used_primary /
+    // used_alias so post-turn quota accounting follows the route that
+    // answered instead of the chain head.
+    #[allow(unused_assignments)]
+    let mut used_provider: Option<Provider> = None;
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
     // HOST COOLDOWN (D8 step 12). A sibling worker on this host tripped the
     // monthly cap, so the marker beside the ledger is live: metered chain
@@ -13281,7 +13364,13 @@ pub(crate) async fn agentic_turn(
             }
 
             if let AgentEvent::Utilization { headers } = &ev {
-                agentic::persist_agentic_utilization(&routed_provider, headers);
+                // F5.4: these headers describe the turn THIS candidate is
+                // serving. Persisting them under the head's provider would
+                // bill a fallback's quota usage to the wrong route.
+                agentic::persist_agentic_utilization(
+                    serving_provider(link_provider.as_ref(), &routed_provider),
+                    headers,
+                );
             }
             // The author-phase cancel scales its ack budget with the tool
             // step the daemon is in; these two events are the whole record.
@@ -13330,6 +13419,9 @@ pub(crate) async fn agentic_turn(
                 used_primary = model;
                 used_alias = alias;
                 used_daemon_model = daemon_model;
+                // F5.4: lock in the answering route's provider with the
+                // winner's identity so quota accounting below follows it.
+                used_provider = link_provider.clone();
                 break r;
             }
             Err(e) => {
@@ -13380,7 +13472,12 @@ pub(crate) async fn agentic_turn(
             }
         }
     };
-    agentic::persist_agentic_counter(&routed_provider, agentic_usage.get());
+    // F5.4: the counter windows belong to the provider that served the turn
+    // (the fallback's on a fallback win), not the chain head's.
+    agentic::persist_agentic_counter(
+        serving_provider(used_provider.as_ref(), &routed_provider),
+        agentic_usage.get(),
+    );
 
     let elapsed_ms = started.elapsed().as_millis() as f64;
 
@@ -13394,11 +13491,15 @@ pub(crate) async fn agentic_turn(
     // also implicitly assumes the daemon reported the actual billed model,
     // which we don't have here).
     //
-    // CHAIN FALLBACK: the alias passed to `agentic_cost` is the WINNING
-    // candidate's alias, not the head's. The cost-scope directory was
-    // opened with the head's alias above (see `AgenticCostScope::start`
-    // comment), so a fallback to a different alias is a known minor
-    // accounting miss — closing it requires the engine to accept a
+    // CHAIN FALLBACK (FB120/F5.4): the alias passed to `agentic_cost` is
+    // the WINNING candidate's alias, not the head's, and the utilization /
+    // counter persistence above/below resolves the winner's provider the
+    // same way — a fallback's spend is recorded against the route that
+    // answered. The cost-scope DIRECTORY is still opened with the head's
+    // alias above (see `AgenticCostScope::start` comment): on a fallback
+    // to a different alias a concurrent head-alias turn can only cause a
+    // false overlap, which fails safe to cost-unknown, never to wrong
+    // attribution. Closing that last gap requires the engine to accept a
     // scope key from the caller.
     // The serving provider is resolved up front: the engine $0 classification
     // (metered + $0 + real traffic = unknown; cost-neutral = known $0) needs
