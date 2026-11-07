@@ -1565,9 +1565,8 @@ mod tests {
         );
 
         // The genuine marker the classifier is built around still lands.
-        let (code, _) = classify_message("cancel not confirmed").expect(
-            "the classifier's own marker must still be recognized",
-        );
+        let (code, _) = classify_message("cancel not confirmed")
+            .expect("the classifier's own marker must still be recognized");
         assert_eq!(code, FailureCode::CancelUnconfirmed);
     }
 
