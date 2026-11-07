@@ -5958,9 +5958,6 @@ fn print_review_dry_run(
     }
 }
 
-// Signature grows with review options; the size/exclusion knobs are bundled
-// into `ReviewSizeOptions`, so the arg count stays close to the historical one.
-#[allow(clippy::too_many_arguments)]
 /// Start a command's structured telemetry from empty buffers.
 ///
 /// The per-call context records and the provider-health skip list are
@@ -5972,6 +5969,9 @@ pub(crate) fn begin_command_telemetry() {
     crate::provider_health::reset_skipped();
 }
 
+// Signature grows with review options; the size/exclusion knobs are bundled
+// into `ReviewSizeOptions`, so the arg count stays close to the historical one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cmd_review(
     cli: &crate::Cli,
     base: Option<String>,
