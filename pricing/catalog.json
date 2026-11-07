@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-06",
+  "generated": "2026-11-07",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "abliteration/abliterated-model": {
@@ -2513,8 +2513,8 @@
       "output_usd_per_mtok": 1.5
     },
     "azure_ai/jais-30b-chat": {
-      "input_usd_per_mtok": 3200.0,
-      "output_usd_per_mtok": 9710.0
+      "input_usd_per_mtok": 3.1999999999999997,
+      "output_usd_per_mtok": 9.71
     },
     "azure_ai/kimi-k2-thinking": {
       "input_usd_per_mtok": 0.6,
@@ -5805,11 +5805,21 @@
       }
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.059,
+      "input_usd_per_mtok": 0.051399999999999994,
       "output_usd_per_mtok": 0.3,
       "off_peak": {
-        "input_usd_per_mtok": 0.0295,
+        "input_usd_per_mtok": 0.0257,
         "output_usd_per_mtok": 0.15,
+        "window_start_utc_min": 990,
+        "window_end_utc_min": 30
+      }
+    },
+    "deepseek/deepseek-v4-flash-0731:batch": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.144,
+      "off_peak": {
+        "input_usd_per_mtok": 0.024,
+        "output_usd_per_mtok": 0.072,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -5859,11 +5869,11 @@
       }
     },
     "deepseek/deepseek-v4.1-flash-1017": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2,
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.6,
       "off_peak": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 0.6,
+        "input_usd_per_mtok": 0.075,
+        "output_usd_per_mtok": 0.3,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -5891,13 +5901,15 @@
       "output_usd_per_mtok": 0.0
     },
     "empiriolabs/deepseek-v4-1-flash-1017": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 1.2,
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7999999999999999,
+      "cache_read_usd_per_mtok": 0.02,
       "off_peak": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 0.6,
+        "input_usd_per_mtok": 0.1,
+        "output_usd_per_mtok": 0.4,
         "window_start_utc_min": 990,
-        "window_end_utc_min": 30
+        "window_end_utc_min": 30,
+        "cache_read_usd_per_mtok": 0.01
       }
     },
     "empiriolabs/deepseek-v4-flash-0731": {
@@ -8688,6 +8700,11 @@
       "output_usd_per_mtok": 15.0,
       "cache_read_usd_per_mtok": 0.3
     },
+    "global.moonshotai.kimi-k3.1": {
+      "input_usd_per_mtok": 4.0,
+      "output_usd_per_mtok": 20.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
     "global.openai.gpt-5.4": {
       "input_usd_per_mtok": 2.5,
       "output_usd_per_mtok": 15.0,
@@ -9575,8 +9592,8 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.3
+      "input_usd_per_mtok": 0.0675,
+      "output_usd_per_mtok": 0.22499999999999998
     },
     "google/gemma-4-26b-a4b-it:free": {
       "input_usd_per_mtok": 0.0,
@@ -10143,6 +10160,11 @@
       "output_usd_per_mtok": 16.5,
       "cache_read_usd_per_mtok": 0.33
     },
+    "in.moonshotai.kimi-k3.1": {
+      "input_usd_per_mtok": 4.4,
+      "output_usd_per_mtok": 22.0,
+      "cache_read_usd_per_mtok": 0.22
+    },
     "inception/mercury-2": {
       "input_usd_per_mtok": 0.25,
       "output_usd_per_mtok": 0.75,
@@ -10170,8 +10192,8 @@
       "output_usd_per_mtok": 0.045
     },
     "inclusionai/ling-3.1-flash": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.22499999999999998
+      "input_usd_per_mtok": 0.045,
+      "output_usd_per_mtok": 0.135
     },
     "inference-net/schematron-v2-small": {
       "input_usd_per_mtok": 0.049999999999999996,
@@ -11139,6 +11161,14 @@
       "input_usd_per_mtok": 0.049999999999999996,
       "output_usd_per_mtok": 0.7
     },
+    "liquid/lfm-3-1.7b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.19999999999999998
+    },
+    "liquid/lfm-3-1.7b:free": {
+      "input_usd_per_mtok": 0.0,
+      "output_usd_per_mtok": 0.0
+    },
     "llamagate/codellama-7b": {
       "input_usd_per_mtok": 0.06,
       "output_usd_per_mtok": 0.12
@@ -11307,6 +11337,10 @@
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 1.2
     },
+    "meta/muse-glimmer-30b:batch": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.96
+    },
     "meta/muse-spark-1.1": {
       "input_usd_per_mtok": 1.25,
       "output_usd_per_mtok": 4.25,
@@ -11400,8 +11434,8 @@
       "output_usd_per_mtok": 2.2
     },
     "minimax/minimax-m2.5": {
-      "input_usd_per_mtok": 0.27,
-      "output_usd_per_mtok": 0.95
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2
     },
     "minimax/minimax-m2.7": {
       "input_usd_per_mtok": 0.21,
@@ -11414,6 +11448,10 @@
     "minimax/minimax-m3.1-flash": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.6
+    },
+    "minimax/minimax-m3:batch": {
+      "input_usd_per_mtok": 0.224,
+      "output_usd_per_mtok": 0.88
     },
     "mistral.devstral-2-123b": {
       "input_usd_per_mtok": 0.39999999999999997,
@@ -11888,6 +11926,11 @@
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5,
       "cache_read_usd_per_mtok": 0.33
+    },
+    "moonshotai.kimi-k3.1": {
+      "input_usd_per_mtok": 4.4,
+      "output_usd_per_mtok": 22.0,
+      "cache_read_usd_per_mtok": 0.22
     },
     "moonshotai/kimi-k2": {
       "input_usd_per_mtok": 0.5700000000000001,
@@ -13154,8 +13197,8 @@
       "output_usd_per_mtok": 0.0
     },
     "nvidia/nemotron-3-super-120b-a12b": {
-      "input_usd_per_mtok": 0.3,
-      "output_usd_per_mtok": 2.4
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.39999999999999997
     },
     "nvidia/nemotron-3-ultra-550b-a55b": {
       "input_usd_per_mtok": 0.6,
@@ -13860,8 +13903,8 @@
       "output_usd_per_mtok": 30.0
     },
     "openai/gpt-oss-120b": {
-      "input_usd_per_mtok": 0.016,
-      "output_usd_per_mtok": 0.06
+      "input_usd_per_mtok": 0.014,
+      "output_usd_per_mtok": 0.052000000000000005
     },
     "openai/gpt-oss-120b:batch": {
       "input_usd_per_mtok": 0.0296,
@@ -14515,6 +14558,10 @@
     "qwen/qwen3.8-27b": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 1.875
+    },
+    "qwen/qwen3.8-27b:batch": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 2.0
     },
     "qwen/qwen3.8-flash": {
       "input_usd_per_mtok": 0.15,
@@ -15715,12 +15762,14 @@
       "output_usd_per_mtok": 0.6
     },
     "tencent/hy4": {
-      "input_usd_per_mtok": 0.417,
-      "output_usd_per_mtok": 1.2505
+      "input_usd_per_mtok": 0.834,
+      "output_usd_per_mtok": 2.501,
+      "cache_read_usd_per_mtok": 0.041999999999999996
     },
     "tencent/hy4-preview": {
       "input_usd_per_mtok": 0.834,
-      "output_usd_per_mtok": 2.501
+      "output_usd_per_mtok": 2.501,
+      "cache_read_usd_per_mtok": 0.041999999999999996
     },
     "tencent/kimi-k2.7-code": {
       "input_usd_per_mtok": 0.95,
@@ -15812,6 +15861,10 @@
     "thinkingmachines/inkling-small": {
       "input_usd_per_mtok": 0.44999999999999996,
       "output_usd_per_mtok": 1.2
+    },
+    "thinkingmachines/inkling-small:batch": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 0.96
     },
     "together-ai-21.1b-41b": {
       "input_usd_per_mtok": 0.7999999999999999,
@@ -16488,6 +16541,11 @@
       "input_usd_per_mtok": 3.3000000000000003,
       "output_usd_per_mtok": 16.5,
       "cache_read_usd_per_mtok": 0.33
+    },
+    "us.moonshotai.kimi-k3.1": {
+      "input_usd_per_mtok": 4.4,
+      "output_usd_per_mtok": 22.0,
+      "cache_read_usd_per_mtok": 0.22
     },
     "us.openai.gpt-5.4": {
       "input_usd_per_mtok": 2.75,
@@ -17690,8 +17748,9 @@
       "cache_read_usd_per_mtok": 0.12
     },
     "wandb/Qwen/Qwen3.6-35B-A3B": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.25
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.8899999999999999,
+      "cache_read_usd_per_mtok": 0.035
     },
     "wandb/Qwen/Qwen3.8-27B": {
       "input_usd_per_mtok": 0.39999999999999997,
@@ -17699,13 +17758,15 @@
       "cache_read_usd_per_mtok": 0.15
     },
     "wandb/deepseek-ai/DeepSeek-V3.1": {
-      "input_usd_per_mtok": 0.55,
-      "output_usd_per_mtok": 1.6500000000000001,
+      "input_usd_per_mtok": 0.5,
+      "output_usd_per_mtok": 1.5,
+      "cache_read_usd_per_mtok": 0.19999999999999998,
       "off_peak": {
-        "input_usd_per_mtok": 0.275,
-        "output_usd_per_mtok": 0.825,
+        "input_usd_per_mtok": 0.25,
+        "output_usd_per_mtok": 0.75,
         "window_start_utc_min": 990,
-        "window_end_utc_min": 30
+        "window_end_utc_min": 30,
+        "cache_read_usd_per_mtok": 0.1
       }
     },
     "wandb/deepseek-ai/DeepSeek-V4-Flash": {
@@ -17722,14 +17783,14 @@
     },
     "wandb/deepseek-ai/DeepSeek-V4-Flash-0731": {
       "input_usd_per_mtok": 0.13,
-      "output_usd_per_mtok": 0.28,
-      "cache_read_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27,
+      "cache_read_usd_per_mtok": 0.049999999999999996,
       "off_peak": {
         "input_usd_per_mtok": 0.065,
-        "output_usd_per_mtok": 0.14,
+        "output_usd_per_mtok": 0.135,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30,
-        "cache_read_usd_per_mtok": 0.035
+        "cache_read_usd_per_mtok": 0.025
       }
     },
     "wandb/deepseek-ai/DeepSeek-V4-Pro": {
@@ -17757,15 +17818,27 @@
       }
     },
     "wandb/deepseek-ai/DeepSeek-V4.1-Flash": {
-      "input_usd_per_mtok": 0.19999999999999998,
+      "input_usd_per_mtok": 0.13,
       "output_usd_per_mtok": 0.65,
-      "cache_read_usd_per_mtok": 0.03,
+      "cache_read_usd_per_mtok": 0.002,
       "off_peak": {
-        "input_usd_per_mtok": 0.1,
+        "input_usd_per_mtok": 0.065,
         "output_usd_per_mtok": 0.325,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30,
-        "cache_read_usd_per_mtok": 0.015
+        "cache_read_usd_per_mtok": 0.001
+      }
+    },
+    "wandb/deepseek-ai/DeepSeek-V4.1-Flash-1017": {
+      "input_usd_per_mtok": 0.13,
+      "output_usd_per_mtok": 0.65,
+      "cache_read_usd_per_mtok": 0.002,
+      "off_peak": {
+        "input_usd_per_mtok": 0.065,
+        "output_usd_per_mtok": 0.325,
+        "window_start_utc_min": 990,
+        "window_end_utc_min": 30,
+        "cache_read_usd_per_mtok": 0.001
       }
     },
     "wandb/google/gemma-4-26B-A4B-it": {
@@ -17782,9 +17855,9 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "wandb/ibm-granite/granite-4.2-8b": {
-      "input_usd_per_mtok": 0.09999999999999999,
+      "input_usd_per_mtok": 0.06,
       "output_usd_per_mtok": 0.15,
-      "cache_read_usd_per_mtok": 0.049999999999999996
+      "cache_read_usd_per_mtok": 0.015
     },
     "wandb/meta-llama/Llama-3.1-70B-Instruct": {
       "input_usd_per_mtok": 0.7999999999999999,
@@ -17809,9 +17882,9 @@
       "cache_read_usd_per_mtok": 0.15
     },
     "wandb/moonshotai/Kimi-K2.7-Code": {
-      "input_usd_per_mtok": 0.71,
-      "output_usd_per_mtok": 3.5,
-      "cache_read_usd_per_mtok": 0.15
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 3.0,
+      "cache_read_usd_per_mtok": 0.12
     },
     "wandb/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B": {
       "input_usd_per_mtok": 0.5,
@@ -17824,9 +17897,9 @@
       "cache_read_usd_per_mtok": 0.04
     },
     "wandb/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B": {
-      "input_usd_per_mtok": 0.25,
-      "output_usd_per_mtok": 1.5,
-      "cache_read_usd_per_mtok": 0.049999999999999996
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.5,
+      "cache_read_usd_per_mtok": 0.02
     },
     "wandb/openai/gpt-oss-120b": {
       "input_usd_per_mtok": 0.03,
@@ -17837,24 +17910,24 @@
       "output_usd_per_mtok": 0.13
     },
     "wandb/reflection/Beam-1.0-501B-A23B": {
-      "input_usd_per_mtok": 1.0,
-      "output_usd_per_mtok": 3.0,
-      "cache_read_usd_per_mtok": 0.09999999999999999
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.0,
+      "cache_read_usd_per_mtok": 0.04
     },
     "wandb/zai-org/GLM-5.2": {
-      "input_usd_per_mtok": 0.76,
+      "input_usd_per_mtok": 0.62,
       "output_usd_per_mtok": 2.42,
       "cache_read_usd_per_mtok": 0.14
     },
     "wandb/zai-org/GLM-5.3": {
-      "input_usd_per_mtok": 1.2,
-      "output_usd_per_mtok": 4.0,
+      "input_usd_per_mtok": 0.75,
+      "output_usd_per_mtok": 3.0,
       "cache_read_usd_per_mtok": 0.19
     },
     "wandb/zai-org/GLM-5.3-Flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.5,
-      "cache_read_usd_per_mtok": 0.049999999999999996
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.38,
+      "cache_read_usd_per_mtok": 0.02
     },
     "watsonx/bigscience/mt0-xxl": {
       "input_usd_per_mtok": 1.9080000000000001,
@@ -17865,8 +17938,8 @@
       "output_usd_per_mtok": 1.9080000000000001
     },
     "watsonx/core42/jais-13b-chat": {
-      "input_usd_per_mtok": 500.0,
-      "output_usd_per_mtok": 2000.0
+      "input_usd_per_mtok": 1.7999999999999998,
+      "output_usd_per_mtok": 1.7999999999999998
     },
     "watsonx/google/flan-t5-xl-3b": {
       "input_usd_per_mtok": 0.6,
@@ -18522,10 +18595,10 @@
       "output_usd_per_mtok": 8.0
     },
     "~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.059,
+      "input_usd_per_mtok": 0.051399999999999994,
       "output_usd_per_mtok": 0.3,
       "off_peak": {
-        "input_usd_per_mtok": 0.0295,
+        "input_usd_per_mtok": 0.0257,
         "output_usd_per_mtok": 0.15,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -18540,8 +18613,8 @@
       "output_usd_per_mtok": 10.0
     },
     "~moonshotai/kimi-latest": {
-      "input_usd_per_mtok": 0.15389999999999998,
-      "output_usd_per_mtok": 9.338799999999999
+      "input_usd_per_mtok": 0.1624,
+      "output_usd_per_mtok": 9.7471
     },
     "~openai/gpt-astra-latest": {
       "input_usd_per_mtok": 10.0,
@@ -18572,7 +18645,7 @@
       "output_usd_per_mtok": 6.0
     },
     "~z-ai/glm-flash-latest": {
-      "input_usd_per_mtok": 0.028399999999999998,
+      "input_usd_per_mtok": 0.0285,
       "output_usd_per_mtok": 0.0923
     },
     "~z-ai/glm-latest": {
