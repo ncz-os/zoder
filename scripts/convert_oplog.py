@@ -69,51 +69,54 @@ def skip_comment(src, i):
 RAW = re.compile(r'b?r(#*)"')
 
 
+CHAR = re.compile(r"'(\\.|[^\\'])'")
+
+
+def skip_non_code(src, i):
+    """Index just past a comment, string, raw string or char literal that
+    starts at `i`; `i` itself when code starts there."""
+    nxt = skip_comment(src, i)
+    if nxt != i:
+        return nxt
+    word_start = i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")
+    raw = RAW.match(src, i)
+    if raw and word_start:
+        close = '"' + raw.group(1)
+        end = src.find(close, raw.end())
+        return len(src) if end < 0 else end + len(close)
+    if src[i] == '"' or (src.startswith('b"', i) and word_start):
+        return literal_end(src, src.index('"', i))
+    char = CHAR.match(src, i)
+    if char:
+        return i + len(char.group(0))
+    return i
+
+
 def code_starts(src):
     """Offsets of every `eprintln!(` that is code: not inside a comment, a
     string, a raw string or a char literal."""
-    starts = []
+    starts = set()
     i = 0
     while i < len(src):
-        nxt = skip_comment(src, i)
+        nxt = skip_non_code(src, i)
         if nxt != i:
             i = nxt
             continue
-        raw = RAW.match(src, i)
-        if raw and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
-            close = '"' + raw.group(1)
-            end = src.find(close, raw.end())
-            i = len(src) if end < 0 else end + len(close)
-            continue
-        c = src[i]
-        if c == '"':
-            i = literal_end(src, i)
-            continue
-        if c == "'" and re.match(r"'(\\.|[^\\'])'", src[i:]):
-            i += len(re.match(r"'(\\.|[^\\'])'", src[i:]).group(0))
-            continue
-        match = CALL.match(src, i)
-        if match and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
-            starts.append(i)
+        if CALL.match(src, i) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            starts.add(i)
         i += 1
-    return set(starts)
+    return starts
 
 
 def matching_paren(src, open_idx):
     depth = 0
     i = open_idx
     while i < len(src):
-        nxt = skip_comment(src, i)
+        nxt = skip_non_code(src, i)
         if nxt != i:
             i = nxt
             continue
         c = src[i]
-        if c == '"':
-            i = literal_end(src, i)
-            continue
-        if c == "'" and re.match(r"'(\\.|[^\\'])'", src[i:]):
-            i += len(re.match(r"'(\\.|[^\\'])'", src[i:]).group(0))
-            continue
         if c == "(":
             depth += 1
         elif c == ")":
@@ -146,9 +149,6 @@ def convert(src):
             continue  # inside a comment or a string: not a call
         if src[:match.start()].endswith("::"):
             continue  # path-qualified (std::/crate::eprintln!): left alone
-        line_start = src.rfind("\n", 0, match.start()) + 1
-        if "//" in src[line_start:match.start()]:
-            continue  # a comment or doc example, not a call
         open_idx = match.end() - 1
         j = open_idx + 1
         while j < len(src) and src[j] in " \t\r\n":
