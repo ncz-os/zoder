@@ -4901,6 +4901,20 @@ pub(crate) struct ResolvedRoutes {
     pub agent_provider_ref: Option<String>,
 }
 
+/// F5.4 type-contract note (reviewed 2026-11-07). In `agentic_turn`, the
+/// dispatch loop declares `let link_provider = provider_for_resolved_model(
+/// ...)`.cloned();` — `provider_for_resolved_model` returns
+/// `Option<&'a Provider>` and `.cloned()` turns it into the OWNED
+/// `Option<Provider>`. The winner is then stored in
+/// `let mut used_provider: Option<Provider> = link_provider.clone();`
+/// (owned, because `link_provider` is rebuilt every iteration and the loop's
+/// borrow must not outlive it) and telemetry is persisted via
+/// `serving_provider(used_provider.as_ref(), &routed_provider)` — i.e. an
+/// `Option<&Provider>` derived from the owned slot. An annotation of
+/// `Option<&'a Provider>` on `link_provider` would not type-check against
+/// `.cloned()`; the owned form above is the only one that compiles, and
+/// `winner_provider_slot_is_owned_not_borrowed` pins it in the test suite.
+
 /// Resolve the provider identity attached to an explicit agent pin. The
 /// Zeroclaw projection is authoritative when present; the zoder-side agent
 /// entry is retained for oneshot/config-only operation.
