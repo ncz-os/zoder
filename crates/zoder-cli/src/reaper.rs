@@ -3721,6 +3721,8 @@ mod tests {
             !session_settled(id),
             "the stale settled mark must be cleared"
         );
+        // No manual cleanup: the `reap_test_lock()` guard clears SESSIONS,
+        // SETTLED and CANCELLED when it drops, also on panic.
     }
 
     /// ZD-16: same for a session whose earlier author-phase cancel the daemon
@@ -3745,6 +3747,8 @@ mod tests {
             !engine_cancelled(id),
             "the stale cancelled mark must be cleared"
         );
+        // No manual cleanup: the `reap_test_lock()` guard clears SESSIONS,
+        // SETTLED and CANCELLED when it drops, also on panic.
     }
 
     /// A process from a tick BEFORE the run began is never ours, even with its
