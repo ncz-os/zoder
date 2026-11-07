@@ -14973,6 +14973,60 @@ must reap the direct shell on the timeout branch)"
         );
     }
 
+    // ZD-08 characterisation: the exact text `author_phase_with_cancel`
+    // reports for each of its three error shapes. Records, MNEMOS events and
+    // operator logs carry these strings, so the typed refactor must keep them
+    // byte-identical.
+
+    #[tokio::test]
+    async fn author_phase_timeout_with_confirmed_cancel_text_is_pinned() {
+        let err = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a turn past its budget fails the phase");
+        assert_eq!(
+            err.to_string(),
+            "author phase timed out after 1s (killed, daemon cancel issued)"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_phase_timeout_with_unconfirmed_cancel_text_is_pinned() {
+        let err = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("daemon silent")) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a turn past its budget fails the phase");
+        assert_eq!(
+            err.to_string(),
+            "author phase timed out after 1s (killed, daemon cancel unconfirmed: \
+             author cancellation unconfirmed:daemon silent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_phase_turn_error_text_passes_through_verbatim() {
+        let err = author_phase_with_cancel(
+            5,
+            true,
+            async { Err::<crate::TurnResult, _>(anyhow::anyhow!("turn failed: HTTP 400 from x")) },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a failed turn fails the phase");
+        assert_eq!(err.to_string(), "turn failed: HTTP 400 from x");
+    }
+
     /// A daemon that answers the handshake and then, for every
     /// `session/cancel`, either confirms it or says nothing.
     ///
