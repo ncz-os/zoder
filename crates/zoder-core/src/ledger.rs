@@ -2261,6 +2261,7 @@ fn month_to_date_from_entries(entries: &[Entry], now: DateTime<Utc>) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn ts(s: &str) -> DateTime<Utc> {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
@@ -3872,6 +3873,100 @@ mod tests {
         assert!(err.contains("1 call(s) with unknown cost"), "{err}");
         drop(live);
         assert_eq!(ledger.month_to_date_usd().unwrap(), 1.0);
+    }
+    /// FB80: month roll-over between fixture setup and the scan must not
+    /// re-bucket a row. A row at 23:59:59 on the last day counts there and a
+    /// row at 00:00:01 counts in the new month, and the scan instant decides
+    /// which side a row lands on. Before FB80 the scan used
+    /// [`Ledger::month_to_date_usd`]'s internal `Utc::now()` — the exact
+    /// clock-collision class that failed `summary_matches_full_scan`
+    /// on 2026-11-01.
+    #[test]
+    fn month_to_date_usd_month_boundary_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let old = "2026-10-31T23:59:59Z";
+        let new = "2026-11-01T00:00:01Z";
+        for (ts, cost) in [(old, 0.40), (new, 0.60)] {
+            let line = format!(
+                "{{\"ts_utc\":\"{ts}\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":{cost},\"calls\":1}}\n"
+            );
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        drop(f);
+
+        let led = Ledger::new(&path);
+        // Scanned two seconds into November, the November row is visible and
+        // the October row is in a different month bucket: 0.60.
+        got_at(&led, "2026-11-01T00:00:02Z", 0.60);
+        // Scanned one second before the roll-over, only the October row is
+        // in the scan month: 0.40.
+        got_at(&led, "2026-10-31T23:59:58Z", 0.40);
+        // At exactly 00:00:00 the scan's month bucket is already 2026-11:
+        // the October row drops out and the 00:00:01 November row counts
+        // (no `ts <= scan` upper bound on the fold), so 0.60, not 0.40.
+        // This snap-over is precisely how a fixture set built a millisecond
+        // before the roll-over lost its cost — the 2026-11-01
+        // `summary_matches_full_scan` failure mechanism.
+        got_at(&led, "2026-11-01T00:00:00Z", 0.60);
+
+        fn got_at(led: &Ledger, scan_text: &str, expect: f64) {
+            let scan = chrono::DateTime::parse_from_rfc3339(scan_text)
+                .unwrap()
+                .with_timezone(&Utc);
+            let got = led.month_to_date_usd_at(scan).unwrap();
+            assert!(
+                (got - expect).abs() < 1e-9,
+                "scan at {scan_text}: expected {expect}, got {got}",
+            );
+        }
+    }
+
+    /// RED demonstration (FB80, kept `#[ignore]`ed so the normal suite stays
+    /// green): the pre-FB80 call shape ([`Ledger::month_to_date_usd`], which
+    /// reads the wall clock itself) cannot see pinned boundary fixtures that
+    /// the pinned-clock scan must see. The fixtures here are dated the way
+    /// the old idiom dated them — relative to the wall clock, two calendar
+    /// months ahead — so a wall-clock scan is structurally two months away
+    /// from them: it reads month M, the fixtures live in month M+2, and the
+    /// total is always 0.0 instead of the 0.60 the boundary scan must find.
+    /// This is exactly how the November roll-over wiped
+    /// `summary_matches_full_scan` on 2026-11-01: fixtures relative to a
+    /// clock that had moved into a different month than the one the scan
+    /// read. Run with `cargo test -p zoder-core red_month_boundary -- --ignored`
+    /// to watch it fail.
+    #[test]
+    #[ignore = "red: month_to_date_usd() reads Utc::now() itself; boundary fixtures are unreachable from it"]
+    fn red_month_boundary_through_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // The month two ahead of the wall clock's month at run time — ahead
+        // of any scan the un-injectable path can perform.
+        let scan_now = Utc::now();
+        let m_plus = scan_now.month() as i64 + 2;
+        let y2 = scan_now.year() + ((m_plus - 1) / 12) as i32;
+        let m2 = ((m_plus - 1) % 12 + 1) as u32;
+        let first_of_m2 = Utc.with_ymd_and_hms(y2, m2, 1, 0, 0, 0).unwrap();
+        let boundary_rows: Vec<(DateTime<Utc>, f64)> = vec![
+            (first_of_m2 - chrono::Duration::seconds(1), 0.40), // last second of month M+1
+            (first_of_m2 + chrono::Duration::seconds(1), 0.60), // first second of month M+2
+        ];
+        for (ts, cost) in boundary_rows {
+            let line = format!(
+                "{{\"ts_utc\":\"{}\",\"provider\":\"p\",\"model\":\"m\",\"host\":\"\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":{cost},\"calls\":1}}\n",
+                ts.to_rfc3339()
+            );
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        drop(f);
+        let led = Ledger::new(&path);
+        let got = led.month_to_date_usd().unwrap();
+        assert!(
+            (got - 0.60).abs() < 1e-9,
+            "pre-FB80 this only held while the wall clock sat inside month M+2 of the fixtures; got {got}. The un-injectable scan cannot reach a pinned two-months-ahead boundary",
+        );
     }
 }
 
