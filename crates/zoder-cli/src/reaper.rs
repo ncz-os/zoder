@@ -975,9 +975,70 @@ impl Drop for ReapGuard {
 static ATTEMPT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
-    // The outcome is deliberately dropped here: this path is the in-band
-    // drain, whose job is to stop the agent, not to report on it.
-    let _ = cancel_recorded_sessions_with_cleanup(socket, budget).await;
+    // The outcome does not decide anything here: this path is the in-band
+    // drain, whose job is to stop the agent. It is kept only for the run's
+    // telemetry (`cancel_report`).
+    note_exit_cleanup(cancel_recorded_sessions_with_cleanup(socket, budget).await);
+}
+
+/// What the exit-path cancels came to across this process, merged with
+/// [`merge_cleanup`]; `None` until a teardown ran. Read only by
+/// [`cancel_report`].
+static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
+
+fn note_exit_cleanup(cleanup: ExitCleanup) {
+    let mut seen = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    *seen = Some(seen.map_or(cleanup, |prev| merge_cleanup(prev, cleanup)));
+}
+
+/// The session and cancel counts for the `zoder.run/1` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CancelReport {
+    /// `no_session`, `not_needed`, `confirmed` or `unconfirmed`.
+    pub outcome: &'static str,
+    pub seen: usize,
+    pub settled: usize,
+    pub cancelled: usize,
+    pub unreachable: usize,
+}
+
+/// What this process's session cancels came to. Read-only: it changes no
+/// teardown decision.
+pub(crate) fn cancel_report() -> CancelReport {
+    let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let seen = sessions.len();
+    let settled = sessions.iter().filter(|id| session_settled(id)).count();
+    let cancelled = {
+        let set = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .filter(|id| set.contains(session_key(id)))
+            .count()
+    };
+    let unreachable = {
+        let set = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .filter(|id| set.contains(session_key(id)))
+            .count()
+    };
+    let cleanup = *EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    let outcome = match cleanup {
+        _ if seen == 0 => "no_session",
+        Some(ExitCleanup::Confirmed) => "confirmed",
+        Some(ExitCleanup::Unconfirmed) => "unconfirmed",
+        Some(ExitCleanup::NothingToDo) => "not_needed",
+        // No teardown ran: only a run whose every turn ended needs none.
+        None if settled == seen => "not_needed",
+        None => "unconfirmed",
+    };
+    CancelReport {
+        outcome,
+        seen,
+        settled,
+        cancelled,
+        unreachable,
+    }
 }
 
 /// [`cancel_recorded_sessions`], also reporting what the CANCEL came to.
@@ -2083,6 +2144,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // its session was retired from the sweep.
         if report.rounds == 0 {
             report.exit_cleanup = cleanup;
+            note_exit_cleanup(cleanup);
         }
         let outcome = reap(plan, grace);
         log_outcome(&outcome);

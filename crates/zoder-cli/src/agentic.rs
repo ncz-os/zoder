@@ -10308,6 +10308,187 @@ impl Drop for LoopEventGuard {
     }
 }
 
+/// The `zoder.turn/1` event for one loop author turn, from what the loop
+/// knows once the author and check phases are over.
+///
+/// `author_err` is the author phase's failure text and `had_session` whether
+/// the turn minted a daemon session. A timeout is still recognised by its text
+/// here, as the loop's other author-failure readers do.
+fn loop_turn_event(
+    iteration: usize,
+    turn: Option<&crate::TurnResult>,
+    author_err: Option<&str>,
+    had_session: bool,
+    check_passed: Option<bool>,
+    elapsed: std::time::Duration,
+) -> crate::telemetry::TurnEvent {
+    let unconfirmed = author_err.is_some_and(|m| m.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
+    let timed_out = author_err.is_some_and(|m| m.contains("timed out") || m.contains("timeout"));
+    let (outcome, cancel_outcome) = match (turn, author_err) {
+        (Some(t), _) => (
+            match t.run.outcome.as_str() {
+                known @ ("completed" | "cancelled" | "failed" | "timeout") => known.to_string(),
+                _ => "failed".to_string(),
+            },
+            "not_needed",
+        ),
+        (None, _) if unconfirmed => ("timeout".to_string(), "unconfirmed"),
+        (None, _) if !had_session => (
+            if timed_out { "timeout" } else { "error" }.to_string(),
+            "no_session",
+        ),
+        // A timed-out turn whose cancel was not reported unconfirmed was
+        // acknowledged by the daemon.
+        (None, _) if timed_out => ("timeout".to_string(), "confirmed"),
+        (None, _) => ("error".to_string(), "not_needed"),
+    };
+    let (provider, model) = turn.map_or((String::new(), String::new()), |t| {
+        (t.provider.clone(), t.model.clone())
+    });
+    let route = if provider.is_empty() && model.is_empty() {
+        String::new()
+    } else {
+        format!("{provider}={model}")
+    };
+    crate::telemetry::TurnEvent {
+        schema: crate::telemetry::TURN_SCHEMA,
+        iteration,
+        phase: "author",
+        route,
+        provider,
+        model,
+        agent_alias: turn.map(|t| t.alias.clone()).unwrap_or_default(),
+        billing: turn
+            .map(|t| t.billing.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        estimated_cost_usd: turn.and_then(|t| t.estimated_cost_usd),
+        billed_cost_usd: turn.filter(|t| !t.cost_unknown).map(|t| t.cost_usd),
+        cost_unknown: turn.is_none_or(|t| t.cost_unknown),
+        tokens_in: turn.map_or(0, |t| t.tokens_in),
+        tokens_out: turn.map_or(0, |t| t.tokens_out),
+        outcome,
+        cancel_outcome,
+        exit_code: check_passed.map(|ok| if ok { 0 } else { 1 }),
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod loop_turn_event_tests {
+    use super::*;
+
+    fn turn(outcome: &str, cost_unknown: bool) -> crate::TurnResult {
+        crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s1".into(),
+                outcome: outcome.into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+                failure_detail: None,
+            },
+            model: "vendor/m".into(),
+            alias: "coder".into(),
+            provider: "p1".into(),
+            billing: "metered".into(),
+            estimated_cost_usd: Some(0.02),
+            cost_usd: 0.01,
+            cost_unknown,
+            tokens_in: 10,
+            tokens_out: 5,
+            elapsed_ms: 1.0,
+            policy_violation: None,
+        }
+    }
+
+    #[test]
+    fn a_returned_turn_carries_its_route_cost_and_check_status() {
+        let t = turn("completed", false);
+        let e = loop_turn_event(
+            2,
+            Some(&t),
+            None,
+            true,
+            Some(false),
+            std::time::Duration::from_millis(7),
+        );
+        assert_eq!(e.route, "p1=vendor/m");
+        assert_eq!(e.billing, "metered");
+        assert_eq!(e.billed_cost_usd, Some(0.01));
+        assert_eq!(e.estimated_cost_usd, Some(0.02));
+        assert_eq!(e.outcome, "completed");
+        assert_eq!(e.cancel_outcome, "not_needed");
+        assert_eq!(e.exit_code, Some(1));
+        assert_eq!(e.elapsed_ms, 7);
+        let unknown = turn("weird", true);
+        let e = loop_turn_event(
+            1,
+            Some(&unknown),
+            None,
+            true,
+            None,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            e.billed_cost_usd, None,
+            "an unknown cost is never billed as $0"
+        );
+        assert!(e.cost_unknown);
+        assert_eq!(e.outcome, "failed");
+        assert_eq!(e.exit_code, None);
+    }
+
+    #[test]
+    fn a_failed_author_phase_maps_to_outcome_and_cancel_outcome() {
+        let cases = [
+            (
+                "no free model has a configured provider",
+                false,
+                "error",
+                "no_session",
+            ),
+            (
+                "author turn timed out after 900s",
+                false,
+                "timeout",
+                "no_session",
+            ),
+            (
+                "author turn timed out after 900s",
+                true,
+                "timeout",
+                "confirmed",
+            ),
+            ("engine closed the connection", true, "error", "not_needed"),
+        ];
+        for (msg, had_session, outcome, cancel) in cases {
+            let e = loop_turn_event(
+                1,
+                None,
+                Some(msg),
+                had_session,
+                None,
+                std::time::Duration::ZERO,
+            );
+            assert_eq!(
+                (e.outcome.as_str(), e.cancel_outcome),
+                (outcome, cancel),
+                "{msg}"
+            );
+            assert_eq!(e.billing, "unknown");
+            assert!(e.cost_unknown);
+            assert_eq!(e.route, "");
+        }
+        let msg = format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER} the daemon never answered");
+        let e = loop_turn_event(1, None, Some(&msg), true, None, std::time::Duration::ZERO);
+        assert_eq!(
+            (e.outcome.as_str(), e.cancel_outcome),
+            ("timeout", "unconfirmed")
+        );
+    }
+}
+
 // The parameter count is the loop's explicit, named configuration — the same
 // shape as `cmd_loop`, which already carries this allowance.
 #[allow(clippy::too_many_arguments)]
@@ -10559,6 +10740,7 @@ async fn cmd_loop_run(
         // and is committed and reported below like any other terminal exit.
         if deadline.expired() {
             deadline_hit = true;
+            crate::telemetry::note_deadline_hit();
             if !cli.quiet {
                 eprintln!(
                     "[loop] iter {i}/{max_iters}: whole-run deadline of {}s reached; stopping \
@@ -11040,6 +11222,18 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             }
         };
 
+        crate::telemetry::emit_turn(&loop_turn_event(
+            i,
+            turn.as_ref(),
+            author_err.as_deref(),
+            active_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            check_passed,
+            author_started.elapsed(),
+        ));
+
         // Streak bookkeeping — both failure modes live in one helper so the
         // full matrix is unit-tested. A wedged check on an already-empty
         // diff bumps the check-timeout streak only (logged for visibility)
@@ -11148,6 +11342,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // recorded as unresolved with every byte of work preserved.
         if deadline.expired() {
             deadline_hit = true;
+            crate::telemetry::note_deadline_hit();
             {
                 let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
                 state.set_phase(LOOP_PHASE_DONE, i);
@@ -15722,6 +15917,9 @@ must reap the direct shell on the timeout branch)"
                 },
                 model: "m".into(),
                 alias: "a".into(),
+                provider: String::new(),
+                billing: String::new(),
+                estimated_cost_usd: None,
                 cost_usd: 0.0,
                 cost_unknown: false,
                 tokens_in: 0,
@@ -16157,6 +16355,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -16221,6 +16422,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -16249,6 +16453,9 @@ not run to max_iters"
                 },
                 model: "m".into(),
                 alias: "a".into(),
+                provider: String::new(),
+                billing: String::new(),
+                estimated_cost_usd: None,
                 cost_usd: 0.0,
                 cost_unknown: false,
                 tokens_in: 0,
@@ -16275,6 +16482,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -18672,6 +18882,9 @@ mod mr1_policy_violation_tests {
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -18725,6 +18938,9 @@ mod mr1_policy_violation_tests {
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,

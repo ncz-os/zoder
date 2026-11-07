@@ -28,6 +28,7 @@ mod review_diff;
 mod review_filter;
 mod reviewer_pool;
 mod sop;
+mod telemetry;
 mod utilization;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
@@ -2690,20 +2691,19 @@ fn filter_token_plan_exhausted<'a>(
 }
 
 fn init_tracing(verbose: u8) {
-    use tracing_subscriber::{fmt, EnvFilter};
-    // Precedence: RUST_LOG wins; otherwise -v/-vv set the level.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(match verbose {
-            0 => "warn",
-            1 => "info,zoder=debug,zoder_core=debug",
-            _ => "debug,zoder=trace,zoder_core=trace",
-        })
-    });
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .try_init();
+    // Precedence: RUST_LOG wins; otherwise -v/-vv set the level. The format
+    // (human text, or one JSON object per line) is `telemetry::format()`.
+    telemetry::init(verbose);
+}
+
+/// The clap subcommand name of this invocation, for the `zoder.run/1` event;
+/// `exec` for a bare prompt (no subcommand).
+fn command_label() -> String {
+    Cli::command()
+        .try_get_matches_from(std::env::args_os())
+        .ok()
+        .and_then(|matches| matches.subcommand_name().map(str::to_string))
+        .unwrap_or_else(|| "exec".to_string())
 }
 
 /// The instant this process started, captured on first read so every
@@ -2740,7 +2740,7 @@ async fn main() {
     // running daemon with no one to call `waitpid`.
     reap_ephemeral_daemons();
     if let Err(e) = res {
-        eprintln!("zoder: error: {e:#}");
+        crate::oplog!("zoder", "zoder: error: {e:#}");
         // `zoder review` / `zoder loop` follow the failure contract (see
         // `docs/EXIT_CODES.md`, `contract_exit_code`): a CLASSIFIED failure
         // exits with the code its class documents, an UNCLASSIFIED one
@@ -2752,13 +2752,18 @@ async fn main() {
         } else {
             error_exit_code(&e)
         };
+        telemetry::finish_run(process_start_instant(), code, Some(format!("{e:#}")));
         std::process::exit(code);
     }
+    telemetry::finish_run(process_start_instant(), 0, None);
 }
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    if telemetry::format() == telemetry::LogFormat::Json {
+        telemetry::set_command(&command_label());
+    }
     // A fresh per-run contract state: nothing a previous run in this
     // process recorded (an emitted result, the contract scope) leaks in.
     failure::begin_contract_run(matches!(
@@ -3602,7 +3607,7 @@ fn cmd_gate(
     //                            are non-zero under dev inner-loop mode)
     let code = gate_exit_code(&mode, &report);
     if code != 0 {
-        std::process::exit(code);
+        telemetry::exit(code);
     }
     Ok(())
 }
@@ -7600,7 +7605,7 @@ raise --max-tokens or lower its reasoning effort",
     let substituted = primary != used_model;
     let exit_code = cmd_exec_oneshot_exit_code(substituted, cli.no_fallback);
     if exit_code != 0 {
-        std::process::exit(exit_code);
+        telemetry::exit(exit_code);
     }
     Ok(())
 }
@@ -11253,6 +11258,13 @@ pub(crate) struct TurnResult {
     pub run: zoder_core::AgentRun,
     pub model: String,
     pub alias: String,
+    /// The provider the ledger row attributes the turn to (empty in fakes).
+    pub provider: String,
+    /// The ledger row's billing posture (`free`, `subscription`,
+    /// `metered`; empty when unknown).
+    pub billing: String,
+    /// The engine's own cost estimate from the ledger row.
+    pub estimated_cost_usd: Option<f64>,
     pub cost_usd: f64,
     pub cost_unknown: bool,
     pub tokens_in: u64,
@@ -13856,6 +13868,9 @@ pub(crate) async fn agentic_turn(
         run,
         model: model_used,
         alias: used_alias,
+        provider: ledger_entry.provider.clone(),
+        billing: ledger_entry.billing.clone().unwrap_or_default(),
+        estimated_cost_usd: ledger_entry.estimated_cost_usd,
         cost_usd: cost,
         cost_unknown: !cost_known,
         tokens_in,
@@ -15264,7 +15279,7 @@ async fn cmd_finops(
     }
     let code = finops_cli(&led, &pricing, &eng.cfg.theme, &argv)?;
     if code != 0 {
-        std::process::exit(code);
+        telemetry::exit(code);
     }
     Ok(())
 }
