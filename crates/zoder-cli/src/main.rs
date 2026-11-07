@@ -9626,6 +9626,56 @@ impl AgenticCostScope {
     }
 }
 
+/// The cost scopes of one agentic turn: one per agent alias the chain
+/// dispatched to, opened before that alias's first dispatch.
+///
+/// The engine's cost tracker is per alias, so the window queried after the
+/// turn must be fenced under the alias that ANSWERED. A chain fallback to a
+/// different alias therefore gets its own scope; with only the head's open,
+/// a concurrent run on the fallback alias was invisible and both runs were
+/// billed each other's spend (ZD-01, F5.4). An alias whose scope could not
+/// be opened is remembered as `None`, so its cost is reported unknown.
+struct AgenticCostScopes {
+    engine_socket: PathBuf,
+    scopes: Vec<(String, Option<AgenticCostScope>)>,
+}
+
+impl AgenticCostScopes {
+    fn new(engine_socket: &Path) -> Self {
+        Self {
+            engine_socket: engine_socket.to_path_buf(),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Open the scope for `alias` unless this turn already has one.
+    fn ensure(&mut self, alias: &str) {
+        if self.scopes.iter().any(|(known, _)| known == alias) {
+            return;
+        }
+        let scope = match AgenticCostScope::start(&self.engine_socket, alias) {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                eprintln!(
+                    "zoder: unable to isolate agentic cost window for agent {alias}; spend will be \
+                     recorded as unknown: {error}"
+                );
+                None
+            }
+        };
+        self.scopes.push((alias.to_string(), scope));
+    }
+
+    /// Close the scope of the alias that answered and return its window and
+    /// overlap flag. `None` when that alias has no usable scope. Every other
+    /// alias's scope is released when `self` drops.
+    fn finish_for(mut self, alias: &str) -> Option<(DateTime<Utc>, DateTime<Utc>, bool)> {
+        let index = self.scopes.iter().position(|(known, _)| known == alias)?;
+        let (_, scope) = self.scopes.swap_remove(index);
+        scope.and_then(|scope| scope.finish().ok())
+    }
+}
+
 impl Drop for AgenticCostScope {
     fn drop(&mut self) {
         self.active_file.take();
@@ -13208,25 +13258,15 @@ pub(crate) async fn agentic_turn(
     ledger_reservation
         .arm_for("", primary.as_str())
         .with_context(|| "verifying ledger reservation before agentic dispatch")?;
-    // The cost scope is opened ONCE before the chain walk and the cost
-    // reconciliation at the end queries the engine for whatever actually
-    // ran. The scope's alias is the head's; a fallback to a different
-    // alias is a known minor accounting miss (the engine's cost tracker
-    // is per-alias) — closing that miss is a follow-up that requires the
-    // engine to accept a scope key from the caller.
-    let cost_scope = if engine_kind == EngineKind::Zeroclaw {
-        match AgenticCostScope::start(&opts.socket, &head_alias) {
-            Ok(scope) => Some(scope),
-            Err(error) => {
-                eprintln!(
-                    "zoder: unable to isolate agentic cost window; spend will be recorded as unknown: {error}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Cost scopes are opened per agent alias: the head's here, before the
+    // chain walk, and a fallback's just before its first dispatch (see
+    // `AgenticCostScopes`). The cost reconciliation at the end queries the
+    // engine for the alias that answered, over that alias's own window.
+    let mut cost_scopes = (engine_kind == EngineKind::Zeroclaw).then(|| {
+        let mut scopes = AgenticCostScopes::new(&opts.socket);
+        scopes.ensure(&head_alias);
+        scopes
+    });
 
     // Set up events file if requested
     let mut events_writer = events_file
@@ -13435,6 +13475,10 @@ pub(crate) async fn agentic_turn(
         };
         chain_opts.agent_alias = alias.clone();
         chain_opts.model_id = Some(model.clone());
+        // ZD-01: fence this alias's cost window before it can spend.
+        if let Some(scopes) = cost_scopes.as_mut() {
+            scopes.ensure(&alias);
+        }
         // MASTER PROMPT (opt-in). The overlay depends on WHICH model is
         // serving this turn — a fallback down the chain is a different
         // family and gets its own overlay — so the prompt is composed
@@ -13595,16 +13639,13 @@ pub(crate) async fn agentic_turn(
     // also implicitly assumes the daemon reported the actual billed model,
     // which we don't have here).
     //
-    // CHAIN FALLBACK (FB120/F5.4): the alias passed to `agentic_cost` is
-    // the WINNING candidate's alias, not the head's, and the utilization /
+    // CHAIN FALLBACK (FB120/F5.4, ZD-01): the alias passed to `agentic_cost`
+    // is the WINNING candidate's alias, not the head's, and the utilization /
     // counter persistence above/below resolves the winner's provider the
     // same way — a fallback's spend is recorded against the route that
-    // answered. The cost-scope DIRECTORY is still opened with the head's
-    // alias above (see `AgenticCostScope::start` comment): on a fallback
-    // to a different alias a concurrent head-alias turn can only cause a
-    // false overlap, which fails safe to cost-unknown, never to wrong
-    // attribution. Closing that last gap requires the engine to accept a
-    // scope key from the caller.
+    // answered. Its cost window comes from that alias's own scope, opened
+    // before its first dispatch, so a concurrent run on the same alias reads
+    // as an overlap (cost unknown), never as this run's spend.
     // The serving provider is resolved up front: the engine $0 classification
     // (metered + $0 + real traffic = unknown; cost-neutral = known $0) needs
     // the posture while the cost query is being interpreted, and the ledger
@@ -13618,7 +13659,7 @@ pub(crate) async fn agentic_turn(
         match engine_kind {
             EngineKind::Zeroclaw => {
                 let socket2 = engine_socket_path();
-                match cost_scope.and_then(|scope| scope.finish().ok()) {
+                match cost_scopes.and_then(|scopes| scopes.finish_for(&used_alias)) {
                     Some((from, to, false)) => {
                         agentic_cost(&socket2, from, to, &used_alias, posture).await
                     }
