@@ -1073,7 +1073,11 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
     // with many sessions cannot hold teardown for minutes. The cap is checked
     // only BETWEEN passes, so a pass that has started asks every session it
     // snapshotted — the ceiling never costs a session its first ask.
-    let phase_started = Instant::now();
+    // Both deadlines are on tokio's clock, the clock every wait inside
+    // `zoder_core::cancel_session` uses: measured on `std::time::Instant` they
+    // drift apart under a paused clock, and the retries were planned from a
+    // window that had already been spent (ZD-18).
+    let phase_started = tokio::time::Instant::now();
     let phase_cap = budget.saturating_mul(CANCEL_PHASE_CAP_WINDOWS);
     // Every session this phase RETIRES (acknowledged, or proven unreachable)
     // is a session whose turn is not still editing the tree. A session the
@@ -1111,7 +1115,7 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
             // A per-session window, then move on to the next session: this one
             // is asked exactly once here and, if unconfirmed, its own retries
             // run inside this window before the next session gets its own.
-            let deadline = Instant::now() + budget;
+            let deadline = tokio::time::Instant::now() + budget;
             let outcome = cancel_session_with_retries(socket, &id, deadline).await;
             cleanup = merge_cleanup(cleanup, outcome);
         }
@@ -1141,8 +1145,12 @@ fn merge_cleanup(a: ExitCleanup, b: ExitCleanup) -> ExitCleanup {
 /// it a per-attempt slice of the remainder instead re-plans the sequence from a
 /// much smaller number and asks the daemon fewer times than the plan promised
 /// — silently, with nothing in the log to show for it.
-async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant) -> ExitCleanup {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+async fn cancel_session_with_retries(
+    socket: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> ExitCleanup {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Cut off before the ask reached the wire: it settles nothing, but it
         // is not evidence the daemon ignored us either.
@@ -1194,7 +1202,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                     // outlives the deadline is cut off mid-flight, which
                     // leaves the cancel unsettled — the state this path
                     // exists to prevent.
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let settled = if left < RETRY_ATTEMPT_FLOOR {
                         // The window is spent. The planner would still grant
                         // one minimum-length retry, but a 1 ms ask cannot
@@ -4402,7 +4410,7 @@ mod tests {
             "the probe needs a budget whose plan has more than one retry: {planned_retries}"
         );
 
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         cancel_session_with_retries(&socket, "planned-sequence-probe", started + budget).await;
         let elapsed = started.elapsed();
 
@@ -4622,7 +4630,12 @@ mod tests {
             spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
         note_session("spent-window");
         let window = Duration::from_millis(150);
-        cancel_session_with_retries(&socket, "spent-window", Instant::now() + window).await;
+        cancel_session_with_retries(
+            &socket,
+            "spent-window",
+            tokio::time::Instant::now() + window,
+        )
+        .await;
         // Let the daemon thread count the connection(s) it served.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
