@@ -193,3 +193,35 @@ fn an_unknown_log_format_keeps_human_text() {
     );
     assert!(err.contains("[loop] iter 1/1: author…"), "{err}");
 }
+
+/// ZD-11: once the operator messages go through `oplog!`, a JSON-mode loop
+/// writes nothing to stderr that is not a JSON object.
+#[test]
+fn json_log_format_writes_only_json_objects_on_stderr() {
+    let output = run_loop(Some("json"));
+    let err = stderr(&output);
+    for (n, line) in err
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let parsed = serde_json::from_str::<serde_json::Value>(line);
+        assert!(
+            parsed.as_ref().is_ok_and(serde_json::Value::is_object),
+            "stderr line {n} is not a JSON object: {line:?}\n{err}"
+        );
+    }
+    let objects = json_objects(&output);
+    let author = objects
+        .iter()
+        .find(|o| o["target"] == "zoder::op" && o["message"] == "iter 1/1: author…")
+        .unwrap_or_else(|| panic!("the author line must be a zoder::op event:\n{err}"));
+    assert_eq!(author["component"], "loop", "{author}");
+    assert!(
+        objects.iter().any(|o| o["component"] == "zoder"
+            && o["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("error: "))),
+        "the final error line must be a zoder::op event:\n{err}"
+    );
+}
