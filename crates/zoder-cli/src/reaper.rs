@@ -3680,6 +3680,59 @@ mod tests {
             .retain(|id| !ids.contains(id));
     }
 
+    /// ZD-16: a session id the engine hands back AGAIN (a resumed session on
+    /// the next loop iteration) is running a NEW turn. The previous turn's
+    /// "settled" or "cancel acknowledged" mark described that earlier turn
+    /// only, so it must not survive the re-mint: a run killed mid-turn has
+    /// to cancel the resumed session at exit, or the daemon keeps editing
+    /// the tree after zoder is gone.
+    #[test]
+    fn a_resumed_settled_session_is_pending_again() {
+        let _lock = reap_test_lock();
+        let id = "zd16-resumed-settled";
+        note_session(id);
+        note_session_settled(id);
+        assert!(
+            !pending_sessions().contains(&id.to_string()),
+            "precondition: a settled turn is not cancelled at exit"
+        );
+        // Iteration 2 resumes the same engine session: the observer reports
+        // the id again the moment the daemon answers `session/new`.
+        note_session(id);
+        assert!(
+            pending_sessions().contains(&id.to_string()),
+            "a resumed session runs a new turn and must be cancelled at exit"
+        );
+        assert!(
+            !session_settled(id),
+            "the stale settled mark must be cleared"
+        );
+    }
+
+    /// ZD-16: same for a session whose earlier author-phase cancel the daemon
+    /// acknowledged. The acknowledgement covered the turn it stopped; a turn
+    /// started later on the same id has never been cancelled.
+    #[test]
+    fn a_resumed_cancelled_session_is_pending_again() {
+        let _lock = reap_test_lock();
+        let id = "zd16-resumed-cancelled";
+        note_session(id);
+        note_session_cancelled(id);
+        assert!(
+            !pending_sessions().contains(&id.to_string()),
+            "precondition: an acknowledged cancel is not re-sent"
+        );
+        note_session(id);
+        assert!(
+            pending_sessions().contains(&id.to_string()),
+            "a resumed session runs a new turn and must be cancelled at exit"
+        );
+        assert!(
+            !engine_cancelled(id),
+            "the stale cancelled mark must be cleared"
+        );
+    }
+
     /// A process from a tick BEFORE the run began is never ours, even with its
     /// cwd inside the workspace. This is the boundary the pid snapshot draws,
     /// and it is the half of the granularity problem that can be decided.
