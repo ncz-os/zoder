@@ -6447,4 +6447,4 @@ mod tests {
 // Fault-injection harness (ZD-20); it shares the test lock above.
 #[cfg(test)]
 #[path = "reaper_fault_tests.rs"]
-mod fault_tests;
+mod reaper_fault_tests;

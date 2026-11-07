@@ -1,6 +1,7 @@
 //! Fault-injection harness for the reaper's cancel phase (ZD-20 / CF-29).
 //!
-//! Mounted from `reaper.rs`'s test module with `#[path]`, so it reaches the
+//! Mounted from `reaper.rs` with `#[path]` and named like its file, so the
+//! src-reachability check resolves it. As a child of `reaper` it reaches the
 //! private cancel-phase functions and the shared test lock.
 //!
 //! * [`FaultDaemon`] is an in-process stand-in for the zeroclaw daemon: a
