@@ -15027,6 +15027,132 @@ must reap the direct shell on the timeout branch)"
         assert_eq!(err.to_string(), "turn failed: HTTP 400 from x");
     }
 
+    /// ZD-08: the loop reads WHAT went wrong from the error's kind, never from
+    /// its wording.
+    #[tokio::test]
+    async fn author_phase_errors_carry_a_typed_kind() {
+        let timed_out = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("timeout");
+        assert_eq!(timed_out.kind, AuthorPhaseErrorKind::TimedOut);
+        assert!(timed_out.timed_out() && !timed_out.cancel_unconfirmed());
+
+        let unconfirmed = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("daemon silent")) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("timeout");
+        assert_eq!(unconfirmed.kind, AuthorPhaseErrorKind::CancelUnconfirmed);
+        assert!(unconfirmed.timed_out() && unconfirmed.cancel_unconfirmed());
+
+        // A provider body that merely NAMES a timeout parameter is not a
+        // timeout (the F2.5 misread, on the author path).
+        let body = author_phase_with_cancel(
+            5,
+            true,
+            async {
+                Err::<crate::TurnResult, _>(anyhow::anyhow!(
+                    "provider HTTP 400: {{\"error\":\"unsupported parameter: stream_timeout\"}}"
+                ))
+            },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("failed turn");
+        assert_eq!(body.kind, AuthorPhaseErrorKind::Failed { timed_out: false });
+        assert!(!body.timed_out() && !body.cancel_unconfirmed());
+
+        // The engine's own timeout only arrives as text: read by the one
+        // text helper.
+        let engine_timeout = author_phase_with_cancel(
+            5,
+            true,
+            async {
+                Err::<crate::TurnResult, _>(anyhow::anyhow!("turn failed: request timed out"))
+            },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("failed turn");
+        assert_eq!(
+            engine_timeout.kind,
+            AuthorPhaseErrorKind::Failed { timed_out: true }
+        );
+    }
+
+    #[test]
+    fn author_phase_error_kinds_have_stable_record_names_and_codes() {
+        use crate::failure::FailureCode;
+        let cases = [
+            (
+                AuthorPhaseErrorKind::TimedOut,
+                "timed_out",
+                FailureCode::AuthorTimeout,
+            ),
+            (
+                AuthorPhaseErrorKind::CancelUnconfirmed,
+                "cancel_unconfirmed",
+                FailureCode::CancelUnconfirmed,
+            ),
+            (
+                AuthorPhaseErrorKind::Failed { timed_out: false },
+                "failed",
+                FailureCode::AuthorFailed,
+            ),
+            (
+                AuthorPhaseErrorKind::Failed { timed_out: true },
+                "failed",
+                FailureCode::AuthorFailed,
+            ),
+        ];
+        for (kind, name, code) in cases {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(kind.failure_code(), code);
+            assert_eq!(AuthorPhaseErrorKind::code_for_record(name), Some(code));
+        }
+        assert_eq!(AuthorPhaseErrorKind::code_for_record("bogus"), None);
+    }
+
+    /// ZD-08: the confirmer's timeout outcome comes from the provider error
+    /// kind when it has one; only an error that never had a kind falls back
+    /// to the shared text helper.
+    #[test]
+    fn confirmer_fatal_timeout_is_read_from_the_error_kind() {
+        use crate::review_confirm::ConfirmerOutcome;
+        let body = ReviewerError::Fatal {
+            message: "reviewer m: provider HTTP 400: {\"error\":\"unsupported parameter: \
+                      stream_timeout\"}"
+                .into(),
+            kind: Some(zoder_core::ErrKind::Http),
+        };
+        assert_eq!(classify_confirmer_error(&body), ConfirmerOutcome::Empty);
+        let typed = ReviewerError::Fatal {
+            message: "reviewer m: stream stalled".into(),
+            kind: Some(zoder_core::ErrKind::Timeout),
+        };
+        assert_eq!(classify_confirmer_error(&typed), ConfirmerOutcome::Timeout);
+        let untyped = ReviewerError::Fatal {
+            message: "reviewer m: request timed out".into(),
+            kind: None,
+        };
+        assert_eq!(
+            classify_confirmer_error(&untyped),
+            ConfirmerOutcome::Timeout
+        );
+    }
+
     /// A daemon that answers the handshake and then, for every
     /// `session/cancel`, either confirms it or says nothing.
     ///
