@@ -28087,3 +28087,39 @@ mod attach_failure_to_result_tests {
         }
     }
 }
+
+/// ZD-03 (F5.2): `--check` validates what the author turn wrote. When the
+/// author turn FAILED and the captured task diff is empty there is nothing
+/// to validate: running the check only spends a phase budget and records a
+/// pass or fail for the unmodified base tree.
+#[cfg(test)]
+mod check_phase_gate_tests {
+    use super::check_phase_runs;
+
+    #[test]
+    fn a_failed_author_with_an_empty_diff_skips_the_check() {
+        assert!(
+            !check_phase_runs(false, true, true),
+            "generic author failure + empty diff: nothing was authored to validate"
+        );
+    }
+
+    #[test]
+    fn a_session_limit_refusal_still_skips_the_check() {
+        assert!(!check_phase_runs(true, true, true));
+        assert!(!check_phase_runs(true, true, false));
+    }
+
+    #[test]
+    fn a_failed_author_that_left_edits_is_still_checked() {
+        // A timed-out turn preserves its partial edits; those are validated.
+        assert!(check_phase_runs(false, true, false));
+    }
+
+    #[test]
+    fn a_finished_author_turn_is_checked_even_with_an_empty_diff() {
+        // Unchanged behaviour: a completed no-op turn still runs the check.
+        assert!(check_phase_runs(false, false, true));
+        assert!(check_phase_runs(false, false, false));
+    }
+}
