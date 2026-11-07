@@ -3071,7 +3071,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
-                anyhow::bail!("session/new resume failed: {err}");
+                return Err(session_new_rejected(effective_session_id.is_some(), &err));
             }
             // Recoverable reject: an evicted session, or one owned by a
             // different agent (the model-fallback case). Do not surface
@@ -5022,7 +5022,7 @@ where
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
-                anyhow::bail!("session/new resume failed: {err}");
+                return Err(session_new_rejected(effective_session_id.is_some(), &err));
             }
             // Engine rejected a resume. Z-24: do NOT clear the
             // on-disk record here. The previous behavior was to
@@ -6060,6 +6060,18 @@ fn is_agent_ownership_rejection(error: &RpcError) -> bool {
 /// An explicit `--session` / `--continue` id is never replaced: the
 /// operator asked for that exact session and a silent fresh one would
 /// hide the problem.
+/// The terminal error for a `session/new` the engine rejected and the client
+/// will not replace. Only a request that carried a session id was a resume;
+/// calling a fresh create a "resume" sends the reader after a persistence bug
+/// that cannot exist on that path (ZD-21).
+fn session_new_rejected(resuming: bool, error: &RpcError) -> anyhow::Error {
+    if resuming {
+        anyhow!("session/new resume failed: {error}")
+    } else {
+        anyhow!("session/new failed: {error}")
+    }
+}
+
 fn may_replace_rejected_session(opts: &AgentOptions, error: &RpcError) -> bool {
     let replaceable = if opts.session_id.is_some() {
         opts.session_id_is_continuity_hint
