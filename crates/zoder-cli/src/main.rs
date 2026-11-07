@@ -4998,7 +4998,7 @@ mod serving_provider_tests {
         let head = mk_provider("head-route");
         let fallback = mk_provider("fallback-route");
         assert_eq!(
-            serving_provider(Some(&fallback), &head).id,
+            serving_provider(Some(&fallback), &head).id.as_str(),
             "fallback-route",
             "telemetry for a turn the fallback answered must name the fallback, not the head"
         );
@@ -5008,7 +5008,7 @@ mod serving_provider_tests {
     fn missing_link_provider_falls_back_to_chain_head() {
         let head = mk_provider("head-route");
         assert_eq!(
-            serving_provider(None, &head).id,
+            serving_provider(None, &head).id.as_str(),
             "head-route",
             "a candidate with no resolved provider keeps the pre-existing head attribution"
         );
@@ -5018,7 +5018,7 @@ mod serving_provider_tests {
     fn head_link_provider_selects_the_head() {
         let head = mk_provider("head-route");
         assert_eq!(
-            serving_provider(Some(&head), &head).id,
+            serving_provider(Some(&head), &head).id.as_str(),
             "head-route",
             "when the head answers, its own provider is selected (no behaviour change)"
         );
@@ -5046,7 +5046,7 @@ mod serving_provider_tests {
         // `as_ref()` therefore yields `Option<&Provider>`, not `Option<&&Provider>`.
         let an_owned_copy: Option<Provider> = used_provider.clone();
         assert_eq!(
-            serving_provider(used_provider.as_ref(), &head).id,
+            serving_provider(used_provider.as_ref(), &head).id.as_str(),
             "fallback-route",
             "the owned winner slot must still attribute to the answering route"
         );
@@ -5056,7 +5056,10 @@ mod serving_provider_tests {
         );
         // And with no winner resolved, the head is retained.
         let none: Option<Provider> = None;
-        assert_eq!(serving_provider(none.as_ref(), &head).id, "head-route");
+        assert_eq!(
+            serving_provider(none.as_ref(), &head).id.as_str(),
+            "head-route"
+        );
     }
 }
 
