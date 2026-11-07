@@ -10314,6 +10314,61 @@ mod agentic_cost_tests {
         assert!(!second.finish().unwrap().2);
     }
 
+    /// ZD-01 (F5.4): the engine's cost tracker is per agent alias, so the
+    /// cost window of a chain fallback must be fenced under the alias that
+    /// ANSWERED. With only the head's scope open, a concurrent run on the
+    /// fallback alias was invisible: both runs then queried the same window
+    /// for that alias and each was billed the other's spend.
+    #[test]
+    fn a_fallback_alias_turn_is_fenced_under_its_own_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let mut scopes = AgenticCostScopes::new(&socket);
+        scopes.ensure("head-agent");
+        // The head failed; the chain falls back to another agent.
+        scopes.ensure("fallback-agent");
+        // Another zoder process runs a turn on that same fallback agent.
+        let other = AgenticCostScope::start(&socket, "fallback-agent").unwrap();
+        assert!(
+            other.finish().unwrap().2,
+            "the other process must see our fallback turn as an overlap"
+        );
+        let (_, _, overlapped) = scopes
+            .finish_for("fallback-agent")
+            .expect("the answering alias has a scope");
+        assert!(
+            overlapped,
+            "the window for the answering alias overlapped another run: its cost is unknown, \
+             never another run's spend"
+        );
+    }
+
+    /// ZD-01: a fallback turn on an otherwise idle alias stays authoritative,
+    /// and the scope is opened once per alias however often it is ensured.
+    #[test]
+    fn a_lone_fallback_alias_turn_stays_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let mut scopes = AgenticCostScopes::new(&socket);
+        scopes.ensure("head-agent");
+        scopes.ensure("fallback-agent");
+        scopes.ensure("fallback-agent");
+        let (from, to, overlapped) = scopes.finish_for("fallback-agent").unwrap();
+        assert!(!overlapped, "no other run touched the fallback alias");
+        assert!(from <= to);
+    }
+
+    /// ZD-01: an alias the chain never dispatched to has no window: the cost
+    /// is unavailable, never the head's window under another alias.
+    #[test]
+    fn an_alias_without_a_scope_has_no_cost_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("engine.sock");
+        let mut scopes = AgenticCostScopes::new(&socket);
+        scopes.ensure("head-agent");
+        assert!(scopes.finish_for("never-dispatched").is_none());
+    }
+
     /// MR !1 finding (issue #13 port): `agentic_cost` must retry the
     /// `cost/query` roundtrip a small number of times (3 total attempts
     /// with exponential backoff) to ride out the zeroclaw cost
