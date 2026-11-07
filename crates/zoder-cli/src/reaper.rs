@@ -399,7 +399,8 @@ fn report_spared_daemon(pid: u32, exemption: DaemonExemption) {
         .unwrap_or_else(|e| e.into_inner())
         .insert(pid)
     {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] left shared zeroclaw daemon pid={pid} running ({}); it serves every \
              zoder on this host, not just this run",
             exemption.reason()
@@ -623,11 +624,25 @@ fn engine_unreachable(id: &str) -> bool {
 /// Record a session id the agent is driving. Fed by the acp-client session
 /// observer the moment the engine mints it; the exit path and the signal
 /// handler read it back.
+///
+/// The observer fires once per `session/new`, so seeing an id again means a
+/// NEW turn is starting on a resumed session. Any `SETTLED` or `CANCELLED`
+/// mark it carries described the turn before this one, so both are cleared
+/// here: otherwise the exit path would skip a turn that is still running
+/// (ZD-16). Each set is locked on its own, never together with `SESSIONS`.
 pub(crate) fn note_session(session_id: &str) {
     let session_id = session_key(session_id);
     if session_id.is_empty() {
         return;
     }
+    SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
+    CANCELLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id);
     let mut seen = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
     if seen.iter().any(|s| s == session_id) {
         return;
@@ -731,7 +746,8 @@ impl ReapPlan {
         {
             roots.push(workspace);
         } else {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] not reaping -C {}: it is the shared temp root (or an ancestor of \
                  it), so a cwd there proves nothing about ownership; only this run's \
                  scratch directory is in scope. Pass --no-reap to silence this.",
@@ -898,7 +914,8 @@ impl ReapGuard {
 /// this whole change exists to stop repeating.
 fn log_outcome(outcome: &ReapOutcome) {
     for entry in &outcome.reaped {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] reaped orphan pid={} comm={} cwd={} via {}",
             entry.pid,
             entry.comm,
@@ -907,14 +924,17 @@ fn log_outcome(outcome: &ReapOutcome) {
         );
     }
     for entry in &outcome.skipped {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] skipped pid={} comm={}: it exited or the pid was recycled before \
              any signal was sent",
-            entry.pid, entry.comm
+            entry.pid,
+            entry.comm
         );
     }
     for entry in &outcome.survivors {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING pid={} comm={} cwd={} survived SIGKILL (uninterruptible \
              sleep?); it was NOT reaped",
             entry.pid,
@@ -923,7 +943,8 @@ fn log_outcome(outcome: &ReapOutcome) {
         );
     }
     if !outcome.reaped.is_empty() {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] reaped {} process(es) left in the workspace by the agent",
             outcome.reaped.len()
         );
@@ -961,9 +982,70 @@ impl Drop for ReapGuard {
 static ATTEMPT_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn cancel_recorded_sessions(socket: &Path, budget: Duration) {
-    // The outcome is deliberately dropped here: this path is the in-band
-    // drain, whose job is to stop the agent, not to report on it.
-    let _ = cancel_recorded_sessions_with_cleanup(socket, budget).await;
+    // The outcome does not decide anything here: this path is the in-band
+    // drain, whose job is to stop the agent. It is kept only for the run's
+    // telemetry (`cancel_report`).
+    note_exit_cleanup(cancel_recorded_sessions_with_cleanup(socket, budget).await);
+}
+
+/// What the exit-path cancels came to across this process, merged with
+/// [`merge_cleanup`]; `None` until a teardown ran. Read only by
+/// [`cancel_report`].
+static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
+
+fn note_exit_cleanup(cleanup: ExitCleanup) {
+    let mut seen = EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    *seen = Some(seen.map_or(cleanup, |prev| merge_cleanup(prev, cleanup)));
+}
+
+/// The session and cancel counts for the `zoder.run/1` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CancelReport {
+    /// `no_session`, `not_needed`, `confirmed` or `unconfirmed`.
+    pub outcome: &'static str,
+    pub seen: usize,
+    pub settled: usize,
+    pub cancelled: usize,
+    pub unreachable: usize,
+}
+
+/// What this process's session cancels came to. Read-only: it changes no
+/// teardown decision.
+pub(crate) fn cancel_report() -> CancelReport {
+    let sessions = SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let seen = sessions.len();
+    let settled = sessions.iter().filter(|id| session_settled(id)).count();
+    let cancelled = {
+        let set = CANCELLED.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .filter(|id| set.contains(session_key(id)))
+            .count()
+    };
+    let unreachable = {
+        let set = UNREACHABLE.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .iter()
+            .filter(|id| set.contains(session_key(id)))
+            .count()
+    };
+    let cleanup = *EXIT_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    let outcome = match cleanup {
+        _ if seen == 0 => "no_session",
+        Some(ExitCleanup::Confirmed) => "confirmed",
+        Some(ExitCleanup::Unconfirmed) => "unconfirmed",
+        Some(ExitCleanup::NothingToDo) => "not_needed",
+        // No teardown ran: only a run whose every turn ended needs none.
+        None if settled == seen => "not_needed",
+        None => "unconfirmed",
+    };
+    CancelReport {
+        outcome,
+        seen,
+        settled,
+        cancelled,
+        unreachable,
+    }
 }
 
 /// [`cancel_recorded_sessions`], also reporting what the CANCEL came to.
@@ -998,7 +1080,11 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
     // with many sessions cannot hold teardown for minutes. The cap is checked
     // only BETWEEN passes, so a pass that has started asks every session it
     // snapshotted — the ceiling never costs a session its first ask.
-    let phase_started = Instant::now();
+    // Both deadlines are on tokio's clock, the clock every wait inside
+    // `zoder_core::cancel_session` uses: measured on `std::time::Instant` they
+    // drift apart under a paused clock, and the retries were planned from a
+    // window that had already been spent (ZD-18).
+    let phase_started = tokio::time::Instant::now();
     let phase_cap = budget.saturating_mul(CANCEL_PHASE_CAP_WINDOWS);
     // Every session this phase RETIRES (acknowledged, or proven unreachable)
     // is a session whose turn is not still editing the tree. A session the
@@ -1036,7 +1122,7 @@ async fn cancel_recorded_sessions_with_cleanup(socket: &Path, budget: Duration) 
             // A per-session window, then move on to the next session: this one
             // is asked exactly once here and, if unconfirmed, its own retries
             // run inside this window before the next session gets its own.
-            let deadline = Instant::now() + budget;
+            let deadline = tokio::time::Instant::now() + budget;
             let outcome = cancel_session_with_retries(socket, &id, deadline).await;
             cleanup = merge_cleanup(cleanup, outcome);
         }
@@ -1066,8 +1152,12 @@ fn merge_cleanup(a: ExitCleanup, b: ExitCleanup) -> ExitCleanup {
 /// it a per-attempt slice of the remainder instead re-plans the sequence from a
 /// much smaller number and asks the daemon fewer times than the plan promised
 /// — silently, with nothing in the log to show for it.
-async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant) -> ExitCleanup {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+async fn cancel_session_with_retries(
+    socket: &Path,
+    id: &str,
+    deadline: tokio::time::Instant,
+) -> ExitCleanup {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Cut off before the ask reached the wire: it settles nothing, but it
         // is not evidence the daemon ignored us either.
@@ -1077,7 +1167,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
     ATTEMPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     match zoder_core::cancel_session(socket, id, remaining).await {
         Ok(()) => {
-            eprintln!("[zoder] cancelled agent session {id}");
+            crate::oplog!("zoder", "[zoder] cancelled agent session {id}");
             // Only a cancel that actually went out is marked. Marking a
             // failed one hides it from the blocking path and the later
             // teardown rounds, and a session nobody cancelled is a
@@ -1096,7 +1186,8 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                     // Said once — an absent socket is a fact about the run,
                     // not about the attempt.
                     if mark_unreachable(id) {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] session {id} not cancelled: the engine at {} is \
                          unreachable ({e:#}); it cannot be cancelled from here and may \
                          still run in a daemon that lost its socket; whatever it \
@@ -1119,7 +1210,7 @@ async fn cancel_session_with_retries(socket: &Path, id: &str, deadline: Instant)
                     // outlives the deadline is cut off mid-flight, which
                     // leaves the cancel unsettled — the state this path
                     // exists to prevent.
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let settled = if left < RETRY_ATTEMPT_FLOOR {
                         // The window is spent. The planner would still grant
                         // one minimum-length retry, but a 1 ms ask cannot
@@ -1359,7 +1450,8 @@ pub(crate) async fn retry_unconfirmed_cancel_within(
         tokio::time::sleep(delay).await;
         match zoder_core::cancel_session(socket, id, per_attempt).await {
             Ok(()) => {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] session {id} cancel confirmed on retry {}/{}",
                     attempt + 1,
                     retries
@@ -1646,7 +1738,7 @@ pub(crate) async fn settle_unconfirmed_cancel(
 /// not acknowledged` plus the session id here instead.
 fn finish(mut settled: UnconfirmedCancel, reason: String) -> UnconfirmedCancel {
     settled.reason = reason;
-    eprintln!("[zoder] WARNING: {}", settled.reason);
+    crate::oplog!("zoder", "[zoder] WARNING: {}", settled.reason);
     settled
 }
 
@@ -1858,7 +1950,8 @@ fn cancel_sessions_blocking_with_cleanup(
                     // later round asks again; anything else leaves the engine
                     // unproven and the session stays pending.
                     if io_error_proves_no_listener(&error) && mark_unreachable(id) {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] session {id} not cancelled: the engine at {} is \
                              unreachable ({error}); it cannot be cancelled from here and may \
                              still run in a daemon that lost its socket; whatever it \
@@ -1913,14 +2006,18 @@ fn cancel_sessions_blocking_with_cleanup(
                 // reply saying there was no turn left. A zero-length read is
                 // EOF, and a timeout is silence: neither is an answer.
                 if read > 0 {
-                    eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+                    crate::oplog!(
+                        "zoder",
+                        "[zoder] cancelled agent session {id} (blocking, best effort)"
+                    );
                     note(ExitCleanup::Confirmed, &mut cleanup);
                 } else {
                     // Reached the daemon, heard nothing. Best-effort cleanup:
                     // WARN, with the wording that says a settled turn does this
                     // too, and never an error -- the run's exit code is the
                     // loop's result and this must not touch it.
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] WARNING: session {id} was asked to cancel on the way out and \
                          the daemon did not ack within {BLOCKING_ACK_WAIT:?}; the session has \
                          already settled or the daemon is still finishing its turn. This is \
@@ -1933,7 +2030,10 @@ fn cancel_sessions_blocking_with_cleanup(
                 // again rather than pretending the agent was stopped.
                 mark_cancelled(id);
             } else {
-                eprintln!("[zoder] could not deliver a cancel for session {id}");
+                crate::oplog!(
+                    "zoder",
+                    "[zoder] could not deliver a cancel for session {id}"
+                );
                 note(ExitCleanup::Unconfirmed, &mut cleanup);
             }
         }
@@ -2075,6 +2175,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         // its session was retired from the sweep.
         if report.rounds == 0 {
             report.exit_cleanup = cleanup;
+            note_exit_cleanup(cleanup);
         }
         let outcome = reap(plan, grace);
         log_outcome(&outcome);
@@ -2107,7 +2208,8 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         if round + 1 == MAX_TEARDOWN_ROUNDS {
             report.producing_work = outcome.signalled_new_work();
             if report.producing_work {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
                      with the agent still producing work; leftovers may remain"
                 );
@@ -2116,7 +2218,8 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
     }
     let unreachable = unreachable_session_count();
     if unreachable > 0 {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING: {} session(s) could not be cancelled because the engine socket \
              at {} is gone; they may still run in a daemon that lost its socket. The \
              workspace was reaped for all {MAX_TEARDOWN_ROUNDS} rounds, but work started \
@@ -2325,7 +2428,8 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     if bounded_out {
         // Say so rather than pretending the workspace is clean: something is
         // still forking faster than the passes can catch it.
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING: stopped after {MAX_REAP_PASSES} reap passes with candidates \
              still appearing; the agent may still be forking new processes"
         );
@@ -2411,19 +2515,28 @@ fn install_signal_handler(plan: ReapPlan) {
     let term = match signal(SignalKind::terminate()) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGTERM handler unavailable ({e}); a signalled run will not reap");
+            crate::oplog!(
+                "zoder",
+                "[zoder] SIGTERM handler unavailable ({e}); a signalled run will not reap"
+            );
             None
         }
     };
     let intr = match signal(SignalKind::interrupt()) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGINT handler unavailable ({e}); Ctrl-C will not reap");
+            crate::oplog!(
+                "zoder",
+                "[zoder] SIGINT handler unavailable ({e}); Ctrl-C will not reap"
+            );
             None
         }
     };
     if term.is_none() && intr.is_none() {
-        eprintln!("[zoder] no signal handler could be installed; reaping is signal-blind");
+        crate::oplog!(
+            "zoder",
+            "[zoder] no signal handler could be installed; reaping is signal-blind"
+        );
         return;
     }
     tokio::spawn(async move {
@@ -2444,7 +2557,8 @@ fn install_signal_handler(plan: ReapPlan) {
             }
             (None, None) => return,
         };
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] {name} received: cancelling the agent session and reaping \
              workspace processes before exit"
         );
@@ -2872,7 +2986,7 @@ mod tests {
     /// only: a test in another module that drives a session through the
     /// installed session observer does not take this lock, so a session it
     /// notes WHILE a reaper test runs is not excluded.
-    struct ReapTestGuard {
+    pub(super) struct ReapTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -2882,7 +2996,7 @@ mod tests {
         }
     }
 
-    fn reap_test_lock() -> ReapTestGuard {
+    pub(super) fn reap_test_lock() -> ReapTestGuard {
         let lock = REAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_reaper_globals();
         ReapTestGuard { _lock: lock }
@@ -3686,6 +3800,63 @@ mod tests {
             .retain(|id| !ids.contains(id));
     }
 
+    /// ZD-16: a session id the engine hands back AGAIN (a resumed session on
+    /// the next loop iteration) is running a NEW turn. The previous turn's
+    /// "settled" or "cancel acknowledged" mark described that earlier turn
+    /// only, so it must not survive the re-mint: a run killed mid-turn has
+    /// to cancel the resumed session at exit, or the daemon keeps editing
+    /// the tree after zoder is gone.
+    #[test]
+    fn a_resumed_settled_session_is_pending_again() {
+        let _lock = reap_test_lock();
+        let id = "zd16-resumed-settled";
+        note_session(id);
+        note_session_settled(id);
+        assert!(
+            !pending_sessions().contains(&id.to_string()),
+            "precondition: a settled turn is not cancelled at exit"
+        );
+        // Iteration 2 resumes the same engine session: the observer reports
+        // the id again the moment the daemon answers `session/new`.
+        note_session(id);
+        assert!(
+            pending_sessions().contains(&id.to_string()),
+            "a resumed session runs a new turn and must be cancelled at exit"
+        );
+        assert!(
+            !session_settled(id),
+            "the stale settled mark must be cleared"
+        );
+        // No manual cleanup: the `reap_test_lock()` guard clears SESSIONS,
+        // SETTLED and CANCELLED when it drops, also on panic.
+    }
+
+    /// ZD-16: same for a session whose earlier author-phase cancel the daemon
+    /// acknowledged. The acknowledgement covered the turn it stopped; a turn
+    /// started later on the same id has never been cancelled.
+    #[test]
+    fn a_resumed_cancelled_session_is_pending_again() {
+        let _lock = reap_test_lock();
+        let id = "zd16-resumed-cancelled";
+        note_session(id);
+        note_session_cancelled(id);
+        assert!(
+            !pending_sessions().contains(&id.to_string()),
+            "precondition: an acknowledged cancel is not re-sent"
+        );
+        note_session(id);
+        assert!(
+            pending_sessions().contains(&id.to_string()),
+            "a resumed session runs a new turn and must be cancelled at exit"
+        );
+        assert!(
+            !engine_cancelled(id),
+            "the stale cancelled mark must be cleared"
+        );
+        // No manual cleanup: the `reap_test_lock()` guard clears SESSIONS,
+        // SETTLED and CANCELLED when it drops, also on panic.
+    }
+
     /// A process from a tick BEFORE the run began is never ours, even with its
     /// cwd inside the workspace. This is the boundary the pid snapshot draws,
     /// and it is the half of the granularity problem that can be decided.
@@ -4275,7 +4446,7 @@ mod tests {
             "the probe needs a budget whose plan has more than one retry: {planned_retries}"
         );
 
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         cancel_session_with_retries(&socket, "planned-sequence-probe", started + budget).await;
         let elapsed = started.elapsed();
 
@@ -4495,7 +4666,12 @@ mod tests {
             spawn_silent_cancel_daemon(&socket, std::sync::Arc::new(Mutex::new(Vec::new())));
         note_session("spent-window");
         let window = Duration::from_millis(150);
-        cancel_session_with_retries(&socket, "spent-window", Instant::now() + window).await;
+        cancel_session_with_retries(
+            &socket,
+            "spent-window",
+            tokio::time::Instant::now() + window,
+        )
+        .await;
         // Let the daemon thread count the connection(s) it served.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -6363,3 +6539,8 @@ mod tests {
         drop(server);
     }
 }
+
+// Fault-injection harness (ZD-20); it shares the test lock above.
+#[cfg(test)]
+#[path = "reaper_fault_tests.rs"]
+mod reaper_fault_tests;

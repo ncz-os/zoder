@@ -1,0 +1,70 @@
+{
+  "zoder.run/1": {
+    "null": {
+      "cancel_outcome": "string",
+      "command": "string",
+      "deadline_hit": "boolean",
+      "duration_ms": "integer",
+      "error": "null",
+      "exit_code": "integer",
+      "schema": "string",
+      "sessions_cancelled": "integer",
+      "sessions_seen": "integer",
+      "sessions_settled": "integer",
+      "sessions_unreachable": "integer"
+    },
+    "set": {
+      "cancel_outcome": "string",
+      "command": "string",
+      "deadline_hit": "boolean",
+      "duration_ms": "integer",
+      "error": "string",
+      "exit_code": "integer",
+      "schema": "string",
+      "sessions_cancelled": "integer",
+      "sessions_seen": "integer",
+      "sessions_settled": "integer",
+      "sessions_unreachable": "integer"
+    }
+  },
+  "zoder.turn/1": {
+    "null": {
+      "agent_alias": "string",
+      "billed_cost_usd": "null",
+      "billing": "string",
+      "cancel_outcome": "string",
+      "cost_unknown": "boolean",
+      "elapsed_ms": "integer",
+      "estimated_cost_usd": "null",
+      "exit_code": "null",
+      "iteration": "integer",
+      "model": "string",
+      "outcome": "string",
+      "phase": "string",
+      "provider": "string",
+      "route": "string",
+      "schema": "string",
+      "tokens_in": "integer",
+      "tokens_out": "integer"
+    },
+    "set": {
+      "agent_alias": "string",
+      "billed_cost_usd": "number",
+      "billing": "string",
+      "cancel_outcome": "string",
+      "cost_unknown": "boolean",
+      "elapsed_ms": "integer",
+      "estimated_cost_usd": "number",
+      "exit_code": "integer",
+      "iteration": "integer",
+      "model": "string",
+      "outcome": "string",
+      "phase": "string",
+      "provider": "string",
+      "route": "string",
+      "schema": "string",
+      "tokens_in": "integer",
+      "tokens_out": "integer"
+    }
+  }
+}

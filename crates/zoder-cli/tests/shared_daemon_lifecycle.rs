@@ -193,6 +193,30 @@ os.makedirs(STATE, exist_ok=True)
 CANCEL_FILE = os.path.join(STATE, "cancel_count")
 SIGNAL_FILE = os.path.join(STATE, "signal_count")
 INSTANCE_FILE = os.path.join(STATE, "instances")
+FAULT_FILE = os.path.join(STATE, "fault_script.json")
+FRAMES_FILE = os.path.join(STATE, "frames")
+
+
+def fault_script():
+    # Re-read on every frame so a test can change behaviour mid-run. No file
+    # (or an unreadable one) means the default behaviour below.
+    try:
+        with open(FAULT_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def send(conn, obj):
+    try:
+        conn.sendall((json.dumps(obj) + "\n").encode())
+    except Exception:
+        pass
+
+
+def turn_complete(conn, sid):
+    send(conn, {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"session_id": sid, "type": "turn_complete"}})
 
 LOCK = threading.Lock()
 CONNS = [0]
@@ -249,6 +273,11 @@ def handle(conn, sid):
                     continue
                 method = frame.get("method", "")
                 rid = frame.get("id")
+                if os.path.exists(FAULT_FILE):
+                    with LOCK:
+                        with open(FRAMES_FILE, "a") as f:
+                            f.write(method + "\n")
+                script = fault_script()
                 if method == "initialize":
                     reply(conn, rid, {"protocol_version": 1, "agent_capabilities": {}})
                 elif method == "agents/status":
@@ -280,12 +309,33 @@ def handle(conn, sid):
                                                                 "text": "fake turn"}}}}) + "\n").encode())
                     except Exception:
                         pass
+                    if script.get("on_prompt") == "complete":
+                        turn_complete(conn, sid)
                 elif method == "session/cancel":
-                    # Count but do NOT acknowledge: the shape of the bug.
+                    # Count but do NOT acknowledge (the shape of the bug)
+                    # unless a fault script says otherwise.
                     with LOCK:
                         CANCELS[0] += 1
                         with open(CANCEL_FILE, "w") as f:
                             f.write(str(CANCELS[0]) + "\n")
+                    target = frame.get("params", {}).get("session_id", sid)
+                    action = script.get("on_cancel", "silent")
+                    if action == "already_idle":
+                        # Echo the id (None: session/cancel is a notification).
+                        send(conn, {"jsonrpc": "2.0", "id": rid, "error": {
+                            "code": -32000, "message": "no active turn for session " + target}})
+                    elif action.startswith("ack_after_ms:"):
+                        delay = int(action.split(":", 1)[1]) / 1000.0
+                        threading.Timer(delay, turn_complete, args=(conn, target)).start()
+                    elif action == "close":
+                        return
+                    # "silent" and "ignore_cancel_honour_abort": no reply.
+                elif method == "session/abort":
+                    target = frame.get("params", {}).get("session_id", sid)
+                    if rid is not None:
+                        reply(conn, rid, {})
+                    if script.get("on_cancel") == "ignore_cancel_honour_abort":
+                        turn_complete(conn, target)
     except Exception:
         pass
     finally:
@@ -997,4 +1047,58 @@ fn a_live_daemons_socket_survives_the_production_start() {
         "the fixture must count the SIGTERM it received: the shared-daemon \
          test reads this counter to prove the daemon was stopped exactly once"
     );
+}
+
+/// The stand-in reads `<state>/fault_script.json` on every frame and logs each
+/// method to `<state>/frames`; with no script it keeps its default (silent)
+/// cancel. Drives the real `zoder_core::cancel_session` (ZD-20).
+#[cfg(target_os = "linux")]
+#[test]
+fn fault_script_drives_the_python_stand_in() {
+    let scratch = Scratch::new();
+    let data = scratch.data_dir.clone();
+    let socket = scratch.socket.clone();
+    // Stopped on every way out, a failed assertion included.
+    struct StopOnDrop(FakeDaemon);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.child.kill();
+            let _ = self.0.child.wait();
+        }
+    }
+    let _daemon = StopOnDrop(start_fake_daemon(&data, &socket));
+    assert!(
+        wait_for_file(&socket, Duration::from_secs(10)),
+        "the stand-in never bound"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cancel = |sid: &str| {
+        runtime.block_on(zoder_core::cancel_session(
+            &socket,
+            sid,
+            Duration::from_millis(400),
+        ))
+    };
+    let script = data.join("fault_script.json");
+    assert!(
+        cancel("default").is_err(),
+        "no script: the cancel is never acknowledged"
+    );
+    assert!(!data.join("frames").exists(), "no script: no frame log");
+    for (on_cancel, acknowledged) in [
+        ("silent", false),
+        ("ack_after_ms:20", true),
+        ("already_idle", true),
+        ("ignore_cancel_honour_abort", false),
+        ("close", false),
+    ] {
+        std::fs::write(&script, format!("{{\"on_cancel\": \"{on_cancel}\"}}")).unwrap();
+        assert_eq!(cancel(on_cancel).is_ok(), acknowledged, "{on_cancel}");
+    }
+    let frames = std::fs::read_to_string(data.join("frames")).unwrap();
+    assert_eq!(frames.matches("session/cancel").count(), 5, "{frames}");
+    assert_eq!(frames.matches("initialize").count(), 5, "{frames}");
 }
