@@ -9527,6 +9527,18 @@ pub(crate) fn turn_is_dead(turn: &Option<crate::TurnResult>) -> bool {
     turn.as_ref().is_none_or(|t| !t.run.succeeded())
 }
 
+/// Whether the loop's `--check` phase runs this iteration.
+///
+/// The check validates what the author turn wrote. It is skipped when the
+/// author never obtained a daemon session (FB110), and when the author turn
+/// failed (`author_failed`, no turn result) and the captured task diff is
+/// empty: in both cases nothing was authored, so a pass or fail would only
+/// describe the unmodified tree. A failed turn that left partial edits is
+/// checked, and a completed turn is always checked (ZD-03, F5.2).
+fn check_phase_runs(author_session_limit: bool, author_failed: bool, diff_is_empty: bool) -> bool {
+    !(author_session_limit || (author_failed && diff_is_empty))
+}
+
 /// Refines [`turn_is_dead`] for dead-streak accounting only. A turn that
 /// made at least one real tool call engaged the engine successfully even
 /// when its outcome was not "completed" (e.g. an internal timeout firing
@@ -10821,8 +10833,19 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // there is nothing the engine authored to validate. `check` still
         // names the configured command in the record; `check_passed: None`
         // is the honest "not run", never a fabricated green.
+        // ZD-03 (F5.2): the same holds for ANY failed author turn that left
+        // the task diff empty -- the check would only re-validate the base
+        // tree. A failed turn that left partial edits is still checked.
         let mut check_timed_out = false;
-        let (check_passed, check_tail) = if author_session_limit {
+        let run_check =
+            check_phase_runs(author_session_limit, turn.is_none(), diff.trim().is_empty());
+        if !run_check && !author_session_limit && check.is_some() && !cli.quiet {
+            eprintln!(
+                "[loop] iter {i}: author turn failed and left no edits; skipping the check \
+                 (nothing was authored to validate)"
+            );
+        }
+        let (check_passed, check_tail) = if !run_check {
             (None, String::new())
         } else {
             match &check {
