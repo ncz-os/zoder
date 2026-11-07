@@ -48,10 +48,65 @@ def literal_end(src, start):
     raise ValueError("unterminated literal")
 
 
+def skip_comment(src, i):
+    """Index just past a `//` or `/* */` comment starting at `i`, else `i`."""
+    if src.startswith("//", i):
+        end = src.find("\n", i)
+        return len(src) if end < 0 else end
+    if src.startswith("/*", i):
+        depth, i = 1, i + 2
+        while i < len(src) and depth:
+            if src.startswith("/*", i):
+                depth, i = depth + 1, i + 2
+            elif src.startswith("*/", i):
+                depth, i = depth - 1, i + 2
+            else:
+                i += 1
+        return i
+    return i
+
+
+RAW = re.compile(r'b?r(#*)"')
+
+
+def code_starts(src):
+    """Offsets of every `eprintln!(` that is code: not inside a comment, a
+    string, a raw string or a char literal."""
+    starts = []
+    i = 0
+    while i < len(src):
+        nxt = skip_comment(src, i)
+        if nxt != i:
+            i = nxt
+            continue
+        raw = RAW.match(src, i)
+        if raw and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            close = '"' + raw.group(1)
+            end = src.find(close, raw.end())
+            i = len(src) if end < 0 else end + len(close)
+            continue
+        c = src[i]
+        if c == '"':
+            i = literal_end(src, i)
+            continue
+        if c == "'" and re.match(r"'(\\.|[^\\'])'", src[i:]):
+            i += len(re.match(r"'(\\.|[^\\'])'", src[i:]).group(0))
+            continue
+        match = CALL.match(src, i)
+        if match and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            starts.append(i)
+        i += 1
+    return set(starts)
+
+
 def matching_paren(src, open_idx):
     depth = 0
     i = open_idx
     while i < len(src):
+        nxt = skip_comment(src, i)
+        if nxt != i:
+            i = nxt
+            continue
         c = src[i]
         if c == '"':
             i = literal_end(src, i)
@@ -83,9 +138,12 @@ def convert(src):
     out = []
     pos = 0
     count = 0
+    code = code_starts(src)
     for match in CALL.finditer(src):
         if match.start() < pos:
             continue
+        if match.start() not in code:
+            continue  # inside a comment or a string: not a call
         if src[:match.start()].endswith("::"):
             continue  # path-qualified (std::/crate::eprintln!): left alone
         line_start = src.rfind("\n", 0, match.start()) + 1
