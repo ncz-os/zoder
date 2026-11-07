@@ -399,7 +399,8 @@ fn report_spared_daemon(pid: u32, exemption: DaemonExemption) {
         .unwrap_or_else(|e| e.into_inner())
         .insert(pid)
     {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] left shared zeroclaw daemon pid={pid} running ({}); it serves every \
              zoder on this host, not just this run",
             exemption.reason()
@@ -745,7 +746,8 @@ impl ReapPlan {
         {
             roots.push(workspace);
         } else {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] not reaping -C {}: it is the shared temp root (or an ancestor of \
                  it), so a cwd there proves nothing about ownership; only this run's \
                  scratch directory is in scope. Pass --no-reap to silence this.",
@@ -912,7 +914,8 @@ impl ReapGuard {
 /// this whole change exists to stop repeating.
 fn log_outcome(outcome: &ReapOutcome) {
     for entry in &outcome.reaped {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] reaped orphan pid={} comm={} cwd={} via {}",
             entry.pid,
             entry.comm,
@@ -921,14 +924,17 @@ fn log_outcome(outcome: &ReapOutcome) {
         );
     }
     for entry in &outcome.skipped {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] skipped pid={} comm={}: it exited or the pid was recycled before \
              any signal was sent",
-            entry.pid, entry.comm
+            entry.pid,
+            entry.comm
         );
     }
     for entry in &outcome.survivors {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING pid={} comm={} cwd={} survived SIGKILL (uninterruptible \
              sleep?); it was NOT reaped",
             entry.pid,
@@ -937,7 +943,8 @@ fn log_outcome(outcome: &ReapOutcome) {
         );
     }
     if !outcome.reaped.is_empty() {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] reaped {} process(es) left in the workspace by the agent",
             outcome.reaped.len()
         );
@@ -1160,7 +1167,7 @@ async fn cancel_session_with_retries(
     ATTEMPT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     match zoder_core::cancel_session(socket, id, remaining).await {
         Ok(()) => {
-            eprintln!("[zoder] cancelled agent session {id}");
+            crate::oplog!("zoder", "[zoder] cancelled agent session {id}");
             // Only a cancel that actually went out is marked. Marking a
             // failed one hides it from the blocking path and the later
             // teardown rounds, and a session nobody cancelled is a
@@ -1179,7 +1186,8 @@ async fn cancel_session_with_retries(
                     // Said once — an absent socket is a fact about the run,
                     // not about the attempt.
                     if mark_unreachable(id) {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] session {id} not cancelled: the engine at {} is \
                          unreachable ({e:#}); it cannot be cancelled from here and may \
                          still run in a daemon that lost its socket; whatever it \
@@ -1442,7 +1450,8 @@ pub(crate) async fn retry_unconfirmed_cancel_within(
         tokio::time::sleep(delay).await;
         match zoder_core::cancel_session(socket, id, per_attempt).await {
             Ok(()) => {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] session {id} cancel confirmed on retry {}/{}",
                     attempt + 1,
                     retries
@@ -1723,7 +1732,7 @@ pub(crate) async fn settle_unconfirmed_cancel(
 /// log scraper keys on (`cancel not confirmed`, the session id) are unchanged.
 fn finish(mut settled: UnconfirmedCancel, reason: String) -> UnconfirmedCancel {
     settled.reason = reason;
-    eprintln!("[zoder] WARNING: {}", settled.reason);
+    crate::oplog!("zoder", "[zoder] WARNING: {}", settled.reason);
     settled
 }
 
@@ -1935,7 +1944,8 @@ fn cancel_sessions_blocking_with_cleanup(
                     // later round asks again; anything else leaves the engine
                     // unproven and the session stays pending.
                     if io_error_proves_no_listener(&error) && mark_unreachable(id) {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] session {id} not cancelled: the engine at {} is \
                              unreachable ({error}); it cannot be cancelled from here and may \
                              still run in a daemon that lost its socket; whatever it \
@@ -1990,14 +2000,18 @@ fn cancel_sessions_blocking_with_cleanup(
                 // reply saying there was no turn left. A zero-length read is
                 // EOF, and a timeout is silence: neither is an answer.
                 if read > 0 {
-                    eprintln!("[zoder] cancelled agent session {id} (blocking, best effort)");
+                    crate::oplog!(
+                        "zoder",
+                        "[zoder] cancelled agent session {id} (blocking, best effort)"
+                    );
                     note(ExitCleanup::Confirmed, &mut cleanup);
                 } else {
                     // Reached the daemon, heard nothing. Best-effort cleanup:
                     // WARN, with the wording that says a settled turn does this
                     // too, and never an error -- the run's exit code is the
                     // loop's result and this must not touch it.
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] WARNING: session {id} was asked to cancel on the way out and \
                          the daemon did not ack within {BLOCKING_ACK_WAIT:?}; the session has \
                          already settled or the daemon is still finishing its turn. This is \
@@ -2010,7 +2024,10 @@ fn cancel_sessions_blocking_with_cleanup(
                 // again rather than pretending the agent was stopped.
                 mark_cancelled(id);
             } else {
-                eprintln!("[zoder] could not deliver a cancel for session {id}");
+                crate::oplog!(
+                    "zoder",
+                    "[zoder] could not deliver a cancel for session {id}"
+                );
                 note(ExitCleanup::Unconfirmed, &mut cleanup);
             }
         }
@@ -2185,7 +2202,8 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
         if round + 1 == MAX_TEARDOWN_ROUNDS {
             report.producing_work = outcome.signalled_new_work();
             if report.producing_work {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] WARNING: teardown stopped after {MAX_TEARDOWN_ROUNDS} rounds \
                      with the agent still producing work; leftovers may remain"
                 );
@@ -2194,7 +2212,8 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
     }
     let unreachable = unreachable_session_count();
     if unreachable > 0 {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING: {} session(s) could not be cancelled because the engine socket \
              at {} is gone; they may still run in a daemon that lost its socket. The \
              workspace was reaped for all {MAX_TEARDOWN_ROUNDS} rounds, but work started \
@@ -2403,7 +2422,8 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
     if bounded_out {
         // Say so rather than pretending the workspace is clean: something is
         // still forking faster than the passes can catch it.
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] WARNING: stopped after {MAX_REAP_PASSES} reap passes with candidates \
              still appearing; the agent may still be forking new processes"
         );
@@ -2489,19 +2509,28 @@ fn install_signal_handler(plan: ReapPlan) {
     let term = match signal(SignalKind::terminate()) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGTERM handler unavailable ({e}); a signalled run will not reap");
+            crate::oplog!(
+                "zoder",
+                "[zoder] SIGTERM handler unavailable ({e}); a signalled run will not reap"
+            );
             None
         }
     };
     let intr = match signal(SignalKind::interrupt()) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!("[zoder] SIGINT handler unavailable ({e}); Ctrl-C will not reap");
+            crate::oplog!(
+                "zoder",
+                "[zoder] SIGINT handler unavailable ({e}); Ctrl-C will not reap"
+            );
             None
         }
     };
     if term.is_none() && intr.is_none() {
-        eprintln!("[zoder] no signal handler could be installed; reaping is signal-blind");
+        crate::oplog!(
+            "zoder",
+            "[zoder] no signal handler could be installed; reaping is signal-blind"
+        );
         return;
     }
     tokio::spawn(async move {
@@ -2522,7 +2551,8 @@ fn install_signal_handler(plan: ReapPlan) {
             }
             (None, None) => return,
         };
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] {name} received: cancelling the agent session and reaping \
              workspace processes before exit"
         );

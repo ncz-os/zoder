@@ -553,7 +553,7 @@ pub(crate) fn reconcile_policy_checked_turn(
 
     health.record_failure(health_model, &format!("policy: {failure}"));
     let health_save_error = health.save().err();
-    eprintln!("zoder: POLICY VIOLATION ({turn_kind}): {failure}");
+    crate::oplog!("zoder", "zoder: POLICY VIOLATION ({turn_kind}): {failure}");
     if let Some(error) = health_save_error {
         anyhow::bail!(
             "policy violation during {turn_kind}: {failure}; additionally failed to persist routing health: {error}"
@@ -2671,15 +2671,18 @@ fn filter_token_plan_exhausted<'a>(
         .find(|provider| !is_exhausted(provider));
     match next {
         Some(next) => {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] skipping MiniMax provider '{}' (M Plan quota exhausted, \
                      see `zoder quota minimax`); falling through to '{}'",
-                choice.id, next.id
+                choice.id,
+                next.id
             );
             Some(next)
         }
         None => {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] every MiniMax provider serving '{}' is M Plan quota-exhausted \
                      (see `zoder quota minimax`); attempting the call anyway to surface \
                      the reset time",
@@ -3133,7 +3136,10 @@ fn emit_json_failure(error: &anyhow::Error) {
         // attached. Say so on stderr and carry the write error in the
         // standalone envelope, so the classification is not lost.
         Err(write_err) => {
-            eprintln!("zoder: warning: could not attach the failure to result.json: {write_err:#}");
+            crate::oplog!(
+                "zoder",
+                "zoder: warning: could not attach the failure to result.json: {write_err:#}"
+            );
             classified.extra.insert(
                 "result_write_error".into(),
                 serde_json::Value::String(format!("{write_err:#}")),
@@ -4197,12 +4203,15 @@ async fn cmd_models(
     if verbose > 0 {
         if let Some(out) = &enrichment {
             if out.has_live_data() {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
-                    out.added, out.enriched, out.rows
+                    out.added,
+                    out.enriched,
+                    out.rows
                 );
             } else if let Some(err) = &out.error {
-                eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                crate::oplog!("zoder", "[zoder] live catalog enrichment skipped: {err}");
             }
         }
     }
@@ -5627,12 +5636,15 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
         if cli.verbose > 0 {
             if let Some(out) = &enrichment {
                 if out.has_live_data() {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
-                        out.added, out.enriched, out.rows
+                        out.added,
+                        out.enriched,
+                        out.rows
                     );
                 } else if let Some(err) = &out.error {
-                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                    crate::oplog!("zoder", "[zoder] live catalog enrichment skipped: {err}");
                 }
             }
         }
@@ -5650,12 +5662,15 @@ async fn cmd_route(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
         if cli.verbose > 0 {
             if let Some(out) = &enrichment {
                 if out.has_live_data() {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
-                        out.added, out.enriched, out.rows
+                        out.added,
+                        out.enriched,
+                        out.rows
                     );
                 } else if let Some(err) = &out.error {
-                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                    crate::oplog!("zoder", "[zoder] live catalog enrichment skipped: {err}");
                 }
             }
         }
@@ -5700,12 +5715,15 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
         if cli.verbose > 0 {
             if let Some(out) = &enrichment {
                 if out.has_live_data() {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
-                        out.added, out.enriched, out.rows
+                        out.added,
+                        out.enriched,
+                        out.rows
                     );
                 } else if let Some(err) = &out.error {
-                    eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                    crate::oplog!("zoder", "[zoder] live catalog enrichment skipped: {err}");
                 }
             }
         }
@@ -5715,12 +5733,15 @@ async fn cmd_consult(cli: &Cli, free_only: bool, limit: Option<usize>) -> anyhow
     if cli.verbose > 0 {
         if let Some(out) = &enrichment {
             if out.has_live_data() {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] live catalog: +{} added, ~{} enriched ({} daemon rows)",
-                    out.added, out.enriched, out.rows
+                    out.added,
+                    out.enriched,
+                    out.rows
                 );
             } else if let Some(err) = &out.error {
-                eprintln!("[zoder] live catalog enrichment skipped: {err}");
+                crate::oplog!("zoder", "[zoder] live catalog enrichment skipped: {err}");
             }
         }
     }
@@ -5854,7 +5875,8 @@ async fn try_model_with_budget(
                             .flatten(),
                     );
                     if !quiet {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] {} (retry {}/{} in {:.1}s)",
                             e.message,
                             attempt + 1,
@@ -6034,7 +6056,8 @@ async fn cmd_sop_with_socket<W: std::io::Write>(
                 .get("run_id")
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] warning: sops/run returned no `run_id` field; raw result: {}",
                         serde_json::to_string(&result).unwrap_or_default()
                     );
@@ -6794,7 +6817,7 @@ async fn cmd_exec_inner(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()>
         Ok(()) => Ok(()),
         Err(e) if is_engine_unavailable(&e) => {
             if !cli.quiet {
-                eprintln!("[zoder] engine unavailable ({e}); falling back to single-shot. Use --oneshot to skip the engine.");
+                crate::oplog!("zoder", "[zoder] engine unavailable ({e}); falling back to single-shot. Use --oneshot to skip the engine.");
             }
             cmd_exec_oneshot(cli, prompt).await
         }
@@ -6861,9 +6884,9 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
         .clone();
 
     if cli.explain || cli.dry_run {
-        eprintln!("[route] {reason}");
+        crate::oplog!("route", "[route] {reason}");
         if chain.len() > 1 {
-            eprintln!("[route] chain: {}", chain.join(" -> "));
+            crate::oplog!("route", "[route] chain: {}", chain.join(" -> "));
         }
     }
 
@@ -7157,8 +7180,8 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
             {
                 if !cli.quiet {
-                    eprintln!(
-                        "[zoder] skipping paid fallback {model_id} via {pid} (pass --allow-paid to use it)"
+                    crate::oplog!(
+                        "zoder", "[zoder] skipping paid fallback {model_id} via {pid} (pass --allow-paid to use it)"
                     );
                 }
                 continue;
@@ -7255,7 +7278,7 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
                 crate::provider_health::admit(&eng.cfg.health_path, pcfg, provider, model_id).await
             {
                 if !cli.quiet {
-                    eprintln!("[zoder] {message}");
+                    crate::oplog!("zoder", "[zoder] {message}");
                 }
                 attempt_failures.push(format!("{model_id} via {pid}: {message}"));
                 continue;
@@ -7363,7 +7386,7 @@ raise --max-tokens or lower its reasoning effort",
                 }
                 if i + 1 < chain.len() && !cli.quiet {
                     let next = &chain[i + 1];
-                    eprintln!("[zoder] {model_id} failed; falling back to {next}");
+                    crate::oplog!("zoder", "[zoder] {model_id} failed; falling back to {next}");
                 }
             }
         }
@@ -7510,15 +7533,15 @@ raise --max-tokens or lower its reasoning effort",
             sess.push("user", &prompt);
             sess.push("assistant", &content);
         }) {
-            eprintln!("zoder: warning: failed to save session: {e}");
+            crate::oplog!("zoder", "zoder: warning: failed to save session: {e}");
         }
     }
 
     // Reasoning-empty hint: some models spend the whole budget on hidden
     // reasoning, leaving content empty. Nudge the user toward --show-reasoning.
     if res.content.is_empty() && !cli.show_reasoning && !cli.quiet {
-        eprintln!(
-            "[zoder] note: empty content (model may be reasoning-only at this max-tokens; try --show-reasoning or a higher --max-tokens)"
+        crate::oplog!(
+            "zoder", "[zoder] note: empty content (model may be reasoning-only at this max-tokens; try --show-reasoning or a higher --max-tokens)"
         );
     }
 
@@ -7566,7 +7589,8 @@ raise --max-tokens or lower its reasoning effort",
             })
         );
         if substituted && !cli.quiet {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] WARNING: requested {requested} but served {served} \
                  (fallback substitution); pass --no-fallback to abort on fallback"
             );
@@ -7584,12 +7608,16 @@ raise --max-tokens or lower its reasoning effort",
             // use — a benchmark that pipes JSON will still catch it
             // via the structured `substituted` field above.
             if primary != used_model {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] WARNING: requested {primary} but served {used_model} \
                      (fallback substitution); pass --no-fallback to abort on fallback"
                 );
             }
-            eprintln!("[zoder] {used_model}  {tokens_out} tok  {cost_label}  {elapsed_ms:.0}ms");
+            crate::oplog!(
+                "zoder",
+                "[zoder] {used_model}  {tokens_out} tok  {cost_label}  {elapsed_ms:.0}ms"
+            );
         }
     }
     // The per-call records belong to the RUN, not to the JSON-output
@@ -8280,7 +8308,8 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
                 // daemon so the sibling processes' teardown can tell "a live
                 // client is using this daemon" from live state.
                 if let Err(e) = &lease {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "zoder: could not record this client's lease for the daemon at {} \
                          ({e}); the daemon is still usable, but this process will not stop it, \
                          because it cannot prove that nobody else is using it",
@@ -8308,7 +8337,8 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
                 // means something IS there and did not answer in time. There is
                 // no safe way to turn that into "delete it" without asking the
                 // operator, so we surface it and stop.
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "zoder: daemon at {} did not become ready ({reason}), but something \n\
                      is still bound to that socket. Refusing to remove it -- deleting a \n\
                      live daemon's socket is worse than failing here.\n\
@@ -8425,7 +8455,8 @@ async fn ensure_engine_daemon() -> Result<std::path::PathBuf, EngineUnavailableE
                         std::process::id(),
                         child.id(),
                     ) {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "zoder: started the daemon at {} but could not record this \
                              client's lease ({e}); the daemon is usable, and this process \
                              still owns it, but it will not stop it while another client \
@@ -8584,7 +8615,8 @@ fn record_daemon_pid(pid: u32, socket: &Path) -> Option<DaemonIdentity> {
     // that is the file every decision about THAT socket reads.
     let path = daemon_record_path_next_to(socket);
     if let Err(e) = write_daemon_record(&path, identity, owner) {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] could not record the daemon identity at {} ({e}); the reap scope \
              will still spare this daemon by executable identity, and any other zoder \
              process may not",
@@ -8916,7 +8948,8 @@ fn daemon_command(bin: &Path, config_dir: &Path) -> std::process::Command {
 /// 2026-10-21 incident, and one line naming the directory it actually got is
 /// what makes the next report of that class diagnosable.
 fn announce_daemon_spawn(working_dir: &Path) {
-    eprintln!(
+    crate::oplog!(
+        "zoder",
         "[zoder] starting the shared zeroclaw daemon (identity recorded at {}, cwd {})",
         daemon_pid_file_path().display(),
         working_dir.display()
@@ -12847,9 +12880,9 @@ pub(crate) async fn agentic_turn(
     // chain walk) and by the --explain / dry-run echo below.
     let primary = chain[0].clone();
     if cli.explain {
-        eprintln!("[route] {reason}");
+        crate::oplog!("route", "[route] {reason}");
         if chain.len() > 1 {
-            eprintln!("[route] chain: {}", chain.join(" -> "));
+            crate::oplog!("route", "[route] chain: {}", chain.join(" -> "));
         }
     }
 
@@ -13043,7 +13076,8 @@ pub(crate) async fn agentic_turn(
     // nothing.
     let writable_roots = resolve_writable_roots(&cwd, &cli.add_dir)?;
     if cli.enforce_writable_roots {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] writable-root enforcement ON: writes must land in {}",
             format_root_list(&writable_roots)
         );
@@ -13288,8 +13322,8 @@ pub(crate) async fn agentic_turn(
                 .append(true)
                 .open(&path)
                 .map_err(|e| {
-                    eprintln!(
-                        "zoder: warning: unable to open events file {:?}: {e}; event logging disabled",
+                    crate::oplog!(
+                        "zoder", "zoder: warning: unable to open events file {:?}: {e}; event logging disabled",
                         path
                     )
                 })
@@ -13364,7 +13398,8 @@ pub(crate) async fn agentic_turn(
     // fails OPEN, so a missing/corrupt marker changes nothing.
     let host_cooldown = zoder_core::cooldown_active(&eng.cfg.ledger_path);
     if host_cooldown && !cli.quiet {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] host cooldown active (monthly spend cap tripped on this host); \
              skipping metered chain links"
         );
@@ -13418,7 +13453,8 @@ pub(crate) async fn agentic_turn(
         // reports the cap instead of silently doing nothing.
         if host_cooldown && !link_provider_cost_neutral && !last {
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "zoder",
                     "[zoder] skipping metered chain link {model}: host cooldown (monthly cap)"
                 );
             }
@@ -13435,7 +13471,7 @@ pub(crate) async fn agentic_turn(
                 );
             }
             if !cli.quiet {
-                eprintln!("[zoder] skipping non-free chain link {model}");
+                crate::oplog!("zoder", "[zoder] skipping non-free chain link {model}");
             }
             skipped.insert(model);
             continue;
@@ -13451,8 +13487,8 @@ pub(crate) async fn agentic_turn(
                 gate.check(&link_entry, link_provider_paid, link_provider_cost_neutral)
             {
                 if !cli.quiet {
-                    eprintln!(
-                        "[zoder] skipping paid fallback {model} (pass --allow-paid to use it): {msg}"
+                    crate::oplog!(
+                        "zoder", "[zoder] skipping paid fallback {model} (pass --allow-paid to use it): {msg}"
                     );
                 }
                 if last {
@@ -13557,7 +13593,7 @@ pub(crate) async fn agentic_turn(
                     eprint!("{t}");
                 }
                 AgentEvent::ToolCall { name } => {
-                    eprintln!("\n[tool] {name}");
+                    crate::oplog!("tool", "\n[tool] {name}");
                 }
                 AgentEvent::ToolResult { .. } => {}
                 AgentEvent::Approval { tool, approved } => {
@@ -13592,8 +13628,8 @@ pub(crate) async fn agentic_turn(
                 // (the loop) to classify as `session_limit`.
                 if is_capacity_setup_error(&e) {
                     if !cli.quiet {
-                        eprintln!(
-                            "[zoder] {model} failed before any output (daemon at session capacity, \
+                        crate::oplog!(
+                            "zoder", "[zoder] {model} failed before any output (daemon at session capacity, \
                              not a model defect; no fallback attempted): {e}"
                         );
                     }
@@ -13621,7 +13657,7 @@ pub(crate) async fn agentic_turn(
                     Classification::Error,
                 );
                 if !cli.quiet {
-                    eprintln!("[zoder] {model} failed before any output: {e}");
+                    crate::oplog!("zoder", "[zoder] {model} failed before any output: {e}");
                 }
                 if last {
                     save_health(&health);
@@ -13841,7 +13877,8 @@ pub(crate) async fn agentic_turn(
         match turn_failure_health(&run.outcome, run.failure_detail.as_deref()) {
             TurnFailureHealth::SkipCapacity => {
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] {} did not complete: daemon at session capacity, \
                          not a model defect; no breaker strike recorded",
                         model_used
@@ -13970,9 +14007,15 @@ pub(crate) async fn cmd_exec_agentic(
             } else {
                 format!("${:.4}", t.cost_usd)
             };
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] {} via {}  {} tools  {}  {:.0}ms  [{}]",
-                t.model, t.alias, t.run.tool_calls, cost_label, t.elapsed_ms, t.run.outcome
+                t.model,
+                t.alias,
+                t.run.tool_calls,
+                cost_label,
+                t.elapsed_ms,
+                t.run.outcome
             );
         }
     }
@@ -13996,7 +14039,7 @@ pub(crate) async fn cmd_exec_agentic(
         // object (which also has it under `failure_detail` / `error`).
         if !cli.quiet {
             if let Some(detail) = t.run.failure_detail.as_deref() {
-                eprintln!("[zoder] {}", detail.trim());
+                crate::oplog!("zoder", "[zoder] {}", detail.trim());
             }
         }
         // Partial work is preserved: on-disk edits stay, and the streamed text
@@ -14004,8 +14047,8 @@ pub(crate) async fn cmd_exec_agentic(
         if !cli.quiet && !cli.json {
             let timed_out = t.run.outcome == zoder_core::AgentOutcome::Timeout;
             let idle = t.run.outcome == zoder_core::AgentOutcome::IdleTimeout;
-            eprintln!(
-                "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
+            crate::oplog!(
+                "zoder", "[zoder] turn {} ({} chars captured). Resume with: zoder exec --session {} \"<continue>\"{}",
                 if timed_out {
                     "timed out — partial work kept"
                 } else if idle {
@@ -14174,7 +14217,10 @@ fn resolve_engine_kind(cli: &Cli) -> anyhow::Result<EngineKind> {
 /// L5: surface a warning instead of silently dropping a persistence failure.
 fn save_health(health: &HealthStore) {
     if let Err(e) = health.save() {
-        eprintln!("zoder: warning: failed to persist health store: {e}");
+        crate::oplog!(
+            "zoder",
+            "zoder: warning: failed to persist health store: {e}"
+        );
     }
 }
 
@@ -15805,7 +15851,8 @@ async fn run_probe_default(
     let targets = default_probe_targets(provider_cfg, &eng.corpus);
     if targets.is_empty() {
         if !quiet {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] no free corpus model is served by default provider '{}'; nothing \
                  probed. Use `health --probe --all` to probe every provider's live catalog.",
                 provider_cfg.id
@@ -15814,7 +15861,8 @@ async fn run_probe_default(
         return Ok(());
     }
     if !quiet {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "[zoder] probing {} free models served by {}...",
             targets.len(),
             provider_cfg.id
@@ -16023,7 +16071,7 @@ async fn run_probe_all(
             Ok(pr) => pr,
             Err(e) => {
                 if !quiet {
-                    eprintln!("[zoder] skip provider {}: {e}", p.id);
+                    crate::oplog!("zoder", "[zoder] skip provider {}: {e}", p.id);
                 }
                 // C3-HP1: the provider is in the config but its prober
                 // could not be built. If we just `continue`, none of its
@@ -16061,10 +16109,12 @@ async fn run_probe_all(
             Ok(Err(_)) => None,
             Err(_) => {
                 if !quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] list_models() for {} timed out after {}s; \
                          falling back to provider id",
-                        p.id, PROBE_PING_TIMEOUT_SECS
+                        p.id,
+                        PROBE_PING_TIMEOUT_SECS
                     );
                 }
                 None
@@ -16625,14 +16675,19 @@ async fn cmd_refresh(cli: &Cli, force: bool) -> anyhow::Result<()> {
                     Ok(ids) => ids,
                     Err(e) => {
                         if !cli.quiet {
-                            eprintln!("[refresh] skip free provider {}: {}", p.id, e.message);
+                            crate::oplog!(
+                                "refresh",
+                                "[refresh] skip free provider {}: {}",
+                                p.id,
+                                e.message
+                            );
                         }
                         continue;
                     }
                 },
                 Err(e) => {
                     if !cli.quiet {
-                        eprintln!("[refresh] skip free provider {}: {e}", p.id);
+                        crate::oplog!("refresh", "[refresh] skip free provider {}: {e}", p.id);
                     }
                     continue;
                 }
@@ -17230,8 +17285,8 @@ fn pricing_source_switch_with(config_wants_file: bool) -> FileSwitch {
             "" | "auto" => FileSwitch::None,
             "file" => FileSwitch::Env,
             other => {
-                eprintln!(
-                    "zoder: warning: invalid ZODER_PRICING_SOURCE={other:?} (expected \"auto\" or \"file\"); treating as auto"
+                crate::oplog!(
+                    "zoder", "zoder: warning: invalid ZODER_PRICING_SOURCE={other:?} (expected \"auto\" or \"file\"); treating as auto"
                 );
                 FileSwitch::None
             }
@@ -18156,7 +18211,10 @@ async fn cmd_quota(provider: &str, local: bool, json: bool) -> anyhow::Result<()
         let mut state = zoder_core::minimax::load_state(&path);
         state.record_remains(&p.id, r.clone(), chrono::Utc::now());
         if let Err(e) = zoder_core::minimax::save_state(&path, &state) {
-            eprintln!("zoder: warning: could not persist the quota refresh: {e}");
+            crate::oplog!(
+                "zoder",
+                "zoder: warning: could not persist the quota refresh: {e}"
+            );
         }
     }
     let persisted = zoder_core::minimax::default_state_path()
