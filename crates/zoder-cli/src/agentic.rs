@@ -645,7 +645,12 @@ enum ReviewerError {
     /// (policy rejection, missing provider config, ledger reservation
     /// failure, etc.). The chain MUST stop — the next call site must report
     /// the error instead of fabricating success.
-    Fatal { message: String },
+    Fatal {
+        message: String,
+        /// The provider error kind, when the failure came from a provider
+        /// call; `None` for zoder's own structural refusals.
+        kind: Option<zoder_core::ErrKind>,
+    },
     /// The pre-query health gate refused to query this model (breaker open,
     /// or its health probe failed). Already recorded in the health
     /// store and in `skipped_unhealthy`; the chain moves to the next
@@ -666,6 +671,7 @@ impl ReviewerError {
     fn fatal<S: Into<String>>(msg: S) -> Self {
         ReviewerError::Fatal {
             message: msg.into(),
+            kind: None,
         }
     }
 }
@@ -1083,7 +1089,7 @@ async fn complete_once_tracked(
                     reason: "unavailable".to_string(),
                 });
             }
-            Err(ReviewerError::Fatal { message }) => {
+            Err(ReviewerError::Fatal { message, .. }) => {
                 // A non-fallback-worthy error MUST halt the chain — these
                 // are structural problems (policy, missing provider
                 // config, ledger failure, token gating, etc.) where the
@@ -1138,16 +1144,9 @@ async fn complete_once_tracked(
 /// out separately because an operator triaging "why did this reviewer take a
 /// second model?" needs to tell a slow endpoint from a dead one.
 fn reviewer_skip_reason(kind: zoder_core::ErrKind, message: &str) -> &'static str {
-    // F2.5: only the diagnostic HEAD describes the failure. A provider error
-    // body can name a parameter like `stream_timeout` on a plain 400, and
-    // reporting that as "timeout" sends an operator after the wrong cause.
-    let lower = message.to_ascii_lowercase();
-    let head = lower.split('{').next().unwrap_or("");
-    if matches!(kind, zoder_core::ErrKind::Timeout)
-        || head.contains("timed out")
-        || head.contains("timeout")
-        || head.contains("deadline")
-    {
+    // F2.5: only the diagnostic HEAD describes the failure (see
+    // `text_reads_as_timeout`).
+    if matches!(kind, zoder_core::ErrKind::Timeout) || text_reads_as_timeout(message) {
         "timeout"
     } else {
         "unavailable"
@@ -2531,6 +2530,7 @@ async fn dispatch_reviewer_for_model(
                 if e.emitted {
                     return Err(ReviewerError::Fatal {
                         message: format!("reviewer {model}: {}", e.message),
+                        kind: Some(e.kind),
                     });
                 }
                 // A gated model answering 429 is rate-limited fleet-wide:
@@ -2608,6 +2608,7 @@ async fn dispatch_reviewer_for_model(
                 }
                 return Err(ReviewerError::Fatal {
                     message: format!("reviewer {model}: {}", e.message),
+                    kind: Some(e.kind),
                 });
             }
         }
@@ -7143,8 +7144,22 @@ fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::Confirm
             _ => ConfirmerOutcome::Empty,
         },
         ReviewerError::Skipped { .. } => ConfirmerOutcome::Unavailable,
-        ReviewerError::Fatal { message } => {
-            if message.contains("timed out") || message.contains("timeout") {
+        // A provider error's kind decides; only an error that never had one
+        // falls back to the shared text helper.
+        ReviewerError::Fatal {
+            kind: Some(kind), ..
+        } => {
+            if *kind == zoder_core::ErrKind::Timeout {
+                ConfirmerOutcome::Timeout
+            } else {
+                ConfirmerOutcome::Empty
+            }
+        }
+        ReviewerError::Fatal {
+            message,
+            kind: None,
+        } => {
+            if text_reads_as_timeout(message) {
                 ConfirmerOutcome::Timeout
             } else {
                 ConfirmerOutcome::Empty
@@ -7924,9 +7939,8 @@ impl UnconfirmedCancelTracker {
     }
 
     /// Record one iteration's author outcome and report whether the loop must
-    /// abort. `cancel_unconfirmed` is the single bit the loop already derives
-    /// from [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`]; the text matching is NOT
-    /// changed here.
+    /// abort. `cancel_unconfirmed` is the single bit the loop reads from the
+    /// author error's [`AuthorPhaseErrorKind::CancelUnconfirmed`] kind.
     pub(crate) fn observe(&mut self, cancel_unconfirmed: bool) -> bool {
         if cancel_unconfirmed {
             self.streak = self.streak.saturating_add(1);
@@ -7940,6 +7954,109 @@ impl UnconfirmedCancelTracker {
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
 pub(crate) const AUTHOR_CANCEL_UNCONFIRMED_MARKER: &str = "author cancellation unconfirmed:";
+
+/// What went wrong in the author phase, decided where it happened rather than
+/// re-read from the message text afterwards (ZD-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorPhaseErrorKind {
+    /// The turn returned an error before the watchdog fired. `timed_out` is
+    /// the engine's own timeout, which only reaches zoder as text and is read
+    /// by [`text_reads_as_timeout`].
+    Failed { timed_out: bool },
+    /// The watchdog fired and the daemon cancel was confirmed (or the turn
+    /// never minted a session, so there was nothing to cancel).
+    TimedOut,
+    /// The watchdog fired and the daemon never confirmed the cancel: the turn
+    /// may still be running, so its tree is not a finished turn.
+    CancelUnconfirmed,
+}
+
+impl AuthorPhaseErrorKind {
+    /// The name the iteration record carries in `author_error_kind`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AuthorPhaseErrorKind::Failed { .. } => "failed",
+            AuthorPhaseErrorKind::TimedOut => "timed_out",
+            AuthorPhaseErrorKind::CancelUnconfirmed => "cancel_unconfirmed",
+        }
+    }
+
+    /// Whether the phase ran out of time, by the watchdog or the engine.
+    pub(crate) fn timed_out(self) -> bool {
+        !matches!(self, AuthorPhaseErrorKind::Failed { timed_out: false })
+    }
+
+    /// The failure code this author error stands for when it is the root
+    /// cause of an unresolved loop.
+    pub(crate) fn failure_code(self) -> crate::failure::FailureCode {
+        match self {
+            AuthorPhaseErrorKind::Failed { .. } => crate::failure::FailureCode::AuthorFailed,
+            AuthorPhaseErrorKind::TimedOut => crate::failure::FailureCode::AuthorTimeout,
+            AuthorPhaseErrorKind::CancelUnconfirmed => {
+                crate::failure::FailureCode::CancelUnconfirmed
+            }
+        }
+    }
+
+    /// The failure code for an `author_error_kind` read back from a record.
+    pub(crate) fn code_for_record(name: &str) -> Option<crate::failure::FailureCode> {
+        [
+            AuthorPhaseErrorKind::Failed { timed_out: false },
+            AuthorPhaseErrorKind::TimedOut,
+            AuthorPhaseErrorKind::CancelUnconfirmed,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == name)
+        .map(AuthorPhaseErrorKind::failure_code)
+    }
+}
+
+/// The error [`author_phase_with_cancel`] returns: a typed kind plus the
+/// operator-facing message. `Display` is the message, byte-identical to the
+/// strings the phase reported before it was typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorPhaseError {
+    pub(crate) kind: AuthorPhaseErrorKind,
+    pub(crate) message: String,
+}
+
+impl AuthorPhaseError {
+    /// A turn error, passed through verbatim.
+    fn failed(message: String) -> Self {
+        Self {
+            kind: AuthorPhaseErrorKind::Failed {
+                timed_out: text_reads_as_timeout(&message),
+            },
+            message,
+        }
+    }
+
+    pub(crate) fn timed_out(&self) -> bool {
+        self.kind.timed_out()
+    }
+
+    pub(crate) fn cancel_unconfirmed(&self) -> bool {
+        self.kind == AuthorPhaseErrorKind::CancelUnconfirmed
+    }
+}
+
+impl std::fmt::Display for AuthorPhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The ONE place a timeout is read from error text, for errors that only
+/// arrive as text (the engine's turn errors, untyped reviewer errors).
+///
+/// F2.5: only the diagnostic head describes the failure. A provider body can
+/// name a parameter like `stream_timeout` on a plain 400, and reading that as
+/// a timeout sends an operator after the wrong cause.
+pub(crate) fn text_reads_as_timeout(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let head = lower.split('{').next().unwrap_or("");
+    head.contains("timed out") || head.contains("timeout") || head.contains("deadline")
+}
 
 /// Prefix of a best-effort author-cancel warning: the turn MAY still be
 /// running, the tree may be mid-edit, so the iteration is unresolved — but the
@@ -8172,7 +8289,7 @@ async fn author_phase_with_cancel<F, C, S>(
     turn_fut: F,
     cancel: C,
     settled: S,
-) -> Result<crate::TurnResult, String>
+) -> Result<crate::TurnResult, AuthorPhaseError>
 where
     F: std::future::Future<Output = anyhow::Result<crate::TurnResult>>,
     C: std::future::Future<Output = anyhow::Result<()>>,
@@ -8180,7 +8297,7 @@ where
 {
     let budget = std::time::Duration::from_secs(secs.max(1));
     match tokio::time::timeout(budget, turn_fut).await {
-        Ok(res) => res.map_err(|e| e.to_string()),
+        Ok(res) => res.map_err(|e| AuthorPhaseError::failed(e.to_string())),
         Err(_) => {
             if !quiet {
                 eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
@@ -8198,15 +8315,21 @@ where
             let cancelled = cancel_under_deadline(deadline, cancel).await;
             settled.await;
             match cancelled {
-                Ok(()) => Err(format!(
-                    "author phase timed out after {secs}s (killed, daemon cancel issued)"
-                )),
+                Ok(()) => Err(AuthorPhaseError {
+                    kind: AuthorPhaseErrorKind::TimedOut,
+                    message: format!(
+                        "author phase timed out after {secs}s (killed, daemon cancel issued)"
+                    ),
+                }),
                 // Best-effort: the caller must still capture and report the
                 // tree, but it must NOT treat this diff as reviewable.
-                Err(cancel_err) => Err(format!(
-                    "author phase timed out after {secs}s (killed, daemon cancel unconfirmed: \
-                     {cancel_err})"
-                )),
+                Err(cancel_err) => Err(AuthorPhaseError {
+                    kind: AuthorPhaseErrorKind::CancelUnconfirmed,
+                    message: format!(
+                        "author phase timed out after {secs}s (killed, daemon cancel \
+                         unconfirmed: {cancel_err})"
+                    ),
+                }),
             }
         }
     }
@@ -9661,7 +9784,18 @@ fn loop_failure(
     // failure join it here. When the author DID produce a model and the
     // review then failed, the review error still wins as before.
     let author_failed_before_model = field("author_model").is_none() && author_error.is_some();
-    let evidence = if author_hit_engine_budget || author_failed_before_model {
+    let author_is_evidence = author_hit_engine_budget || author_failed_before_model;
+    // ZD-08: when the author is the root cause, its TYPED kind names the
+    // failure. The watchdog's own outcomes (timeout, unconfirmed cancel) are
+    // facts and win outright; a plain failed turn defers to a more specific
+    // engine code in its text (budget refusal, session limit) and is
+    // `author_failed` otherwise.
+    let author_kind_code = if author_is_evidence {
+        field("author_error_kind").and_then(|kind| AuthorPhaseErrorKind::code_for_record(&kind))
+    } else {
+        None
+    };
+    let evidence = if author_is_evidence {
         author_error.unwrap_or_default()
     } else {
         review_error.or(author_error).unwrap_or_default()
@@ -9680,7 +9814,16 @@ fn loop_failure(
             message,
         ));
     }
-    let class = if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
+    let watchdog_code = author_kind_code.filter(|code| {
+        matches!(
+            code,
+            crate::failure::FailureCode::AuthorTimeout
+                | crate::failure::FailureCode::CancelUnconfirmed
+        )
+    });
+    let class = if let Some(code) = watchdog_code {
+        crate::failure::ClassifiedFailure::new(code, evidence.clone())
+    } else if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
         // The engine's own budget refusal carries a reset timestamp; it
         // must survive into the JSON so the caller knows when to come back.
         if code == crate::failure::FailureCode::EngineBudgetExceeded {
@@ -9688,6 +9831,8 @@ fn loop_failure(
         } else {
             crate::failure::ClassifiedFailure::new(code, evidence.clone())
         }
+    } else if let Some(code) = author_kind_code {
+        crate::failure::ClassifiedFailure::new(code, evidence.clone())
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
         crate::failure::ClassifiedFailure::new(
             crate::failure::FailureCode::ReviewersUnavailable,
@@ -10469,6 +10614,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // [`author_phase_with_cancel`] for the cancel/settle contract and the
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
+        // The typed kind of `author_err` (ZD-08): every check below reads
+        // this, never the message text.
+        let mut author_err_kind: Option<AuthorPhaseErrorKind> = None;
         // Consecutive author turns whose cancel could not be confirmed. This is
         // the ONE thing about an unconfirmed cancel that can stop the loop. On
         // a daemon this loop owns, two in a row means the daemon is not
@@ -10620,7 +10768,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 total_cost += t.cost_usd;
                 Some(t)
             }
-            Err(msg) => {
+            Err(err) => {
                 // An unconfirmed author cancel is NOT fatal any more: the tree
                 // still gets captured, committed and reported, and the reason
                 // is carried in `author_error` + the iter record. Only a run
@@ -10633,7 +10781,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         .unwrap_or_else(|e| e.into_inner())
                         .clone()
                     {
-                        let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                        let cancel_state = if err.cancel_unconfirmed() {
                             "cancel_unconfirmed"
                         } else {
                             // The daemon answered or the turn failed on its
@@ -10646,9 +10794,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         };
                         state.note_session(&sid, cancel_state);
                     }
-                    state.note_provider_error(&msg);
+                    state.note_provider_error(&err.message);
                 }
-                if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                if err.cancel_unconfirmed() {
                     unconfirmed_cancel_streak.observe(true);
                     eprintln!(
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
@@ -10660,9 +10808,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 } else {
                     unconfirmed_cancel_streak.observe(false);
                 }
-                let timed_out = msg.contains("timed out") || msg.contains("timeout");
+                let timed_out = err.timed_out();
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: author turn did not finish: {msg}");
+                    eprintln!("[loop] iter {i}: author turn did not finish: {err}");
                     if timed_out {
                         eprintln!(
                             "[loop] hint: raise the per-turn budget with `--agent-timeout <secs>` \
@@ -10671,14 +10819,15 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                         );
                     }
                 }
-                author_err = Some(msg);
+                author_err_kind = Some(err.kind);
+                author_err = Some(err.message);
                 None
             }
         };
         {
             let (a_status, a_error) = match (&turn, &author_err) {
                 (Some(_), _) => ("ok", None),
-                (None, Some(m)) if m.contains("timed out") || m.contains("timeout") => {
+                (None, Some(m)) if author_err_kind.is_some_and(AuthorPhaseErrorKind::timed_out) => {
                     ("timeout", Some(m.chars().take(300).collect::<String>()))
                 }
                 (None, Some(m)) => ("error", Some(m.chars().take(300).collect::<String>())),
@@ -10788,10 +10937,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // The run is ONE on a daemon this loop owns and the FIRST one on a
         // shared daemon (`cancel_abort_threshold`): there, a second attempt
         // just queues behind other tenants for another full phase budget.
-        let cancel_unconfirmed = matches!(
-            author_err.as_deref(),
-            Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
-        );
+        let cancel_unconfirmed = author_err_kind == Some(AuthorPhaseErrorKind::CancelUnconfirmed);
         let aborted_on_unconfirmed_cancel = cancel_unconfirmed
             && unconfirmed_cancel_streak.streak() >= unconfirmed_cancel_streak.threshold();
         if aborted_on_unconfirmed_cancel {
@@ -10942,7 +11088,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     (None, Some(e)) => format!("interrupted: {e}"),
                     (None, None) => "interrupted".to_string(),
                 },
-                "author_cancel_unconfirmed": author_err.as_deref().is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)),
+                "author_cancel_unconfirmed": cancel_unconfirmed,
+                "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
                 "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
                 "diff_lines": diff_lines,
                 "substance": format!("{:?}", diff_substance),
@@ -10953,7 +11100,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 "start_dirty": loop_start.dirty,
                 "review_chunks": 0,
                 "review_error": "review skipped: the author cancel was never confirmed, so this \
-diff is not a finished turn",
+            diff is not a finished turn",
                 "review_complete": false,
                 "reviewer_verdicts": [],
                 "review_unconfirmed_cancel": true,
@@ -11003,6 +11150,7 @@ diff is not a finished turn",
                 "iter": i,
                 "author_model": turn.as_ref().map(|t| t.model.clone()),
                 "author_error": author_err.clone(),
+                "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
                 "author_outcome": turn.as_ref().map(|t| t.run.outcome.clone()),
                 "author_cancel_unconfirmed": cancel_unconfirmed,
                 "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
@@ -11137,9 +11285,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // either. Skip the reviewer, record the iteration as unresolved with
         // the exact reason, and let the tree stay on disk — the loop's exit
         // paths commit and report it.
-        let review_unconfirmed_cancel = author_err
-            .as_deref()
-            .is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
+        let review_unconfirmed_cancel = cancel_unconfirmed;
         // A. The loop reviewer path accepts ONLY a structured JSON verdict per
         // chunk (see `run_loop_review`), and an INCOMPLETE review — provider
         // error, timeout, unparseable chunk, oversized diff — is
@@ -11437,6 +11583,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
             "iter": i,
             "author_model": author_model,
             "author_error": author_error,
+            "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
             "reviewer_model": reviewer_model,
             "tool_calls": tool_calls,
             "author_outcome": author_outcome,
@@ -14792,7 +14939,8 @@ must reap the direct shell on the timeout branch)"
         let res = watchdog_handle
             .await
             .expect("watchdog task must complete")
-            .expect_err("watchdog must return Err on timeout");
+            .expect_err("watchdog must return Err on timeout")
+            .to_string();
         assert!(
             cancel_called.load(Ordering::SeqCst),
             "Z-8 fix: watchdog must invoke cancel on timeout; got no cancel"
@@ -14830,7 +14978,9 @@ must reap the direct shell on the timeout branch)"
             async move { settled_flag.store(true, std::sync::atomic::Ordering::SeqCst) },
         )
         .await;
-        let msg = result.expect_err("a timed-out turn is still an Err");
+        let msg = result
+            .expect_err("a timed-out turn is still an Err")
+            .to_string();
         assert!(
             msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
             "the reason must carry the unconfirmed marker; got: {msg}"
@@ -14961,7 +15111,8 @@ must reap the direct shell on the timeout branch)"
             std::future::ready(()),
         )
         .await
-        .expect_err("a turn that never finishes must fail the phase");
+        .expect_err("a turn that never finishes must fail the phase")
+        .to_string();
 
         assert!(
             err.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
