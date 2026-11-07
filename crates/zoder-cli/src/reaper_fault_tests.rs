@@ -223,7 +223,9 @@ async fn serve(
                 match action {
                     OnCancel::Silent | OnCancel::IgnoreCancelHonourAbort => {}
                     OnCancel::AlreadyIdle => out.push(frame_line(serde_json::json!({
-                        "jsonrpc": "2.0", "id": null,
+                        // `session/cancel` is a notification, so this echoes a null id;
+                        // echoing keeps the reply correct for a daemon that is sent one.
+                        "jsonrpc": "2.0", "id": id,
                         "error": {"code": -32000, "message": format!("no active turn for session {sid}")},
                     }))),
                     OnCancel::AckAfter(delay) => {

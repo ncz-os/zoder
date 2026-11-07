@@ -321,7 +321,8 @@ def handle(conn, sid):
                     target = frame.get("params", {}).get("session_id", sid)
                     action = script.get("on_cancel", "silent")
                     if action == "already_idle":
-                        send(conn, {"jsonrpc": "2.0", "id": None, "error": {
+                        # Echo the id (None: session/cancel is a notification).
+                        send(conn, {"jsonrpc": "2.0", "id": rid, "error": {
                             "code": -32000, "message": "no active turn for session " + target}})
                     elif action.startswith("ack_after_ms:"):
                         delay = int(action.split(":", 1)[1]) / 1000.0
