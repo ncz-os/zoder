@@ -24,7 +24,7 @@ run_assert() {
     return 1
 }
 
-# Test 1: clean tri-arch build with manifest + .sha256 files must exit 0.
+# Test 1: clean Linux build (x86_64 + aarch64) with manifest + .sha256 files must exit 0.
 test_clean_pass() {
     workdir=$(mktemp -d)
     mkdir -p "$workdir/dist"
@@ -32,15 +32,15 @@ test_clean_pass() {
 {"zoder": {"head": "deadbeef", "version": "0.2.1"}, "zeroclaw": {"sha": "0123456789abcdef0123456789abcdef01234567"}, "goose": {"sha": "abcdef0123456789abcdef0123456789abcdef01", "ref": "v1.39.0"}}
 EOF
     # Create tarballs with matching .sha256
-    for t in x86_64-unknown-linux-gnu aarch64-apple-darwin aarch64-unknown-linux-gnu; do
+    for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         file="$workdir/dist/zoder-0.2.1-$t.tar.gz"
         echo "fake binary $t" > "$file"
         (cd "$workdir/dist" && sha256sum "$(basename "$file")" > "$(basename "$file").sha256")
     done
     if run_assert "$workdir" 0; then
-        ok "clean tri-arch build with manifest + sha256 -> exit 0"
+        ok "clean Linux build with manifest + sha256 -> exit 0"
     else
-        bad "clean tri-arch build REJECTED (false alarm)"
+        bad "clean Linux build REJECTED (false alarm)"
     fi
     rm -rf "$workdir"
 }

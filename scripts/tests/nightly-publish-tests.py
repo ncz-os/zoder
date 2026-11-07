@@ -20,10 +20,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/native-builds.yml").read_text())
 SCRIPT = WORKFLOW["jobs"]["publish"]["steps"][-1]["run"]
+# Linux only (operator 2026-11-07): macOS/Windows use the container image.
 TARGETS = (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
 )
 
 
@@ -196,10 +196,47 @@ class NightlyPublishTests(unittest.TestCase):
     def test_complete_matrix_publishes(self):
         result, events = self.run_publish()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum(e.startswith("curl ") for e in events), 74)
+        # 2 targets x 4 files (3 binaries + manifest) x 2 (file + .sha256)
+        # x 3 channels, plus the run-channel and master release.json.
+        self.assertEqual(sum(e.startswith("curl ") for e in events), 50)
         self.assertEqual(sum(e.startswith("gh ") for e in events), 3)
         self.assertTrue(events[-1].endswith("/master/release.json"))
         self.assertTrue(events[-2].startswith("gh release edit"))
+
+    def test_release_pointer_is_linux_only(self):
+        # Capture the release.json the publish step writes by copying it aside
+        # when the master pointer upload is stubbed.
+        with tempfile.TemporaryDirectory() as keep:
+            pointer = Path(keep) / "release.json"
+            global SCRIPT
+            original = SCRIPT
+            SCRIPT = SCRIPT.replace(
+                'echo "$NOTES" >> "$GITHUB_STEP_SUMMARY"',
+                "cp release.json "
+                + shlex.quote(str(pointer))
+                + '; echo "$NOTES" >> "$GITHUB_STEP_SUMMARY"',
+            )
+            try:
+                result, _ = self.run_publish()
+            finally:
+                SCRIPT = original
+            self.assertEqual(result.returncode, 0, result.stderr)
+            release = json.loads(pointer.read_text())
+        self.assertEqual(set(release["manifests"]), set(TARGETS))
+        self.assertEqual(release["schema"], 1)
+        for key in ("channel", "zoder_sha", "engine_sha", "upstream_sha"):
+            self.assertIn(key, release)
+
+    def test_workflow_builds_and_publishes_linux_only(self):
+        matrix = WORKFLOW["jobs"]["build"]["strategy"]["matrix"]["include"]
+        self.assertEqual({row["triple"] for row in matrix}, set(TARGETS))
+        self.assertTrue(all(row["os"].startswith("ubuntu") for row in matrix))
+        # Parsed YAML, so explanatory comments may still name the old target.
+        release = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        for jobs in (WORKFLOW["jobs"], release["jobs"]):
+            text = json.dumps(jobs).lower()
+            for needle in ("darwin", "macos"):
+                self.assertNotIn(needle, text)
 
     def test_failed_github_publication_does_not_activate(self):
         result, events = self.run_publish("gh_failure")
