@@ -645,7 +645,12 @@ enum ReviewerError {
     /// (policy rejection, missing provider config, ledger reservation
     /// failure, etc.). The chain MUST stop — the next call site must report
     /// the error instead of fabricating success.
-    Fatal { message: String },
+    Fatal {
+        message: String,
+        /// The provider error kind, when the failure came from a provider
+        /// call; `None` for zoder's own structural refusals.
+        kind: Option<zoder_core::ErrKind>,
+    },
     /// The pre-query health gate refused to query this model (breaker open,
     /// or its health probe failed). Already recorded in the health
     /// store and in `skipped_unhealthy`; the chain moves to the next
@@ -666,6 +671,7 @@ impl ReviewerError {
     fn fatal<S: Into<String>>(msg: S) -> Self {
         ReviewerError::Fatal {
             message: msg.into(),
+            kind: None,
         }
     }
 }
@@ -954,7 +960,8 @@ async fn complete_once_tracked(
     let mut last_err_msg: Option<String> = None;
     for (idx, model) in plan.candidates.iter().enumerate() {
         if idx > 0 && !cli.quiet {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] reviewer {prev} failed; falling back to {model}",
                 prev = plan.candidates[idx - 1]
             );
@@ -1075,7 +1082,7 @@ async fn complete_once_tracked(
             }
             Err(ReviewerError::Skipped { message }) => {
                 if !cli.quiet {
-                    eprintln!("[zoder] {message}");
+                    crate::oplog!("zoder", "[zoder] {message}");
                 }
                 last_err_msg = Some(format!("reviewer {model}: {message}"));
                 skipped.push(SkippedReviewCandidate {
@@ -1083,7 +1090,7 @@ async fn complete_once_tracked(
                     reason: "unavailable".to_string(),
                 });
             }
-            Err(ReviewerError::Fatal { message }) => {
+            Err(ReviewerError::Fatal { message, .. }) => {
                 // A non-fallback-worthy error MUST halt the chain — these
                 // are structural problems (policy, missing provider
                 // config, ledger failure, token gating, etc.) where the
@@ -1138,16 +1145,9 @@ async fn complete_once_tracked(
 /// out separately because an operator triaging "why did this reviewer take a
 /// second model?" needs to tell a slow endpoint from a dead one.
 fn reviewer_skip_reason(kind: zoder_core::ErrKind, message: &str) -> &'static str {
-    // F2.5: only the diagnostic HEAD describes the failure. A provider error
-    // body can name a parameter like `stream_timeout` on a plain 400, and
-    // reporting that as "timeout" sends an operator after the wrong cause.
-    let lower = message.to_ascii_lowercase();
-    let head = lower.split('{').next().unwrap_or("");
-    if matches!(kind, zoder_core::ErrKind::Timeout)
-        || head.contains("timed out")
-        || head.contains("timeout")
-        || head.contains("deadline")
-    {
+    // F2.5: only the diagnostic HEAD describes the failure (see
+    // `text_reads_as_timeout`).
+    if matches!(kind, zoder_core::ErrKind::Timeout) || text_reads_as_timeout(message) {
         "timeout"
     } else {
         "unavailable"
@@ -1910,7 +1910,8 @@ pub(crate) fn build_reviewer_plan(
                 // same-family review is unmistakable in the record.
                 forced = true;
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] WARNING: explicit reviewer {model} is in the author's model \
 family `{family}` (author families: {}); keeping it because --reviewer is an explicit \
 operator pin",
@@ -2531,6 +2532,7 @@ async fn dispatch_reviewer_for_model(
                 if e.emitted {
                     return Err(ReviewerError::Fatal {
                         message: format!("reviewer {model}: {}", e.message),
+                        kind: Some(e.kind),
                     });
                 }
                 // A gated model answering 429 is rate-limited fleet-wide:
@@ -2554,7 +2556,8 @@ async fn dispatch_reviewer_for_model(
                             .flatten(),
                     );
                     if !cli.quiet {
-                        eprintln!(
+                        crate::oplog!(
+                            "zoder",
                             "[zoder] reviewer {model}: {} (retry {}/{} in {:.1}s)",
                             e.message,
                             attempt + 1,
@@ -2608,6 +2611,7 @@ async fn dispatch_reviewer_for_model(
                 }
                 return Err(ReviewerError::Fatal {
                     message: format!("reviewer {model}: {}", e.message),
+                    kind: Some(e.kind),
                 });
             }
         }
@@ -2758,7 +2762,8 @@ async fn dispatch_reviewer_for_model(
             h.record_success(model, elapsed_ms);
         }
     }) {
-        eprintln!(
+        crate::oplog!(
+            "zoder",
             "zoder: warning: failed to persist reviewer health store (success for {model}): {e}"
         );
     }
@@ -5684,8 +5689,8 @@ async fn complete_review_chunks_with_concurrency(
                     if let Some((new_users, new_tokens)) = replan(&outcome.completion.model) {
                         if new_users != users || new_tokens != max_tokens {
                             if !cli.quiet {
-                                eprintln!(
-                                    "[zoder] reviewer {} served the first chunk instead of {planned}; \
+                                crate::oplog!(
+                                    "zoder", "[zoder] reviewer {} served the first chunk instead of {planned}; \
                                      re-planning chunks for it ({} -> {} chunk(s))",
                                     outcome.completion.model,
                                     users.len(),
@@ -5957,6 +5962,17 @@ fn print_review_dry_run(
     }
 }
 
+/// Start a command's structured telemetry from empty buffers.
+///
+/// The per-call context records and the provider-health skip list are
+/// process-global; the payloads read them back at the end of a command.
+/// Clearing them at the start means a command never reports calls or skips
+/// from anything that ran earlier in the same process (ZD-15, F2.6).
+pub(crate) fn begin_command_telemetry() {
+    crate::context_opt::reset();
+    crate::provider_health::reset_skipped();
+}
+
 // Signature grows with review options; the size/exclusion knobs are bundled
 // into `ReviewSizeOptions`, so the arg count stays close to the historical one.
 #[allow(clippy::too_many_arguments)]
@@ -5970,6 +5986,7 @@ pub(crate) async fn cmd_review(
     focus: &[String],
     opts: ReviewSizeOptions,
 ) -> anyhow::Result<()> {
+    begin_command_telemetry();
     let cwd = crate::agentic_cwd(cli)?;
 
     // Background: re-exec self detached, then return the job id.
@@ -5984,7 +6001,10 @@ pub(crate) async fn cmd_review(
         )?;
         println!("{id}");
         if !cli.quiet {
-            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
+            crate::oplog!(
+                "zoder",
+                "[zoder] started background job {id} (zoder status {id} / result {id})"
+            );
         }
         return Ok(());
     }
@@ -6347,7 +6367,7 @@ unbound, or missing imports:\n{context}"
     let head_caps = caps_for(reviewer_for_caps.as_deref());
     let head_plan = build_plan(head_caps, reviewer_for_caps.as_deref())?;
     if !head_plan.prepared.excluded.is_empty() && !cli.quiet && !opts.dry_run {
-        eprintln!("[zoder] {}", head_plan.prepared.excluded.render());
+        crate::oplog!("zoder", "[zoder] {}", head_plan.prepared.excluded.render());
     }
 
     // Standalone review has no author turn: `-m` pins its primary reviewer.
@@ -6462,7 +6482,8 @@ unbound, or missing imports:\n{context}"
             Ok(plan) => Some((plan.users, tokens_for(&caps))),
             Err(e) => {
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "zoder",
                         "[zoder] could not re-plan chunks for fallback reviewer {model}: {e:#}; \
                          keeping the current chunks"
                     );
@@ -6630,8 +6651,8 @@ A review that no model produced must not be reported as success."
     }
 
     if failed_count > 0 && !cli.quiet {
-        eprintln!(
-            "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
+        crate::oplog!(
+            "zoder", "[zoder] review: {ok_models}/{requested} reviewers succeeded ({failed_count} failed; partial review)"
         );
     }
     // The classified failure is the exit signal. The payload has already
@@ -7143,8 +7164,22 @@ fn classify_confirmer_error(e: &ReviewerError) -> crate::review_confirm::Confirm
             _ => ConfirmerOutcome::Empty,
         },
         ReviewerError::Skipped { .. } => ConfirmerOutcome::Unavailable,
-        ReviewerError::Fatal { message } => {
-            if message.contains("timed out") || message.contains("timeout") {
+        // A provider error's kind decides; only an error that never had one
+        // falls back to the shared text helper.
+        ReviewerError::Fatal {
+            kind: Some(kind), ..
+        } => {
+            if *kind == zoder_core::ErrKind::Timeout {
+                ConfirmerOutcome::Timeout
+            } else {
+                ConfirmerOutcome::Empty
+            }
+        }
+        ReviewerError::Fatal {
+            message,
+            kind: None,
+        } => {
+            if text_reads_as_timeout(message) {
                 ConfirmerOutcome::Timeout
             } else {
                 ConfirmerOutcome::Empty
@@ -7532,7 +7567,10 @@ pub(crate) async fn cmd_rescue(
         let id = spawn_background("rescue", &cwd)?;
         println!("{id}");
         if !cli.quiet {
-            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
+            crate::oplog!(
+                "zoder",
+                "[zoder] started background job {id} (zoder status {id} / result {id})"
+            );
         }
         return Ok(());
     }
@@ -7613,13 +7651,19 @@ Explain the root cause and the fix when done.\n\nTask: {task_txt}"
             } else {
                 format!("${:.4}", t.cost_usd)
             };
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] rescue {} via {}  {} tools  {}  {:.0}ms  [{}]",
-                t.model, t.alias, t.run.tool_calls, cost_label, t.elapsed_ms, t.run.outcome
+                t.model,
+                t.alias,
+                t.run.tool_calls,
+                cost_label,
+                t.elapsed_ms,
+                t.run.outcome
             );
             if timed_out {
-                eprintln!(
-                    "[rescue] timed out after {:.0}s — partial work preserved: on-disk edits kept, \
+                crate::oplog!(
+                    "rescue", "[rescue] timed out after {:.0}s — partial work preserved: on-disk edits kept, \
 {} chars of transcript captured, {} tool call(s) made. Resume where it left off with:\n  \
 zoder rescue --session {} \"continue\"\nOr give it more room: raise --agent-timeout <secs> \
 (default 900), or pick a stronger/faster model with -m.",
@@ -7924,9 +7968,8 @@ impl UnconfirmedCancelTracker {
     }
 
     /// Record one iteration's author outcome and report whether the loop must
-    /// abort. `cancel_unconfirmed` is the single bit the loop already derives
-    /// from [`AUTHOR_CANCEL_UNCONFIRMED_MARKER`]; the text matching is NOT
-    /// changed here.
+    /// abort. `cancel_unconfirmed` is the single bit the loop reads from the
+    /// author error's [`AuthorPhaseErrorKind::CancelUnconfirmed`] kind.
     pub(crate) fn observe(&mut self, cancel_unconfirmed: bool) -> bool {
         if cancel_unconfirmed {
             self.streak = self.streak.saturating_add(1);
@@ -7940,6 +7983,109 @@ impl UnconfirmedCancelTracker {
 /// The marker that tells the loop's error handling "the author's diff cannot
 /// be trusted, do not review it".
 pub(crate) const AUTHOR_CANCEL_UNCONFIRMED_MARKER: &str = "author cancellation unconfirmed:";
+
+/// What went wrong in the author phase, decided where it happened rather than
+/// re-read from the message text afterwards (ZD-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorPhaseErrorKind {
+    /// The turn returned an error before the watchdog fired. `timed_out` is
+    /// the engine's own timeout, which only reaches zoder as text and is read
+    /// by [`text_reads_as_timeout`].
+    Failed { timed_out: bool },
+    /// The watchdog fired and the daemon cancel was confirmed (or the turn
+    /// never minted a session, so there was nothing to cancel).
+    TimedOut,
+    /// The watchdog fired and the daemon never confirmed the cancel: the turn
+    /// may still be running, so its tree is not a finished turn.
+    CancelUnconfirmed,
+}
+
+impl AuthorPhaseErrorKind {
+    /// The name the iteration record carries in `author_error_kind`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AuthorPhaseErrorKind::Failed { .. } => "failed",
+            AuthorPhaseErrorKind::TimedOut => "timed_out",
+            AuthorPhaseErrorKind::CancelUnconfirmed => "cancel_unconfirmed",
+        }
+    }
+
+    /// Whether the phase ran out of time, by the watchdog or the engine.
+    pub(crate) fn timed_out(self) -> bool {
+        !matches!(self, AuthorPhaseErrorKind::Failed { timed_out: false })
+    }
+
+    /// The failure code this author error stands for when it is the root
+    /// cause of an unresolved loop.
+    pub(crate) fn failure_code(self) -> crate::failure::FailureCode {
+        match self {
+            AuthorPhaseErrorKind::Failed { .. } => crate::failure::FailureCode::AuthorFailed,
+            AuthorPhaseErrorKind::TimedOut => crate::failure::FailureCode::AuthorTimeout,
+            AuthorPhaseErrorKind::CancelUnconfirmed => {
+                crate::failure::FailureCode::CancelUnconfirmed
+            }
+        }
+    }
+
+    /// The failure code for an `author_error_kind` read back from a record.
+    pub(crate) fn code_for_record(name: &str) -> Option<crate::failure::FailureCode> {
+        [
+            AuthorPhaseErrorKind::Failed { timed_out: false },
+            AuthorPhaseErrorKind::TimedOut,
+            AuthorPhaseErrorKind::CancelUnconfirmed,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == name)
+        .map(AuthorPhaseErrorKind::failure_code)
+    }
+}
+
+/// The error [`author_phase_with_cancel`] returns: a typed kind plus the
+/// operator-facing message. `Display` is the message, byte-identical to the
+/// strings the phase reported before it was typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorPhaseError {
+    pub(crate) kind: AuthorPhaseErrorKind,
+    pub(crate) message: String,
+}
+
+impl AuthorPhaseError {
+    /// A turn error, passed through verbatim.
+    fn failed(message: String) -> Self {
+        Self {
+            kind: AuthorPhaseErrorKind::Failed {
+                timed_out: text_reads_as_timeout(&message),
+            },
+            message,
+        }
+    }
+
+    pub(crate) fn timed_out(&self) -> bool {
+        self.kind.timed_out()
+    }
+
+    pub(crate) fn cancel_unconfirmed(&self) -> bool {
+        self.kind == AuthorPhaseErrorKind::CancelUnconfirmed
+    }
+}
+
+impl std::fmt::Display for AuthorPhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The ONE place a timeout is read from error text, for errors that only
+/// arrive as text (the engine's turn errors, untyped reviewer errors).
+///
+/// F2.5: only the diagnostic head describes the failure. A provider body can
+/// name a parameter like `stream_timeout` on a plain 400, and reading that as
+/// a timeout sends an operator after the wrong cause.
+pub(crate) fn text_reads_as_timeout(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let head = lower.split('{').next().unwrap_or("");
+    head.contains("timed out") || head.contains("timeout") || head.contains("deadline")
+}
 
 /// Prefix of a best-effort author-cancel warning: the turn MAY still be
 /// running, the tree may be mid-edit, so the iteration is unresolved — but the
@@ -8027,7 +8173,10 @@ pub(crate) async fn cancel_author_session_best_effort(
         .await
         {
             Ok(()) => {
-                eprintln!("[loop] daemon acknowledged the author cancel on retry {n}");
+                crate::oplog!(
+                    "loop",
+                    "[loop] daemon acknowledged the author cancel on retry {n}"
+                );
                 return Ok(());
             }
             Err(e) => failures.push(format!("retry {n}: {e:#}")),
@@ -8121,7 +8270,8 @@ where
         Ok(res) => res.map_err(|e| e.to_string()),
         Err(_) => {
             if !quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "loop: {phase} timed out after {secs}s, killing",
                     phase = phase.as_str()
                 );
@@ -8172,7 +8322,7 @@ async fn author_phase_with_cancel<F, C, S>(
     turn_fut: F,
     cancel: C,
     settled: S,
-) -> Result<crate::TurnResult, String>
+) -> Result<crate::TurnResult, AuthorPhaseError>
 where
     F: std::future::Future<Output = anyhow::Result<crate::TurnResult>>,
     C: std::future::Future<Output = anyhow::Result<()>>,
@@ -8180,10 +8330,13 @@ where
 {
     let budget = std::time::Duration::from_secs(secs.max(1));
     match tokio::time::timeout(budget, turn_fut).await {
-        Ok(res) => res.map_err(|e| e.to_string()),
+        Ok(res) => res.map_err(|e| AuthorPhaseError::failed(e.to_string())),
         Err(_) => {
             if !quiet {
-                eprintln!("loop: author timed out after {secs}s, cancelling daemon turn");
+                crate::oplog!(
+                    "loop",
+                    "loop: author timed out after {secs}s, cancelling daemon turn"
+                );
             }
             // The settle signal is awaited on EVERY path below: the diff is
             // captured after this function returns, and a tree captured while
@@ -8198,15 +8351,21 @@ where
             let cancelled = cancel_under_deadline(deadline, cancel).await;
             settled.await;
             match cancelled {
-                Ok(()) => Err(format!(
-                    "author phase timed out after {secs}s (killed, daemon cancel issued)"
-                )),
+                Ok(()) => Err(AuthorPhaseError {
+                    kind: AuthorPhaseErrorKind::TimedOut,
+                    message: format!(
+                        "author phase timed out after {secs}s (killed, daemon cancel issued)"
+                    ),
+                }),
                 // Best-effort: the caller must still capture and report the
                 // tree, but it must NOT treat this diff as reviewable.
-                Err(cancel_err) => Err(format!(
-                    "author phase timed out after {secs}s (killed, daemon cancel unconfirmed: \
-                     {cancel_err})"
-                )),
+                Err(cancel_err) => Err(AuthorPhaseError {
+                    kind: AuthorPhaseErrorKind::CancelUnconfirmed,
+                    message: format!(
+                        "author phase timed out after {secs}s (killed, daemon cancel \
+                         unconfirmed: {cancel_err})"
+                    ),
+                }),
             }
         }
     }
@@ -8456,7 +8615,8 @@ async fn run_check_watched_with_env(
             // Wall-clock fired. nuke the process group; the child.handle is
             // already gone (wait_with_output consumes it), so go via pgid.
             kill_process_group(pgid, pid);
-            eprintln!(
+            crate::oplog!(
+                "loop",
                 "loop: {} timed out after {}s, killing",
                 LoopPhase::Check.as_str(),
                 secs
@@ -9323,7 +9483,8 @@ fn loop_task_diff(
             }
             let task = task_journal.agent_diff(cwd);
             if diff_has_content(&task) {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] working-tree diff is empty but the task changed files since the \
                      loop began (the author committed mid-turn); reviewing the task delta"
                 );
@@ -9527,6 +9688,18 @@ pub(crate) fn turn_is_dead(turn: &Option<crate::TurnResult>) -> bool {
     turn.as_ref().is_none_or(|t| !t.run.succeeded())
 }
 
+/// Whether the loop's `--check` phase runs this iteration.
+///
+/// The check validates what the author turn wrote. It is skipped when the
+/// author never obtained a daemon session (FB110), and when the author turn
+/// failed (`author_failed`, no turn result) and the captured task diff is
+/// empty: in both cases nothing was authored, so a pass or fail would only
+/// describe the unmodified tree. A failed turn that left partial edits is
+/// checked, and a completed turn is always checked (ZD-03, F5.2).
+fn check_phase_runs(author_session_limit: bool, author_failed: bool, diff_is_empty: bool) -> bool {
+    !(author_session_limit || (author_failed && diff_is_empty))
+}
+
 /// Refines [`turn_is_dead`] for dead-streak accounting only. A turn that
 /// made at least one real tool call engaged the engine successfully even
 /// when its outcome was not "completed" (e.g. an internal timeout firing
@@ -9649,7 +9822,18 @@ fn loop_failure(
     // failure join it here. When the author DID produce a model and the
     // review then failed, the review error still wins as before.
     let author_failed_before_model = field("author_model").is_none() && author_error.is_some();
-    let evidence = if author_hit_engine_budget || author_failed_before_model {
+    let author_is_evidence = author_hit_engine_budget || author_failed_before_model;
+    // ZD-08: when the author is the root cause, its TYPED kind names the
+    // failure. The watchdog's own outcomes (timeout, unconfirmed cancel) are
+    // facts and win outright; a plain failed turn defers to a more specific
+    // engine code in its text (budget refusal, session limit) and is
+    // `author_failed` otherwise.
+    let author_kind_code = if author_is_evidence {
+        field("author_error_kind").and_then(|kind| AuthorPhaseErrorKind::code_for_record(&kind))
+    } else {
+        None
+    };
+    let evidence = if author_is_evidence {
         author_error.unwrap_or_default()
     } else {
         review_error.or(author_error).unwrap_or_default()
@@ -9668,7 +9852,16 @@ fn loop_failure(
             message,
         ));
     }
-    let class = if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
+    let watchdog_code = author_kind_code.filter(|code| {
+        matches!(
+            code,
+            crate::failure::FailureCode::AuthorTimeout
+                | crate::failure::FailureCode::CancelUnconfirmed
+        )
+    });
+    let class = if let Some(code) = watchdog_code {
+        crate::failure::ClassifiedFailure::new(code, evidence.clone())
+    } else if let Some((code, reset)) = crate::failure::classify_message(&evidence) {
         // The engine's own budget refusal carries a reset timestamp; it
         // must survive into the JSON so the caller knows when to come back.
         if code == crate::failure::FailureCode::EngineBudgetExceeded {
@@ -9676,6 +9869,8 @@ fn loop_failure(
         } else {
             crate::failure::ClassifiedFailure::new(code, evidence.clone())
         }
+    } else if let Some(code) = author_kind_code {
+        crate::failure::ClassifiedFailure::new(code, evidence.clone())
     } else if final_verdict == REVIEWER_UNAVAILABLE_VERDICT {
         crate::failure::ClassifiedFailure::new(
             crate::failure::FailureCode::ReviewersUnavailable,
@@ -9848,7 +10043,10 @@ pub(crate) async fn cmd_loop(
         let id = spawn_background("loop", &cwd)?;
         println!("{id}");
         if !cli.quiet {
-            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
+            crate::oplog!(
+                "zoder",
+                "[zoder] started background job {id} (zoder status {id} / result {id})"
+            );
         }
         return Ok(());
     }
@@ -10139,6 +10337,187 @@ impl Drop for LoopEventGuard {
     }
 }
 
+/// The `zoder.turn/1` event for one loop author turn, from what the loop
+/// knows once the author and check phases are over.
+///
+/// `author_err` is the author phase's failure text and `had_session` whether
+/// the turn minted a daemon session. A timeout is still recognised by its text
+/// here, as the loop's other author-failure readers do.
+fn loop_turn_event(
+    iteration: usize,
+    turn: Option<&crate::TurnResult>,
+    author_err: Option<&str>,
+    had_session: bool,
+    check_passed: Option<bool>,
+    elapsed: std::time::Duration,
+) -> crate::telemetry::TurnEvent {
+    let unconfirmed = author_err.is_some_and(|m| m.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
+    let timed_out = author_err.is_some_and(|m| m.contains("timed out") || m.contains("timeout"));
+    let (outcome, cancel_outcome) = match (turn, author_err) {
+        (Some(t), _) => (
+            match t.run.outcome.as_str() {
+                known @ ("completed" | "cancelled" | "failed" | "timeout") => known.to_string(),
+                _ => "failed".to_string(),
+            },
+            "not_needed",
+        ),
+        (None, _) if unconfirmed => ("timeout".to_string(), "unconfirmed"),
+        (None, _) if !had_session => (
+            if timed_out { "timeout" } else { "error" }.to_string(),
+            "no_session",
+        ),
+        // A timed-out turn whose cancel was not reported unconfirmed was
+        // acknowledged by the daemon.
+        (None, _) if timed_out => ("timeout".to_string(), "confirmed"),
+        (None, _) => ("error".to_string(), "not_needed"),
+    };
+    let (provider, model) = turn.map_or((String::new(), String::new()), |t| {
+        (t.provider.clone(), t.model.clone())
+    });
+    let route = if provider.is_empty() && model.is_empty() {
+        String::new()
+    } else {
+        format!("{provider}={model}")
+    };
+    crate::telemetry::TurnEvent {
+        schema: crate::telemetry::TURN_SCHEMA,
+        iteration,
+        phase: "author",
+        route,
+        provider,
+        model,
+        agent_alias: turn.map(|t| t.alias.clone()).unwrap_or_default(),
+        billing: turn
+            .map(|t| t.billing.clone())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        estimated_cost_usd: turn.and_then(|t| t.estimated_cost_usd),
+        billed_cost_usd: turn.filter(|t| !t.cost_unknown).map(|t| t.cost_usd),
+        cost_unknown: turn.is_none_or(|t| t.cost_unknown),
+        tokens_in: turn.map_or(0, |t| t.tokens_in),
+        tokens_out: turn.map_or(0, |t| t.tokens_out),
+        outcome,
+        cancel_outcome,
+        exit_code: check_passed.map(|ok| if ok { 0 } else { 1 }),
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod loop_turn_event_tests {
+    use super::*;
+
+    fn turn(outcome: &str, cost_unknown: bool) -> crate::TurnResult {
+        crate::TurnResult {
+            run: zoder_core::AgentRun {
+                session_id: "s1".into(),
+                outcome: outcome.into(),
+                content: String::new(),
+                input_tokens: 0,
+                tool_calls: 0,
+                failure_detail: None,
+            },
+            model: "vendor/m".into(),
+            alias: "coder".into(),
+            provider: "p1".into(),
+            billing: "metered".into(),
+            estimated_cost_usd: Some(0.02),
+            cost_usd: 0.01,
+            cost_unknown,
+            tokens_in: 10,
+            tokens_out: 5,
+            elapsed_ms: 1.0,
+            policy_violation: None,
+        }
+    }
+
+    #[test]
+    fn a_returned_turn_carries_its_route_cost_and_check_status() {
+        let t = turn("completed", false);
+        let e = loop_turn_event(
+            2,
+            Some(&t),
+            None,
+            true,
+            Some(false),
+            std::time::Duration::from_millis(7),
+        );
+        assert_eq!(e.route, "p1=vendor/m");
+        assert_eq!(e.billing, "metered");
+        assert_eq!(e.billed_cost_usd, Some(0.01));
+        assert_eq!(e.estimated_cost_usd, Some(0.02));
+        assert_eq!(e.outcome, "completed");
+        assert_eq!(e.cancel_outcome, "not_needed");
+        assert_eq!(e.exit_code, Some(1));
+        assert_eq!(e.elapsed_ms, 7);
+        let unknown = turn("weird", true);
+        let e = loop_turn_event(
+            1,
+            Some(&unknown),
+            None,
+            true,
+            None,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            e.billed_cost_usd, None,
+            "an unknown cost is never billed as $0"
+        );
+        assert!(e.cost_unknown);
+        assert_eq!(e.outcome, "failed");
+        assert_eq!(e.exit_code, None);
+    }
+
+    #[test]
+    fn a_failed_author_phase_maps_to_outcome_and_cancel_outcome() {
+        let cases = [
+            (
+                "no free model has a configured provider",
+                false,
+                "error",
+                "no_session",
+            ),
+            (
+                "author turn timed out after 900s",
+                false,
+                "timeout",
+                "no_session",
+            ),
+            (
+                "author turn timed out after 900s",
+                true,
+                "timeout",
+                "confirmed",
+            ),
+            ("engine closed the connection", true, "error", "not_needed"),
+        ];
+        for (msg, had_session, outcome, cancel) in cases {
+            let e = loop_turn_event(
+                1,
+                None,
+                Some(msg),
+                had_session,
+                None,
+                std::time::Duration::ZERO,
+            );
+            assert_eq!(
+                (e.outcome.as_str(), e.cancel_outcome),
+                (outcome, cancel),
+                "{msg}"
+            );
+            assert_eq!(e.billing, "unknown");
+            assert!(e.cost_unknown);
+            assert_eq!(e.route, "");
+        }
+        let msg = format!("{AUTHOR_CANCEL_UNCONFIRMED_MARKER} the daemon never answered");
+        let e = loop_turn_event(1, None, Some(&msg), true, None, std::time::Duration::ZERO);
+        assert_eq!(
+            (e.outcome.as_str(), e.cancel_outcome),
+            ("timeout", "unconfirmed")
+        );
+    }
+}
+
 // The parameter count is the loop's explicit, named configuration — the same
 // shape as `cmd_loop`, which already carries this allowance.
 #[allow(clippy::too_many_arguments)]
@@ -10159,6 +10538,7 @@ async fn cmd_loop_run(
     require_approval: bool,
     cwd: &Path,
 ) -> anyhow::Result<()> {
+    begin_command_telemetry();
     // Read the operator's exec-safety policy (the OS-level sandbox backend
     // selection — see `zoder_core::ExecSafetyConfig`). Default = `None`
     // preserves the pre-sandbox byte-for-byte behavior. We do this once at
@@ -10206,7 +10586,7 @@ async fn cmd_loop_run(
     // Validate timeout configuration: loop-timeout must exceed agent-timeout
     // since it covers author + check + review phases, not just the author turn.
     if let Some(warning) = validate_loop_timeouts(loop_timeout_secs, agent_timeout_secs) {
-        eprintln!("\n[zoder] {warning}");
+        crate::oplog!("zoder", "\n[zoder] {warning}");
     }
 
     let max_iters = max_iters.max(1);
@@ -10305,15 +10685,22 @@ async fn cmd_loop_run(
     let review_root = crate::review_diff::repo_root(cwd);
     if !cli.quiet {
         match (&loop_base, base.as_deref(), loop_start.tree.as_deref()) {
-            (Some(b), None, Some(tree)) => eprintln!(
+            (Some(b), None, Some(tree)) => crate::oplog!(
+                "loop",
                 "[loop] review base: {b} (loop start commit) + working-tree snapshot {tree}; \
                  --base overrides both"
             ),
             (Some(b), None, None) => {
-                eprintln!("[loop] review base: {b} (loop start; --base overrides)")
+                crate::oplog!(
+                    "loop",
+                    "[loop] review base: {b} (loop start; --base overrides)"
+                )
             }
-            (Some(b), Some(_), _) => eprintln!("[loop] review base: {b} (explicit --base)"),
-            (None, _, _) => eprintln!(
+            (Some(b), Some(_), _) => {
+                crate::oplog!("loop", "[loop] review base: {b} (explicit --base)")
+            }
+            (None, _, _) => crate::oplog!(
+                "loop",
                 "[loop] review base: unresolved (repository has no commits); branch scope \
                  reviews the loop-start working-tree snapshot"
             ),
@@ -10324,12 +10711,14 @@ async fn cmd_loop_run(
     // means "these diff_lines are the loop's work, not the tree's", and a
     // failed snapshot means branch scope will refuse to review at all.
     match (&loop_start.tree, loop_start.dirty) {
-        (Some(tree), true) => eprintln!(
+        (Some(tree), true) => crate::oplog!(
+            "loop",
             "[loop] working tree was already dirty at start (snapshot tree {tree}); \
              pre-existing tracked and untracked changes are excluded from the reviewed delta"
         ),
         (Some(_), false) => {}
-        (None, _) => eprintln!(
+        (None, _) => crate::oplog!(
+            "loop",
             "[loop] WARNING: could not snapshot the working tree at loop start; the loop \
              cannot tell its own changes from pre-existing ones and branch-scope review \
              will refuse to run"
@@ -10347,7 +10736,7 @@ async fn cmd_loop_run(
     if let Err(e) = validate_loop_reviewer_pin(cli, reviewer.as_deref()) {
         let detail = format!("reviewer pin {e}");
         if !cli.quiet {
-            eprintln!("[loop] {detail}");
+            crate::oplog!("loop", "[loop] {detail}");
         }
         // The `--reviewer` pin names a model no configured provider serves
         // (or one outside the allowlist). The operator must fix the pin or
@@ -10389,8 +10778,10 @@ async fn cmd_loop_run(
         // and is committed and reported below like any other terminal exit.
         if deadline.expired() {
             deadline_hit = true;
+            crate::telemetry::note_deadline_hit();
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}/{max_iters}: whole-run deadline of {}s reached; stopping \
                      with {} iteration(s)' work preserved and reported",
                     deadline.secs,
@@ -10434,7 +10825,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         };
 
         if !cli.quiet {
-            eprintln!("\n[loop] iter {i}/{max_iters}: author…");
+            crate::oplog!("loop", "\n[loop] iter {i}/{max_iters}: author…");
         }
         crate::mnemos::event(
             event_job_id.as_deref(),
@@ -10457,6 +10848,9 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
         // [`author_phase_with_cancel`] for the cancel/settle contract and the
         // unit tests that pin the timeout-path invariants.
         let mut author_err: Option<String> = None;
+        // The typed kind of `author_err` (ZD-08): every check below reads
+        // this, never the message text.
+        let mut author_err_kind: Option<AuthorPhaseErrorKind> = None;
         // Consecutive author turns whose cancel could not be confirmed. This is
         // the ONE thing about an unconfirmed cancel that can stop the loop. On
         // a daemon this loop owns, two in a row means the daemon is not
@@ -10508,7 +10902,8 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     if first_budget > std::time::Duration::from_secs(SETTLE_BUDGET_SECS)
                         && !cli.quiet
                     {
-                        eprintln!(
+                        crate::oplog!(
+                            "loop",
                             "[loop] the daemon is mid tool step; waiting up to {first_budget:?} \
                              for it to acknowledge the cancel"
                         );
@@ -10544,7 +10939,8 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                     // No session id means the turn never minted one, so there
                     // is no turn to cancel. That is not a failure: the tree is
                     // still captured and reported.
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] author timed out before a session id was minted; nothing to cancel"
                     );
                 }
@@ -10608,7 +11004,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 total_cost += t.cost_usd;
                 Some(t)
             }
-            Err(msg) => {
+            Err(err) => {
                 // An unconfirmed author cancel is NOT fatal any more: the tree
                 // still gets captured, committed and reported, and the reason
                 // is carried in `author_error` + the iter record. Only a run
@@ -10621,7 +11017,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         .unwrap_or_else(|e| e.into_inner())
                         .clone()
                     {
-                        let cancel_state = if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                        let cancel_state = if err.cancel_unconfirmed() {
                             "cancel_unconfirmed"
                         } else {
                             // The daemon answered or the turn failed on its
@@ -10634,11 +11030,12 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                         };
                         state.note_session(&sid, cancel_state);
                     }
-                    state.note_provider_error(&msg);
+                    state.note_provider_error(&err.message);
                 }
-                if msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER) {
+                if err.cancel_unconfirmed() {
                     unconfirmed_cancel_streak.observe(true);
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: author turn TIMED OUT and the daemon cancel was never \
                          confirmed ({}/{cancel_abort_threshold}). \
                          The tree is captured and reported as unresolved, and the edits on disk \
@@ -10648,25 +11045,27 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 } else {
                     unconfirmed_cancel_streak.observe(false);
                 }
-                let timed_out = msg.contains("timed out") || msg.contains("timeout");
+                let timed_out = err.timed_out();
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: author turn did not finish: {msg}");
+                    crate::oplog!("loop", "[loop] iter {i}: author turn did not finish: {err}");
                     if timed_out {
-                        eprintln!(
+                        crate::oplog!(
+                            "loop",
                             "[loop] hint: raise the per-turn budget with `--agent-timeout <secs>` \
 (default 900) or the loop-phase watchdog with `--loop-timeout <secs>` (default 900), or \
 pick a faster model with `-m` for the loop. Preserving partial edits and continuing."
                         );
                     }
                 }
-                author_err = Some(msg);
+                author_err_kind = Some(err.kind);
+                author_err = Some(err.message);
                 None
             }
         };
         {
             let (a_status, a_error) = match (&turn, &author_err) {
                 (Some(_), _) => ("ok", None),
-                (None, Some(m)) if m.contains("timed out") || m.contains("timeout") => {
+                (None, Some(m)) if author_err_kind.is_some_and(AuthorPhaseErrorKind::timed_out) => {
                     ("timeout", Some(m.chars().take(300).collect::<String>()))
                 }
                 (None, Some(m)) => ("error", Some(m.chars().take(300).collect::<String>())),
@@ -10697,7 +11096,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             )
         });
         if author_session_limit && !cli.quiet {
-            eprintln!(
+            crate::oplog!(
+                "loop",
                 "[loop] iter {i}: author turn never obtained a daemon session (session limit); \
                  recording the refusal and stopping before check/review/commit"
             );
@@ -10721,7 +11121,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 let result = enforce_repo_commit_author(cwd);
                 if let CommitAuthorEnforcement::Corrected { from, to } = &result {
                     if !cli.quiet {
-                        eprintln!("[zoder] corrected commit author: {from} -> {to}");
+                        crate::oplog!("zoder", "[zoder] corrected commit author: {from} -> {to}");
                     }
                 }
                 Some(result)
@@ -10744,7 +11144,10 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             Err(e) => {
                 let detail = format!("{e:#}");
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}/{max_iters}: diff capture failed: {detail}");
+                    crate::oplog!(
+                        "loop",
+                        "[loop] iter {i}/{max_iters}: diff capture failed: {detail}"
+                    );
                 }
                 iterations.push(json!({
                     "iteration": i,
@@ -10776,10 +11179,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // The run is ONE on a daemon this loop owns and the FIRST one on a
         // shared daemon (`cancel_abort_threshold`): there, a second attempt
         // just queues behind other tenants for another full phase budget.
-        let cancel_unconfirmed = matches!(
-            author_err.as_deref(),
-            Some(e) if e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)
-        );
+        let cancel_unconfirmed = author_err_kind == Some(AuthorPhaseErrorKind::CancelUnconfirmed);
         let aborted_on_unconfirmed_cancel = cancel_unconfirmed
             && unconfirmed_cancel_streak.streak() >= unconfirmed_cancel_streak.threshold();
         if aborted_on_unconfirmed_cancel {
@@ -10821,14 +11221,25 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         // there is nothing the engine authored to validate. `check` still
         // names the configured command in the record; `check_passed: None`
         // is the honest "not run", never a fabricated green.
+        // ZD-03 (F5.2): the same holds for ANY failed author turn that left
+        // the task diff empty -- the check would only re-validate the base
+        // tree. A failed turn that left partial edits is still checked.
         let mut check_timed_out = false;
-        let (check_passed, check_tail) = if author_session_limit {
+        let run_check =
+            check_phase_runs(author_session_limit, turn.is_none(), diff.trim().is_empty());
+        if !run_check && !author_session_limit && check.is_some() && !cli.quiet {
+            eprintln!(
+                "[loop] iter {i}: author turn failed and left no edits; skipping the check \
+                 (nothing was authored to validate)"
+            );
+        }
+        let (check_passed, check_tail) = if !run_check {
             (None, String::new())
         } else {
             match &check {
                 Some(c) => {
                     if !cli.quiet {
-                        eprintln!("[loop] iter {i}: check `{c}`…");
+                        crate::oplog!("loop", "[loop] iter {i}: check `{c}`…");
                     }
                     run_state
                         .lock()
@@ -10846,7 +11257,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     if !ok && tail.contains("killed after ") && tail.contains("(loop timeout)") {
                         check_timed_out = true;
                         if !cli.quiet {
-                            eprintln!(
+                            crate::oplog!(
+                                "loop",
                                 "[loop] iter {i}: check wedge killed after {}s (--loop-timeout)",
                                 t0.elapsed().as_secs()
                             );
@@ -10857,6 +11269,18 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 None => (None, String::new()),
             }
         };
+
+        crate::telemetry::emit_turn(&loop_turn_event(
+            i,
+            turn.as_ref(),
+            author_err.as_deref(),
+            active_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            check_passed,
+            author_started.elapsed(),
+        ));
 
         // Streak bookkeeping — both failure modes live in one helper so the
         // full matrix is unit-tested. A wedged check on an already-empty
@@ -10883,7 +11307,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
         check_timeout_streak = streaks.check_timeout_streak;
         if streaks.abort {
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: author produced no edits twice in a row \
                      (engine unreachable or timing out before any tool call); stopping."
                 );
@@ -10899,7 +11324,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
             // iteration's work: the diff was captured above, this record is
             // pushed, and the loop's own exit paths commit what is on disk.
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: the daemon did not confirm an author cancel \
                      {} time(s) in a row (abort threshold \
                      {cancel_abort_threshold}); stopping with this iteration's work preserved \
@@ -10919,7 +11345,8 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                     (None, Some(e)) => format!("interrupted: {e}"),
                     (None, None) => "interrupted".to_string(),
                 },
-                "author_cancel_unconfirmed": author_err.as_deref().is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER)),
+                "author_cancel_unconfirmed": cancel_unconfirmed,
+                "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
                 "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
                 "diff_lines": diff_lines,
                 "substance": format!("{:?}", diff_substance),
@@ -10930,7 +11357,7 @@ pick a faster model with `-m` for the loop. Preserving partial edits and continu
                 "start_dirty": loop_start.dirty,
                 "review_chunks": 0,
                 "review_error": "review skipped: the author cancel was never confirmed, so this \
-diff is not a finished turn",
+            diff is not a finished turn",
                 "review_complete": false,
                 "reviewer_verdicts": [],
                 "review_unconfirmed_cancel": true,
@@ -10951,7 +11378,8 @@ diff is not a finished turn",
             // diff is logged but the loop continues; the next author turn has
             // a chance to produce edits.
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: check wedge observed on empty diff \
                      (streak={check_timeout_streak}); author will retry."
                 );
@@ -10965,12 +11393,14 @@ diff is not a finished turn",
         // recorded as unresolved with every byte of work preserved.
         if deadline.expired() {
             deadline_hit = true;
+            crate::telemetry::note_deadline_hit();
             {
                 let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());
                 state.set_phase(LOOP_PHASE_DONE, i);
             }
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: whole-run deadline of {}s reached before review; \
                      recording the iteration as unresolved and stopping",
                     deadline.secs
@@ -10980,6 +11410,7 @@ diff is not a finished turn",
                 "iter": i,
                 "author_model": turn.as_ref().map(|t| t.model.clone()),
                 "author_error": author_err.clone(),
+                "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
                 "author_outcome": turn.as_ref().map(|t| t.run.outcome.clone()),
                 "author_cancel_unconfirmed": cancel_unconfirmed,
                 "tool_calls": turn.as_ref().map(|t| t.run.tool_calls).unwrap_or(0),
@@ -11037,7 +11468,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
             }
         }
         if !cli.quiet {
-            eprintln!("[loop] iter {i}: adversarial review…");
+            crate::oplog!("loop", "[loop] iter {i}: adversarial review…");
         }
         // Resolve a fresh scenario-routed reviewer chain per review
         // pass so KNEMON's "most-idle sub first" view reflects the
@@ -11114,9 +11545,7 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
         // either. Skip the reviewer, record the iteration as unresolved with
         // the exact reason, and let the tree stay on disk — the loop's exit
         // paths commit and report it.
-        let review_unconfirmed_cancel = author_err
-            .as_deref()
-            .is_some_and(|e| e.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER));
+        let review_unconfirmed_cancel = cancel_unconfirmed;
         // A. The loop reviewer path accepts ONLY a structured JSON verdict per
         // chunk (see `run_loop_review`), and an INCOMPLETE review — provider
         // error, timeout, unparseable chunk, oversized diff — is
@@ -11146,7 +11575,10 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
             if let Some(detail) = engine_load_error {
                 let detail = format!("review skipped: {detail}");
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                    crate::oplog!(
+                        "loop",
+                        "[loop] iter {i}: {detail}; iteration unresolved, work preserved"
+                    );
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11161,7 +11593,10 @@ or hypothetical concerns. Assign findings their appropriate severity and cite an
 diff is not a finished turn"
                     .to_string();
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved, work preserved");
+                    crate::oplog!(
+                        "loop",
+                        "[loop] iter {i}: {detail}; iteration unresolved, work preserved"
+                    );
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11183,7 +11618,7 @@ diff is not a finished turn"
 (session limit reached); nothing was authored to review"
                     .to_string();
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: {detail}; iteration unresolved");
+                    crate::oplog!("loop", "[loop] iter {i}: {detail}; iteration unresolved");
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11207,7 +11642,7 @@ diff is not a finished turn"
                         .or(author_err.as_deref()),
                 );
                 if !cli.quiet {
-                    eprintln!("[loop] iter {i}: {detail}");
+                    crate::oplog!("loop", "[loop] iter {i}: {detail}");
                 }
                 review_error = Some(detail.clone());
                 (
@@ -11245,7 +11680,8 @@ diff is not a finished turn"
                     Err(msg) => {
                         let detail = format!("review incomplete: {msg}");
                         if !cli.quiet {
-                            eprintln!(
+                            crate::oplog!(
+                                "loop",
                                 "[loop] iter {i}: {detail}; failing closed (iteration unresolved)"
                             );
                         }
@@ -11414,6 +11850,7 @@ or comment together with an explicit statement that no blocking defect exists.\n
             "iter": i,
             "author_model": author_model,
             "author_error": author_error,
+            "author_error_kind": author_err_kind.map(AuthorPhaseErrorKind::as_str),
             "reviewer_model": reviewer_model,
             "tool_calls": tool_calls,
             "author_outcome": author_outcome,
@@ -11508,7 +11945,8 @@ or comment together with an explicit statement that no blocking defect exists.\n
             review_unlocated_no_evidence,
         ) {
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] {}",
                     loop_unresolved_review_message(
                         review_error.as_deref(),
@@ -11562,7 +12000,8 @@ or comment together with an explicit statement that no blocking defect exists.\n
         // no edit landed.
         if (check_green || check_satisfied) && !substance_ok && !review_skipped_empty_diff {
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: REJECTED green — diff is {diff_substance:?}, \
  not substantive work (anti-gaming guard)"
                 );
@@ -11585,7 +12024,8 @@ or comment together with an explicit statement that no blocking defect exists.\n
             prev_diff = diff.clone();
             if abort {
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: no new progress for {stall_streak} \
 consecutive non-substantive iteration(s); stopping."
                     );
@@ -11604,7 +12044,8 @@ consecutive non-substantive iteration(s); stopping."
             && (check_green || check_satisfied)
             && !cli.quiet
         {
-            eprintln!(
+            crate::oplog!(
+                "loop",
                 "[loop] iter {i}: WARNING accepting a test-only diff \
  (no non-test source changed)"
             );
@@ -11614,7 +12055,8 @@ consecutive non-substantive iteration(s); stopping."
         // explicitly so an operator can see the resolution rests on review
         // alone. Never claim a green check.
         if check.is_none() && !cli.quiet {
-            eprintln!(
+            crate::oplog!(
+                "loop",
                 "[loop] iter {i}: NOTE no --check configured — resolution rests on review \
  alone (verdict={}, blocking={blocking})",
                 review.verdict
@@ -11637,12 +12079,15 @@ consecutive non-substantive iteration(s); stopping."
                     ""
                 };
                 if via.is_empty() {
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: RESOLVED (check={:?} verdict={})",
-                        check_passed, review.verdict
+                        check_passed,
+                        review.verdict
                     );
                 } else {
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: RESOLVED {via} (reviewer advisory, verdict={}, \
  blocking={blocking})",
                         review.verdict
@@ -11667,7 +12112,8 @@ consecutive non-substantive iteration(s); stopping."
             // firmer nudge (see the escalated feedback below). Only give up
             // after STALL_LIMIT consecutive stalls — otherwise keep grinding.
             if !review_ok && !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: reviewer still blocking on unchanged diff \
  (verdict={}, blocking={blocking}); will iterate and stop after {STALL_LIMIT} \
  consecutive stalls.",
@@ -11689,7 +12135,8 @@ consecutive non-substantive iteration(s); stopping."
             // No fresh samples of an empty diff: there is nothing to review.
             if !review_ok && stall_streak >= 1 && !review_skipped_empty_diff {
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: unchanged diff with the same blocker; \
 re-running the reviewer twice for a 3-sample majority (both fresh samples must \
 approve)…"
@@ -11754,7 +12201,8 @@ approve)…"
                     resolved = true;
                     final_verdict = "approve".into();
                     if !cli.quiet {
-                        eprintln!(
+                        crate::oplog!(
+                            "loop",
                             "[loop] iter {i}: RESOLVED by majority of three reviewer \
 samples on an unchanged diff"
                         );
@@ -11770,7 +12218,8 @@ samples on an unchanged diff"
             }
             if stall_streak >= STALL_LIMIT {
                 if !cli.quiet {
-                    eprintln!(
+                    crate::oplog!(
+                        "loop",
                         "[loop] iter {i}: no new progress for {stall_streak} consecutive \
 iteration(s); stopping."
                     );
@@ -11778,7 +12227,8 @@ iteration(s); stopping."
                 break;
             }
             if !cli.quiet {
-                eprintln!(
+                crate::oplog!(
+                    "loop",
                     "[loop] iter {i}: no new progress ({stall_streak}/{STALL_LIMIT}); \
 re-prompting the author with a firmer directive."
                 );
@@ -12537,7 +12987,7 @@ fn print_host_cooldown(json: bool) -> Option<Value> {
     let view = zoder_core::host_cooldown_view(&marker);
     let line = zoder_core::host_cooldown_status_line(&ledger_path)?;
     if json {
-        eprintln!("[zoder] {line}");
+        crate::oplog!("zoder", "[zoder] {line}");
     } else {
         println!("[zoder] {line}");
     }
@@ -14769,7 +15219,8 @@ must reap the direct shell on the timeout branch)"
         let res = watchdog_handle
             .await
             .expect("watchdog task must complete")
-            .expect_err("watchdog must return Err on timeout");
+            .expect_err("watchdog must return Err on timeout")
+            .to_string();
         assert!(
             cancel_called.load(Ordering::SeqCst),
             "Z-8 fix: watchdog must invoke cancel on timeout; got no cancel"
@@ -14807,7 +15258,9 @@ must reap the direct shell on the timeout branch)"
             async move { settled_flag.store(true, std::sync::atomic::Ordering::SeqCst) },
         )
         .await;
-        let msg = result.expect_err("a timed-out turn is still an Err");
+        let msg = result
+            .expect_err("a timed-out turn is still an Err")
+            .to_string();
         assert!(
             msg.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
             "the reason must carry the unconfirmed marker; got: {msg}"
@@ -14938,7 +15391,8 @@ must reap the direct shell on the timeout branch)"
             std::future::ready(()),
         )
         .await
-        .expect_err("a turn that never finishes must fail the phase");
+        .expect_err("a turn that never finishes must fail the phase")
+        .to_string();
 
         assert!(
             err.contains(AUTHOR_CANCEL_UNCONFIRMED_MARKER),
@@ -14947,6 +15401,186 @@ must reap the direct shell on the timeout branch)"
         assert!(
             err.contains(AUTHOR_CANCEL_BEST_EFFORT_MARKER),
             "the phase error must keep the best-effort detail: {err}"
+        );
+    }
+
+    // ZD-08 characterisation: the exact text `author_phase_with_cancel`
+    // reports for each of its three error shapes. Records, MNEMOS events and
+    // operator logs carry these strings, so the typed refactor must keep them
+    // byte-identical.
+
+    #[tokio::test]
+    async fn author_phase_timeout_with_confirmed_cancel_text_is_pinned() {
+        let err = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a turn past its budget fails the phase");
+        assert_eq!(
+            err.to_string(),
+            "author phase timed out after 1s (killed, daemon cancel issued)"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_phase_timeout_with_unconfirmed_cancel_text_is_pinned() {
+        let err = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("daemon silent")) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a turn past its budget fails the phase");
+        assert_eq!(
+            err.to_string(),
+            "author phase timed out after 1s (killed, daemon cancel unconfirmed: \
+             author cancellation unconfirmed:daemon silent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_phase_turn_error_text_passes_through_verbatim() {
+        let err = author_phase_with_cancel(
+            5,
+            true,
+            async { Err::<crate::TurnResult, _>(anyhow::anyhow!("turn failed: HTTP 400 from x")) },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("a failed turn fails the phase");
+        assert_eq!(err.to_string(), "turn failed: HTTP 400 from x");
+    }
+
+    /// ZD-08: the loop reads WHAT went wrong from the error's kind, never from
+    /// its wording.
+    #[tokio::test]
+    async fn author_phase_errors_carry_a_typed_kind() {
+        let timed_out = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("timeout");
+        assert_eq!(timed_out.kind, AuthorPhaseErrorKind::TimedOut);
+        assert!(timed_out.timed_out() && !timed_out.cancel_unconfirmed());
+
+        let unconfirmed = author_phase_with_cancel(
+            1,
+            true,
+            std::future::pending::<anyhow::Result<crate::TurnResult>>(),
+            async { Err::<(), anyhow::Error>(anyhow::anyhow!("daemon silent")) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("timeout");
+        assert_eq!(unconfirmed.kind, AuthorPhaseErrorKind::CancelUnconfirmed);
+        assert!(unconfirmed.timed_out() && unconfirmed.cancel_unconfirmed());
+
+        // A provider body that merely NAMES a timeout parameter is not a
+        // timeout (the F2.5 misread, on the author path).
+        let body = author_phase_with_cancel(
+            5,
+            true,
+            async {
+                Err::<crate::TurnResult, _>(anyhow::anyhow!(
+                    "provider HTTP 400: {{\"error\":\"unsupported parameter: stream_timeout\"}}"
+                ))
+            },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("failed turn");
+        assert_eq!(body.kind, AuthorPhaseErrorKind::Failed { timed_out: false });
+        assert!(!body.timed_out() && !body.cancel_unconfirmed());
+
+        // The engine's own timeout only arrives as text: read by the one
+        // text helper.
+        let engine_timeout = author_phase_with_cancel(
+            5,
+            true,
+            async {
+                Err::<crate::TurnResult, _>(anyhow::anyhow!("turn failed: request timed out"))
+            },
+            async { Ok::<(), anyhow::Error>(()) },
+            std::future::ready(()),
+        )
+        .await
+        .expect_err("failed turn");
+        assert_eq!(
+            engine_timeout.kind,
+            AuthorPhaseErrorKind::Failed { timed_out: true }
+        );
+    }
+
+    #[test]
+    fn author_phase_error_kinds_have_stable_record_names_and_codes() {
+        use crate::failure::FailureCode;
+        let cases = [
+            (
+                AuthorPhaseErrorKind::TimedOut,
+                "timed_out",
+                FailureCode::AuthorTimeout,
+            ),
+            (
+                AuthorPhaseErrorKind::CancelUnconfirmed,
+                "cancel_unconfirmed",
+                FailureCode::CancelUnconfirmed,
+            ),
+            (
+                AuthorPhaseErrorKind::Failed { timed_out: false },
+                "failed",
+                FailureCode::AuthorFailed,
+            ),
+            (
+                AuthorPhaseErrorKind::Failed { timed_out: true },
+                "failed",
+                FailureCode::AuthorFailed,
+            ),
+        ];
+        for (kind, name, code) in cases {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(kind.failure_code(), code);
+            assert_eq!(AuthorPhaseErrorKind::code_for_record(name), Some(code));
+        }
+        assert_eq!(AuthorPhaseErrorKind::code_for_record("bogus"), None);
+    }
+
+    /// ZD-08: the confirmer's timeout outcome comes from the provider error
+    /// kind when it has one; only an error that never had a kind falls back
+    /// to the shared text helper.
+    #[test]
+    fn confirmer_fatal_timeout_is_read_from_the_error_kind() {
+        use crate::review_confirm::ConfirmerOutcome;
+        let body = ReviewerError::Fatal {
+            message: "reviewer m: provider HTTP 400: {\"error\":\"unsupported parameter: \
+                      stream_timeout\"}"
+                .into(),
+            kind: Some(zoder_core::ErrKind::Http),
+        };
+        assert_eq!(classify_confirmer_error(&body), ConfirmerOutcome::Empty);
+        let typed = ReviewerError::Fatal {
+            message: "reviewer m: stream stalled".into(),
+            kind: Some(zoder_core::ErrKind::Timeout),
+        };
+        assert_eq!(classify_confirmer_error(&typed), ConfirmerOutcome::Timeout);
+        let untyped = ReviewerError::Fatal {
+            message: "reviewer m: request timed out".into(),
+            kind: None,
+        };
+        assert_eq!(
+            classify_confirmer_error(&untyped),
+            ConfirmerOutcome::Timeout
         );
     }
 
@@ -15355,6 +15989,9 @@ must reap the direct shell on the timeout branch)"
                 },
                 model: "m".into(),
                 alias: "a".into(),
+                provider: String::new(),
+                billing: String::new(),
+                estimated_cost_usd: None,
                 cost_usd: 0.0,
                 cost_unknown: false,
                 tokens_in: 0,
@@ -15790,6 +16427,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -15854,6 +16494,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -15882,6 +16525,9 @@ not run to max_iters"
                 },
                 model: "m".into(),
                 alias: "a".into(),
+                provider: String::new(),
+                billing: String::new(),
+                estimated_cost_usd: None,
                 cost_usd: 0.0,
                 cost_unknown: false,
                 tokens_in: 0,
@@ -15908,6 +16554,9 @@ not run to max_iters"
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -16205,6 +16854,59 @@ not run to max_iters"
         let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
             .expect("unresolved loop has a failure");
         assert_eq!(f.code, crate::failure::FailureCode::ReviewersUnavailable);
+    }
+
+    /// ZD-08: a watchdog timeout before the author produced a model is the
+    /// author's failure. Its text ("author phase timed out after ...") matches
+    /// no message marker, so on master the run was filed as
+    /// `reviewer_unavailable`, blaming a reviewer that reviewed nothing. The
+    /// record's typed `author_error_kind` decides it instead.
+    #[test]
+    fn loop_failure_files_a_watchdog_author_timeout_as_author_timeout() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "author phase timed out after 900s (killed, daemon cancel issued)",
+            "author_error_kind": "timed_out",
+            "review_error": "review skipped: the author turn failed and left no edits",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::AuthorTimeout);
+        assert!(
+            f.message.contains("author phase timed out"),
+            "{}",
+            f.message
+        );
+    }
+
+    /// ZD-08: an author turn that failed with engine text no marker knows is
+    /// `author_failed`, not `reviewer_unavailable`.
+    #[test]
+    fn loop_failure_files_an_unrecognised_author_error_as_author_failed() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "turn failed: the engine closed the stream",
+            "author_error_kind": "failed",
+            "review_error": "review skipped: the author turn failed and left no edits",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::AuthorFailed);
+    }
+
+    /// ZD-08: a more specific engine code in the author's text still wins
+    /// over the generic `failed` kind (session limit, budget refusal).
+    #[test]
+    fn loop_failure_keeps_a_specific_engine_code_over_the_failed_kind() {
+        let last = serde_json::json!({
+            "author_model": Value::Null,
+            "author_error": "session/new failed: Session limit reached (code -32001)",
+            "author_error_kind": "failed",
+            "review_error": "review skipped",
+        });
+        let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::SessionLimit);
     }
 
     /// FB110 (audit F2): the teardown names the author-side failure code
@@ -18252,6 +18954,9 @@ mod mr1_policy_violation_tests {
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -18305,6 +19010,9 @@ mod mr1_policy_violation_tests {
             },
             model: "m".into(),
             alias: "a".into(),
+            provider: String::new(),
+            billing: String::new(),
+            estimated_cost_usd: None,
             cost_usd: 0.0,
             cost_unknown: false,
             tokens_in: 0,
@@ -28085,5 +28793,83 @@ mod attach_failure_to_result_tests {
                 "{original}: a refused attach must leave the result untouched"
             );
         }
+    }
+}
+
+/// ZD-03 (F5.2): `--check` validates what the author turn wrote. When the
+/// author turn FAILED and the captured task diff is empty there is nothing
+/// to validate: running the check only spends a phase budget and records a
+/// pass or fail for the unmodified base tree.
+#[cfg(test)]
+mod check_phase_gate_tests {
+    use super::check_phase_runs;
+
+    #[test]
+    fn a_failed_author_with_an_empty_diff_skips_the_check() {
+        assert!(
+            !check_phase_runs(false, true, true),
+            "generic author failure + empty diff: nothing was authored to validate"
+        );
+    }
+
+    #[test]
+    fn a_session_limit_refusal_still_skips_the_check() {
+        assert!(!check_phase_runs(true, true, true));
+        assert!(!check_phase_runs(true, true, false));
+    }
+
+    #[test]
+    fn a_failed_author_that_left_edits_is_still_checked() {
+        // A timed-out turn preserves its partial edits; those are validated.
+        assert!(check_phase_runs(false, true, false));
+    }
+
+    #[test]
+    fn a_finished_author_turn_is_checked_even_with_an_empty_diff() {
+        // Unchanged behaviour: a completed no-op turn still runs the check.
+        assert!(check_phase_runs(false, false, true));
+        assert!(check_phase_runs(false, false, false));
+    }
+}
+
+/// ZD-15 (F2.6): the per-call context telemetry and the provider-health skip
+/// list are process-global. `zoder` runs one command per process today, but
+/// a command must not inherit the records of anything that ran before it in
+/// the same process: `cmd_review` and `cmd_loop_run` start from empty
+/// buffers.
+#[cfg(test)]
+mod command_telemetry_reset_tests {
+    #[test]
+    fn begin_command_telemetry_drops_the_previous_runs_records_and_skips() {
+        let home = tempfile::tempdir().unwrap();
+        // ENV_LOCK serialises this with every test that records or drains
+        // these buffers (they all hold a home guard).
+        let _guard = crate::test_env::EnvGuard::new(home.path());
+        let res = zoder_core::provider::ChatResult {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(2),
+            ..Default::default()
+        };
+        let segments = crate::context_opt::segments_for("sys", "user");
+        crate::context_opt::record_call("review", &segments, &res);
+        crate::provider_health::note_skip_for_test("stale-model", "stale-provider");
+        assert!(!crate::context_opt::records().is_empty());
+
+        super::begin_command_telemetry();
+
+        assert!(
+            crate::context_opt::records().is_empty(),
+            "a new command must not report an earlier run's calls"
+        );
+        assert!(
+            crate::provider_health::take_skipped().is_empty(),
+            "a new command must not report an earlier run's skips"
+        );
+        // Turn numbering restarts with the buffer.
+        crate::context_opt::record_call("review", &segments, &res);
+        let records = crate::context_opt::records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].turn, 1, "{records:?}");
+        super::begin_command_telemetry();
     }
 }

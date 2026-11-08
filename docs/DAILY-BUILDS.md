@@ -1,6 +1,6 @@
 # Daily trio builds
 
-The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/native-builds.yml), scheduled at **09:15 UTC daily**. GitHub may delay scheduled runs. It builds native macOS arm64, Linux arm64, and Linux x86_64 on hosted runners, then publishes the `zoder` / `zerocode` / `zeroclaw` trio to the GitLab `zoder-nightly/master` package channel and GitHub rolling `nightly` release.
+The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/native-builds.yml), scheduled at **09:15 UTC daily**. GitHub may delay scheduled runs. It builds native Linux arm64 and Linux x86_64 on hosted runners (Linux only since 2026-11-07; macOS and Windows users run the `ghcr.io/ncz-os/zoder` container image), then publishes the `zoder` / `zerocode` / `zeroclaw` trio to the GitLab `zoder-nightly/master` package channel and GitHub rolling `nightly` release.
 
 ## Source and acceptance
 
@@ -10,7 +10,7 @@ The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/
 - Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
 - Every archive contains `manifest.json`: exact repository/commit pairs, target, run URL, immutable channel, and SHA-256 hashes of all three binaries. The raw package channel also contains `manifest.json-<target>` plus its checksum.
 - Each run publishes `run-<run-id>-<source-job-attempt>` alongside the legacy date/master binary paths. After every target and both publishers succeed, `master/release.json` activates that complete immutable snapshot. Fleet pullers read this pointer once, verify its target manifest hash and source identity, then verify the three binary hashes from the immutable channel. A partial publish never activates the new snapshot.
-- All three targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.
+- Both targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.
 - Manual dispatch on a topic branch validates that branch and uploads Actions artifacts, but does not replace the master/nightly fleet channels. Fixes on a topic branch must be reviewed and merged to master before the scheduled nightly includes them. The GitHub hosting tag uses the workflow commit; archive manifests and release notes identify the canonical commits actually compiled.
 
 ## Verify a nightly
@@ -22,7 +22,7 @@ gh run view <run-id> -R ncz-os/zoder --log
 gh workflow run native-builds.yml -R ncz-os/zoder --ref master
 ```
 
-Require completed success for all three build jobs and publication, and read the archive manifest. A green build of an old source revision does not prove a newer repair was shipped. A scheduled pipeline is not evidence of fleet installation; verify installed binary provenance separately.
+Require completed success for both build jobs and publication, and read the archive manifest. A green build of an old source revision does not prove a newer repair was shipped. A scheduled pipeline is not evidence of fleet installation; verify installed binary provenance separately.
 
 ## Other automation
 

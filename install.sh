@@ -6,7 +6,8 @@ set -eu
 # canonical, authoritative home of the project. GitLab CI rebuilds master every
 # night and publishes a per-platform binary to a rolling generic package; this
 # script fetches the one for your platform. POSIX sh — no bash required. Works
-# on Debian, Alpine-glibc, macOS (Apple Silicon), everywhere with curl.
+# on Debian, Alpine-glibc, any Linux with curl. macOS and Windows: run the
+# container image instead: docker run --rm ghcr.io/ncz-os/zoder --help
 #
 # Interactive (canonical, GitLab):
 #   curl -fsSL https://gitlab.com/ncz-os/zoder/-/raw/master/install.sh | sh
@@ -96,7 +97,8 @@ Options:
   --help            Show this help
 
 GitLab CI rebuilds master nightly and publishes per-platform binaries for
-linux-x86_64, linux-aarch64, and macOS-arm64. The installer detects your
+linux-x86_64 and linux-aarch64 (macOS and Windows: docker run --rm ghcr.io/ncz-os/zoder --help).
+The installer detects your
 platform, verifies the download against its published SHA256 when available,
 and installs zoder into your bin directory.
 EOF
@@ -212,16 +214,6 @@ detect_target_triple() {
   os=$(uname -s)
   arch=$(uname -m)
   case "$os" in
-  Darwin)
-    # A Rosetta-translated shell on Apple Silicon reports x86_64 from
-    # `uname -m`; consult sysctl to recover the true CPU so we never hand an
-    # arm64 Mac the wrong binary ("bad CPU type in executable").
-    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
-      echo "aarch64-apple-darwin"
-    else
-      echo "x86_64-apple-darwin"
-    fi
-    ;;
   Linux)
     libc=$(detect_libc)
     case "$arch" in
@@ -257,7 +249,7 @@ shell_profile() {
 # ── Resolve platform + package base ──────────────────────────────
 
 triple=$(detect_target_triple)
-[ -n "$triple" ] || die "unsupported platform: $(uname -s)/$(uname -m) (Linux or macOS-arm64 only; on Windows use WSL)"
+[ -n "$triple" ] || die "unsupported platform: $(uname -s)/$(uname -m) (Linux x86_64/aarch64 only; macOS and Windows: docker run --rm ghcr.io/ncz-os/zoder --help)"
 
 # URL-encode owner/repo into a GitLab project path (ncz-os/zoder -> ncz-os%2Fzoder).
 proj=$(printf '%s' "$REPO" | sed 's#/#%2F#g')
@@ -353,7 +345,7 @@ for b in $BIN_REQUIRED; do
 done
 
 if [ "$required_failed" -gt 0 ]; then
-  die "no nightly build for ${triple} (channel ${CHANNEL}). The nightly builds x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and aarch64-apple-darwin; musl and Intel macOS are not published."
+  die "no nightly build for ${triple} (channel ${CHANNEL}). The nightly builds x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu only; musl is not published (macOS and Windows: use the container image)."
 fi
 [ "$required_staged" -gt 0 ] || die "nothing staged for install"
 

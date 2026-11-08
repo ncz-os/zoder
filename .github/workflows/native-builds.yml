@@ -1,6 +1,8 @@
-name: native nightly builds (all arches)
+name: native nightly builds (linux x86_64 + aarch64)
 
 # Resolve latest canonical HEAD once, build every native target, then publish.
+# Linux only: macOS and Windows users run the ghcr.io/ncz-os/zoder container
+# image (container-weekly.yml); no darwin binary is built or published.
 # Dispatches on topic branches exercise the complete build without replacing
 # the fleet's master channel. GitLab remains the source of truth.
 on:
@@ -95,7 +97,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,         triple: aarch64-apple-darwin }
           - { os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
           - { os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
@@ -198,7 +199,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             sha256sum -c "zoder-${triple}.tar.gz.sha256"
             tar -xzf "zoder-${triple}.tar.gz"
             TRIPLE="$triple" python3 - <<'PY'
@@ -216,7 +217,7 @@ jobs:
           done
           DATE="$(date -u +%F)"
           BASE="https://gitlab.com/api/v4/projects/${PROJECT_ID}/packages/generic/zoder-nightly"
-          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             for bin in zoder zerocode zeroclaw manifest.json; do
               src="zoder-${triple}/${bin}"
               dst="${bin}-${triple}"
@@ -229,7 +230,7 @@ jobs:
           done
           python3 - <<'PY'
           import hashlib, json, os, pathlib
-          targets = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin')
+          targets = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')
           release = {'schema': 1, 'channel': os.environ['CHANNEL'],
                      'zoder_sha': os.environ['ZODER_SHA'], 'engine_sha': os.environ['ENGINE_SHA'],
                      'upstream_sha': os.environ['UPSTREAM_SHA'],
@@ -237,7 +238,7 @@ jobs:
           pathlib.Path('release.json').write_text(json.dumps(release, indent=2) + '\n')
           PY
           curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${PKG_TOKEN}" --upload-file release.json "${BASE}/${CHANNEL}/release.json"
-          NOTES="Rolling nightly trio, ${DATE} UTC. zoder ${ZODER_SHA}; engine ${ENGINE_SHA}. All three native targets built with --locked. Each archive includes manifest.json with exact source SHAs and build run."
+          NOTES="Rolling nightly trio, ${DATE} UTC. zoder ${ZODER_SHA}; engine ${ENGINE_SHA}. Both Linux targets (x86_64, aarch64) built with --locked. Each archive includes manifest.json with exact source SHAs and build run."
           # Preserve old downloads until all targets and manifests pass.
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "zoder nightly (rolling)" --notes "$NOTES"

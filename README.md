@@ -15,7 +15,8 @@ Detects your OS/arch, verifies the SHA-256 checksum, and installs the selected
 nightly channel build to `~/.local/bin` (`zoder`). The nightly release bundles
 `zerocode` (TUI) and `zeroclaw` (engine) alongside zoder — the installer installs
 all three when the channel artifact exists (the installer treats them as optional
-only for backward compatibility with old channels that predate the trio). Targets: linux-x86_64, linux-aarch64, macOS-arm64 (Windows → WSL).
+only for backward compatibility with old channels that predate the trio). Targets: linux-x86_64, linux-aarch64. macOS and Windows: run the
+[container image](#container-docker) (`docker run --rm ghcr.io/ncz-os/zoder --help`).
 Pin/automate: set `ZODER_CHANNEL=YYYY-MM-DD` or pass `--channel YYYY-MM-DD`.
 Full options, manual, and source builds are [below](#install--build-targets).
 
@@ -632,13 +633,13 @@ to pin a nightly), `ZODER_BIN_DIR` / `--bin-dir <dir>` (default `~/.local/bin`),
 
 **Manual (tarball):** grab your platform's tarball from the GitHub **nightly**
 release <https://github.com/ncz-os/zoder/releases/tag/nightly> — refreshed every
-night with all three arches; each `.tar.gz` has a sibling `.sha256`:
+night for both Linux arches; each `.tar.gz` has a sibling `.sha256`:
 
 ```bash
 base=https://github.com/ncz-os/zoder/releases/download/nightly
 curl -fLO "$base/zoder-<target>.tar.gz"
 curl -fLO "$base/zoder-<target>.tar.gz.sha256"
-sha256sum -c zoder-<target>.tar.gz.sha256      # macOS: shasum -a 256 -c
+sha256sum -c zoder-<target>.tar.gz.sha256
 tar -xzf zoder-<target>.tar.gz
 sudo install zoder-<target>/{zoder,zerocode,zeroclaw} /usr/local/bin/
 zoder --help          # the trio is now on your PATH
@@ -648,8 +649,8 @@ The raw per-binary artifacts `install.sh` pulls (rolling + date-pinned) live in
 the GitLab package registry: <https://gitlab.com/ncz-os/zoder/-/packages>
 (`zoder-nightly/master`, or `zoder-nightly/<YYYY-MM-DD>` for a pinned day).
 
-Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`aarch64-apple-darwin` (Apple Silicon). Windows → use WSL.
+Targets: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`. No macOS or
+Windows binaries are published: use the [container image](#container-docker).
 
 ### Debian / Ubuntu (apt)
 
@@ -671,7 +672,9 @@ The package carries the `zoder` CLI only; `zerocode` and `zeroclaw` come from
 ### Container (Docker)
 
 The full stack (zoder + zerocode + zeroclaw + goose) ships as a multi-arch image
-(`linux/amd64` + `linux/arm64`) on GitHub Container Registry, rebuilt weekly:
+(`linux/amd64` + `linux/arm64`) on GitHub Container Registry, rebuilt weekly.
+This is the supported route on macOS and Windows (Docker Desktop or Podman;
+`podman` takes the same arguments):
 
 ```bash
 docker pull ghcr.io/ncz-os/zoder:latest        # or :weekly-<ISO-week>, e.g. :weekly-2026-W27
@@ -681,18 +684,16 @@ docker run --rm ghcr.io/ncz-os/zoder --help
 
 ### Build from source
 
-zoder builds natively for:
+Supported (built, tested and published) targets are Linux only:
 
 | Platform | Target |
 |---|---|
-| macOS arm (Apple Silicon) | `aarch64-apple-darwin` |
-| macOS x86_64 (Intel) | `x86_64-apple-darwin` |
 | linux x86 | `x86_64-unknown-linux-gnu` |
 | linux arm | `aarch64-unknown-linux-gnu` |
 
-- Local build: `./scripts/build.sh mac` (or `mac-x86`, `linux`).
-- Nightly binaries: `.github/workflows/native-builds.yml` builds all three
-  arches natively on GitHub (macOS + arm64-Linux + x86_64-Linux), publishes raw
+- Local build: `./scripts/build.sh linux`.
+- Nightly binaries: `.github/workflows/native-builds.yml` builds both Linux
+  arches natively on GitHub (arm64-Linux + x86_64-Linux), publishes raw
   binaries to the GitLab `zoder-nightly` channel and tarballs to the GitHub
   `nightly` release. Tagged `v*` releases: `.github/workflows/release.yml`.
 - The per-push quality gate runs on **GitLab** (`.gitlab-ci.yml`):
