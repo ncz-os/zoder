@@ -91,6 +91,19 @@ pub(crate) fn take_skipped() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Forget every skip record, so a command reports only its own (ZD-15).
+pub(crate) fn reset_skipped() {
+    if let Ok(mut v) = SKIPPED.lock() {
+        v.clear();
+    }
+}
+
+/// Record a skip without a health store, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn note_skip_for_test(model: &str, provider: &str) {
+    let _ = note_skip(model, provider, now(), "test");
+}
+
 fn note_skip(model: &str, provider: &str, until_unix: i64, reason: &str) -> String {
     if let Ok(mut v) = SKIPPED.lock() {
         v.push(json!({

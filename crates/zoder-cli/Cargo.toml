@@ -49,6 +49,8 @@ landlock = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Paused-clock tests of the reaper's cancel phase (reaper_fault_tests.rs).
+tokio = { workspace = true, features = ["test-util", "net"] }
 # Shared env lock / env guard / isolated home for hermetic tests.
 zoder-test-support = { path = "../test-support" }
 # Used by the reviewer-fallback-chain integration tests so the dispatcher

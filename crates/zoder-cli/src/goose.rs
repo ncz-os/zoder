@@ -53,7 +53,10 @@ where
         let id = dispatch_fn("run", &cwd)?;
         println!("{id}");
         if !cli.quiet {
-            eprintln!("[zoder] started background job {id} (zoder status {id} / result {id})");
+            crate::oplog!(
+                "zoder",
+                "[zoder] started background job {id} (zoder status {id} / result {id})"
+            );
         }
         return Ok(Some(id));
     }
@@ -239,7 +242,12 @@ fn cmd_recipe_list_write<W: std::io::Write>(dir: &Path, out: &mut W) -> anyhow::
             let raw = match read_recipe_file(&p, Config::MAX_CONFIG_BYTES) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("zoder: warning: skipping recipe {} — {:#}", p.display(), e);
+                    crate::oplog!(
+                        "zoder",
+                        "zoder: warning: skipping recipe {} — {:#}",
+                        p.display(),
+                        e
+                    );
                     continue;
                 }
             };
