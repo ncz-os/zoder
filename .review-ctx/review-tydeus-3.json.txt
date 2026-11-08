@@ -1,8 +1,0 @@
-```json
-{
-  "verdict": "APPROVE",
-  "findings": [],
-  "confidence": "high",
-  "notes": "The code has been verified against the D3 contract. All exit codes (20, 40, 50) and failure classes (transient, config, permanent) in the test assertions match the requirements in docs/EXIT_CODES.md. The JSON shape logic (failure inside result for successful runs vs standalone error for failed runs) is correctly implemented in the assertions. The rework table in PLAN-FB67.md is consistent with the implementation in failure_contract_golden.rs. The test harness correctly handles environment isolation (ZODER_HOME, ZEROCLAW_CONFIG_DIR, PATH) and uses a portable subset of assertions for the Linux-only reaper logic. The comments have been updated to reflect the new exit ladder, removing the stale 'exit 1' claims."
-}
-```
