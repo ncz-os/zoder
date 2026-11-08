@@ -3071,7 +3071,7 @@ async fn drive<F: FnMut(AgentEvent)>(
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
-                anyhow::bail!("session/new resume failed: {err}");
+                return Err(session_new_rejected(effective_session_id.is_some(), &err));
             }
             // Recoverable reject: an evicted session, or one owned by a
             // different agent (the model-fallback case). Do not surface
@@ -5022,7 +5022,7 @@ where
         Ok(v) => v,
         Err(err) => {
             if !may_replace_rejected_session(opts, &err) {
-                anyhow::bail!("session/new resume failed: {err}");
+                return Err(session_new_rejected(effective_session_id.is_some(), &err));
             }
             // Engine rejected a resume. Z-24: do NOT clear the
             // on-disk record here. The previous behavior was to
@@ -6060,6 +6060,18 @@ fn is_agent_ownership_rejection(error: &RpcError) -> bool {
 /// An explicit `--session` / `--continue` id is never replaced: the
 /// operator asked for that exact session and a silent fresh one would
 /// hide the problem.
+/// The terminal error for a `session/new` the engine rejected and the client
+/// will not replace. Only a request that carried a session id was a resume;
+/// calling a fresh create a "resume" sends the reader after a persistence bug
+/// that cannot exist on that path (ZD-21).
+fn session_new_rejected(resuming: bool, error: &RpcError) -> anyhow::Error {
+    if resuming {
+        anyhow!("session/new resume failed: {error}")
+    } else {
+        anyhow!("session/new failed: {error}")
+    }
+}
+
 fn may_replace_rejected_session(opts: &AgentOptions, error: &RpcError) -> bool {
     let replaceable = if opts.session_id.is_some() {
         opts.session_id_is_continuity_hint
@@ -6686,6 +6698,39 @@ mod tests {
     /// The same wire rejection stays fatal for an EXPLICIT `--session`
     /// id: the operator asked for that session and a silent replacement
     /// would hide why it is unusable.
+    /// ZD-21: a FRESH `session/new` (no session id sent, nothing persisted)
+    /// that the daemon rejects must not be reported as a failed resume.
+    /// "resume failed" sends whoever reads the log looking for a session
+    /// persistence bug that cannot exist on this path.
+    #[tokio::test]
+    async fn fresh_session_new_rejection_is_not_called_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fresh-reject.sock");
+        let server = ownership_rejecting_daemon(socket.clone()).await;
+
+        let mut opts = AgentOptions::new(&socket, "agent-b", "/tmp", "fresh turn");
+        opts.timeout = Duration::from_secs(5);
+        assert!(opts.session_id.is_none() && !opts.persist_session_id);
+        let err = run_agent(&opts, |_| {})
+            .await
+            .expect_err("a rejected fresh session/new must fail the turn");
+        let frames = server.await.unwrap();
+
+        let text = err.to_string();
+        assert!(
+            !text.contains("resume"),
+            "no resume was attempted, so the error must not name one; got: {text}"
+        );
+        assert!(
+            text.contains("session/new failed") && text.contains("different agent"),
+            "the error must still name the call and the daemon's reason; got: {text}"
+        );
+        assert!(
+            frames[1]["params"].get("session_id").is_none(),
+            "precondition: the request carried no session id"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_resume_ownership_rejection_remains_fatal() {
         let dir = tempfile::tempdir().unwrap();
@@ -14036,6 +14081,54 @@ mod tests {
             "the first window must still measure the silence; took {elapsed:?}"
         );
         server.abort();
+    }
+
+    /// ZD-21, goose path: a fresh `session/new` the engine rejects is a
+    /// failed session/new, not a failed resume.
+    #[tokio::test]
+    async fn goose_fresh_session_new_rejection_is_not_called_a_resume() {
+        let script = r#"while IFS= read -r line; do
+  case "$line" in
+    *'"id":"init"'*) printf '%s\n' '{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}' ;;
+    *'"id":"new"'*) printf '%s\n' '{"jsonrpc":"2.0","id":"new","error":{"code":-32000,"message":"engine refused the session"}}' ;;
+  esac
+done
+"#;
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn the fake goose child");
+        let pid = child.id().expect("spawned child must have a pid");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut conn = ConnectedTransport {
+            reader: TransportReader::ChildStdout(stdout),
+            writer: TransportWriter::ChildStdin(stdin),
+            child: Some(child),
+            pgid: Some(pid as i32),
+        };
+
+        let mut opts = goose_opts(Some("gpt-4o-mini"));
+        opts.timeout = Duration::from_secs(10);
+        assert!(opts.session_id.is_none() && !opts.persist_session_id);
+        let err = run_goose_agent_with_conn(&mut conn, &opts, |_| {})
+            .await
+            .expect_err("a rejected fresh session/new must fail the turn");
+        let text = err.to_string();
+        assert!(
+            !text.contains("resume"),
+            "no resume was attempted, so the error must not name one; got: {text}"
+        );
+        assert!(
+            text.contains("session/new failed") && text.contains("engine refused the session"),
+            "the error must still name the call and the engine's reason; got: {text}"
+        );
     }
 
     #[tokio::test]

@@ -69,24 +69,30 @@ pub(crate) async fn checkpoint(cwd: &std::path::Path, evidence: Value) {
                 .open(path)
             {
                 if writeln!(file, "{evidence}").is_err() {
-                    eprintln!("[zoder] local MNEMOS ledger write failed");
+                    crate::oplog!("zoder", "[zoder] local MNEMOS ledger write failed");
                 }
             } else {
-                eprintln!("[zoder] local MNEMOS ledger could not be opened");
+                crate::oplog!("zoder", "[zoder] local MNEMOS ledger could not be opened");
             }
         } else {
-            eprintln!("[zoder] local MNEMOS ledger unavailable: not a Git checkout");
+            crate::oplog!(
+                "zoder",
+                "[zoder] local MNEMOS ledger unavailable: not a Git checkout"
+            );
         }
     } else {
-        eprintln!("[zoder] local MNEMOS ledger unavailable: Git failed");
+        crate::oplog!(
+            "zoder",
+            "[zoder] local MNEMOS ledger unavailable: Git failed"
+        );
     }
     let (Ok(base), Ok(token)) = (std::env::var("MNEMOS_URL"), std::env::var("MNEMOS_TOKEN")) else {
         return;
     };
     let body = json!({"content":evidence.to_string(),"category":"projects","subcategory":"zoder-work","source_agent":"zoder","metadata":{"job_id":std::env::var("HIVE_JOB_ID").ok()}});
     match request(&base, &token, "/v1/memories", body).await {
-        Ok(value) => eprintln!("[zoder] MNEMOS checkpoint {}", value["id"]),
-        Err(error) => eprintln!("[zoder] MNEMOS checkpoint pending: {error}"),
+        Ok(value) => crate::oplog!("zoder", "[zoder] MNEMOS checkpoint {}", value["id"]),
+        Err(error) => crate::oplog!("zoder", "[zoder] MNEMOS checkpoint pending: {error}"),
     }
 }
 
@@ -129,7 +135,7 @@ pub(crate) async fn event(job_id: Option<&str>, phase: &str, payload: Value) {
     )
     .await;
     if !matches!(sent, Ok(Ok(_))) {
-        eprintln!("[zoder] loop event {phase} not recorded");
+        crate::oplog!("zoder", "[zoder] loop event {phase} not recorded");
     }
 }
 
@@ -168,7 +174,7 @@ pub(crate) fn event_blocking(job_id: Option<&str>, phase: &str, payload: Value) 
     .join()
     .unwrap_or(false);
     if !sent {
-        eprintln!("[zoder] loop event {phase} not recorded");
+        crate::oplog!("zoder", "[zoder] loop event {phase} not recorded");
     }
 }
 

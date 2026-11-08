@@ -208,7 +208,8 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
 
     let exe = std::env::current_exe().context("locating the zoder binary to re-invoke")?;
     let total = cases.len() * arms.len() * args.repeat.max(1);
-    eprintln!(
+    crate::oplog!(
+        "eval",
         "[eval] {} case(s) x {} arm(s) x {} rep(s) = {total} run(s); artifacts -> {}",
         cases.len(),
         arms.len(),
@@ -257,7 +258,7 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
 
                 if args.dry_run {
                     row.skipped_reason = Some("dry-run".into());
-                    eprintln!("[eval] would run {} / {}", case.name, arm.name);
+                    crate::oplog!("eval", "[eval] would run {} / {}", case.name, arm.name);
                     record(&mut index_file, &row);
                     rows.push(row);
                     continue;
@@ -268,7 +269,7 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
                     // reason and excluded from rates -- calling it a model failure is
                     // the exact mistake this runner exists to stop making.
                     row.skipped_reason = Some(format!("setup: {e}"));
-                    eprintln!("[eval] SKIP {} / {}: {e}", case.name, arm.name);
+                    crate::oplog!("eval", "[eval] SKIP {} / {}: {e}", case.name, arm.name);
                     record(&mut index_file, &row);
                     rows.push(row);
                     continue;
@@ -297,7 +298,12 @@ pub(crate) fn cmd_eval(cli: &crate::Cli, args: EvalArgs) -> anyhow::Result<()> {
                     cmd.args(["--max-tokens", &t.to_string()]);
                 }
 
-                eprintln!("[eval] run {} / {} (cap {cap})", case.name, arm.name);
+                crate::oplog!(
+                    "eval",
+                    "[eval] run {} / {} (cap {cap})",
+                    case.name,
+                    arm.name
+                );
                 let output = match cmd.output() {
                     Ok(o) => o,
                     Err(e) => {
