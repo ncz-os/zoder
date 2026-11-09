@@ -166,6 +166,14 @@ pub(crate) fn record_call(
     }
 }
 
+/// Forget every record, so the next command's turn numbering starts at 1 and
+/// its payload carries only its own calls (ZD-15).
+pub(crate) fn reset() {
+    if let Ok(mut records) = RECORDS.lock() {
+        records.clear();
+    }
+}
+
 /// The records of this process, in call order.
 pub(crate) fn records() -> Vec<CallRecord> {
     RECORDS.lock().map(|r| r.clone()).unwrap_or_default()

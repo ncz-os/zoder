@@ -144,7 +144,8 @@ pub(crate) async fn acquire(
             );
         }
         if !quiet && waited >= next_notice {
-            eprintln!(
+            crate::oplog!(
+                "zoder",
                 "[zoder] waiting {}s for a local {provider} slot ({limit} in use by other zoder \
                  processes; ZODER_PROVIDER_CONCURRENCY)",
                 waited.as_secs()
