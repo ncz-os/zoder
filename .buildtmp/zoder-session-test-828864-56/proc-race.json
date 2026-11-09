@@ -1,0 +1,27 @@
+{
+  "id": "proc-race",
+  "created": 1794199139,
+  "updated": 1794199139,
+  "messages": [
+    {
+      "role": "user",
+      "content": "seed"
+    },
+    {
+      "role": "user",
+      "content": "child-A-prompt"
+    },
+    {
+      "role": "assistant",
+      "content": "child-A-reply"
+    },
+    {
+      "role": "user",
+      "content": "child-B-prompt"
+    },
+    {
+      "role": "assistant",
+      "content": "child-B-reply"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "id": "ok",
+  "created": 1794199050,
+  "updated": 1794199050,
+  "messages": [
+    {
+      "role": "user",
+      "content": "ok-prompt"
+    }
+  ]
+}
