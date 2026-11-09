@@ -1,17 +1,17 @@
 {
   "overlay": {
-    "age_days": 0,
+    "age_days": 1,
     "built_at": "2026-11-08T09:07:23Z",
-    "candidate_models_with_score": 198,
+    "candidate_models_with_score": 149,
     "models_with_score": 198,
-    "reason": "",
-    "stale": false
+    "reason": "bench source(s) unavailable with no LKG: fetch-arena.py",
+    "stale": true
   },
-  "overlay_age_days": 0,
-  "overlay_stale": false,
+  "overlay_age_days": 1,
+  "overlay_stale": true,
   "prices": {
     "catalog_models": 3770,
-    "generated": "2026-11-08",
+    "generated": "2026-11-09",
     "litellm": {
       "models": 3329,
       "ok": true,
@@ -23,7 +23,7 @@
       "ok": true,
       "reason": ""
     },
-    "previous_catalog_models": 3765
+    "previous_catalog_models": 3770
   },
   "schema": 2,
   "sources": [
@@ -51,12 +51,12 @@
       "kind": "bench",
       "lkg": false,
       "name": "fetch-arena.py",
-      "ok": true,
+      "ok": false,
       "outputs": [
         "arena-webdev.json",
         "arena-agent.json"
       ],
-      "reason": ""
+      "reason": "arena: https://datasets-server.huggingface.co/rows?dataset=lmarena-ai/leaderboard-dataset&config=webdev&split=latest&offset=0&length=100 failed after 3 attempts (HTTP 503)"
     },
     {
       "kind": "bench",
@@ -79,5 +79,5 @@
       "reason": ""
     }
   ],
-  "ts": "2026-11-08T09:07:23Z"
+  "ts": "2026-11-09T09:07:37Z"
 }
