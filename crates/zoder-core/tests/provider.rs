@@ -515,7 +515,12 @@ async fn choice_without_delta_is_decode_error() {
         .await
         .unwrap_err();
     assert_eq!(error.kind, ErrKind::Decode);
-    assert!(error.message.contains("malformed provider stream frame"));
+    // `{"choices":[{}]}` no longer fails deserialization: 25e1b10d made
+    // `choices` and each choice's `delta` default when absent so a usage-only
+    // frame that spells `choices: []` (or omits the key) is accepted. An inert
+    // choice now parses and is rejected at the end of the stream instead,
+    // which is still a Decode error.
+    assert!(error.message.contains("no content delta"));
 }
 
 #[tokio::test]
