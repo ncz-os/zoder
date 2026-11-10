@@ -58,6 +58,7 @@ bench/raw/
 # Never a source artifact: a previous unfinished run committed these by
 # accident, which is why it is now ignored explicitly.
 /.build/
+/.buildtmp/
 
 # Review/harness dump of this branch's own diff. Generated locally for review
 # inspection (2026-11-05); never a source artifact, never committed.
