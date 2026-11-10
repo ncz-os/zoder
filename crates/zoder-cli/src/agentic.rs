@@ -10995,7 +10995,7 @@ validation command and make it pass.\n\n{feedback}\n\nOriginal task (for referen
                 // The turn RETURNED: it is over, and the exit path must not
                 // ask the daemon to cancel it (a finished turn is never
                 // acknowledged, which cost one settle budget and a
-                // `cancel not confirmed` line per session -- 2026-11-05).
+                // `cancel not acknowledged` line per session -- 2026-11-05).
                 crate::reaper::note_session_settled(&t.run.session_id);
                 {
                     let mut state = run_state.lock().unwrap_or_else(|e| e.into_inner());

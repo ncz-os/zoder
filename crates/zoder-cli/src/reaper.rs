@@ -96,7 +96,7 @@
 //! 2026-10-22 (a fleet host, a fleet job): at the end of a `zoder loop` every
 //! `session/cancel` failed with `connecting to engine at
 //! ~/.zoder/data/daemon.sock: No such file or directory (os error 2)`, the same
-//! "cancel not confirmed" line repeated for one session across the cancel
+//! "cancel not acknowledged" line repeated for one session across the cancel
 //! passes and all four teardown rounds, and teardown then printed `WARNING:
 //! teardown stopped after 4 rounds with the agent still producing work;
 //! leftovers may remain`. Nothing was producing work. The engine socket path
@@ -114,7 +114,7 @@
 //! cancel, and it is certainly not work still being produced. It is said once
 //! per session, the session is retired from the teardown instead of retried,
 //! and it is never counted as evidence that the agent is still going. Every
-//! other cancel failure is what "cancel not confirmed" has always meant: the
+//! other cancel failure is what "cancel not acknowledged" has always meant: the
 //! engine was reached and did not acknowledge.
 //!
 //! For the same reason the "still producing work" warning is now gated on the
@@ -448,9 +448,9 @@ static CANCELLED: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// sending `turn_complete` for the turn it stopped, and a turn that already
 /// ended has no such frame to send: the exit path therefore waited a full
 /// settle budget per session for an acknowledgement that could NEVER come,
-/// printed `session <id> cancel not confirmed after N attempt(s) (daemon did
-/// not acknowledge session/cancel within 4.99s)`, and the worker read that as
-/// a failed job. Every zoder job that DELIVERED its commits ended that way,
+/// printed `session <id> cancel not acknowledged after N attempt(s) (daemon
+/// did not acknowledge session/cancel within 4.99s)`, and the worker read
+/// that as a failed job. Every zoder job that DELIVERED its commits ended that way,
 /// and finished work landed in needs-review.
 ///
 /// A settled session is not cancelled at all: asking the daemon to stop a turn
@@ -4222,7 +4222,7 @@ mod tests {
 
     /// 2026-10-22 (a fleet host, a fleet job): the engine socket path no
     /// longer existed, yet the teardown ran all four rounds, repeated the same
-    /// "cancel not confirmed" line for one session, and then reported the agent
+    /// "cancel not acknowledged" line for one session, and then reported the agent
     /// as still producing work. The cancel is not retried (one unreachable
     /// line per session) and the producing-work warning does not fire; the
     /// reap still runs every round, because an unreachable session may still
@@ -4628,7 +4628,7 @@ mod tests {
     /// A cancel the LOOP already had acknowledged is settled for the exit path
     /// too: the session is retired from the teardown's pending list, so the
     /// daemon is not asked to cancel a turn it has already ended (which it
-    /// never acknowledges, and which printed a `cancel not confirmed` line
+    /// never acknowledges, and which printed a `cancel not acknowledged` line
     /// for a cancel that was in fact confirmed).
     #[test]
     fn a_confirmed_loop_cancel_retires_the_session_from_the_exit_path() {
@@ -4646,7 +4646,7 @@ mod tests {
         forget_session("loop-confirmed");
     }
 
-    /// The fleet log line `cancel not confirmed after 2 attempt(s) (... within
+    /// The fleet log line `cancel not acknowledged after 2 attempt(s) (... within
     /// 4.999999932s)`: the first attempt had burnt the whole per-session
     /// window, so the "retry" the planner granted was a 1 ms ask that could
     /// not reach the wire. The daemon is asked ONCE and the record says so.
@@ -6071,7 +6071,7 @@ mod tests {
     //
     // Measured 2026-11-05 (every Hive zoder job that delivered its commits):
     // the run's last words were
-    //   `[zoder] session <id> cancel not confirmed after N attempt(s)
+    //   `[zoder] session <id> cancel not acknowledged after N attempt(s)
     //    (daemon did not acknowledge session/cancel within 4.99s)`
     // repeated once per session, and the process exited 50. A turn that has
     // ALREADY ended -- completed, result delivered -- is never acknowledged by
