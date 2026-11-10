@@ -45,14 +45,18 @@ toolchain), before and after this refresh. The new regression test
 behind `zoder-core`'s `integration-tests` feature, so `--all-features` is
 used to make sure it actually executes:
 
-| Tree | passed | failed |
-|---|---|---|
-| branch before merge (this head's first parent) | — | — |
-| target `origin/master` @ `7e5e15c9` | see baseline run | see baseline run |
-| branch after merge @ `5c5ffd15` | see after run | see after run |
+| Tree | passed | failed | ignored |
+|---|---|---|---|
+| branch before merge @ `5c5ffd15` (head's first parent `34495d0c` + `7e5e15c9`) | 2757 | 0 | 7 |
+| branch after merge + this record @ `abcc9bc3` | 2757 | 0 | 7 |
 
-Failures do not grow versus the target (see the run logs recorded in the
-job's delivery note).
+Failures do not grow versus the target: zero on both sides of the merge,
+and the post-merge head runs the same 2757 green tests as its first
+parent. (One run showed a single transient
+`openai_chat_path_remains_byte_identical_after_responses_fork` network
+flake against its in-process wiremock on 127.0.0.1; the immediate
+re-run was fully green and the test does not touch any file this
+refresh changes.)
 
 ## Note on feature-gated tests
 
