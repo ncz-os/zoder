@@ -16007,6 +16007,18 @@ fn probe_targets_for_unbuilt_provider(
     capped
 }
 
+/// Keep only the catalog models a provider's `serves` prefixes allow (all of
+/// them when the provider declares no allow-list).
+fn serves_filter(p: &zoder_core::config::Provider, models: Vec<String>) -> Vec<String> {
+    if p.serves.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|m| p.serves.iter().any(|pref| m.starts_with(pref.as_str())))
+        .collect()
+}
+
 fn exact_probe_target(provider: &zoder_core::config::Provider, model: &str) -> Option<String> {
     provider
         .serves
@@ -16144,10 +16156,19 @@ async fn run_probe_all(
             // `serves` match and the corpus lookup all key on the real id.
             (vec![eng.corpus.resolve_alias(model).to_string()], 0)
         } else {
-            cap_targets(
-                live.unwrap_or_else(|| vec![p.id.clone()]),
-                PROBE_MAX_MODELS_PER_PROVIDER,
-            )
+            // A provider with a `serves` allow-list is probed on those models
+            // only: the live catalog of a shared gateway lists models the
+            // fleet must never call.
+            let listed = match live {
+                Some(v) => serves_filter(p, v),
+                None => Vec::new(),
+            };
+            let listed = if listed.is_empty() {
+                probe_targets_for_unbuilt_provider(p, &eng.corpus)
+            } else {
+                listed
+            };
+            cap_targets(listed, PROBE_MAX_MODELS_PER_PROVIDER)
         };
         if targets.is_empty() {
             continue;
@@ -19390,6 +19411,25 @@ mod probe_skip_class_tests {
             None
         );
         assert_eq!(exact_probe_target(&provider_a, "other/model"), None);
+    }
+
+    /// `health --probe --all` on a shared gateway: the live catalog is cut to
+    /// the provider's `serves` allow-list, so models the fleet must not call
+    /// are never pinged (2026-11-11: 50 EIH catalog models were probed).
+    #[test]
+    fn probe_all_targets_stay_inside_the_serves_allow_list() {
+        let gateway = mk_provider("nvidia-eih", &["nvidia/nemotron-3-ultra"]);
+        let catalog = vec![
+            "01-ai/yi-large".to_string(),
+            "deepseek-ai/deepseek-v4.1-flash".to_string(),
+            "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+        ];
+        assert_eq!(
+            serves_filter(&gateway, catalog.clone()),
+            vec!["nvidia/nemotron-3-ultra-550b-a55b".to_string()]
+        );
+        let open = mk_provider("open", &[]);
+        assert_eq!(serves_filter(&open, catalog.clone()), catalog);
     }
 
     /// HP1: when a provider declares `serves` prefixes, the derived probe
