@@ -78,3 +78,29 @@ or broken.
 Same head branch pushed to ARGONAS (`origin`,
 `ssh://jasonperlow@192.168.207.101/mnt/datapool/git/zoder.git`) with upstream
 tracking; remote SHA matches local HEAD.
+
+## Post-refresh review round (fix round 1)
+
+The refreshed head `6bd4d5a3` was reviewed read-only by two children of the
+refresh job (`01a1c8fc`):
+
+- `01a1c96a` (review ref
+  `review/hv/zoder-mimo-usage-frame-20261105-01a1c96a-2e0d-7f65-8fee-17583b6c07ca`,
+  reviewer `gemini-3.8-flash-medium` via `studio-agy-reviewer`): **approve**,
+  `findings: []`.
+- `01a1c91c` (review ref
+  `review/hv/zoder-mimo-usage-frame-20261105-01a1c91c-f7d1-7d1d-aa04-d24abb3bd8d0`,
+  reviewer `coder`): **approve**, `findings: []`.
+
+Both verdicts verify the same change set documented above: the MiMo
+usage-frame regression test, the contract notes, the `FAULT-TO-FIX.md` row,
+and this refresh record. No blocking findings were reported by either child.
+
+The branch was left unchanged by that round because there was no defect to
+fix: the only open item is that the first review is an *advisory* approve
+(the reviewer is below the tier review floor for this branch), so the merge
+gate waits for a reviewer at or above that tier (`doctor_reason`: "advisory
+approve... waiting for a reviewer at or above it"). That is a reviewer-tier
+condition on the parent refresh job, not a code defect on this branch. This
+commit records that verification so the delivery state is complete on the
+branch itself.
