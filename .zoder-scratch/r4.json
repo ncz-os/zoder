@@ -1,0 +1,146 @@
+{
+  "chunking": {
+    "budget_bytes": 400000,
+    "chunk_cap_bytes": 32000,
+    "context_bytes": 0,
+    "context_capped": false,
+    "diff_bytes": 12124,
+    "mode": "single",
+    "reason": "whole diff and definition context fit the single-review budget",
+    "window_tokens": 131072
+  },
+  "complete": true,
+  "context": {
+    "cache_hit_tokens": 3726,
+    "cache_miss_tokens": 3963,
+    "cache_reported_calls": 2,
+    "calls": 2,
+    "completion_tokens": 684,
+    "final_prompt_tokens": 3962,
+    "hit_share": 0.48458837300039015,
+    "peak_prompt_tokens": 3962,
+    "per_call": [
+      {
+        "cache_hit_tokens": 3726,
+        "cache_miss_tokens": 1,
+        "completion_tokens": 56,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 12556,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3727,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 1
+      },
+      {
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 3962,
+        "completion_tokens": 628,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 12556,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3962,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 2
+      }
+    ],
+    "prompt_tokens": 7689,
+    "resent_prompt_tokens": 0
+  },
+  "cost_usd": 0.0,
+  "exclusions": {
+    "bytes": 0,
+    "count": 0,
+    "files": []
+  },
+  "failed_models": 0,
+  "filtered_findings": [],
+  "ok_models": 2,
+  "provenance": [
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 790,
+      "health": null,
+      "latency_ms": 3415.0,
+      "ledger_wait_ms": 7,
+      "provider": "cerberus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "cerberus-reviewer",
+      "response_model": "cerberus-narrator",
+      "served_by": "http://192.168.207.96:8080/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 6468,
+      "health": null,
+      "latency_ms": 6486.0,
+      "ledger_wait_ms": 3,
+      "provider": "nvidia-eih",
+      "proxy_deployment_id": null,
+      "requested_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "response_model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "served_by": "https://integrate.api.nvidia.com/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    }
+  ],
+  "requested": 2,
+  "reviewers": [
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "cerberus-reviewer",
+      "next_steps": [],
+      "ok": true,
+      "summary": "The diff adds a new ADR documentation file without touching any source code. No defects are present in the supplied content.",
+      "verdict": "approve"
+    },
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [
+        {
+          "body": "The ADR recommends keying on `error.class == \"infrastructure\"` (string) rather than exit code 60 alone. This avoids misclassification if 60 is reused, but couples the runner to a string value that could be renamed. The zoder test `each_named_code_carries_its_documented_class_and_exit_code` would catch a rename in zoder, but the runner (external) would silently revert to current broken behavior. Consider adding a runner-side test that asserts the class string, or documenting the coupling as a known risk.",
+          "location": "docs/adr/ADR-D-ZD6-exit-60-envelope-for-hive-zd-19.md:165-172",
+          "severity": "info",
+          "title": "Runner coupling to JSON prose vs. numeric exit code"
+        },
+        {
+          "body": "The ADR notes it could not verify whether the bus increments `retry_count` on a `claimed -> queued` release (hive_worker.py:4770-4787 asserts it does, but bus source is unavailable). If the bus does NOT increment, Option A's primary benefit (saving retry budget) disappears, leaving only \"no bogus review\". The operator should confirm this before committing to the runner change.",
+          "location": "docs/adr/ADR-D-ZD6-exit-60-envelope-for-hive-zd-19.md:195-198",
+          "severity": "info",
+          "title": "Unverified bus behavior for retry_count on claimed->queued"
+        }
+      ],
+      "forced_family_conflict": false,
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "next_steps": [
+        "Operator to answer Open Question 1: confirm bus retry_count behavior on claimed->queued release.",
+        "Operator to answer Open Question 2: assess risk of misconfigured daemons always returning -32001 (session_limit) causing fleet-wide requeue loops.",
+        "If proceeding with Option A: implement runner changes behind HIVE_INFRA_ENVELOPE=1 flag, observe on one host, then roll out.",
+        "Track Option B (additive fields requeue_without_review, phase, attribution) as follow-up with slot-lease merge."
+      ],
+      "ok": true,
+      "summary": "This ADR proposes adopting exit code 60 as a stable contract between zoder and the Hive runner so that capacity refusals (session_limit) are requeued without consuming a retry or generating a bogus review. The document is thorough, well-evidenced against the current codebase, and acknowledges external dependencies (the runner lives in /opt/graeae). No code changes are included in this diff; it is a design record. I have no defects to report in the ADR itself, but I flag two operational risks the operator should resolve before implementation.",
+      "verdict": "comment"
+    }
+  ],
+  "skipped_unhealthy": [],
+  "substituted": true,
+  "verdict": "comment"
+}
