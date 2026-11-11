@@ -5919,32 +5919,62 @@ fn is_session_limit_error(error: &RpcError) -> bool {
         && error.message.to_ascii_lowercase().contains("session limit")
 }
 
+/// Total nominal wait (before jitter) a client rides out a full daemon for
+/// before it reports `session_limit`.
+///
+/// 2026-11-11: the old budget was 6 tries over ~60 s. A daemon at capacity
+/// frees slots as other runs finish and close their sessions (or as the
+/// daemon's idle reaper evicts abandoned ones), which takes minutes, not
+/// seconds; 60 s turned every brief capacity squeeze on a shared host into a
+/// failed Hive job ("session_limit: daemon session capacity reached after 6
+/// tries"). Ten minutes is well inside every author/agent watchdog the fleet
+/// runs (1500-7200 s), and the outer watchdog still bounds it.
+pub(crate) const SESSION_LIMIT_RETRY_BUDGET: Duration = Duration::from_secs(600);
+
+/// Cap on one backoff step, so a long wait still re-asks every minute.
+const SESSION_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+
 /// Attempt budget for a daemon session-capacity refusal: 1 initial try plus
-/// one retry per schedule entry (6 tries total).
-pub(crate) const SESSION_LIMIT_MAX_ATTEMPTS: u32 = 6;
+/// one retry per schedule entry. Derived from the schedule (2 s doubling to
+/// a 60 s cap until [`SESSION_LIMIT_RETRY_BUDGET`] is covered): 15 tries.
+/// Pinned against the schedule by the tests.
+#[cfg(test)]
+pub(crate) const SESSION_LIMIT_MAX_ATTEMPTS: u32 = 15;
 
 /// Base backoff before retry attempt `attempt` (1-based: the delay slept
-/// after attempt N hit the session limit). 2 s doubling, 30 s cap:
-/// attempt 1 -> 2 s, 2 -> 4 s, 3 -> 8 s, 4 -> 16 s, 5 -> 30 s (capped).
-/// The caller adds jitter (see [`session_limit_jitter`]); this schedule is
-/// pure so tests pin it exactly.
+/// after attempt N hit the session limit). 2 s doubling, 60 s cap:
+/// 2, 4, 8, 16, 32, then 60 s. The caller adds jitter (see
+/// [`session_limit_jitter_seeded`]); this schedule is pure so tests pin it exactly.
 fn session_limit_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(
-        2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4))
-            .min(30),
+        2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(5))
+            .min(SESSION_LIMIT_MAX_DELAY.as_secs()),
     )
 }
 
-/// Uplift `base` by 0..25% using a time-seeded xorshift: enough to spread a
-/// fleet of workers retrying a full daemon, small enough to keep the
-/// schedule's worst case near its nominal sum. No RNG dependency — the
-/// helper lives in `acp-client`, which has none.
-fn session_limit_jitter(base: Duration) -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0x9E3779B9);
-    let mut x = nanos | 1;
+/// The pure base schedule: one entry per retry, until the entries sum to at
+/// least [`SESSION_LIMIT_RETRY_BUDGET`].
+fn session_limit_base_schedule() -> Vec<Duration> {
+    let mut out = Vec::new();
+    let mut total = Duration::ZERO;
+    let mut attempt = 1;
+    while total < SESSION_LIMIT_RETRY_BUDGET {
+        let delay = session_limit_retry_delay(attempt);
+        total += delay;
+        out.push(delay);
+        attempt += 1;
+    }
+    out
+}
+
+/// Uplift `base` by 0..25% using a xorshift seeded from the clock, the
+/// process id and the retry index: enough to spread a fleet of workers
+/// retrying one full daemon (the seed differs per process and per step, so
+/// workers that hit the limit in the same instant do not retry in lockstep),
+/// small enough to keep the worst case near the nominal budget. No RNG
+/// dependency: the helper lives in `acp-client`, which has none.
+fn session_limit_jitter_seeded(base: Duration, seed: u64) -> Duration {
+    let mut x = seed | 1;
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
@@ -5952,10 +5982,24 @@ fn session_limit_jitter(base: Duration) -> Duration {
     base + Duration::from_millis(base.as_millis() as u64 * uplift_pct / 100)
 }
 
-/// Production retry delays: one jittered entry per retry (attempts 1..5).
+fn session_limit_jitter_seed(step: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B9);
+    nanos
+        ^ (u64::from(std::process::id())).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ step.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// Production retry delays: one jittered entry per retry.
 fn session_limit_production_delays() -> Vec<Duration> {
-    (1..SESSION_LIMIT_MAX_ATTEMPTS)
-        .map(|attempt| session_limit_jitter(session_limit_retry_delay(attempt)))
+    session_limit_base_schedule()
+        .into_iter()
+        .enumerate()
+        .map(|(step, base)| {
+            session_limit_jitter_seeded(base, session_limit_jitter_seed(step as u64))
+        })
         .collect()
 }
 
@@ -6015,8 +6059,9 @@ where
 ///
 /// `delays[i]` is slept (as-is) after attempt `i + 1` hits the limit, so
 /// `delays.len() + 1` is the attempt budget. Production passes
-/// [`session_limit_production_delays`] (6 tries, ~2+4+8+16+30 s plus
-/// jitter); tests pass short or empty schedules for fast determinism.
+/// [`session_limit_production_delays`] (15 tries, 2 s doubling to a 60 s cap
+/// over ~10 min, plus jitter); tests pass short or empty schedules for fast
+/// determinism.
 ///
 /// Returns the result value on success, the non-limit JSON-RPC error as
 /// `Ok(Err(..))` for the caller's resume-reject path, and a fatal `Err` on
@@ -14475,26 +14520,50 @@ mod mr1_reliability_regression {
     /// Pinned exactly: a regression that stretches it delays every fleet
     /// turn against a full daemon; one that shrinks it hot-loops the daemon.
     #[test]
-    fn session_limit_retry_schedule_is_2s_doubling_capped_at_30s() {
-        let got: Vec<Duration> = (1..=SESSION_LIMIT_MAX_ATTEMPTS)
-            .map(session_limit_retry_delay)
+    fn session_limit_retry_schedule_is_2s_doubling_capped_at_60s_over_ten_minutes() {
+        let got = session_limit_base_schedule();
+        let mut want: Vec<Duration> = [2, 4, 8, 16, 32]
+            .into_iter()
+            .map(Duration::from_secs)
             .collect();
-        assert_eq!(
-            got,
-            vec![
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-                Duration::from_secs(8),
-                Duration::from_secs(16),
-                Duration::from_secs(30),
-                Duration::from_secs(30),
-            ],
-            "schedule must be 2/4/8/16/30/30 s"
+        want.extend(std::iter::repeat_n(Duration::from_secs(60), 9));
+        assert_eq!(got, want, "schedule must be 2/4/8/16/32 s then 60 s steps");
+        let total: Duration = got.iter().sum();
+        assert!(
+            total >= SESSION_LIMIT_RETRY_BUDGET
+                && total < SESSION_LIMIT_RETRY_BUDGET + SESSION_LIMIT_MAX_DELAY,
+            "the schedule must cover the budget and stop there: {total:?}"
         );
         assert_eq!(
-            SESSION_LIMIT_MAX_ATTEMPTS, 6,
-            "attempt budget is 6 tries (1 initial + 5 retries)"
+            SESSION_LIMIT_MAX_ATTEMPTS as usize,
+            got.len() + 1,
+            "the attempt budget is 1 initial try + one per schedule entry"
         );
+        // 2026-11-11: the old ~60 s budget failed jobs during a capacity
+        // squeeze that lasts minutes. It must never shrink back to that.
+        assert!(total >= Duration::from_secs(600), "{total:?}");
+    }
+
+    /// The production schedule is the base schedule plus 0..25% jitter per
+    /// step, so its total stays inside [budget, 1.25 x budget + one step].
+    #[test]
+    fn session_limit_production_delays_jitter_every_step_within_bounds() {
+        let base = session_limit_base_schedule();
+        let got = session_limit_production_delays();
+        assert_eq!(got.len(), base.len());
+        for (g, b) in got.iter().zip(base.iter()) {
+            assert!(g >= b, "jitter must never shorten a step: {g:?} < {b:?}");
+            assert!(
+                *g <= *b + *b / 4,
+                "jitter must add at most 25%: {g:?} vs {b:?}"
+            );
+        }
+        // Different seeds (processes / steps) give different uplifts, so a
+        // fleet of workers does not retry in lockstep.
+        let spread: std::collections::HashSet<Duration> = (0..64u64)
+            .map(|seed| session_limit_jitter_seeded(Duration::from_secs(60), seed * 7919 + 1))
+            .collect();
+        assert!(spread.len() > 4, "jitter must actually spread: {spread:?}");
     }
 
     /// FB110: jitter spreads a fleet of retrying workers without changing
@@ -14503,8 +14572,8 @@ mod mr1_reliability_regression {
     #[test]
     fn session_limit_jitter_stays_within_quarter_uplift() {
         let base = Duration::from_secs(8);
-        for _ in 0..50 {
-            let j = session_limit_jitter(base);
+        for step in 0..50 {
+            let j = session_limit_jitter_seeded(base, session_limit_jitter_seed(step));
             assert!(j >= base, "jitter must never shorten the backoff: {j:?}");
             assert!(
                 j <= base + Duration::from_secs(2),

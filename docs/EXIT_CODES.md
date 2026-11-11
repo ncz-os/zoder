@@ -54,8 +54,8 @@ Several codes share a class, and the class fixes the exit code.
 or is something in the environment broken?" It is a hint, not a guarantee. A
 `budget` failure becomes retryable once its window resets, which the envelope
 says with `retry_after_s`. An `infrastructure` failure is NOT marked
-retryable even though a slot may free: the client already spent the fast
-retries (2 s doubling to 30 s, 6 tries) before reporting it, so an immediate
+retryable even though a slot may free: the client already spent its in-client
+retries (2 s doubling to a 60 s cap over ~10 min, 15 tries) before reporting it, so an immediate
 caller-side retry just hot-loops a full daemon — cool down first.
 
 ## The named codes
@@ -179,7 +179,7 @@ fleet worker reads the dispatch handle without joining two keys:
   "failure": {
     "code": "session_limit",
     "class": "infrastructure",
-    "detail": { "message": "session_limit: daemon session capacity reached after 6 tries ..." }
+    "detail": { "message": "session_limit: daemon session capacity reached after 15 tries ..." }
   },
   "failure_class": "infrastructure:session_limit",
   "teardown": { "reason": "session_limit", "resolved": false, "iterations": 1 }
@@ -264,7 +264,7 @@ absent when the engine did not report one.
 The `zeroclaw` daemon answers `session/new` with JSON-RPC -32001 /
 "Session limit reached" when no session slot is free. The ACP client
 (`crates/acp-client/src/lib.rs`: `session_new_with_limit_retry`) retries
-that answer in-client — 6 tries, 2 s doubling to a 30 s cap, plus jitter —
+that answer in-client — 15 tries, 2 s doubling to a 60 s cap over ~10 min, plus jitter —
 and only then fails. The -32001 code alone is NOT matched: the daemon
 reuses it for unrelated replies (for example "user denied approval" on
 approve ids), so code AND the "session limit" message text are required,
