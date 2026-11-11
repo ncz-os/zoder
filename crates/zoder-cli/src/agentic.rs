@@ -419,6 +419,17 @@ mod agentic_utilization_tests {
     /// end-state the `serving_provider` wiring in `agentic_turn` produces:
     /// the winner's provider is passed to `persist_agentic_counter_at`, so
     /// the head bucket stays empty while the fallback bucket accrues.
+    ///
+    /// API contract (verified against this tree): `persist_agentic_counter_at`
+    /// (module fn, line 147) is `(&Provider, u64, &Path, DateTime<Utc>) -> bool`
+    /// — the `_at` variant exists precisely so tests can inject the store path
+    /// and clock; `bool` is the best-effort telemetry contract, so `assert!`
+    /// (not `Result` handling) is the correct consumption. Both providers come
+    /// from this same module: `test_provider()` (line 250, chain head) and
+    /// `minimax_counter_provider()` (line 278, capped-counter fallback).
+    /// `UtilizationStore::open_unlocked` is the public, lock-free reader
+    /// (`zoder_core::utilization::UtilizationStore::open_unlocked`,
+    /// `pub fn open_unlocked(path: impl AsRef<Path>) -> Result<Self, _>`).
     #[test]
     fn fallback_turn_tokens_accrue_only_to_answering_provider_bucket() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,7 +437,12 @@ mod agentic_utilization_tests {
         let now = Utc::now();
         let head = test_provider();
         let fallback = minimax_counter_provider();
-        // The answering route's provider is what the fixed call site passes.
+        // The answering route's provider is what the fixed call site passes:
+        // `agentic_turn` resolves `link_provider` per candidate
+        // (`provider_for_resolved_model(...).cloned()`, an owned
+        // `Option<Provider>`), stores the winner in `used_provider`, and
+        // persists the counter for `serving_provider(used_provider.as_ref(),
+        // &routed_provider)` — never for the chain head.
         assert!(persist_agentic_counter_at(&fallback, 90, &path, now));
 
         let store = UtilizationStore::open_unlocked(&path).unwrap();

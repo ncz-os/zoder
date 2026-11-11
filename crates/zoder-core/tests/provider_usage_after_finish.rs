@@ -367,3 +367,29 @@ async fn streaming_sse_done_marker_ends_the_read_without_waiting_for_close() {
     );
     serve.abort();
 }
+
+#[tokio::test]
+async fn mimo_usage_only_frame_after_content_is_delivered_and_recorded() {
+    // MiMo's usage frame is a separate SSE event with an empty choices array;
+    // this shape must not be mistaken for an empty completion.
+    let (base, listener) = sse_server().await;
+    let p = provider(&base);
+    let parts = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Mi\"}}]}\n\n".to_string(),
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Mo\"}}]}\n\n".to_string(),
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":56}}\n\n"
+            .to_string(),
+        SSE_DONE.to_string(),
+    ];
+    let serve = tokio::spawn(serve_sse_then_hold(listener, parts));
+
+    let result = p
+        .stream_chat(&req("mimo-v2.6-flash", true), None)
+        .await
+        .unwrap();
+
+    assert_eq!(result.content, "MiMo");
+    assert_eq!(result.prompt_tokens, Some(1234));
+    assert_eq!(result.completion_tokens, Some(56));
+    serve.abort();
+}

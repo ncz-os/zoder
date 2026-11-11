@@ -1744,6 +1744,12 @@ fn counter_key(provider: Provider, account_id: &str, plan: &str, window_name: &s
 /// `record_counter` calls (Finding #4). Returns `None` for callers
 /// that don't want calendar-boundary handling; the corresponding
 /// `CounterWindow` rows have `period_id = None` and never reset.
+///
+/// Identity-contract note (reviewed 2026-11-07): `now` is the injected
+/// clock — the only datetime source this helper touches — so period ids
+/// derived from two different calls of `Utc::now()` straddling a
+/// month boundary are compared consistently by [`current_period_for_stored_id`],
+/// and tests may pin deterministic periods without touching the real clock.
 pub fn period_id_for(now: DateTime<Utc>) -> Option<String> {
     Some(now.format("%Y-%m").to_string())
 }
