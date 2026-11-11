@@ -1708,24 +1708,53 @@ pub struct AgentRun {
     pub failure_detail: Option<String>,
 }
 
-/// Decide whether a `turn_complete` frame's `content` is the engine's sole
-/// explanation of a failed turn, and therefore must be surfaced by the caller.
+/// Decide whether a `turn_complete` frame's `content` is the engine's
+/// explanation of a turn that did not complete, and therefore must be
+/// surfaced by the caller.
 ///
-/// It qualifies only when the turn did NOT complete AND nothing was streamed
-/// beforehand (`streamed` still empty). Both conditions matter:
-///   * a completed turn's terminal content is ordinary model output;
-///   * if chunks were streamed, the caller has already printed them and
-///     re-printing the terminal copy would duplicate the whole turn.
+/// A completed turn's terminal content is ordinary model output: never a
+/// failure detail. For any other outcome the terminal content is the
+/// explanation unless it only repeats what was already streamed:
+///   * nothing streamed: the content is the whole explanation;
+///   * the content is (or is contained in) the streamed text, e.g. a timeout
+///     whose terminal copy is the partial work: the caller already printed
+///     it, so it is not a reason and re-printing it would duplicate the turn;
+///   * the content extends the streamed text: only the new tail is the
+///     explanation;
+///   * otherwise (the engine's error after an agentic turn that streamed
+///     model text, then failed on its next request): the content is the
+///     explanation and must be kept.
+///
+/// The last case is the 2026-11-11 fault: an author turn streamed its
+/// reasoning ("Base passes both tests, so the branch is genuinely behind"),
+/// ran tools, and then the engine refused the next request with "This
+/// request exceeds the selected model's context window". Because text had
+/// been streamed the reason was dropped, the loop recorded `author_outcome:
+/// failed` with `author_error: null`, and the job surfaced only as "no
+/// commits on top of base".
 fn terminal_failure_detail(
     outcome: &AgentOutcome,
     streamed: &str,
     terminal: &str,
 ) -> Option<String> {
-    if *outcome != AgentOutcome::Completed && streamed.is_empty() && !terminal.is_empty() {
-        Some(terminal.to_string())
-    } else {
-        None
+    if *outcome == AgentOutcome::Completed {
+        return None;
     }
+    let trimmed = terminal.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if streamed.is_empty() {
+        return Some(terminal.to_string());
+    }
+    if streamed.contains(trimmed) {
+        return None;
+    }
+    if let Some(rest) = terminal.strip_prefix(streamed) {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+    Some(terminal.to_string())
 }
 
 impl AgentRun {
@@ -6205,6 +6234,48 @@ mod tests {
     #[test]
     fn empty_terminal_content_yields_no_detail() {
         assert_eq!(terminal_failure_detail(&AgentOutcome::Failed, "", ""), None);
+    }
+
+    /// The engine's verbatim `turn_complete.content` for a turn whose next
+    /// request did not fit the model's context window (zeroclaw
+    /// `turn-context-window-exceeded-error`), captured from HYDRA session
+    /// 3163 on 2026-11-11.
+    const ZEROCLAW_CONTEXT_WINDOW_FAILURE: &str = "Agent turn failed: This request exceeds the \
+        selected model's context window. Reduce the request or enabled tools, or choose a \
+        model with a larger context window.";
+
+    /// 2026-11-11: an agentic author turn streams model text before its tool
+    /// calls, so `streamed` is never empty when the engine fails the turn
+    /// later. The engine's reason must survive anyway; before the fix it was
+    /// dropped and the loop recorded `author_error: null`.
+    #[test]
+    fn failed_turn_detail_is_kept_when_model_text_was_streamed_first() {
+        let streamed = "Base passes both tests, so the branch is genuinely behind. ";
+        let detail = terminal_failure_detail(
+            &AgentOutcome::Failed,
+            streamed,
+            ZEROCLAW_CONTEXT_WINDOW_FAILURE,
+        )
+        .expect("the engine's failure reason must survive streamed model text");
+        assert!(detail.contains("context window"), "{detail}");
+        assert!(!detail.contains("Base passes"), "{detail}");
+    }
+
+    /// A terminal copy that only extends the streamed text keeps the new
+    /// tail, never the duplicated prefix.
+    #[test]
+    fn failed_turn_detail_keeps_only_the_new_tail_of_an_extended_copy() {
+        let streamed = "partial work so far";
+        let terminal = "partial work so far\nturn failed: provider closed the stream";
+        assert_eq!(
+            terminal_failure_detail(&AgentOutcome::Failed, streamed, terminal).as_deref(),
+            Some("turn failed: provider closed the stream")
+        );
+        // A copy that is already inside the streamed text is no reason.
+        assert_eq!(
+            terminal_failure_detail(&AgentOutcome::Failed, "work so far, more", "work so far"),
+            None
+        );
     }
 
     #[test]
@@ -13365,6 +13436,13 @@ mod tests {
         /// so the silence after the tool result must be measured by the
         /// FIRST window — and not by the short between-events window.
         ToolWaitThenSilent { gap: Duration },
+        /// Complete the ACP handshake, read the prompt, stream `streamed` as
+        /// one `agent_message_chunk`, then end the turn with a FAILED
+        /// `turn_complete` whose content is `failure` (the engine's reason).
+        StreamedThenFailed {
+            streamed: &'static str,
+            failure: &'static str,
+        },
     }
 
     /// Run a fake zeroclaw daemon on `listener`.
@@ -13530,6 +13608,33 @@ mod tests {
                             "type": "turn_complete",
                             "outcome": "completed",
                             "content": "done",
+                        },
+                    }),
+                )
+                .await
+                .unwrap();
+                std::future::pending::<()>().await;
+            }
+            FakeEngine::StreamedThenFailed { streamed, failure } => {
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "type": "agent_message_chunk", "text": streamed },
+                    }),
+                )
+                .await
+                .unwrap();
+                write_frame(
+                    &mut write_half,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "type": "turn_complete",
+                            "outcome": "failed",
+                            "content": failure,
                         },
                     }),
                 )
@@ -13767,6 +13872,43 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(2500),
             "the turn must have waited for the tool; took {elapsed:?}"
+        );
+        server.abort();
+    }
+
+    /// 2026-11-11 (HYDRA, Hive author jobs on `muse_contrib`): the engine
+    /// failed the author turn with its context-window refusal AFTER the model
+    /// had streamed text, and `run_agent` returned `failure_detail: None`, so
+    /// the loop recorded `author_outcome: failed`, `author_error: null`. The
+    /// reason must reach the caller whatever was streamed first.
+    #[tokio::test]
+    async fn a_failed_turn_after_streamed_text_still_carries_the_engine_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("streamed-then-failed.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(run_fake_zeroclaw(
+            listener,
+            FakeEngine::StreamedThenFailed {
+                streamed: "Base passes both tests, so the branch is genuinely behind. ",
+                failure: "Agent turn failed: This request exceeds the selected model's \
+                    context window. Reduce the request or enabled tools, or choose a model \
+                    with a larger context window.",
+            },
+        ));
+
+        let mut opts = AgentOptions::new(&socket, "author", dir.path(), "hello");
+        opts.timeout = Duration::from_secs(30);
+        let run = run_agent(&opts, |_| {})
+            .await
+            .expect("a failed turn is a result, not a transport error");
+
+        assert_eq!(run.outcome, AgentOutcome::Failed, "got {run:?}");
+        let detail = run
+            .failure_detail
+            .expect("the engine's reason must survive the streamed model text");
+        assert!(
+            detail.contains("exceeds the selected model's context window"),
+            "the caller must see why the turn ended; got {detail}"
         );
         server.abort();
     }

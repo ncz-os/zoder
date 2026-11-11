@@ -9838,14 +9838,29 @@ fn loop_failure(
     // failure join it here. When the author DID produce a model and the
     // review then failed, the review error still wins as before.
     let author_failed_before_model = field("author_model").is_none() && author_error.is_some();
-    let author_is_evidence = author_hit_engine_budget || author_failed_before_model;
+    // 2026-11-11: an author turn that RETURNED with outcome `failed`, carried
+    // the engine's reason, and left no work (substance `Empty`) is the root
+    // cause too, even though it produced a model: the review that follows
+    // only reviewed the unchanged base. A context-window refusal after a few
+    // tool calls is the field case (37 of 38 Muse author jobs on HYDRA);
+    // without this it was filed `loop_exhausted` / "no commits on top of
+    // base" and the reason was never the headline.
+    let author_turn_failed_without_work = field("author_outcome").as_deref() == Some("failed")
+        && author_error.is_some()
+        && field("substance").as_deref() == Some("Empty");
+    let author_is_evidence =
+        author_hit_engine_budget || author_failed_before_model || author_turn_failed_without_work;
     // ZD-08: when the author is the root cause, its TYPED kind names the
     // failure. The watchdog's own outcomes (timeout, unconfirmed cancel) are
     // facts and win outright; a plain failed turn defers to a more specific
     // engine code in its text (budget refusal, session limit) and is
     // `author_failed` otherwise.
     let author_kind_code = if author_is_evidence {
-        field("author_error_kind").and_then(|kind| AuthorPhaseErrorKind::code_for_record(&kind))
+        field("author_error_kind")
+            .and_then(|kind| AuthorPhaseErrorKind::code_for_record(&kind))
+            .or_else(|| {
+                author_turn_failed_without_work.then_some(crate::failure::FailureCode::AuthorFailed)
+            })
     } else {
         None
     };
@@ -16908,6 +16923,41 @@ not run to max_iters"
         let f = loop_failure(None, Some(&last), REVIEWER_UNAVAILABLE_VERDICT, 1)
             .expect("unresolved loop has a failure");
         assert_eq!(f.code, crate::failure::FailureCode::AuthorFailed);
+    }
+
+    /// 2026-11-11: an author turn that returned `failed` with the engine's
+    /// reason and left no work is the root cause even though it produced a
+    /// model and the reviewer then answered: the record is `author_failed`
+    /// with the engine's text, never `loop_exhausted` with the review's.
+    #[test]
+    fn loop_failure_files_a_returned_failed_author_turn_without_work_as_author_failed() {
+        let reason = "Agent turn failed: This request exceeds the selected model's context \
+                      window. Reduce the request or enabled tools, or choose a model with a \
+                      larger context window.";
+        let last = serde_json::json!({
+            "author_model": "muse-spark-1.3-contributor",
+            "author_outcome": "failed",
+            "author_error": reason,
+            "author_error_kind": Value::Null,
+            "substance": "Empty",
+            "review_error": Value::Null,
+        });
+        let f = loop_failure(None, Some(&last), "request_changes", 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::AuthorFailed);
+        assert!(f.message.contains("context window"), "{}", f.message);
+
+        // A failed turn that DID leave work keeps the review as the evidence.
+        let partial = serde_json::json!({
+            "author_model": "muse-spark-1.3-contributor",
+            "author_outcome": "failed",
+            "author_error": reason,
+            "substance": "Substantive",
+            "review_error": Value::Null,
+        });
+        let f = loop_failure(None, Some(&partial), "request_changes", 1)
+            .expect("unresolved loop has a failure");
+        assert_eq!(f.code, crate::failure::FailureCode::LoopExhausted);
     }
 
     /// ZD-08: a more specific engine code in the author's text still wins
