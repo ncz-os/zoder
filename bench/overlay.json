@@ -5,8 +5,8 @@
   "arena_webdev_elo": 1436.6,
   "preference": {
    "arena_agent": {
-    "rank": 44,
-    "score": -0.0642,
+    "rank": 45,
+    "score": -0.0591,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -63,7 +63,7 @@
   "w_swe": 0.825
  },
  "claude-fable-5": {
-  "agentic_score": 0.716,
+  "agentic_score": 0.714,
   "arena_coding_elo": 1625.3,
   "arena_webdev_elo": 1625.3,
   "capability": {
@@ -82,8 +82,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 10,
-    "score": 0.077,
+    "rank": 11,
+    "score": 0.073,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -96,7 +96,7 @@
   "w_swe": 0.938
  },
  "claude-fable-5-1": {
-  "agentic_score": 0.704,
+  "agentic_score": 0.707,
   "arena_coding_elo": 1742.1,
   "arena_webdev_elo": 1742.1,
   "capability": {
@@ -109,8 +109,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 4,
-    "score": 0.1434,
+    "rank": 5,
+    "score": 0.1482,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -127,6 +127,11 @@
   "arena_coding_elo": 1835.8,
   "arena_webdev_elo": 1835.8,
   "preference": {
+   "arena_agent": {
+    "rank": 1,
+    "score": 0.3035,
+    "source": "arena.ai"
+   },
    "arena_webdev": {
     "rank": 1,
     "rating": 1835.8,
@@ -164,8 +169,8 @@
   "arena_webdev_elo": 1593.8,
   "preference": {
    "arena_agent": {
-    "rank": 27,
-    "score": 0.0043,
+    "rank": 29,
+    "score": 0.0047,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -297,7 +302,7 @@
   "w_swe": 0.88
  },
  "claude-opus-5": {
-  "agentic_score": 0.776,
+  "agentic_score": 0.775,
   "arena_coding_elo": 1691.0,
   "arena_webdev_elo": 1691.0,
   "capability": {
@@ -316,8 +321,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 11,
-    "score": 0.075,
+    "rank": 12,
+    "score": 0.0723,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -343,8 +348,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 1,
-    "score": 0.1996,
+    "rank": 2,
+    "score": 0.1952,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -431,8 +436,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 21,
-    "score": 0.0206,
+    "rank": 23,
+    "score": 0.02,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -458,8 +463,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 3,
-    "score": 0.1599,
+    "rank": 4,
+    "score": 0.1595,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -631,13 +636,13 @@
   "w_swe": 0.901
  },
  "deepseek-v4-1-flash": {
-  "agentic_score": 0.704,
+  "agentic_score": 0.703,
   "arena_coding_elo": 1663.6,
   "arena_webdev_elo": 1663.6,
   "preference": {
    "arena_agent": {
-    "rank": 20,
-    "score": 0.0207,
+    "rank": 22,
+    "score": 0.02,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -888,8 +893,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 39,
-    "score": -0.0432,
+    "rank": 41,
+    "score": -0.045,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1009,8 +1014,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 34,
-    "score": -0.0189,
+    "rank": 37,
+    "score": -0.022,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1046,8 +1051,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 17,
-    "score": 0.0238,
+    "rank": 20,
+    "score": 0.023,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1086,13 +1091,13 @@
   "w_swe": 0.783
  },
  "gemini-4-argon": {
-  "agentic_score": 0.865,
+  "agentic_score": 0.863,
   "arena_coding_elo": 1682.1,
   "arena_webdev_elo": 1682.1,
   "preference": {
    "arena_agent": {
-    "rank": 8,
-    "score": 0.1083,
+    "rank": 9,
+    "score": 0.1074,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1105,13 +1110,13 @@
   "w_swe": 0.985
  },
  "gemini-4-carbon": {
-  "agentic_score": 0.978,
+  "agentic_score": 0.984,
   "arena_coding_elo": 1768.2,
   "arena_webdev_elo": 1768.2,
   "preference": {
    "arena_agent": {
-    "rank": 2,
-    "score": 0.1663,
+    "rank": 3,
+    "score": 0.1698,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1247,7 +1252,7 @@
   "w_swe": 0.882
  },
  "glm-5-2": {
-  "agentic_score": 0.626,
+  "agentic_score": 0.625,
   "arena_coding_elo": 1607.8,
   "arena_webdev_elo": 1607.8,
   "capability": {
@@ -1264,8 +1269,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 28,
-    "score": 0.004,
+    "rank": 31,
+    "score": 0.0023,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1297,7 +1302,7 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 24,
+    "rank": 27,
     "score": 0.0099,
     "source": "arena.ai"
    },
@@ -1330,8 +1335,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 37,
-    "score": -0.028,
+    "rank": 39,
+    "score": -0.0295,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1665,7 +1670,7 @@
   "w_swe": 0.849
  },
  "gpt-5-6-sol": {
-  "agentic_score": 0.631,
+  "agentic_score": 0.632,
   "arena_coding_elo": 1615.4,
   "arena_webdev_elo": 1615.4,
   "capability": {
@@ -1688,8 +1693,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 15,
-    "score": 0.0453,
+    "rank": 16,
+    "score": 0.0463,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1721,8 +1726,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 33,
-    "score": -0.0189,
+    "rank": 35,
+    "score": -0.0185,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1747,7 +1752,7 @@
   "w_swe": 0.804
  },
  "gpt-6-1-sol": {
-  "agentic_score": 0.716,
+  "agentic_score": 0.715,
   "arena_coding_elo": 1743.0,
   "arena_webdev_elo": 1743.0,
   "capability": {
@@ -1760,8 +1765,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 6,
-    "score": 0.1253,
+    "rank": 7,
+    "score": 0.1246,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1774,13 +1779,13 @@
   "w_swe": 1.0
  },
  "gpt-6-1-terra": {
-  "agentic_score": 0.881,
+  "agentic_score": 0.879,
   "arena_coding_elo": 1678.5,
   "arena_webdev_elo": 1678.5,
   "preference": {
    "arena_agent": {
-    "rank": 7,
-    "score": 0.121,
+    "rank": 8,
+    "score": 0.12,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1793,7 +1798,7 @@
   "w_swe": 0.982
  },
  "gpt-6-astra": {
-  "agentic_score": 0.717,
+  "agentic_score": 0.719,
   "arena_coding_elo": 1764.4,
   "arena_webdev_elo": 1764.4,
   "capability": {
@@ -1810,8 +1815,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 5,
-    "score": 0.1424,
+    "rank": 6,
+    "score": 0.1454,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1837,8 +1842,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 23,
-    "score": 0.0152,
+    "rank": 26,
+    "score": 0.0156,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -1851,7 +1856,7 @@
   "w_swe": 0.898
  },
  "gpt-6-sol": {
-  "agentic_score": 0.605,
+  "agentic_score": 0.604,
   "arena_coding_elo": 1673.0,
   "arena_webdev_elo": 1673.0,
   "capability": {
@@ -1864,8 +1869,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 12,
-    "score": 0.07,
+    "rank": 13,
+    "score": 0.0691,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2068,8 +2073,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 32,
-    "score": -0.0016,
+    "rank": 34,
+    "score": -0.0019,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2095,8 +2100,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 16,
-    "score": 0.0265,
+    "rank": 17,
+    "score": 0.0256,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2140,8 +2145,8 @@
   "arena_webdev_elo": 1505.7,
   "preference": {
    "arena_agent": {
-    "rank": 46,
-    "score": -0.0767,
+    "rank": 48,
+    "score": -0.0756,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2154,13 +2159,13 @@
   "w_swe": 0.838
  },
  "hy4": {
-  "agentic_score": 0.707,
+  "agentic_score": 0.716,
   "arena_coding_elo": 1631.6,
   "arena_webdev_elo": 1631.6,
   "preference": {
    "arena_agent": {
     "rank": 14,
-    "score": 0.0466,
+    "score": 0.0526,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2186,8 +2191,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 55,
-    "score": -0.1707,
+    "rank": 57,
+    "score": -0.1732,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2200,13 +2205,13 @@
   "w_swe": 0.888
  },
  "inkling-2-small": {
-  "agentic_score": 0.652,
+  "agentic_score": 0.69,
   "arena_coding_elo": 1646.2,
   "arena_webdev_elo": 1646.2,
   "preference": {
    "arena_agent": {
-    "rank": 31,
-    "score": 0.0008,
+    "rank": 18,
+    "score": 0.0251,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2232,8 +2237,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 56,
-    "score": -0.1768,
+    "rank": 58,
+    "score": -0.1806,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2370,8 +2375,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 25,
-    "score": 0.0057,
+    "rank": 28,
+    "score": 0.0055,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2384,13 +2389,13 @@
   "w_swe": 0.967
  },
  "kimi-k3-1": {
-  "agentic_score": 0.783,
+  "agentic_score": 0.777,
   "arena_coding_elo": 1687.7,
   "arena_webdev_elo": 1687.7,
   "preference": {
    "arena_agent": {
-    "rank": 13,
-    "score": 0.0524,
+    "rank": 15,
+    "score": 0.049,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2520,13 +2525,13 @@
   "w_swe": 0.87
  },
  "mimo-v2-6": {
-  "agentic_score": 0.661,
+  "agentic_score": 0.662,
   "arena_coding_elo": 1624.3,
   "arena_webdev_elo": 1624.3,
   "preference": {
    "arena_agent": {
-    "rank": 18,
-    "score": 0.0233,
+    "rank": 19,
+    "score": 0.024,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2539,13 +2544,13 @@
   "w_swe": 0.937
  },
  "mimo-v2-6-flash": {
-  "agentic_score": 0.641,
+  "agentic_score": 0.64,
   "arena_coding_elo": 1637.6,
   "arena_webdev_elo": 1637.6,
   "preference": {
    "arena_agent": {
-    "rank": 30,
-    "score": 0.0009,
+    "rank": 33,
+    "score": -0.0003,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2669,8 +2674,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 51,
-    "score": -0.1042,
+    "rank": 52,
+    "score": -0.1046,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2688,8 +2693,8 @@
   "arena_webdev_elo": 1584.5,
   "preference": {
    "arena_agent": {
-    "rank": 36,
-    "score": -0.0276,
+    "rank": 38,
+    "score": -0.027,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2733,8 +2738,8 @@
   "arena_webdev_elo": 1564.5,
   "preference": {
    "arena_agent": {
-    "rank": 42,
-    "score": -0.0608,
+    "rank": 44,
+    "score": -0.0544,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2760,8 +2765,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 52,
-    "score": -0.1393,
+    "rank": 54,
+    "score": -0.1373,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2774,10 +2779,15 @@
   "w_swe": 0.832
  },
  "muse-ember": {
-  "agentic_score": 0.848,
+  "agentic_score": 0.632,
   "arena_coding_elo": 1608.6,
   "arena_webdev_elo": 1608.6,
   "preference": {
+   "arena_agent": {
+    "rank": 25,
+    "score": 0.0167,
+    "source": "arena.ai"
+   },
    "arena_webdev": {
     "rank": 36,
     "rating": 1608.6,
@@ -2835,8 +2845,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 47,
-    "score": -0.0786,
+    "rank": 50,
+    "score": -0.0801,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2862,8 +2872,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 49,
-    "score": -0.0802,
+    "rank": 51,
+    "score": -0.0824,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2889,8 +2899,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 19,
-    "score": 0.0221,
+    "rank": 21,
+    "score": 0.0219,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2917,13 +2927,13 @@
   "w_swe": 0.855
  },
  "muse-wonder": {
-  "agentic_score": 0.684,
+  "agentic_score": 0.681,
   "arena_coding_elo": 1648.6,
   "arena_webdev_elo": 1648.6,
   "preference": {
    "arena_agent": {
-    "rank": 22,
-    "score": 0.0193,
+    "rank": 24,
+    "score": 0.0177,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2936,13 +2946,13 @@
   "w_swe": 0.957
  },
  "muse-wonder-full": {
-  "agentic_score": 0.859,
+  "agentic_score": 0.857,
   "arena_coding_elo": 1723.4,
   "arena_webdev_elo": 1723.4,
   "preference": {
    "arena_agent": {
-    "rank": 9,
-    "score": 0.0909,
+    "rank": 10,
+    "score": 0.0896,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -2958,8 +2968,8 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 53,
-    "score": -0.1437,
+    "rank": 55,
+    "score": -0.156,
     "source": "arena.ai"
    }
   },
@@ -2994,8 +3004,8 @@
   "arena_webdev_elo": 1401.3,
   "preference": {
    "arena_agent": {
-    "rank": 54,
-    "score": -0.1626,
+    "rank": 56,
+    "score": -0.1599,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3339,8 +3349,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 45,
-    "score": -0.0712,
+    "rank": 47,
+    "score": -0.0715,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3356,15 +3366,15 @@
   "agentic_score": 0.0,
   "preference": {
    "arena_agent": {
-    "rank": 48,
-    "score": -0.0787,
+    "rank": 49,
+    "score": -0.0799,
     "source": "arena.ai"
    }
   },
   "w_swe": 0.5
  },
  "qwen3-8": {
-  "agentic_score": 0.608,
+  "agentic_score": 0.606,
   "arena_coding_elo": 1675.8,
   "arena_webdev_elo": 1675.8,
   "capability": {
@@ -3383,8 +3393,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 29,
-    "score": 0.0033,
+    "rank": 32,
+    "score": 0.0011,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3410,8 +3420,8 @@
   },
   "preference": {
    "arena_agent": {
-    "rank": 40,
-    "score": -0.046,
+    "rank": 43,
+    "score": -0.0476,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3429,8 +3439,8 @@
   "arena_webdev_elo": 1623.5,
   "preference": {
    "arena_agent": {
-    "rank": 41,
-    "score": -0.0466,
+    "rank": 42,
+    "score": -0.0461,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3498,8 +3508,8 @@
   "arena_webdev_elo": 1369.1,
   "preference": {
    "arena_agent": {
-    "rank": 57,
-    "score": -0.2284,
+    "rank": 59,
+    "score": -0.226,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3527,8 +3537,8 @@
   "arena_webdev_elo": 1484.7,
   "preference": {
    "arena_agent": {
-    "rank": 50,
-    "score": -0.1034,
+    "rank": 53,
+    "score": -0.1074,
     "source": "arena.ai"
    },
    "arena_webdev": {
@@ -3546,8 +3556,8 @@
   "arena_webdev_elo": 1573.4,
   "preference": {
    "arena_agent": {
-    "rank": 38,
-    "score": -0.0343,
+    "rank": 40,
+    "score": -0.0374,
     "source": "arena.ai"
    },
    "arena_webdev": {
