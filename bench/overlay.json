@@ -1133,9 +1133,17 @@
   "w_swe": 0.783
  },
  "gemini-4-argon": {
-  "agentic_score": 0.862,
+  "agentic_score": 0.662,
   "arena_coding_elo": 1681.0,
   "arena_webdev_elo": 1681.0,
+  "capability": {
+   "terminal_bench": {
+    "acc": 55.45,
+    "date": "2026-09-30",
+    "harness": "Antigravity CLI",
+    "source": "terminal-bench"
+   }
+  },
   "preference": {
    "arena_agent": {
     "rank": 9,
@@ -1152,9 +1160,17 @@
   "w_swe": 0.984
  },
  "gemini-4-carbon": {
-  "agentic_score": 0.984,
+  "agentic_score": 0.764,
   "arena_coding_elo": 1768.2,
   "arena_webdev_elo": 1768.2,
+  "capability": {
+   "terminal_bench": {
+    "acc": 64.55,
+    "date": "2026-10-28",
+    "harness": "Antigravity CLI",
+    "source": "terminal-bench"
+   }
+  },
   "preference": {
    "arena_agent": {
     "rank": 3,
@@ -1171,9 +1187,17 @@
   "w_swe": 1.0
  },
  "gemini-4-hydrogen": {
-  "agentic_score": 1.0,
+  "agentic_score": 0.685,
   "arena_coding_elo": 1704.2,
   "arena_webdev_elo": 1704.2,
+  "capability": {
+   "terminal_bench": {
+    "acc": 56.36,
+    "date": "2026-11-12",
+    "harness": "Antigravity CLI",
+    "source": "terminal-bench"
+   }
+  },
   "preference": {
    "arena_webdev": {
     "rank": 10,
@@ -3067,9 +3091,17 @@
   "w_swe": 0.855
  },
  "muse-wonder": {
-  "agentic_score": 0.68,
+  "agentic_score": 0.543,
   "arena_coding_elo": 1647.4,
   "arena_webdev_elo": 1647.4,
+  "capability": {
+   "terminal_bench": {
+    "acc": 46.97,
+    "date": "2026-10-12",
+    "harness": "Muse Code",
+    "source": "terminal-bench"
+   }
+  },
   "preference": {
    "arena_agent": {
     "rank": 24,

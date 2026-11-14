@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-13",
-  "generated": "2026-11-13",
-  "count": 3873,
+  "arena_date": "2026-11-14",
+  "generated": "2026-11-14",
+  "count": 3879,
   "routable": 77,
-  "scored": 2544,
+  "scored": 2549,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -32670,6 +32670,48 @@
       "w_swe": 0.87
     },
     {
+      "id": "deepinfra/XiaomiMiMo/MiMo-V2.6-Flash",
+      "host": "deepinfra",
+      "leaf": "XiaomiMiMo/MiMo-V2.6-Flash",
+      "family": "deepinfra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.14,
+        "output_usd_per_mtok": 0.28,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.0028
+      },
+      "agentic_score": 0.329,
+      "arena_coding_elo": 1638.1,
+      "arena_webdev_elo": 1638.1,
+      "capability": {
+        "terminal_bench": {
+          "acc": 16.06,
+          "date": "2026-09-22",
+          "harness": "mini-swe-agent",
+          "source": "terminal-bench"
+        }
+      },
+      "preference": {
+        "arena_agent": {
+          "rank": 33,
+          "score": -0.0003,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 25,
+          "rating": 1638.1,
+          "source": "arena.ai",
+          "votes": 8944
+        }
+      },
+      "w_swe": 0.948
+    },
+    {
       "id": "deepinfra/allenai/olmOCR-7B-0725-FP8",
       "host": "deepinfra",
       "leaf": "allenai/olmOCR-7B-0725-FP8",
@@ -34884,6 +34926,36 @@
       }
     },
     {
+      "id": "deepinfra/nvidia/NVIDIA-Nemotron-3.5-Super-VL",
+      "host": "deepinfra",
+      "leaf": "nvidia/NVIDIA-Nemotron-3.5-Super-VL",
+      "family": "deepinfra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.02
+      },
+      "agentic_score": 0.58,
+      "w_swe": 0.58,
+      "capability": {
+        "swe_verified": {
+          "acc": 58.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.74,
+        "grind": 0.56
+      }
+    },
+    {
       "id": "deepinfra/nvidia/NVIDIA-Nemotron-Nano-9B-v2",
       "host": "deepinfra",
       "leaf": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
@@ -35149,6 +35221,48 @@
         }
       },
       "w_swe": 0.838
+    },
+    {
+      "id": "deepinfra/tencent/Hy4-preview",
+      "host": "deepinfra",
+      "leaf": "tencent/Hy4-preview",
+      "family": "deepinfra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.834,
+        "output_usd_per_mtok": 2.501,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.041999999999999996
+      },
+      "agentic_score": 0.497,
+      "arena_coding_elo": 1631.7,
+      "arena_webdev_elo": 1631.7,
+      "capability": {
+        "terminal_bench": {
+          "acc": 37.88,
+          "date": "2026-11-04",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "preference": {
+        "arena_agent": {
+          "rank": 14,
+          "score": 0.0526,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 26,
+          "rating": 1631.7,
+          "source": "arena.ai",
+          "votes": 4601
+        }
+      },
+      "w_swe": 0.943
     },
     {
       "id": "deepinfra/thinkingmachines/Inkling",
@@ -35519,6 +35633,58 @@
           "rating": 1607.7,
           "source": "arena.ai",
           "votes": 17925
+        }
+      }
+    },
+    {
+      "id": "deepinfra/zai-org/GLM-5.3-Flash",
+      "host": "deepinfra",
+      "leaf": "zai-org/GLM-5.3-Flash",
+      "family": "deepinfra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.03
+      },
+      "agentic_score": 0.631,
+      "w_swe": 0.924,
+      "capability": {
+        "swe_verified": {
+          "acc": 92.0,
+          "cost_per_test": 0.018,
+          "latency_s": 3817.4,
+          "source": "vals.ai"
+        },
+        "terminal_bench": {
+          "acc": 36.97,
+          "date": "2026-08-26",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.86,
+        "grind": 0.78
+      },
+      "arena_coding_elo": 1608.8,
+      "arena_webdev_elo": 1608.8,
+      "preference": {
+        "arena_agent": {
+          "rank": 39,
+          "score": -0.0295,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 36,
+          "rating": 1608.8,
+          "source": "arena.ai",
+          "votes": 23608
         }
       }
     },
@@ -36487,8 +36653,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.050699999999999995,
+        "output_usd_per_mtok": 0.20279999999999998,
         "source": "openrouter"
       },
       "agentic_score": 0.496,
@@ -36532,8 +36698,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
+        "input_usd_per_mtok": 0.038000000000000006,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
       "agentic_score": 0.496,
@@ -49742,9 +49908,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -49776,9 +49950,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -49810,9 +49992,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.075
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.685,
       "arena_coding_elo": 1704.2,
       "arena_webdev_elo": 1704.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 56.36,
+          "date": "2026-11-12",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_webdev": {
           "rank": 10,
@@ -50965,9 +51155,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -50999,9 +51197,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -51013,6 +51219,43 @@
           "rating": 1768.2,
           "source": "arena.ai",
           "votes": 2120
+        }
+      },
+      "w_swe": 1.0
+    },
+    {
+      "id": "github_copilot/gemini-4-hydrogen",
+      "host": "github_copilot",
+      "leaf": "gemini-4-hydrogen",
+      "family": "github_copilot",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 7.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.075
+      },
+      "agentic_score": 0.685,
+      "arena_coding_elo": 1704.2,
+      "arena_webdev_elo": 1704.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 56.36,
+          "date": "2026-11-12",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
+      "preference": {
+        "arena_webdev": {
+          "rank": 10,
+          "rating": 1704.2,
+          "source": "arena.ai",
+          "votes": 1997
         }
       },
       "w_swe": 1.0
@@ -54640,9 +54883,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -54674,9 +54925,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -57534,9 +57793,17 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -57583,9 +57850,17 @@
         "output_usd_per_mtok": 10.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -57632,9 +57907,17 @@
         "output_usd_per_mtok": 7.5,
         "source": "openrouter"
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.685,
       "arena_coding_elo": 1704.2,
       "arena_webdev_elo": 1704.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 56.36,
+          "date": "2026-11-12",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_webdev": {
           "rank": 10,
@@ -57793,8 +58076,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.0675,
+        "output_usd_per_mtok": 0.22499999999999998,
         "source": "openrouter"
       },
       "agentic_score": 0.431,
@@ -61060,6 +61343,22 @@
       }
     },
     {
+      "id": "inclusionai/ling-3.2-flash:free",
+      "host": "inclusionai",
+      "leaf": "ling-3.2-flash:free",
+      "family": "inclusionai",
+      "kind": "chat",
+      "route_candidate": true,
+      "free": true,
+      "paid": false,
+      "gated_reason": null,
+      "economics": {
+        "input_usd_per_mtok": 0.0,
+        "output_usd_per_mtok": 0.0,
+        "source": "openrouter"
+      }
+    },
+    {
       "id": "inference-net/schematron-v2-small",
       "host": "inference-net",
       "leaf": "schematron-v2-small",
@@ -62881,6 +63180,22 @@
       }
     },
     {
+      "id": "kt/midm-k-3.0-pro",
+      "host": "kt",
+      "leaf": "midm-k-3.0-pro",
+      "family": "kt",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.19999999999999998,
+        "output_usd_per_mtok": 0.7999999999999999,
+        "source": "openrouter"
+      }
+    },
+    {
       "id": "kyma/claude-fable-5",
       "host": "kyma",
       "leaf": "claude-fable-5",
@@ -63827,9 +64142,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.27
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -65666,9 +65989,17 @@
         "output_usd_per_mtok": 27.0,
         "source": "litellm"
       },
-      "agentic_score": 0.68,
+      "agentic_score": 0.543,
       "arena_coding_elo": 1647.4,
       "arena_webdev_elo": 1647.4,
+      "capability": {
+        "terminal_bench": {
+          "acc": 46.97,
+          "date": "2026-10-12",
+          "harness": "Muse Code",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 24,
@@ -66937,38 +67268,6 @@
       }
     },
     {
-      "id": "liquid/lfm-2.5-2.6b",
-      "host": "liquid",
-      "leaf": "lfm-2.5-2.6b",
-      "family": "liquid",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.35,
-        "output_usd_per_mtok": 0.5,
-        "source": "openrouter"
-      }
-    },
-    {
-      "id": "liquid/lfm-2.5-2.6b:free",
-      "host": "liquid",
-      "leaf": "lfm-2.5-2.6b:free",
-      "family": "liquid",
-      "kind": "chat",
-      "route_candidate": true,
-      "free": true,
-      "paid": false,
-      "gated_reason": null,
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "openrouter"
-      }
-    },
-    {
       "id": "liquid/lfm-2.5-24b-a2b",
       "host": "liquid",
       "leaf": "lfm-2.5-24b-a2b",
@@ -67396,8 +67695,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 0.33,
+        "input_usd_per_mtok": 0.0509,
+        "output_usd_per_mtok": 0.335,
         "source": "openrouter"
       }
     },
@@ -68012,9 +68311,17 @@
         "output_usd_per_mtok": 20.0,
         "source": "openrouter"
       },
-      "agentic_score": 0.68,
+      "agentic_score": 0.543,
       "arena_coding_elo": 1647.4,
       "arena_webdev_elo": 1647.4,
+      "capability": {
+        "terminal_bench": {
+          "acc": 46.97,
+          "date": "2026-10-12",
+          "harness": "Muse Code",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 24,
@@ -68497,7 +68804,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.27,
-        "output_usd_per_mtok": 1.08,
+        "output_usd_per_mtok": 0.95,
         "source": "openrouter"
       },
       "agentic_score": 0.471,
@@ -71867,6 +72174,22 @@
       "economics": {
         "input_usd_per_mtok": 0.44999999999999996,
         "output_usd_per_mtok": 0.95,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "motif-technologies/motif-3",
+      "host": "motif-technologies",
+      "leaf": "motif-3",
+      "family": "motif-technologies",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       }
     },
@@ -82019,8 +82342,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 4.4,
-        "output_usd_per_mtok": 22.0,
+        "input_usd_per_mtok": 4.0,
+        "output_usd_per_mtok": 20.0,
         "source": "openrouter"
       },
       "agentic_score": 0.632,
@@ -83416,9 +83739,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -86524,8 +86855,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.094,
-        "output_usd_per_mtok": 0.13799999999999998,
+        "input_usd_per_mtok": 0.16799999999999998,
+        "output_usd_per_mtok": 0.248,
         "source": "openrouter"
       },
       "agentic_score": 0.7,
@@ -89708,9 +90039,17 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm"
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -104723,9 +105062,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.862,
+      "agentic_score": 0.662,
       "arena_coding_elo": 1681.0,
       "arena_webdev_elo": 1681.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 55.45,
+          "date": "2026-09-30",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 9,
@@ -104774,9 +105121,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.09999999999999999
       },
-      "agentic_score": 0.984,
+      "agentic_score": 0.764,
       "arena_coding_elo": 1768.2,
       "arena_webdev_elo": 1768.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 64.55,
+          "date": "2026-10-28",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_agent": {
           "rank": 3,
@@ -104825,9 +105180,17 @@
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.075
       },
-      "agentic_score": 1.0,
+      "agentic_score": 0.685,
       "arena_coding_elo": 1704.2,
       "arena_webdev_elo": 1704.2,
+      "capability": {
+        "terminal_bench": {
+          "acc": 56.36,
+          "date": "2026-11-12",
+          "harness": "Antigravity CLI",
+          "source": "terminal-bench"
+        }
+      },
       "preference": {
         "arena_webdev": {
           "rank": 10,
