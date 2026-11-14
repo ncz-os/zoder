@@ -15696,6 +15696,47 @@ async fn cmd_health(cli: &Cli, opts: HealthCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Close the ledger reservation of a probe ping that ended at
+/// `finish_reason: "length"` after spending real completion tokens (a
+/// reasoning route; see `length_exhaustion_proves_serving`). The call reached
+/// the provider and was billed, so the row carries the published usage and,
+/// as for any call without a verified price, `cost_unknown`. Unlike
+/// [`reconcile_probe_success`] there is no served-backend telemetry to run
+/// the free-route proof against: the budget-exhaustion error carries none.
+async fn reconcile_probe_length_exhausted(
+    cli: &Cli,
+    eng: &Engine,
+    provider_id: &str,
+    model_id: &str,
+    usage: zoder_core::provider::EmptyLengthUsage,
+    reservation: BillableReservation,
+) -> anyhow::Result<()> {
+    let posture = eng
+        .cfg
+        .provider(provider_id)
+        .map(BillingPosture::from)
+        .unwrap_or(BillingPosture::Metered);
+    let tokens_in = usage.prompt_tokens.unwrap_or(0);
+    let entry = Entry {
+        ts_utc: Utc::now(),
+        provider: provider_id.to_string(),
+        model: model_id.to_string(),
+        host: zoder_core::ledger::host_of_model(model_id),
+        tokens_in,
+        tokens_out: usage.completion_tokens.unwrap_or(0),
+        cost_usd: 0.0,
+        cost_unknown: true,
+        calls: 1,
+        violation: None,
+        tags: finops_tags(cli, tokens_in, None),
+        billing: Some(posture.as_str().to_string()),
+        estimated_cost_usd: None,
+    };
+    tokio::task::spawn_blocking(move || record_turn_entry(reservation, &entry, "health probe"))
+        .await
+        .context("joining health probe ledger reconcile task")?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_probe_success(
     cli: &Cli,
@@ -15941,6 +15982,30 @@ async fn run_probe_default(
                 health.record_success(id, ms);
                 if !quiet {
                     eprintln!("  ok   {id}  {ms:.0}ms");
+                }
+            }
+            Err(e) if zoder_core::length_exhaustion_proves_serving(&e) => {
+                // A reasoning route spent the probe budget thinking: HTTP
+                // 200, well-formed, completion tokens spent. Reachable.
+                let ms = t.elapsed().as_millis() as f64;
+                let usage = e.length_exhausted.unwrap_or_default();
+                reconcile_probe_length_exhausted(
+                    cli,
+                    eng,
+                    provider_cfg.id.as_str(),
+                    id,
+                    usage,
+                    reservation,
+                )
+                .await?;
+                health.record_classified_success(
+                    id,
+                    ms,
+                    &provider_cfg.id,
+                    Classification::Reachable,
+                );
+                if !quiet {
+                    eprintln!("  ok   {id}  {ms:.0}ms  (reasoning route; budget spent thinking)");
                 }
             }
             Err(e) => {
@@ -16331,6 +16396,35 @@ async fn run_probe_all(
                             latency_ms: Some(ms),
                             classification: Classification::Reachable,
                             note: None,
+                        }
+                    }
+                    Ok(Err(err)) if zoder_core::length_exhaustion_proves_serving(&err) => {
+                        // A reasoning route spent the 8-token probe budget
+                        // thinking: HTTP 200, well-formed, completion tokens
+                        // spent. It is reachable and serving, not an error.
+                        let ms = t.elapsed().as_millis() as f64;
+                        let usage = err.length_exhausted.unwrap_or_default();
+                        reconcile_probe_length_exhausted(
+                            cli,
+                            eng,
+                            &provider_id,
+                            model_id,
+                            usage,
+                            reservation,
+                        )
+                        .await?;
+                        health.record_classified_success(
+                            model_id,
+                            ms,
+                            &provider_id,
+                            Classification::Reachable,
+                        );
+                        ProbeOutcome {
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            latency_ms: Some(ms),
+                            classification: Classification::Reachable,
+                            note: Some(zoder_core::LENGTH_EXHAUSTED_SERVING_NOTE.into()),
                         }
                     }
                     Ok(Err(err)) => {
@@ -20077,6 +20171,183 @@ mod default_probe_scope_tests {
         result.expect("nothing to probe is not an error");
         assert!(requested.is_empty(), "{requested:?}");
         assert!(ledger.is_empty(), "{ledger:?}");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_probe_tests {
+    // Regression (FAULT-TO-FIX FB-reasoning-probe): the liveness probe asks for
+    // 8 completion tokens. A reasoning route (gpt-oss, DeepSeek, Muse,
+    // Nemotron, qwen38) spends them thinking and answers HTTP 200 with
+    // `finish_reason: "length"` and no visible content; the probe recorded
+    // that as an error, so the route never earned a fresh `Reachable` record
+    // and `--reviewer-pool-routes` never admitted it. These tests drive the
+    // real `health --probe --all -m <model>` path against real response shapes.
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zoder_core::{Corpus, ModelEntry, Provider};
+
+    const MODEL: &str = "local-reasoner";
+
+    fn corpus() -> Corpus {
+        let models = vec![ModelEntry {
+            id: MODEL.into(),
+            kind: "chat".into(),
+            free: true,
+            route_candidate: true,
+            ..Default::default()
+        }];
+        Corpus {
+            source: "test".into(),
+            arena_date: "2026-11-14".into(),
+            count: models.len(),
+            models,
+            ..Default::default()
+        }
+    }
+
+    fn provider(base_url: &str) -> Provider {
+        Provider {
+            model_aliases: Vec::new(),
+            id: "local".into(),
+            engine_provider_ref: None,
+            base_url: base_url.into(),
+            kind: "openai-chat".into(),
+            auth: zoder_core::Auth::None,
+            paid: false,
+            billing: BillingMode::Free,
+            subscription: None,
+            serves: vec![MODEL.to_string()],
+            azure_api_version: None,
+            max_context_tokens: None,
+            overload_backoff_min_s: None,
+            first_token_timeout_s: None,
+            stream: None,
+            rate_limit_group: None,
+            max_concurrent: None,
+            max_requests_per_minute: None,
+        }
+    }
+
+    /// Probe `MODEL` once against a server answering `response`; return the
+    /// recorded health store and the ledger rows.
+    async fn probe_with(response: ResponseTemplate) -> (HealthStore, Vec<serde_json::Value>) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default_provider(dir.path());
+        cfg.providers = vec![provider(&format!("{}/v1", server.uri()))];
+        cfg.default_provider = "local".into();
+        let eng = Engine::from_parts(cfg, corpus());
+        let cli = Cli::try_parse_from(["zoder", "--quiet", "health", "--probe", "-m", MODEL])
+            .expect("health probe arguments parse");
+        let mut health = HealthStore::load(&dir.path().join("health.json"));
+        run_health_probe(&cli, &eng, &mut health, false)
+            .await
+            .expect("a probe outcome is recorded, never an error");
+        let ledger = std::fs::read_to_string(dir.path().join("ledger.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l.trim()).ok())
+            .collect();
+        (health, ledger)
+    }
+
+    fn pool_routes() -> Vec<(String, String)> {
+        vec![("local".to_string(), MODEL.to_string())]
+    }
+
+    fn admitted(health: &HealthStore) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        !crate::reviewer_pool::healthy_models(&pool_routes(), health, now).is_empty()
+    }
+
+    fn length_response(usage: serde_json::Value) -> ResponseTemplate {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": null,
+                            "reasoning_content": "The user said ping, so I should"},
+                "finish_reason": "length"
+            }],
+        });
+        if !usage.is_null() {
+            body["usage"] = usage;
+        }
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    #[tokio::test]
+    async fn reasoning_route_that_spends_the_probe_budget_thinking_is_admitted_to_the_pool() {
+        let (health, ledger) = probe_with(length_response(
+            serde_json::json!({"prompt_tokens": 9, "completion_tokens": 8, "total_tokens": 17}),
+        ))
+        .await;
+        let rec = &health.models[MODEL];
+        assert_eq!(rec.classification, Some(Classification::Reachable));
+        assert_eq!(rec.consecutive_failures, 0);
+        assert_eq!(rec.provider_id.as_deref(), Some("local"));
+        assert!(
+            admitted(&health),
+            "a serving reasoning route must satisfy the reviewer pool's health gate"
+        );
+        // The ping spent real tokens: the ledger row carries the usage.
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        assert_eq!(ledger[0]["model"], MODEL);
+        assert_eq!(ledger[0]["tokens_out"], 8);
+        assert_eq!(ledger[0]["tokens_in"], 9);
+    }
+
+    #[tokio::test]
+    async fn length_finish_with_zero_completion_tokens_is_still_an_error() {
+        let (health, _) = probe_with(length_response(
+            serde_json::json!({"prompt_tokens": 9, "completion_tokens": 0, "total_tokens": 9}),
+        ))
+        .await;
+        assert_eq!(
+            health.models[MODEL].classification,
+            Some(Classification::Error)
+        );
+        assert!(!admitted(&health));
+    }
+
+    #[tokio::test]
+    async fn length_finish_without_a_usage_block_is_still_an_error() {
+        let (health, _) = probe_with(length_response(serde_json::Value::Null)).await;
+        assert_eq!(
+            health.models[MODEL].classification,
+            Some(Classification::Error)
+        );
+        assert!(!admitted(&health));
+    }
+
+    #[tokio::test]
+    async fn server_errors_and_malformed_bodies_are_still_failures() {
+        for response in [
+            ResponseTemplate::new(500).set_body_string("boom"),
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(401).set_body_string("bad key"),
+        ] {
+            let (health, _) = probe_with(response).await;
+            assert!(
+                !admitted(&health),
+                "a real failure must never admit the route: {:?}",
+                health.models[MODEL]
+            );
+            assert_ne!(
+                health.models[MODEL].classification,
+                Some(Classification::Reachable)
+            );
+        }
     }
 }
 

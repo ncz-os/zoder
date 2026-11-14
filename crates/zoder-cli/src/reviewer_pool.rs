@@ -113,6 +113,40 @@ mod tests {
     }
 
     #[test]
+    fn freshness_window_boundary_is_exclusive_at_max_age() {
+        let mut health = HealthStore::default();
+        record(&mut health, "model", 20.0);
+        let routes = [("review-provider".to_string(), "model".to_string())];
+        assert_eq!(
+            healthy_models(&routes, &health, 1000 + MAX_HEALTH_AGE_SECS - 1),
+            ["model"]
+        );
+        assert!(
+            healthy_models(&routes, &health, 1000 + MAX_HEALTH_AGE_SECS).is_empty(),
+            "a record exactly MAX_HEALTH_AGE_SECS old is stale"
+        );
+    }
+
+    #[test]
+    fn reasoning_route_probe_record_is_admitted_while_fresh_and_dropped_when_stale() {
+        // The shape a reasoning route's probe now leaves behind: classified
+        // Reachable, bound to its provider, zero consecutive failures.
+        let mut health = HealthStore::default();
+        health.record_classified_success(
+            "reasoner",
+            900.0,
+            "review-provider",
+            Classification::Reachable,
+        );
+        let checked = health.models["reasoner"].checked_at_unix.unwrap();
+        let routes = [("review-provider".to_string(), "reasoner".to_string())];
+        assert_eq!(healthy_models(&routes, &health, checked + 60), ["reasoner"]);
+        assert!(healthy_models(&routes, &health, checked + MAX_HEALTH_AGE_SECS).is_empty());
+        let wrong_provider = [("other-provider".to_string(), "reasoner".to_string())];
+        assert!(healthy_models(&wrong_provider, &health, checked + 60).is_empty());
+    }
+
+    #[test]
     fn failed_pool_member_requires_successful_probe_to_recover() {
         let mut health = HealthStore::default();
         record(&mut health, "model", 20.0);

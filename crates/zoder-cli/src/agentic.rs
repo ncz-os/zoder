@@ -24788,6 +24788,85 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A route is kept in the reviewer pool by being USED, not only by the
+    /// periodic probe: a real review served through a pool route re-stamps its
+    /// health record (checked_at, Reachable, bound to its provider), so a route
+    /// that serves reviews never ages out of the one-hour freshness window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pool_route_serving_a_real_review_refreshes_its_health_record() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let _guard = HomeGuard::new(home);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/broken/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("primary unavailable"))
+            .mount(&server)
+            .await;
+        mount_200_openai_chat_completion(&server).await;
+        write_corpus(
+            home,
+            &[
+                "broken-model/coder",
+                "broken-model/reviewer",
+                "working-model/reviewer",
+            ],
+        );
+        write_config(
+            home,
+            &server.uri(),
+            "broken-model/reviewer,working-model/reviewer",
+        );
+        let cli = Cli::try_parse_from([
+            "zoder",
+            "exec",
+            "-m",
+            "broken-model/coder",
+            "--retries",
+            "0",
+            "--allowed-routes",
+            "wiremock-broken=broken-model/coder,wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-allowed-routes",
+            "wiremock-broken=broken-model/reviewer,wiremock-working=working-model/reviewer",
+            "--reviewer-pool-routes",
+            "wiremock-working=working-model/reviewer",
+        ])
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let seeded = now - 3000;
+        HealthStore::mutate_locked(&home.join("health.json"), |health| {
+            health.record_classified_success(
+                "working-model/reviewer",
+                100.0,
+                "wiremock-working",
+                zoder_core::Classification::Reachable,
+            );
+            health
+                .models
+                .get_mut("working-model/reviewer")
+                .unwrap()
+                .checked_at_unix = Some(seeded);
+        })
+        .unwrap();
+        let completion = complete_once(&cli, None, &[], REVIEW_SYSTEM, "diff", 2048, None)
+            .await
+            .expect("the pool fallback completes the review");
+        assert_eq!(completion.model, "working-model/reviewer");
+        let health = HealthStore::load(&home.join("health.json"));
+        let rec = &health.models["working-model/reviewer"];
+        assert!(
+            rec.checked_at_unix.unwrap() >= now,
+            "serving a review must refresh the pool route's checked_at (seeded {seeded}, now {now}, got {:?})",
+            rec.checked_at_unix
+        );
+        assert_eq!(
+            rec.classification,
+            Some(zoder_core::Classification::Reachable)
+        );
+        assert_eq!(rec.provider_id.as_deref(), Some("wiremock-working"));
+        assert_eq!(rec.consecutive_failures, 0);
+    }
+
     /// An old-schema loop record (no `review_complete`, `reviewer_verdicts`,
     /// or `findings`) must still parse and keep its existing fields unchanged
     /// — the new fields are additive. Absent new fields must read as unknown,

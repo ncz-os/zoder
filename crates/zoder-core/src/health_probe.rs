@@ -162,6 +162,37 @@ pub fn classify_err_kind(kind: crate::provider::ErrKind) -> Classification {
     }
 }
 
+/// A reasoning route that answers a liveness ping with HTTP 200, a
+/// well-formed completion, `finish_reason: "length"` and NO visible content
+/// spent its tiny [`PROBE_MAX_TOKENS`] budget thinking. That is proof the
+/// route is reachable and serving (auth, model id and the completion
+/// round-trip all worked), not an error: only the visible answer was cut.
+///
+/// Evidence required, all of it, so a real failure is never mistaken for
+/// serving:
+/// - the provider surfaced the parsed budget exhaustion
+///   (`length_exhausted`, set only on a 2xx body that decoded cleanly and
+///   terminated at `finish_reason: "length"`),
+/// - no HTTP error status rode along,
+/// - nothing was streamed to a sink, and
+/// - the provider-published usage shows completion tokens were spent
+///   (`> 0`). A length finish with no usage block or zero tokens proves
+///   nothing, so it stays an error.
+pub fn length_exhaustion_proves_serving(err: &ProviderError) -> bool {
+    err.kind == crate::provider::ErrKind::Truncation
+        && err.status.is_none()
+        && !err.emitted
+        && err
+            .length_exhausted
+            .and_then(|usage| usage.completion_tokens)
+            .is_some_and(|tokens| tokens > 0)
+}
+
+/// Note recorded on a probe row that was Reachable only because a reasoning
+/// route spent the probe budget on hidden reasoning.
+pub const LENGTH_EXHAUSTED_SERVING_NOTE: &str =
+    "reachable: finish_reason length, probe budget spent on reasoning";
+
 /// A row of the per-provider report. `targets` is the live model id set
 /// the iteration chose for the provider (live `list_models()` or fallback).
 pub struct ProbePlan<'a> {
@@ -267,6 +298,21 @@ pub fn probe_all<'a>(
                                 latency_ms: Some(elapsed_ms),
                                 classification: Classification::Reachable,
                                 note: None,
+                            }
+                        }
+                        Err(err) if length_exhaustion_proves_serving(&err) => {
+                            store.record_classified_success(
+                                model_id,
+                                elapsed_ms,
+                                plan.provider_id,
+                                Classification::Reachable,
+                            );
+                            ProbeOutcome {
+                                provider_id: plan.provider_id.to_string(),
+                                model_id: model_id.clone(),
+                                latency_ms: Some(elapsed_ms),
+                                classification: Classification::Reachable,
+                                note: Some(LENGTH_EXHAUSTED_SERVING_NOTE.into()),
                             }
                         }
                         Err(err) => {
@@ -810,5 +856,92 @@ mod tests {
             "PROBE_MAX_MODELS_PER_PROVIDER must be <= 200 (got {})",
             PROBE_MAX_MODELS_PER_PROVIDER
         );
+    }
+
+    fn length_exhausted(completion_tokens: Option<u64>) -> ProviderError {
+        ProviderError {
+            message: "completion ended at finish_reason \"length\" with no answer".into(),
+            kind: ErrKind::Truncation,
+            length_exhausted: Some(crate::provider::EmptyLengthUsage {
+                prompt_tokens: Some(9),
+                completion_tokens,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn length_exhaustion_is_serving_only_with_spent_completion_tokens() {
+        assert!(length_exhaustion_proves_serving(&length_exhausted(Some(8))));
+        assert!(!length_exhaustion_proves_serving(&length_exhausted(Some(
+            0
+        ))));
+        assert!(!length_exhaustion_proves_serving(&length_exhausted(None)));
+        // An HTTP status, streamed output or another kind voids the proof.
+        let mut with_status = length_exhausted(Some(8));
+        with_status.status = Some(503);
+        assert!(!length_exhaustion_proves_serving(&with_status));
+        let mut emitted = length_exhausted(Some(8));
+        emitted.emitted = true;
+        assert!(!length_exhaustion_proves_serving(&emitted));
+        let mut other_kind = length_exhausted(Some(8));
+        other_kind.kind = ErrKind::Server;
+        assert!(!length_exhaustion_proves_serving(&other_kind));
+        // A plain truncation (stream EOF) carries no length evidence.
+        let plain = ProviderError {
+            message: "stream ended".into(),
+            kind: ErrKind::Truncation,
+            ..Default::default()
+        };
+        assert!(!length_exhaustion_proves_serving(&plain));
+    }
+
+    #[test]
+    fn probe_all_records_reasoning_route_reachable_and_real_failures_as_errors() {
+        struct Fixed(Vec<(&'static str, Result<ChatResult, ProviderError>)>);
+        impl Probe for Fixed {
+            fn list_models(&self) -> Option<Vec<String>> {
+                Some(self.0.iter().map(|(m, _)| (*m).to_string()).collect())
+            }
+            fn ping(&self, model_id: &str) -> Result<ChatResult, ProviderError> {
+                self.0
+                    .iter()
+                    .find(|(m, _)| *m == model_id)
+                    .map(|(_, r)| r.clone())
+                    .expect("fixture model")
+            }
+        }
+        struct One(Fixed);
+        impl ProbeResolver for One {
+            fn resolve<'a>(&'a self, _: &'a str) -> Option<&'a dyn Probe> {
+                Some(&self.0)
+            }
+        }
+        let server_err = ProviderError {
+            message: "HTTP 500".into(),
+            kind: ErrKind::Server,
+            status: Some(500),
+            ..Default::default()
+        };
+        let resolver = One(Fixed(vec![
+            ("thinks", Err(length_exhausted(Some(8)))),
+            ("silent", Err(length_exhausted(Some(0)))),
+            ("down", Err(server_err)),
+        ]));
+        let plans = vec![ProbePlan {
+            provider_id: "p",
+            targets: vec!["thinks".into(), "silent".into(), "down".into()],
+        }];
+        let mut s = store();
+        let out = probe_all(plans, &resolver, &mut s);
+        assert_eq!(out[0].classification, Classification::Reachable);
+        assert_eq!(out[0].note.as_deref(), Some(LENGTH_EXHAUSTED_SERVING_NOTE));
+        assert_eq!(out[1].classification, Classification::Error);
+        assert_eq!(out[2].classification, Classification::Error);
+        let thinks = &s.models["thinks"];
+        assert_eq!(thinks.provider_id.as_deref(), Some("p"));
+        assert_eq!(thinks.consecutive_failures, 0);
+        assert_eq!(s.models["silent"].consecutive_failures, 1);
+        assert_eq!(s.models["down"].consecutive_failures, 1);
     }
 }

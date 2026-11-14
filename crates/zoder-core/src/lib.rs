@@ -36,9 +36,9 @@ pub mod gate_bundle;
 pub mod health_probe;
 pub mod host_cooldown;
 pub use health_probe::{
-    cap_targets, classify_err, classify_err_kind, probe_all, probe_request, Probe, ProbeOutcome,
-    ProbePlan, ProbeResolver, PROBE_MAX_MODELS_PER_PROVIDER, PROBE_MAX_TOKENS,
-    PROBE_PING_TIMEOUT_SECS, PROBE_PROMPT,
+    cap_targets, classify_err, classify_err_kind, length_exhaustion_proves_serving, probe_all,
+    probe_request, Probe, ProbeOutcome, ProbePlan, ProbeResolver, LENGTH_EXHAUSTED_SERVING_NOTE,
+    PROBE_MAX_MODELS_PER_PROVIDER, PROBE_MAX_TOKENS, PROBE_PING_TIMEOUT_SECS, PROBE_PROMPT,
 };
 pub use host_cooldown::{
     clear_cooldown, cooldown_active, cooldown_path_for, note_budget_decline, read_cooldown,
