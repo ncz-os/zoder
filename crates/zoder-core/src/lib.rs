@@ -43,8 +43,9 @@ pub use health_probe::{
 pub use host_cooldown::{
     clear_cooldown, cooldown_active, cooldown_path_for, note_budget_decline, read_cooldown,
     read_cooldown_at, status_line as host_cooldown_status_line, status_view as host_cooldown_view,
-    trip_monthly_cap_cooldown, write_cooldown, HostCooldown, COOLDOWN_SUFFIX, COOLDOWN_VERSION,
-    REASON_MONTHLY_CAP,
+    trip_daily_cap_cooldown, trip_monthly_cap_cooldown, trip_weekly_cap_cooldown, write_cooldown,
+    HostCooldown, COOLDOWN_SUFFIX, COOLDOWN_VERSION, REASON_DAILY_CAP, REASON_MONTHLY_CAP,
+    REASON_WEEKLY_CAP,
 };
 pub use model_health as health;
 pub mod catalog_models;
@@ -117,7 +118,7 @@ pub fn agent_idle_between_events_s_from_env() -> Option<u64> {
         .ok()
         .and_then(|v| v.parse().ok())
 }
-pub use budget::{estimate_tokens, Budget, BudgetDecline, BudgetVerdict, TrippedCap};
+pub use budget::{estimate_tokens, Budget, BudgetDecline, BudgetVerdict, TrippedCap, WindowSpend};
 pub use cancel_budget::{
     cancel_ack_budget, cancel_ack_cap_from_env, CANCEL_ACK_CAP_ENV, DEFAULT_CANCEL_ACK_CAP,
 };

@@ -1118,6 +1118,12 @@ enum Cmd {
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
     },
+    /// Budget caps vs local ledger spend: configured caps, current
+    /// day/week/month windows, and the host cooldown state.
+    Budget {
+        #[command(subcommand)]
+        action: BudgetCmd,
+    },
     /// Usage + chargeback report from the local ledger for a period
     /// (day/week/month/quarter/ytd), bucketed by time + by model, with the
     /// free-tier counterfactual + savings. Colorized output.
@@ -1760,6 +1766,19 @@ enum ReviewScope {
     WorkingTree,
     /// Committed branch changes vs base.
     Branch,
+}
+
+/// Subcommands for `zoder budget …`: local spend-cap enforcement state.
+#[derive(Subcommand, Clone, Debug)]
+enum BudgetCmd {
+    /// Show the configured `[budget]` caps against current day/week/month
+    /// ledger spend, plus the host cooldown marker state. `--json` emits the
+    /// same document for machines.
+    Status {
+        /// Emit machine-readable JSON to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -2816,6 +2835,9 @@ async fn run() -> anyhow::Result<()> {
             host.as_deref(),
             cli.json,
         ),
+        Some(Cmd::Budget { action }) => match action {
+            BudgetCmd::Status { json } => cmd_budget_status(*json),
+        },
         Some(Cmd::Report {
             period,
             days,
@@ -7038,10 +7060,12 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
     let budget_confirm = if !cli.allow_paid && !provider_cost_neutral {
         let pricing = crate::config_cache::pricing_catalog(&Config::home().join("pricing.json"));
         let now = chrono::Utc::now();
-        // The cooldown-aware form (D8 step 12): a MONTHLY cap trip also
-        // writes/extends `<ledger path>.cooldown.json`, the host-local signal
-        // a sibling worker reads instead of re-deriving the same refusal.
-        let verdict = eng.cfg.budget.evaluate_call_with_host_cooldown(
+        // The windowed cooldown-aware form (D8 step 12, NG2-ZD-007): a
+        // DAILY/WEEKLY/MONTHLY cap trip also writes/extends `<ledger
+        // path>.cooldown.json` (expiring at the end of the tripped window),
+        // the host-local signal a sibling worker reads instead of
+        // re-deriving the same refusal.
+        let verdict = eng.cfg.budget.evaluate_call_windows_with_host_cooldown(
             &eng.cfg.ledger_path,
             &pricing,
             &primary,
@@ -7052,10 +7076,14 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             },
             Some(now),
             || {
-                initial_reservation
+                let reservation = initial_reservation
                     .as_ref()
-                    .expect("initial reservation exists before dispatch")
-                    .month_to_date_usd()
+                    .expect("initial reservation exists before dispatch");
+                Ok(zoder_core::budget::WindowSpend::new(
+                    reservation.day_to_date_usd()?,
+                    reservation.week_to_date_usd()?,
+                    reservation.month_to_date_usd()?,
+                ))
             },
         );
         match verdict {
@@ -11365,16 +11393,18 @@ fn evaluate_default_exec_budget(
     model: &str,
     prompt: &str,
     provider_cost_neutral: bool,
-    month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    spend: impl FnOnce() -> anyhow::Result<zoder_core::budget::WindowSpend>,
 ) -> BudgetVerdict {
     if provider_cost_neutral {
         return BudgetVerdict::WithinBudget;
     }
-    // The cooldown-aware form (D8 step 12): a MONTHLY cap trip also writes or
-    // extends the host cooldown marker beside the ledger, so a sibling worker
-    // (and the Hive worker's budget back-off) sees that the month is spent
-    // without re-deriving it. Every other decline leaves the marker alone.
-    cfg.budget.evaluate_call_with_host_cooldown(
+    // The windowed cooldown-aware form (D8 step 12, NG2-ZD-007): a
+    // DAILY/WEEKLY/MONTHLY cap trip also writes or extends the host cooldown
+    // marker beside the ledger (expiring at the end of the tripped window),
+    // so a sibling worker (and the Hive worker's budget back-off) sees that
+    // the window is spent without re-deriving it. Every other decline leaves
+    // the marker alone.
+    cfg.budget.evaluate_call_windows_with_host_cooldown(
         &cfg.ledger_path,
         pricing,
         model,
@@ -11384,7 +11414,7 @@ fn evaluate_default_exec_budget(
             cache_hit_tokens: 0,
         },
         Some(chrono::Utc::now()),
-        month_spent,
+        spend,
     )
 }
 
@@ -11412,7 +11442,7 @@ mod default_exec_budget_tests {
             "paid-model",
             "agentic prompt",
             false,
-            || Ok(0.0),
+            || Ok(zoder_core::budget::WindowSpend::new(0.0, 0.0, 0.0)),
         );
         assert!(matches!(verdict, BudgetVerdict::Confirm(_)));
     }
@@ -11445,7 +11475,11 @@ mod default_exec_budget_tests {
                 model,
                 "agentic prompt",
                 is_cost_neutral_provider(&cfg.providers[0]),
-                || panic!("a free provider must not consult paid ledger spend"),
+                || {
+                    panic!("a free provider must not consult paid ledger spend");
+                    #[allow(unreachable_code)]
+                    Ok::<_, anyhow::Error>(zoder_core::budget::WindowSpend::new(0.0, 0.0, 0.0))
+                },
             );
             assert_eq!(verdict, BudgetVerdict::WithinBudget);
         }
@@ -13015,7 +13049,13 @@ pub(crate) async fn agentic_turn(
             &primary,
             &prompt,
             provider_cost_neutral,
-            || ledger_reservation.month_to_date_usd(),
+            || {
+                Ok::<_, anyhow::Error>(zoder_core::budget::WindowSpend::new(
+                    ledger_reservation.day_to_date_usd()?,
+                    ledger_reservation.week_to_date_usd()?,
+                    ledger_reservation.month_to_date_usd()?,
+                ))
+            },
         );
         match verdict {
             BudgetVerdict::Confirm(msg) => Some(msg),
@@ -14439,6 +14479,112 @@ fn spend_unknown_cost_note(roll: &std::collections::BTreeMap<String, Rollup>) ->
          The engine's monthly figure may be higher until these rows are priced.",
         if rows == 1 { "row" } else { "rows" }
     ))
+}
+
+/// `zoder budget status`: the configured `[budget]` caps against current
+/// day/week/month ledger spend, plus the host cooldown marker state.
+///
+/// `--json` emits one document with all three windows:
+/// `{"caps": {"daily_cap_usd": .., "weekly_cap_usd": .., ...},
+/// "spend": {"day": .., "week": .., "month": ..}, "host_cooldown": ..}`.
+/// A window with no configured cap reports `cap_usd: null` and
+/// `tripped: false`. The human path prints the same numbers as a table.
+fn cmd_budget_status(json: bool) -> anyhow::Result<()> {
+    // `budget status` reads the ledger, not the model corpus (same rule as
+    // `spend`/`report`: a host with no corpus installed must still report).
+    let eng = Engine::load_config_only(None)?;
+    let ledger = Ledger::new(&eng.cfg.ledger_path);
+    // The gate's `read_window_spend_or_default` is fail-closed (an `Err`
+    // refuses the call); this is a REPORT, so an unreadable window prints
+    // as `unreadable` rather than failing the command.
+    let spend = zoder_core::budget::read_window_spend_or_default(&ledger);
+    let (day, week, month) = match &spend {
+        Ok(w) => (w.day, w.week, w.month),
+        Err(_) => (f64::NAN, f64::NAN, f64::NAN),
+    };
+    let cooldown = zoder_core::host_cooldown::read_cooldown(&eng.cfg.ledger_path)
+        .ok()
+        .flatten();
+    let budget = &eng.cfg.budget;
+    let window = |cap: Option<f64>, spent: f64| {
+        let tripped = match (cap, spent.is_finite()) {
+            (Some(limit), true) => spent >= limit,
+            _ => false,
+        };
+        (cap, spent, tripped)
+    };
+    let (daily_cap, day_spent, daily_tripped) = window(budget.daily_cap_usd, day);
+    let (weekly_cap, week_spent, weekly_tripped) = window(budget.weekly_cap_usd, week);
+    let (monthly_cap, month_spent, monthly_tripped) = window(budget.monthly_cap_usd, month);
+    if json {
+        let spend_or_null = |spent: f64| {
+            if spent.is_finite() {
+                serde_json::json!(spent)
+            } else {
+                serde_json::Value::Null
+            }
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "caps": {
+                    "max_cost_per_call_usd": budget.max_cost_per_call_usd,
+                    "daily_cap_usd": budget.daily_cap_usd,
+                    "weekly_cap_usd": budget.weekly_cap_usd,
+                    "monthly_cap_usd": budget.monthly_cap_usd,
+                    "est_output_tokens": budget.est_output_tokens,
+                },
+                "spend": {
+                    "day": spend_or_null(day),
+                    "week": spend_or_null(week),
+                    "month": spend_or_null(month),
+                },
+                "tripped": {
+                    "daily": daily_tripped,
+                    "weekly": weekly_tripped,
+                    "monthly": monthly_tripped,
+                },
+                "host_cooldown": cooldown
+                    .as_ref()
+                    .map(zoder_core::host_cooldown::status_view),
+            }))?,
+        );
+        return Ok(());
+    }
+    let money = |spent: f64| {
+        if spent.is_finite() {
+            format!("${spent:.2}")
+        } else {
+            "unreadable".to_string()
+        }
+    };
+    println!(
+        "{:<8} {:>12} {:>12} {:>8}",
+        "window", "cap_usd", "spent_usd", "tripped"
+    );
+    for (name, cap, spent, tripped) in [
+        ("day", daily_cap, day_spent, daily_tripped),
+        ("week", weekly_cap, week_spent, weekly_tripped),
+        ("month", monthly_cap, month_spent, monthly_tripped),
+    ] {
+        println!(
+            "{:<8} {:>12} {:>12} {:>8}",
+            name,
+            cap.map(|c| format!("${c:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            money(spent),
+            if tripped { "YES" } else { "no" },
+        );
+    }
+    match &cooldown {
+        Some(marker) => println!(
+            "host cooldown ACTIVE ({}); metered routes skipped until {}",
+            marker.reason,
+            marker.expires_at.to_rfc3339(),
+        ),
+        None => println!("host cooldown: none"),
+    }
+    Ok(())
 }
 
 fn cmd_spend(

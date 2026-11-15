@@ -319,12 +319,11 @@ pub struct Ledger {
 /// Suffix of the sidecar checkpoint kept beside the ledger. Like the `.lock`
 /// companion it is derived from the ledger path, so the two move together.
 const CHECKPOINT_SUFFIX: &str = ".checkpoint";
-/// Layout version of the checkpoint. A checkpoint of another version is
-/// ignored (the full scan rebuilds it), never misread.
-///
-/// Version 2: month totals hold only metered rows (D8 step 1). A version-1
-/// checkpoint also summed `subscription`/`free` rows, so it is rebuilt.
-const CHECKPOINT_VERSION: u32 = 2;
+/// Checkpoint layout version 3: per-day and per-week metered totals alongside
+/// the per-month ones (NG2-ZD-007). A version-2 checkpoint is rebuilt — the
+/// same rule as the version-1 → version-2 migration: an older sidecar is
+/// never partially believed.
+const CHECKPOINT_VERSION: u32 = 3;
 /// A checkpoint holds a few numbers per calendar month; a file this large was
 /// not written by this build and is not parsed.
 const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
@@ -399,6 +398,23 @@ impl MonthTotal {
         }
         Ok(self.cost_usd)
     }
+
+    /// The same answer with the window named in the fail-closed error, for
+    /// the day and week cap reads. `month_to_date` keeps the exact
+    /// month-era wording (`month_to_date_from_entries` is the documented
+    /// oracle); day and week windows name their own window instead.
+    fn window_to_date(&self, window: &str) -> anyhow::Result<f64> {
+        if self.overflowed {
+            anyhow::bail!("ledger cost rollup overflowed; refusing to report a misleading total");
+        }
+        if self.unknown_cost_calls > 0 {
+            anyhow::bail!(
+                "{window}-to-date spend contains {} call(s) with unknown cost",
+                self.unknown_cost_calls
+            );
+        }
+        Ok(self.cost_usd)
+    }
 }
 
 /// Sidecar checkpoint: every byte of the ledger before `offset` has been
@@ -429,6 +445,15 @@ struct LedgerCheckpoint {
     tail_fingerprint: u64,
     /// Per-month totals of the rows before `offset`, keyed `YYYY-MM`.
     months: BTreeMap<String, MonthTotal>,
+    /// Per-day totals of the rows before `offset`, keyed `YYYY-MM-DD` (UTC).
+    /// Written by NG2-ZD-007 for the daily cap; absent on a version-2
+    /// sidecar (which is rebuilt from scratch, never merged).
+    #[serde(default)]
+    days: BTreeMap<String, MonthTotal>,
+    /// Per-ISO-week totals of the rows before `offset`, keyed `YYYY-Www`
+    /// (UTC). Same migration story as `days`.
+    #[serde(default)]
+    weeks: BTreeMap<String, MonthTotal>,
     /// Compactable padding before `offset`, as the recovery scan counts it.
     waste: u64,
     /// Newest legacy-size reservation-provider row before `offset`; recovery
@@ -563,6 +588,10 @@ fn settled_prefixes() -> &'static std::sync::Mutex<std::collections::HashMap<Pat
 struct Fold {
     /// Per-month totals of every valid row in the file, prefix included.
     months: BTreeMap<String, MonthTotal>,
+    /// Per-day totals of every valid row in the file, prefix included.
+    days: BTreeMap<String, MonthTotal>,
+    /// Per-ISO-week totals of every valid row in the file, prefix included.
+    weeks: BTreeMap<String, MonthTotal>,
     /// The checkpoint describing the settled prefix after this read.
     next: LedgerCheckpoint,
     /// Lines actually read (not covered by the starting checkpoint).
@@ -589,6 +618,22 @@ impl Fold {
         self.months
             .get(&bucket)
             .map_or(Ok(0.0), MonthTotal::month_to_date)
+    }
+
+    /// Day-to-date for the UTC calendar day containing `now`.
+    fn day_to_date_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        let bucket = Period::Day.bucket(&now);
+        self.days
+            .get(&bucket)
+            .map_or(Ok(0.0), |total| total.window_to_date("day"))
+    }
+
+    /// Week-to-date for the UTC ISO week containing `now`.
+    fn week_to_date_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        let bucket = Period::Week.bucket(&now);
+        self.weeks
+            .get(&bucket)
+            .map_or(Ok(0.0), |total| total.window_to_date("week"))
     }
 }
 
@@ -629,6 +674,8 @@ fn fold_ledger(
     let base_offset = base.as_ref().map(|cp| cp.offset);
     let mut next = base.unwrap_or_default();
     let mut months = next.months.clone();
+    let mut days = next.days.clone();
+    let mut weeks = next.weeks.clone();
     let mut settled = true;
     let mut malformed = Vec::new();
     let mut lines_read = 0usize;
@@ -655,18 +702,26 @@ fn fold_ledger(
                 continue;
             }
         };
-        let bucket = Period::Month.bucket(&entry.ts_utc);
+        let month_bucket = Period::Month.bucket(&entry.ts_utc);
+        let day_bucket = Period::Day.bucket(&entry.ts_utc);
+        let week_bucket = Period::Week.bucket(&entry.ts_utc);
         if is_unsettled_reservation(&entry) {
             settled = false;
             if entry.model == PREPARED_RESERVATION_MODEL && skip_prepared(&entry, line.raw_len)? {
                 continue;
             }
-            months.entry(bucket).or_default().add(&entry);
+            months.entry(month_bucket).or_default().add(&entry);
+            days.entry(day_bucket).or_default().add(&entry);
+            weeks.entry(week_bucket).or_default().add(&entry);
             continue;
         }
-        months.entry(bucket.clone()).or_default().add(&entry);
+        months.entry(month_bucket.clone()).or_default().add(&entry);
+        days.entry(day_bucket.clone()).or_default().add(&entry);
+        weeks.entry(week_bucket.clone()).or_default().add(&entry);
         if settled {
-            next.months.entry(bucket).or_default().add(&entry);
+            next.months.entry(month_bucket).or_default().add(&entry);
+            next.days.entry(day_bucket).or_default().add(&entry);
+            next.weeks.entry(week_bucket).or_default().add(&entry);
             next.waste = next.waste.saturating_add(slot_padding(&line));
             if line.raw_len == LEGACY_RESERVATION_BYTES && entry.provider == RESERVATION_PROVIDER {
                 next.legacy_reservation_newest = Some(
@@ -691,6 +746,8 @@ fn fold_ledger(
     }
     Ok(Fold {
         months,
+        days,
+        weeks,
         next,
         lines_read,
         base_offset,
@@ -707,6 +764,10 @@ pub struct BillableReservation {
     slot_bytes: usize,
     marker: String,
     month_to_date: Result<f64, String>,
+    /// Day-to-date known spend from the same snapshot.
+    day_to_date: Result<f64, String>,
+    /// Week-to-date (UTC ISO week) known spend from the same snapshot.
+    week_to_date: Result<f64, String>,
     armed: bool,
     /// True once the slot holds a final entry, so the drop guard knows not to
     /// overwrite it.
@@ -742,6 +803,22 @@ impl BillableReservation {
     /// reservation was created under the exclusive sidecar lock.
     pub fn month_to_date_usd(&self) -> anyhow::Result<f64> {
         self.month_to_date
+            .as_ref()
+            .copied()
+            .map_err(|message| anyhow::anyhow!(message.clone()))
+    }
+
+    /// Day-to-date known spend from the same snapshot.
+    pub fn day_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.day_to_date
+            .as_ref()
+            .copied()
+            .map_err(|message| anyhow::anyhow!(message.clone()))
+    }
+
+    /// Week-to-date (UTC ISO week) known spend from the same snapshot.
+    pub fn week_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.week_to_date
             .as_ref()
             .copied()
             .map_err(|message| anyhow::anyhow!(message.clone()))
@@ -1402,6 +1479,13 @@ impl Ledger {
         // is left to skip.
         let fold = fold_ledger(&mut file, &self.path, base, |_, _| Ok(false))?;
         let month_to_date = fold.month_to_date().map_err(|error| error.to_string());
+        let snapshot_now = Utc::now();
+        let day_to_date = fold
+            .day_to_date_at(snapshot_now)
+            .map_err(|error| error.to_string());
+        let week_to_date = fold
+            .week_to_date_at(snapshot_now)
+            .map_err(|error| error.to_string());
         self.publish_checkpoint(&mut file, fold);
 
         let offset = file.seek(SeekFrom::End(0))?;
@@ -1472,6 +1556,8 @@ impl Ledger {
             slot_bytes: BILLABLE_RESERVATION_BYTES,
             marker,
             month_to_date,
+            day_to_date,
+            week_to_date,
             armed: false,
             reconciled: false,
             dispatched_provider: String::new(),
@@ -2146,6 +2232,45 @@ impl Ledger {
     /// [`Self::month_to_date_usd`] for the UTC calendar month containing
     /// `now`, so the month boundary can be tested with a pinned clock.
     fn month_to_date_usd_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        self.window_to_date_usd_at(Period::Month, now, "month")
+    }
+
+    /// Total spend (USD) recorded in the current UTC calendar day. Same
+    /// fail-closed contract as [`Self::month_to_date_usd`]: the pre-call
+    /// budget gate checks a projected call against the daily cap.
+    pub fn day_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.day_to_date_usd_at(Utc::now())
+    }
+
+    /// [`Self::day_to_date_usd`] for the UTC calendar day containing `now`,
+    /// so the day boundary can be tested with a pinned clock.
+    fn day_to_date_usd_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        self.window_to_date_usd_at(Period::Day, now, "day")
+    }
+
+    /// Total spend (USD) recorded in the current UTC ISO week. Same
+    /// fail-closed contract as [`Self::month_to_date_usd`]: the pre-call
+    /// budget gate checks a projected call against the weekly cap.
+    pub fn week_to_date_usd(&self) -> anyhow::Result<f64> {
+        self.week_to_date_usd_at(Utc::now())
+    }
+
+    /// [`Self::week_to_date_usd`] for the UTC ISO week containing `now`,
+    /// so the week boundary can be tested with a pinned clock.
+    fn week_to_date_usd_at(&self, now: DateTime<Utc>) -> anyhow::Result<f64> {
+        self.window_to_date_usd_at(Period::Week, now, "week")
+    }
+
+    /// Shared strict read for the three cap windows: read under the shared
+    /// lock, fold from the checkpoint, return that window's bucket (or
+    /// `Ok(0.0)` when no ledger rows exist yet). Unknown-cost or overflowed
+    /// totals and malformed rows fail closed, exactly as the monthly read.
+    fn window_to_date_usd_at(
+        &self,
+        period: Period,
+        now: DateTime<Utc>,
+        window: &str,
+    ) -> anyhow::Result<f64> {
         let Some((_lock, mut file)) = self.open_shared()? else {
             return Ok(0.0);
         };
@@ -2153,9 +2278,14 @@ impl Ledger {
         let fold = fold_ledger(&mut file, &self.path, base, |entry, raw_len| {
             Ok(self.prepared_owner_is_gone(entry, raw_len))
         })?;
-        let month_to_date = fold.month_to_date_at(now);
+        let total = match period {
+            Period::Month => fold.month_to_date_at(now),
+            Period::Day => fold.day_to_date_at(now),
+            Period::Week => fold.week_to_date_at(now),
+            Period::Year => anyhow::bail!("no {window} spend cap window for a yearly rollup"),
+        };
         self.publish_checkpoint(&mut file, fold);
-        month_to_date
+        total
     }
 
     /// Spend rolled up by period bucket within an optional date window.
@@ -2710,6 +2840,58 @@ mod tests {
             (got - 0.50).abs() < 1e-9,
             "only the metered row counts toward the cap, got {got}"
         );
+    }
+
+    /// NG2-ZD-007: day and week windows read from the ledger the same way
+    /// the month does. A row from yesterday counts toward the month and the
+    /// ISO week but not toward today; a row from last month counts toward
+    /// none of the current windows.
+    #[test]
+    fn day_and_week_spend_read_from_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        // Wednesday 2026-11-18 12:00 UTC: ISO week 47.
+        let now: DateTime<Utc> = "2026-11-18T12:00:00Z".parse().unwrap();
+        let mut today = entry("2026-11-18 10:00:00", "cloud/m", 4.90, 10, 10, 1);
+        today.billing = Some("metered".into());
+        let mut yesterday = entry("2026-11-17 10:00:00", "cloud/m", 3.00, 10, 10, 1);
+        yesterday.billing = Some("metered".into());
+        // Last week (ISO week 46) but still November.
+        let mut last_week = entry("2026-11-10 10:00:00", "cloud/m", 7.00, 10, 10, 1);
+        last_week.billing = Some("metered".into());
+        // Last month entirely.
+        let mut last_month = entry("2026-10-05 10:00:00", "cloud/m", 9.00, 10, 10, 1);
+        last_month.billing = Some("metered".into());
+        for e in [&today, &yesterday, &last_week, &last_month] {
+            led.record(e).unwrap();
+        }
+        let day = led.day_to_date_usd_at(now).unwrap();
+        assert!((day - 4.90).abs() < 1e-9, "today only, got {day}");
+        let week = led.week_to_date_usd_at(now).unwrap();
+        assert!(
+            (week - 7.90).abs() < 1e-9,
+            "today + yesterday (same ISO week), got {week}"
+        );
+        let month = led.month_to_date_usd_at(now).unwrap();
+        assert!(
+            (month - 14.90).abs() < 1e-9,
+            "today + yesterday + last week (same month), got {month}"
+        );
+    }
+
+    /// NG2-ZD-007: the day/week windows fail closed on unknown-cost rows in
+    /// the current window, exactly like the month does.
+    #[test]
+    fn day_and_week_spend_fail_closed_on_unknown_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::new(&dir.path().join("ledger.jsonl"));
+        let now: DateTime<Utc> = "2026-11-18T12:00:00Z".parse().unwrap();
+        let mut unknown = entry("2026-11-18 10:00:00", "cloud/m", 0.0, 10, 10, 1);
+        unknown.cost_unknown = true;
+        led.record(&unknown).unwrap();
+        assert!(led.day_to_date_usd_at(now).is_err());
+        assert!(led.week_to_date_usd_at(now).is_err());
+        assert!(led.month_to_date_usd_at(now).is_err());
     }
 
     /// Rows written before the `billing` field existed carry `billing: None`.

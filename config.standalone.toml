@@ -92,5 +92,7 @@ max_context_tokens = 131072
 # per-invocation bypass, not a persistent config-wide setting.
 [budget]
 max_cost_per_call_usd = 1.00
+# daily_cap_usd = 5.00
+# weekly_cap_usd = 20.00
 monthly_cap_usd = 50.00
 est_output_tokens = 1024
