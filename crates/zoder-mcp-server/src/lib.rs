@@ -6,11 +6,12 @@
 //! # Protocol
 //!
 //! The server speaks the Model Context Protocol over stdio using JSON-RPC 2.0
-//! framing. It implements three MCP methods:
+//! framing. It implements three MCP methods plus the `ping` liveness probe:
 //!
 //! * `initialize` — server info + capabilities
 //! * `tools/list` — routing and SOP lifecycle tools
 //! * `tools/call`  — runs a route or forwards an SOP operation
+//! * `ping` — empty-result liveness probe, valid before initialization too
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -308,9 +309,17 @@ fn daemon_socket_path() -> std::path::PathBuf {
 // Server: stdio loop that dispatches MCP methods
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Methods accepted before the client completes initialization.
+/// `initialize` starts the handshake, `notifications/initialized` finishes
+/// it, and `ping` is a spec-mandated liveness probe that must work at any
+/// time (several MCP clients send it first and drop servers that reject it).
+pub(crate) fn method_allowed_before_init(method: &str) -> bool {
+    matches!(method, "initialize" | "notifications/initialized" | "ping")
+}
 /// Run the MCP server: read JSON-RPC messages from stdin, write responses to
 /// stdout.  The server starts in a "not initialized" state and will reject
-/// every method except `initialize` until the client sends one.
+/// every method except `initialize` (and the `ping` liveness probe) until
+/// the client sends one.
 pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -366,10 +375,7 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
                 }
                 if jsonrpc != "2.0" {
                     RpcMessage::error_response(id.clone(), -32600, "invalid JSON-RPC version")
-                } else if !initialized
-                    && method.as_str() != "initialize"
-                    && method.as_str() != "notifications/initialized"
-                {
+                } else if !initialized && !method_allowed_before_init(method.as_str()) {
                     RpcMessage::error_response(
                         id.clone(),
                         -32601,
@@ -705,6 +711,11 @@ fn dispatch_request(
                 ),
             }
         }
+
+        // ── ping ───────────────────────────────────────────────────────
+        // MCP liveness probe: valid at any time (also before initialize),
+        // answered with an empty result per the spec.
+        "ping" => RpcMessage::success_response(id.clone(), serde_json::json!({})),
 
         // ── Unknown method ───────────────────────────────────────────────
         _ => RpcMessage::error_response(id.clone(), -32601, "method not found"),
@@ -1566,6 +1577,45 @@ mod tests {
             host_cooldown: false,
         };
         assert!(empty_route_response(&Value::Number(203.into()), &actionable).is_none());
+    }
+
+    /// Regression (NG2-ZD-004): `ping` must answer `{"result":{}}` both
+    /// before and after initialize. Clients use it as a liveness probe, so
+    /// it previously made them conclude the server was dead (-32601).
+    #[test]
+    fn dispatch_ping_returns_empty_result() {
+        let tools = tools_list();
+        for id in [7, 8] {
+            let response = dispatch_request("ping", &None, &Value::Number(id.into()), None, &tools);
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"], serde_json::json!({}));
+            assert!(response.get("error").is_none());
+        }
+    }
+
+    /// Unknown methods must still return -32601 after adding the `ping` arm.
+    #[test]
+    fn dispatch_unknown_method_still_returns_method_not_found() {
+        let tools = tools_list();
+        let response =
+            dispatch_request("frobnicate", &None, &Value::Number(9.into()), None, &tools);
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response.get("result").is_none());
+    }
+
+    /// The not-initialized gate must let `ping` through (the probe may be
+    /// sent before `initialize`) while still rejecting other methods.
+    #[test]
+    fn pre_init_gate_allows_ping_only() {
+        assert!(method_allowed_before_init("initialize"));
+        assert!(method_allowed_before_init("notifications/initialized"));
+        assert!(method_allowed_before_init("ping"));
+        assert!(!method_allowed_before_init("tools/list"));
+        assert!(!method_allowed_before_init("tools/call"));
+        assert!(!method_allowed_before_init("frobnicate"));
     }
 }
 
