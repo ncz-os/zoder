@@ -24,7 +24,7 @@ Commands:
   agents              List zeroclaw agent aliases and their current availability/session status. Pass an alias to show only that agent
   daemon              Probe the engine-daemon lifecycle: report whether a daemon is reachable at the engine socket, whether this process holds a live lease on it, and how many live leases the daemon directory holds. Read-only — it acquires no lease and stops nothing. Used by regression tests to watch two processes share one daemon
   update              Check for a newer zoder release and update to it. Without `--check`, re-runs the official installer to self-replace this binary
-  route               Show the routing decision for a task without executing it
+  route               Show the routing decision without executing it. Routing is tier-based (capability/health); the optional prompt is only echoed for traceability. A heuristic task-content classifier is future work
   consult             Rank models for a human to pick from: health (circuit-breaker) + coding capability + SWE Elo — the same signals the router uses. Use `--json` for machine output
   spend               Spend report (local ledger) by period
   report              Usage + chargeback report from the local ledger for a period (day/week/month/quarter/ytd), bucketed by time + by model, with the free-tier counterfactual + savings. Colorized output
@@ -2597,6 +2597,13 @@ Options:
           
           [default: 1024]
 
+      --deadline <SECS>
+          Whole-run wall-clock deadline for `zoder loop`, in seconds.
+          
+          Unlike `--loop-timeout` (which bounds ONE phase — an author turn, the `--check`, or a review), this bounds the entire run. When it expires the loop stops at the next safe point, commits what is on disk, and still writes its final JSON result, instead of being killed blind by the worker's own timeout.
+          
+          Default: derived from the worker's 7,200 s job timeout and kept strictly below it (6,300 s: a tenth of the budget, minimum five minutes, is left for teardown and reporting). Config key: `loop_deadline_s`.
+
       --no-stream
           Disable streaming output
 
@@ -5163,7 +5170,7 @@ Options:
 
 zoder route:
 
-Show the routing decision for a task without executing it
+Show the routing decision without executing it. Routing is tier-based (capability/health); the optional prompt is only echoed for traceability. A heuristic task-content classifier is future work
 
 Usage: zoder route [OPTIONS] [PROMPT]
 

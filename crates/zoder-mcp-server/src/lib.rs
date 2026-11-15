@@ -185,9 +185,11 @@ pub struct ToolCallParams {
 /// Arguments passed to a tool call.
 #[derive(Debug, Deserialize, Default)]
 pub struct ToolCallArguments {
-    /// The task description to route.
+    /// Optional task label retained for traceability. It does not affect
+    /// routing: routing is tier-based (capability/health), and a heuristic
+    /// task-content classifier is a separate future item.
     #[serde(default)]
-    pub task: String,
+    pub task: Option<String>,
     /// Routing tier: fast | strong | single-pass | grind | auto (default).
     #[serde(default)]
     pub tier: Option<String>,
@@ -488,7 +490,7 @@ fn dispatch_request(
 
             match args.name.as_str() {
                 "zoder_route" => {
-                    let arguments = match serde_json::from_value::<ToolCallArguments>(arguments) {
+                    let raw_task = match serde_json::from_value::<ToolCallArguments>(arguments) {
                         Ok(arguments) => arguments,
                         Err(_) => {
                             return RpcMessage::error_response(
@@ -498,31 +500,33 @@ fn dispatch_request(
                             );
                         }
                     };
-
-                    if arguments.task.trim().is_empty() {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter is required and must be non-empty",
-                        );
-                    }
-                    if arguments.task.contains('\0') {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter contains invalid characters",
-                        );
-                    }
-                    const MAX_TASK_LENGTH: usize = 10_000;
-                    if arguments.task.len() > MAX_TASK_LENGTH {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter exceeds maximum length",
-                        );
+                    // `task` is an optional traceability label; routing is
+                    // tier-based, so an absent/empty task must not change the
+                    // routing decision. Only validate when one is supplied.
+                    let task_label = raw_task
+                        .task
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|task| !task.is_empty());
+                    if let Some(task) = task_label {
+                        if task.contains('\0') {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "task parameter contains invalid characters",
+                            );
+                        }
+                        const MAX_TASK_LENGTH: usize = 10_000;
+                        if task.len() > MAX_TASK_LENGTH {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "task parameter exceeds maximum length",
+                            );
+                        }
                     }
                     const MAX_TIER_LENGTH: usize = 64;
-                    if let Some(ref tier_str) = arguments.tier {
+                    if let Some(ref tier_str) = raw_task.tier {
                         if tier_str.len() > MAX_TIER_LENGTH {
                             return RpcMessage::error_response(
                                 id.clone(),
@@ -531,7 +535,7 @@ fn dispatch_request(
                             );
                         }
                     }
-                    let tier = match arguments.tier.as_deref() {
+                    let tier = match raw_task.tier.as_deref() {
                         None | Some("") | Some("auto") => Tier::Auto,
                         Some("fast") => Tier::Fast,
                         Some("strong") | Some("codex") => Tier::Strong,
@@ -550,7 +554,10 @@ fn dispatch_request(
                         }
                     };
 
-                    match ctx.route(&arguments.task, tier) {
+                    // Pass the validated label through. Routing ignores it
+                    // (RoutingContext::route never reads its task argument),
+                    // so results are byte-identical with or without a task.
+                    match ctx.route(task_label.unwrap_or(""), tier) {
                         Ok(route) => {
                             if let Some(response) = empty_route_response(id, &route) {
                                 return response;
@@ -731,11 +738,11 @@ fn tools_list() -> Vec<Tool> {
     vec![
         Tool {
             name: "zoder_route".to_string(),
-            description: "Route a task to the best free model using zoder's smart router. Returns the recommended model, fallback chain, and reasoning.".to_string(),
+            description: "Select the best free model for the requested routing tier using zoder's router. Routing is tier-based (capability/health); the optional task label is only echoed for traceability. Returns the recommended model, fallback chain, and reasoning. A heuristic task-content classifier is future work.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "description": "The task description to route." },
+                    "task": { "type": "string", "description": "Optional task label for traceability; does not affect routing, which is tier-based." },
                     "tier": {
                         "type": "string",
                         "description": "Routing tier; defaults to auto.",
@@ -743,7 +750,7 @@ fn tools_list() -> Vec<Tool> {
                         "default": "auto"
                     }
                 },
-                "required": ["task"]
+                "required": []
             }),
         },
         Tool {
@@ -858,13 +865,12 @@ mod tests {
         }
         assert!(tools[0].input_schema["required"]
             .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("task")));
+            .is_none_or(|required| !required.contains(&serde_json::json!("task"))));
     }
 
-    /// Verify the tool input schema has the expected structure.
+    /// Verify that the tool input schema documents `task` as optional.
     #[test]
-    fn tool_input_schema_has_required_task_field() {
+    fn tool_input_schema_has_optional_task_field() {
         let tools = tools_list();
         let schema = &tools[0].input_schema;
         assert_eq!(schema["type"], "object");
@@ -1222,9 +1228,64 @@ mod tests {
             .is_some_and(|s| s.contains("parse error")));
     }
 
-    /// Verify that tools/call rejects an empty task string.
+    /// Verify that calling without `task` succeeds and matches the same
+    /// routing decision as calling with a task (routing is tier-based).
     #[test]
-    fn dispatch_tools_call_rejects_empty_task() {
+    fn dispatch_tools_call_accepts_missing_task_and_matches_tasked_route() {
+        let ctx = RoutingContext::load_with_fixture();
+        let tools = tools_list();
+        for tier in [serde_json::json!({}), serde_json::json!({"tier": "fast"})] {
+            let mut tasked = tier.clone();
+            tasked["task"] = serde_json::json!("fix the login bug in auth.py");
+            let with_task = dispatch_request(
+                "tools/call",
+                &Some(serde_json::json!({"name": "zoder_route", "arguments": tasked})),
+                &Value::Number(20.into()),
+                Some(&ctx),
+                &tools,
+            );
+            let without_task = dispatch_request(
+                "tools/call",
+                &Some(serde_json::json!({"name": "zoder_route", "arguments": tier})),
+                &Value::Number(21.into()),
+                Some(&ctx),
+                &tools,
+            );
+            assert!(
+                with_task.get("error").is_none(),
+                "tasked call should succeed; got: {with_task}"
+            );
+            assert!(
+                without_task.get("error").is_none(),
+                "taskless call should succeed; got: {without_task}"
+            );
+            assert_eq!(
+                with_task["result"], without_task["result"],
+                "routing must be byte-identical with and without task"
+            );
+        }
+    }
+
+    /// Verify that the tool description no longer claims task-based routing.
+    #[test]
+    fn tool_description_documents_tier_based_routing() {
+        let tools = tools_list();
+        let description = tools[0].description.to_lowercase();
+        assert!(
+            description.contains("tier-based") || description.contains("tier based"),
+            "description should state routing is tier-based; got: {}",
+            tools[0].description
+        );
+        assert!(
+            !description.contains("route a task"),
+            "description must not claim task-based routing; got: {}",
+            tools[0].description
+        );
+    }
+
+    /// Verify that tools/call accepts an empty task label (task is optional).
+    #[test]
+    fn dispatch_tools_call_accepts_empty_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1241,17 +1302,13 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
-    /// Verify that tools/call rejects a whitespace-only task string.
+    /// Verify that tools/call accepts a whitespace-only task label.
     #[test]
-    fn dispatch_tools_call_rejects_whitespace_task() {
+    fn dispatch_tools_call_accepts_whitespace_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1268,17 +1325,13 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
-    /// Verify that tools/call rejects a missing task field.
+    /// Verify that tools/call accepts a missing task field (task is optional).
     #[test]
-    fn dispatch_tools_call_rejects_missing_task() {
+    fn dispatch_tools_call_accepts_missing_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1293,12 +1346,8 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
     /// Verify that tools/call rejects a task containing a null byte.
