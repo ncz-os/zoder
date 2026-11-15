@@ -38,6 +38,15 @@ pub struct Budget {
     /// confirmation (or `--allow-paid`). `None` = no per-call cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_per_call_usd: Option<f64>,
+    /// Rolling day-to-date spend cap (USD, UTC calendar day), checked against
+    /// the local ledger. A call that would push today's spend over this cap
+    /// needs confirmation. `None` = no daily cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap_usd: Option<f64>,
+    /// Rolling week-to-date spend cap (USD, UTC ISO week), checked against the
+    /// local ledger. `None` = no weekly cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_cap_usd: Option<f64>,
     /// Rolling month-to-date spend cap (USD), checked against the local ledger.
     /// A call that would push the current calendar month over this cap needs
     /// confirmation. `None` = no monthly cap.
@@ -53,6 +62,8 @@ impl Default for Budget {
     fn default() -> Self {
         Self {
             max_cost_per_call_usd: None,
+            daily_cap_usd: None,
+            weekly_cap_usd: None,
             monthly_cap_usd: None,
             est_output_tokens: default_est_output_tokens(),
         }
@@ -71,14 +82,19 @@ pub enum BudgetVerdict {
 
 /// WHICH cap a [`BudgetVerdict::Confirm`] tripped.
 ///
-/// The host-level back-off (D8 step 12) keys on the MONTHLY cap only: it
-/// is a host-wide condition (this month's budget is gone) that a sibling
-/// worker must respect. A per-call cap is a per-CALL condition — the very
-/// next cheap call may fit under it — so it must NOT park the host.
+/// The host-level back-off (D8 step 12) keys on the WINDOW caps (daily,
+/// weekly, monthly): a tripped spend window is a host-wide condition (this
+/// window's budget is gone) that a sibling worker must respect. A per-call
+/// cap is a per-CALL condition — the very next cheap call may fit under
+/// it — so it must NOT park the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrippedCap {
     /// The per-call cap was exceeded.
     PerCall,
+    /// The day-to-date cap was exceeded.
+    Daily,
+    /// The week-to-date (UTC ISO week) cap was exceeded.
+    Weekly,
     /// The month-to-date cap was exceeded.
     Monthly,
 }
@@ -98,8 +114,9 @@ pub struct BudgetDecline {
     pub tripped: Option<TrippedCap>,
     /// The configured cap that was exceeded, in USD.
     pub limit_usd: Option<f64>,
-    /// The month-to-date BILLED spend that was already on the books when the
-    /// cap tripped, in USD. `None` when no month-to-date read happened.
+    /// The window-to-date BILLED spend that was already on the books when the
+    /// cap tripped, in USD. `None` when no window spend was read (a per-call
+    /// trip never reads the ledger).
     pub spent_usd: Option<f64>,
 }
 
@@ -109,6 +126,47 @@ impl BudgetDecline {
     pub fn monthly_cap_tripped(&self) -> bool {
         self.tripped == Some(TrippedCap::Monthly)
     }
+
+    /// `true` when any SPEND-WINDOW cap (daily, weekly, monthly) tripped —
+    /// the host-wide conditions that must write the cooldown marker. A
+    /// per-call trip is a per-CALL condition and must NOT park the host.
+    pub fn any_cap_tripped(&self) -> bool {
+        matches!(
+            self.tripped,
+            Some(TrippedCap::Daily | TrippedCap::Weekly | TrippedCap::Monthly)
+        )
+    }
+}
+
+/// The ledger's billed spend for each cap window, read the same way
+/// `read_month_spent_or_default` reads the month: day and week come from the
+/// same ledger, UTC day / UTC ISO week.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSpend {
+    /// Day-to-date billed spend (UTC calendar day).
+    pub day: f64,
+    /// Week-to-date billed spend (UTC ISO week).
+    pub week: f64,
+    /// Month-to-date billed spend (UTC calendar month).
+    pub month: f64,
+}
+
+impl WindowSpend {
+    /// All three windows at once; the pre-call gate reads them together so
+    /// one ledger scan serves every cap.
+    pub fn new(day: f64, week: f64, month: f64) -> Self {
+        Self { day, week, month }
+    }
+
+    /// The two-argument call shape: only the month is known (no ledger
+    /// evidence for day/week), so only per-call and monthly caps can trip.
+    pub fn month_only(month: f64) -> Self {
+        Self {
+            day: 0.0,
+            week: 0.0,
+            month,
+        }
+    }
 }
 
 impl Budget {
@@ -116,12 +174,18 @@ impl Budget {
     /// (pricing catalog × estimated tokens); `month_spent_usd` is the ledger's
     /// month-to-date total. A non-positive estimate is always within budget
     /// (the free path is never gated by spend caps).
+    ///
+    /// Kept for the two-argument call shape: day and week windows read as
+    /// zero here (no ledger evidence), so only per-call and monthly caps
+    /// can trip. Callers with all three window spends use
+    /// [`Budget::evaluate_windows_decline`].
     pub fn evaluate(&self, estimate_usd: f64, month_spent_usd: f64) -> BudgetVerdict {
-        match self.evaluate_decline(estimate_usd, month_spent_usd) {
+        match self.evaluate_windows_decline(estimate_usd, WindowSpend::month_only(month_spent_usd))
+        {
             Ok(Some(decline)) => BudgetVerdict::Confirm(decline.message),
             Ok(None) => BudgetVerdict::WithinBudget,
-            // `evaluate_decline` never fails on these inputs; a decline is
-            // still the safe answer if it ever did.
+            // `evaluate_windows_decline` never fails on these inputs; a
+            // decline is still the safe answer if it ever did.
             Err(_) => BudgetVerdict::WithinBudget,
         }
     }
@@ -142,15 +206,32 @@ impl Budget {
         estimate_usd: f64,
         month_spent_usd: f64,
     ) -> anyhow::Result<Option<BudgetDecline>> {
+        self.evaluate_windows_decline(estimate_usd, WindowSpend::month_only(month_spent_usd))
+    }
+
+    /// The three-window pre-call decision. `spend` carries the ledger's
+    /// day-, week- and month-to-date totals; a non-positive estimate is
+    /// always within budget (the free path is never gated by spend caps).
+    ///
+    /// Every reason is reported (the message joins them), and the tripped
+    /// cap prefers the WIDEST window that fired: monthly beats weekly beats
+    /// daily beats per-call. A wider window owns the longer back-off, so a
+    /// call that blows both the day and the month parks the host until the
+    /// month resets rather than waking at midnight into the same wall.
+    /// (Per-call stays last: it is a per-CALL condition, never host-wide.)
+    pub fn evaluate_windows_decline(
+        &self,
+        estimate_usd: f64,
+        spend: WindowSpend,
+    ) -> anyhow::Result<Option<BudgetDecline>> {
         if estimate_usd <= 0.0 {
             return Ok(None);
         }
         let mut reasons = Vec::new();
         // `None` = no cap of this kind is configured; `Some` = it tripped.
-        // The monthly cap wins when BOTH tripped: it is the host-wide one,
-        // and a host whose monthly budget is gone must back off even if the
-        // per-call cap also fired.
         let mut per_call_tripped = false;
+        let mut daily_tripped = false;
+        let mut weekly_tripped = false;
         let mut monthly_tripped = false;
         if let Some(cap) = self.max_cost_per_call_usd {
             if estimate_usd > cap {
@@ -160,13 +241,36 @@ impl Budget {
                 ));
             }
         }
+        if let Some(cap) = self.daily_cap_usd {
+            let after = spend.day + estimate_usd;
+            if after > cap {
+                daily_tripped = true;
+                reasons.push(format!(
+                    "this call (~${estimate_usd:.4}) would push day-to-date spend to \
+                     ${after:.2}, over the daily cap ${cap:.2} (already ${:.2})",
+                    spend.day
+                ));
+            }
+        }
+        if let Some(cap) = self.weekly_cap_usd {
+            let after = spend.week + estimate_usd;
+            if after > cap {
+                weekly_tripped = true;
+                reasons.push(format!(
+                    "this call (~${estimate_usd:.4}) would push week-to-date spend to \
+                     ${after:.2}, over the weekly cap ${cap:.2} (already ${:.2})",
+                    spend.week
+                ));
+            }
+        }
         if let Some(cap) = self.monthly_cap_usd {
-            let after = month_spent_usd + estimate_usd;
+            let after = spend.month + estimate_usd;
             if after > cap {
                 monthly_tripped = true;
                 reasons.push(format!(
                     "this call (~${estimate_usd:.4}) would push month-to-date spend to \
-                     ${after:.2}, over the monthly cap ${cap:.2} (already ${month_spent_usd:.2})"
+                     ${after:.2}, over the monthly cap ${cap:.2} (already ${:.2})",
+                    spend.month
                 ));
             }
         }
@@ -175,6 +279,10 @@ impl Budget {
         }
         let tripped = if monthly_tripped {
             Some(TrippedCap::Monthly)
+        } else if weekly_tripped {
+            Some(TrippedCap::Weekly)
+        } else if daily_tripped {
+            Some(TrippedCap::Daily)
         } else if per_call_tripped {
             Some(TrippedCap::PerCall)
         } else {
@@ -183,7 +291,9 @@ impl Budget {
         // The numbers go into the marker so an operator (and the Hive
         // worker) can see WHY the host backed off without re-deriving them.
         let (limit_usd, spent_usd) = match tripped {
-            Some(TrippedCap::Monthly) => (self.monthly_cap_usd, Some(month_spent_usd)),
+            Some(TrippedCap::Daily) => (self.daily_cap_usd, Some(spend.day)),
+            Some(TrippedCap::Weekly) => (self.weekly_cap_usd, Some(spend.week)),
+            Some(TrippedCap::Monthly) => (self.monthly_cap_usd, Some(spend.month)),
             Some(TrippedCap::PerCall) => (self.max_cost_per_call_usd, None),
             None => (None, None),
         };
@@ -221,7 +331,10 @@ impl Budget {
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
-        self.evaluate_call_with_cache(
+        // Legacy two-argument call shape: only the month is read. Day and
+        // week read as zero (no ledger evidence), so only per-call and
+        // monthly caps can trip.
+        self.evaluate_call_windows(
             pricing,
             model,
             CallTokens {
@@ -230,8 +343,26 @@ impl Budget {
                 cache_hit_tokens: 0,
             },
             ts,
-            month_spent,
+            || month_spent().map(WindowSpend::month_only),
         )
+    }
+
+    /// The three-window form of [`Budget::evaluate_call`]: `spend` supplies
+    /// the ledger's day-, week- and month-to-date totals in one read, so one
+    /// ledger scan serves every cap.
+    pub fn evaluate_call_windows(
+        &self,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        spend: impl FnOnce() -> anyhow::Result<WindowSpend>,
+    ) -> BudgetVerdict {
+        match self.evaluate_call_windows_decline(pricing, model, tokens, ts, spend) {
+            Ok(Some(decline)) => BudgetVerdict::Confirm(decline.message),
+            Ok(None) => BudgetVerdict::WithinBudget,
+            Err(_) => BudgetVerdict::WithinBudget,
+        }
     }
 
     /// Evaluate a call whose cache-hit token count is known.
@@ -251,22 +382,23 @@ impl Budget {
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
-        match self.evaluate_call_decline(pricing, model, tokens, ts, month_spent) {
-            Ok(Some(decline)) => BudgetVerdict::Confirm(decline.message),
-            Ok(None) => BudgetVerdict::WithinBudget,
-            Err(_) => BudgetVerdict::WithinBudget,
-        }
+        // Legacy two-argument call shape: only the month is read.
+        self.evaluate_call_windows(pricing, model, tokens, ts, || {
+            month_spent().map(WindowSpend::month_only)
+        })
     }
 
-    /// The catalog-aware decision, with the tripped cap reported
-    /// STRUCTURALLY.
+    /// The catalog-aware decision (month-only legacy shape), with the
+    /// tripped cap reported STRUCTURALLY. Prefer
+    /// [`Budget::evaluate_call_windows_decline`] when all three windows are
+    /// available.
     ///
     /// `Ok(None)` = within budget. `Ok(Some(decline))` = the call must be
     /// confirmed: a cap tripped, the cost could not be priced, or the
-    /// ledger could not be read. Only a MONTHLY-cap trip carries
-    /// `Some(TrippedCap::Monthly)` — that is the host-wide event that must
-    /// write the cooldown marker (D8 step 12). An unpriceable model or an
-    /// unreadable ledger is a per-call event and carries `None`.
+    /// ledger could not be read. Only a spend-window trip carries its
+    /// `TrippedCap` — the host-wide event that must write the cooldown
+    /// marker (D8 step 12). An unpriceable model or an unreadable ledger is
+    /// a per-call event and carries `None`.
     ///
     /// The message is byte-identical to
     /// [`Budget::evaluate_call_with_cache`]'s `BudgetVerdict::Confirm` text.
@@ -277,6 +409,32 @@ impl Budget {
         tokens: CallTokens,
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
+    ) -> anyhow::Result<Option<BudgetDecline>> {
+        // Legacy two-argument call shape: only the month is read.
+        self.evaluate_call_windows_decline(pricing, model, tokens, ts, || {
+            month_spent().map(WindowSpend::month_only)
+        })
+    }
+
+    /// The catalog-aware decision with all three windows, and the tripped cap
+    /// reported STRUCTURALLY.
+    ///
+    /// `Ok(None)` = within budget. `Ok(Some(decline))` = the call must be
+    /// confirmed: a cap tripped, the cost could not be priced, or the
+    /// ledger could not be read. Only a DAILY/WEEKLY/MONTHLY-cap trip
+    /// carries its `TrippedCap` — the host-wide event that must write the
+    /// cooldown marker (D8 step 12). An unpriceable model or an
+    /// unreadable ledger is a per-call event and carries `None`.
+    ///
+    /// The message is byte-identical to
+    /// [`Budget::evaluate_call_with_cache`]'s `BudgetVerdict::Confirm` text.
+    pub fn evaluate_call_windows_decline(
+        &self,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        spend: impl FnOnce() -> anyhow::Result<WindowSpend>,
     ) -> anyhow::Result<Option<BudgetDecline>> {
         // Step 1: cost verdict. Unknown = could not price = fail closed.
         let verdict = pricing.classify_cost_with_cache(
@@ -310,9 +468,9 @@ impl Budget {
                 }));
             }
         };
-        // Step 2: month-to-date spend. Fail closed on I/O errors so a
+        // Step 2: window spend. Fail closed on I/O errors so a
         // corrupted / permission-denied ledger can never bypass the cap.
-        let month_spent_usd = match month_spent() {
+        let spend = match spend() {
             Ok(v) => v,
             Err(e) => {
                 return Ok(Some(BudgetDecline {
@@ -329,7 +487,7 @@ impl Budget {
                 }));
             }
         };
-        self.evaluate_decline(estimate_usd, month_spent_usd)
+        self.evaluate_windows_decline(estimate_usd, spend)
     }
 }
 
@@ -370,12 +528,13 @@ impl Budget {
     /// Same call, same verdict, same `month_spent` closure; the only extra
     /// effect is host-local state:
     ///
-    /// * a MONTHLY cap trip writes/extends `<ledger path>.cooldown.json`, so
-    ///   every sibling worker on the host can see the month is spent without
-    ///   re-deriving it (see [`crate::host_cooldown`] for the format);
+    /// * a DAILY/WEEKLY/MONTHLY cap trip writes/extends `<ledger path>.cooldown.json`,
+    ///   expiring at the end of the tripped window, so every sibling worker on
+    ///   the host can see the window is spent without re-deriving it (see
+    ///   [`crate::host_cooldown`] for the format);
     /// * a METERED call that fits CLEARS a live marker — it read the
-    ///   month-to-date spend and the cap is by definition not tripped any
-    ///   more, so a stale hold-off must not keep parking the host;
+    ///   window spend and no cap is by definition tripped any more, so a
+    ///   stale hold-off must not keep parking the host;
     /// * a FREE call (`CostVerdict::Free`) leaves the marker ALONE. It never
     ///   reads month-to-date spend — it does not need to, a $0 call is not
     ///   gated — so it has no evidence the cap stopped tripping. Clearing on
@@ -404,6 +563,31 @@ impl Budget {
         ts: Option<DateTime<Utc>>,
         month_spent: impl FnOnce() -> anyhow::Result<f64>,
     ) -> BudgetVerdict {
+        // Legacy two-argument call shape: only the month is read.
+        self.evaluate_call_windows_with_host_cooldown(
+            ledger_path,
+            pricing,
+            model,
+            tokens,
+            ts,
+            || month_spent().map(WindowSpend::month_only),
+        )
+    }
+
+    /// The three-window form of
+    /// [`Budget::evaluate_call_with_host_cooldown`]: `spend` supplies the
+    /// ledger's day-, week- and month-to-date totals in one read, so one
+    /// ledger scan serves every cap. A DAILY/WEEKLY/MONTHLY trip writes the
+    /// cooldown marker with an expiry at the end of the tripped window.
+    pub fn evaluate_call_windows_with_host_cooldown(
+        &self,
+        ledger_path: &Path,
+        pricing: &PricingCatalog,
+        model: &str,
+        tokens: CallTokens,
+        ts: Option<DateTime<Utc>>,
+        spend: impl FnOnce() -> anyhow::Result<WindowSpend>,
+    ) -> BudgetVerdict {
         let now = ts.unwrap_or_else(Utc::now);
         // A free model is not gated, and `evaluate_call_decline` short-circuits
         // it to `Ok(None)` WITHOUT reading month-to-date spend. That `None` is
@@ -420,8 +604,9 @@ impl Budget {
             ),
             CostVerdict::Free
         );
-        let verdict =
-            decline_to_verdict(self.evaluate_call_decline(pricing, model, tokens, ts, month_spent));
+        let verdict = decline_to_verdict(
+            self.evaluate_call_windows_decline(pricing, model, tokens, ts, spend),
+        );
         // Only a real (Ok) decision touches the marker; an evaluation error
         // writes none (an error is not a proven cap trip).
         match verdict.1 {
@@ -448,7 +633,25 @@ impl Budget {
         month_spent_usd: f64,
         now: DateTime<Utc>,
     ) -> BudgetVerdict {
-        let verdict = decline_to_verdict(self.evaluate_decline(estimate_usd, month_spent_usd));
+        // Legacy two-argument call shape: only the month is known.
+        self.evaluate_windows_with_host_cooldown(
+            ledger_path,
+            estimate_usd,
+            WindowSpend::month_only(month_spent_usd),
+            now,
+        )
+    }
+
+    /// The three-window form of [`Budget::evaluate_with_host_cooldown`], for
+    /// callers that have already priced the call and read all three windows.
+    pub fn evaluate_windows_with_host_cooldown(
+        &self,
+        ledger_path: &Path,
+        estimate_usd: f64,
+        spend: WindowSpend,
+        now: DateTime<Utc>,
+    ) -> BudgetVerdict {
+        let verdict = decline_to_verdict(self.evaluate_windows_decline(estimate_usd, spend));
         match verdict.1 {
             Some(None) if estimate_usd <= 0.0 => {}
             Some(decline) => self.sync_host_cooldown_or_warn(ledger_path, decline.as_ref(), now),
@@ -483,12 +686,13 @@ impl Budget {
     /// Bring the host cooldown marker in line with ONE decision.
     ///
     /// Returns the marker left in force (`Some` only when this decision
-    /// tripped the monthly cap), or `None` when the host is not backed off by
-    /// this decision. See [`note_budget_decline`] and [`clear_cooldown`].
+    /// tripped a spend-window cap), or `None` when the host is not backed
+    /// off by this decision. See [`note_budget_decline`] and
+    /// [`clear_cooldown`].
     ///
     /// `Ok(None)` in `decline` means "within budget" and clears a live
     /// marker, so a caller may only pass it when the decision actually
-    /// OBSERVED month-to-date spend. A free call and a $0 estimate never do;
+    /// OBSERVED window spend. A free call and a $0 estimate never do;
     /// their wrappers ([`Budget::evaluate_call_with_host_cooldown`],
     /// [`Budget::evaluate_with_host_cooldown`]) skip this call for them
     /// rather than reporting "no spend evidence" as "this call fits".
@@ -498,14 +702,14 @@ impl Budget {
         decline: Option<&BudgetDecline>,
         now: DateTime<Utc>,
     ) -> anyhow::Result<Option<HostCooldown>> {
-        if decline.is_some_and(BudgetDecline::monthly_cap_tripped) {
+        if decline.is_some_and(BudgetDecline::any_cap_tripped) {
             return note_budget_decline(Some(ledger_path), decline, now);
         }
         // Not a host-wide decline: a marker still sitting beside the ledger
-        // is stale (the month rolled over, or the operator raised the cap),
+        // is stale (the window rolled over, or the operator raised the cap),
         // and keeping it would park the host on state nothing re-confirms.
         // Only a definite "this call fits" clears; a decline for another
-        // reason says nothing about the monthly cap.
+        // reason says nothing about the spend caps.
         if decline.is_none() {
             clear_cooldown(ledger_path)?;
         }
@@ -519,6 +723,17 @@ impl Budget {
 /// so CLI call sites don't repeat the `Err` → "confirm" decision.
 pub fn read_month_spent_or_default(ledger: &Ledger) -> anyhow::Result<f64> {
     ledger.month_to_date_usd()
+}
+
+/// Convenience helper: read all three cap windows in one ledger scan.
+/// Fails closed like [`read_month_spent_or_default`]: any unreadable
+/// window is an `Err` the gate turns into a `Confirm`.
+pub fn read_window_spend_or_default(ledger: &Ledger) -> anyhow::Result<WindowSpend> {
+    Ok(WindowSpend::new(
+        ledger.day_to_date_usd()?,
+        ledger.week_to_date_usd()?,
+        ledger.month_to_date_usd()?,
+    ))
 }
 
 #[cfg(test)]
@@ -593,6 +808,111 @@ mod tests {
             _ => panic!("expected Confirm citing both caps"),
         }
     }
+
+    /// NG2-ZD-007 acceptance: with `daily_cap_usd = 5` and $4.90 spent
+    /// today, a $0.50 estimate trips the daily cap with the exact message
+    /// and `TrippedCap::Daily`.
+    #[test]
+    fn daily_cap_trips_on_day_spend() {
+        let b = Budget {
+            daily_cap_usd: Some(5.0),
+            ..Default::default()
+        };
+        let spend = WindowSpend::new(4.90, 0.0, 0.0);
+        match b.evaluate_windows_decline(0.50, spend) {
+            Ok(Some(decline)) => {
+                assert_eq!(decline.tripped, Some(TrippedCap::Daily));
+                assert!(
+                    decline.message.contains("daily cap"),
+                    "the message must name the daily cap, got {:?}",
+                    decline.message
+                );
+                assert_eq!(decline.limit_usd, Some(5.0));
+                assert_eq!(decline.spent_usd, Some(4.90));
+            }
+            Ok(None) => panic!("expected the daily cap to trip"),
+            Err(e) => panic!("evaluate_windows_decline failed: {e:#}"),
+        }
+        // Just under the cap stays within budget.
+        let spend = WindowSpend::new(4.40, 0.0, 0.0);
+        assert!(b.evaluate_windows_decline(0.50, spend).unwrap().is_none());
+    }
+
+    /// NG2-ZD-007 acceptance: the weekly cap trips on ISO-week (UTC)
+    /// spend the same way.
+    #[test]
+    fn weekly_cap_trips_on_week_spend() {
+        let b = Budget {
+            weekly_cap_usd: Some(20.0),
+            ..Default::default()
+        };
+        let spend = WindowSpend::new(0.0, 19.80, 0.0);
+        match b.evaluate_windows_decline(0.50, spend) {
+            Ok(Some(decline)) => {
+                assert_eq!(decline.tripped, Some(TrippedCap::Weekly));
+                assert!(
+                    decline.message.contains("weekly cap"),
+                    "the message must name the weekly cap, got {:?}",
+                    decline.message
+                );
+                assert_eq!(decline.limit_usd, Some(20.0));
+                assert_eq!(decline.spent_usd, Some(19.80));
+            }
+            Ok(None) => panic!("expected the weekly cap to trip"),
+            Err(e) => panic!("evaluate_windows_decline failed: {e:#}"),
+        }
+    }
+
+    /// The widest tripped window owns the marker: a call that blows both
+    /// the day and the month trips `Monthly`, so the host backs off until
+    /// the month resets rather than waking at midnight into the same wall.
+    #[test]
+    fn widest_tripped_window_wins() {
+        let b = Budget {
+            daily_cap_usd: Some(5.0),
+            weekly_cap_usd: Some(20.0),
+            monthly_cap_usd: Some(50.0),
+            ..Default::default()
+        };
+        let spend = WindowSpend::new(4.90, 19.80, 49.90);
+        match b.evaluate_windows_decline(0.50, spend) {
+            Ok(Some(decline)) => {
+                assert_eq!(decline.tripped, Some(TrippedCap::Monthly));
+                assert!(decline.message.contains("daily cap"));
+                assert!(decline.message.contains("weekly cap"));
+                assert!(decline.message.contains("monthly cap"));
+            }
+            Ok(None) => panic!("expected a cap to trip"),
+            Err(e) => panic!("evaluate_windows_decline failed: {e:#}"),
+        }
+        // Day-only trip stays daily.
+        let spend = WindowSpend::new(4.90, 1.0, 1.0);
+        match b.evaluate_windows_decline(0.50, spend) {
+            Ok(Some(decline)) => assert_eq!(decline.tripped, Some(TrippedCap::Daily)),
+            Ok(None) => panic!("expected the daily cap to trip"),
+            Err(e) => panic!("evaluate_windows_decline failed: {e:#}"),
+        }
+    }
+
+    /// `deny_unknown_fields` keeps working with the two new optional caps:
+    /// a config with daily/weekly caps parses, and an unknown key still
+    /// fails.
+    #[test]
+    fn budget_config_accepts_daily_weekly_and_still_denies_unknown() {
+        let parsed: Budget = serde_json::from_value(serde_json::json!({
+            "daily_cap_usd": 5.0,
+            "weekly_cap_usd": 20.0,
+            "monthly_cap_usd": 50.0,
+            "max_cost_per_call_usd": 1.0,
+            "est_output_tokens": 1024,
+        }))
+        .expect("daily/weekly caps must parse");
+        assert_eq!(parsed.daily_cap_usd, Some(5.0));
+        assert_eq!(parsed.weekly_cap_usd, Some(20.0));
+        assert!(
+            serde_json::from_value::<Budget>(serde_json::json!({"bogus_cap_usd": 1.0})).is_err()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -610,7 +930,7 @@ mod cap_trip_sets_host_cooldown {
     use super::*;
     use crate::host_cooldown::{
         clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown,
-        trip_monthly_cap_cooldown, REASON_MONTHLY_CAP,
+        trip_monthly_cap_cooldown, REASON_DAILY_CAP, REASON_MONTHLY_CAP, REASON_WEEKLY_CAP,
     };
     use crate::pricing::ModelPrice;
 
@@ -703,6 +1023,70 @@ mod cap_trip_sets_host_cooldown {
         assert!(
             !cooldown_active(&ledger),
             "a per-call cap is a per-CALL condition: it must not park the host"
+        );
+    }
+
+    /// NG2-ZD-007: a DAILY trip through the window-aware evaluator writes a
+    /// daily marker that expires at UTC midnight, and a WEEKLY trip writes a
+    /// weekly marker expiring at Monday 00:00 UTC. The acceptance shape: a
+    /// $0.50 estimate on $4.90 of day spend against a $5 daily cap confirms
+    /// with `TrippedCap::Daily` and parks the host only until midnight.
+    #[test]
+    fn daily_and_weekly_trips_set_windowed_host_cooldown() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 18, 13, 50, 32)
+            .unwrap();
+        let budget = Budget {
+            daily_cap_usd: Some(5.0),
+            weekly_cap_usd: Some(20.0),
+            ..Default::default()
+        };
+        // $0.50 estimate on $4.90 of day spend: the daily cap trips.
+        let verdict = budget.evaluate_windows_with_host_cooldown(
+            &ledger,
+            0.50,
+            WindowSpend::new(4.90, 10.0, 10.0),
+            now,
+        );
+        match verdict {
+            BudgetVerdict::Confirm(m) => assert!(m.contains("daily cap"), "got {m:?}"),
+            other => panic!("expected the daily cap to trip, got {other:?}"),
+        }
+        let marker = read_cooldown(&ledger)
+            .expect("reading the marker must not fail")
+            .expect("a daily cap trip must leave a host cooldown marker beside the ledger");
+        assert_eq!(marker.reason, REASON_DAILY_CAP);
+        assert_eq!(marker.limit_usd, Some(5.0));
+        assert_eq!(marker.spent_usd, Some(4.90));
+        assert_eq!(
+            marker.expires_at,
+            chrono::Utc.with_ymd_and_hms(2026, 11, 19, 0, 0, 0).unwrap(),
+            "a daily trip must expire at UTC midnight, not month end"
+        );
+        clear_cooldown(&ledger).unwrap();
+
+        // $0.50 estimate on $19.80 of week spend: the weekly cap trips.
+        let verdict = budget.evaluate_windows_with_host_cooldown(
+            &ledger,
+            0.50,
+            WindowSpend::new(1.0, 19.80, 10.0),
+            now,
+        );
+        match verdict {
+            BudgetVerdict::Confirm(m) => assert!(m.contains("weekly cap"), "got {m:?}"),
+            other => panic!("expected the weekly cap to trip, got {other:?}"),
+        }
+        let marker = read_cooldown(&ledger)
+            .expect("reading the marker must not fail")
+            .expect("a weekly cap trip must leave a host cooldown marker beside the ledger");
+        assert_eq!(marker.reason, REASON_WEEKLY_CAP);
+        assert_eq!(
+            marker.expires_at,
+            chrono::Utc.with_ymd_and_hms(2026, 11, 23, 0, 0, 0).unwrap(),
+            "a weekly trip must expire at Monday 00:00 UTC, not month end"
         );
     }
 

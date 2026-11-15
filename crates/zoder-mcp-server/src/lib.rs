@@ -6,11 +6,12 @@
 //! # Protocol
 //!
 //! The server speaks the Model Context Protocol over stdio using JSON-RPC 2.0
-//! framing. It implements three MCP methods:
+//! framing. It implements three MCP methods plus the `ping` liveness probe:
 //!
 //! * `initialize` — server info + capabilities
 //! * `tools/list` — routing and SOP lifecycle tools
 //! * `tools/call`  — runs a route or forwards an SOP operation
+//! * `ping` — empty-result liveness probe, valid before initialization too
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,6 +97,25 @@ impl RpcMessage {
             "jsonrpc": "2.0",
             "id": id,
             "result": result,
+        })
+    }
+
+    /// Build a `tools/call` tool-level failure: per MCP, a tool that ran
+    /// and failed must return `result.isError=true` with readable text so
+    /// the calling model can react — not a JSON-RPC protocol `error`,
+    /// which clients typically hide from the model. Argument validation
+    /// problems (-32602) stay protocol errors.
+    fn tool_error_response(id: Value, message: &str) -> Value {
+        // Built as literal JSON so the failure path itself cannot panic on
+        // serialization; the shape matches `ToolCallResult` with
+        // `is_error: Some(true)`.
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": message }],
+                "isError": true,
+            },
         })
     }
 }
@@ -197,9 +217,11 @@ pub struct ToolCallParams {
 /// Arguments passed to a tool call.
 #[derive(Debug, Deserialize, Default)]
 pub struct ToolCallArguments {
-    /// The task description to route.
+    /// Optional task label retained for traceability. It does not affect
+    /// routing: routing is tier-based (capability/health), and a heuristic
+    /// task-content classifier is a separate future item.
     #[serde(default)]
-    pub task: String,
+    pub task: Option<String>,
     /// Routing tier: fast | strong | single-pass | grind | auto (default).
     #[serde(default)]
     pub tier: Option<String>,
@@ -208,9 +230,10 @@ pub struct ToolCallArguments {
 /// `tools/call` response — the routing decision structured as JSON.
 #[derive(Debug, Serialize)]
 pub struct ToolCallResult {
-    /// Whether the tool call succeeded.
+    /// Tool content blocks.
     pub content: Vec<ContentBlock>,
-    /// `false` when an error occurred during tool execution.
+    /// `Some(true)` when the tool ran and failed; `None` (omitted) on
+    /// success, per MCP convention.
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
@@ -320,9 +343,17 @@ fn daemon_socket_path() -> std::path::PathBuf {
 // Server: stdio loop that dispatches MCP methods
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Methods accepted before the client completes initialization.
+/// `initialize` starts the handshake, `notifications/initialized` finishes
+/// it, and `ping` is a spec-mandated liveness probe that must work at any
+/// time (several MCP clients send it first and drop servers that reject it).
+pub(crate) fn method_allowed_before_init(method: &str) -> bool {
+    matches!(method, "initialize" | "notifications/initialized" | "ping")
+}
 /// Run the MCP server: read JSON-RPC messages from stdin, write responses to
 /// stdout.  The server starts in a "not initialized" state and will reject
-/// every method except `initialize` until the client sends one.
+/// every method except `initialize` (and the `ping` liveness probe) until
+/// the client sends one.
 pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -378,10 +409,7 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
                 }
                 if jsonrpc != "2.0" {
                     RpcMessage::error_response(id.clone(), -32600, "invalid JSON-RPC version")
-                } else if !initialized
-                    && method.as_str() != "initialize"
-                    && method.as_str() != "notifications/initialized"
-                {
+                } else if !initialized && !method_allowed_before_init(method.as_str()) {
                     RpcMessage::error_response(
                         id.clone(),
                         -32601,
@@ -415,6 +443,20 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
     }
 
     Ok(())
+}
+
+/// Return the `tools/call` tool-level failure when a routing decision came
+/// back empty (no usable model), or `None` when the route is actionable.
+/// Split out so the empty-route arm is directly unit-testable.
+fn empty_route_response(id: &Value, route: &Route) -> Option<Value> {
+    if route.primary.is_empty() || route.reason.is_empty() {
+        Some(RpcMessage::tool_error_response(
+            id.clone(),
+            "routing decision is empty — no valid model could be selected",
+        ))
+    } else {
+        None
+    }
 }
 
 /// Dispatch a single JSON-RPC request to the appropriate handler.
@@ -456,9 +498,8 @@ fn dispatch_request(
         // ── tools/call ───────────────────────────────────────────────────
         "tools/call" => {
             let Some(ctx) = ctx else {
-                return RpcMessage::error_response(
+                return RpcMessage::tool_error_response(
                     id.clone(),
-                    -32603,
                     "routing context not available — config or corpus could not be loaded",
                 );
             };
@@ -485,7 +526,7 @@ fn dispatch_request(
 
             match args.name.as_str() {
                 "zoder_route" => {
-                    let arguments = match serde_json::from_value::<ToolCallArguments>(arguments) {
+                    let raw_task = match serde_json::from_value::<ToolCallArguments>(arguments) {
                         Ok(arguments) => arguments,
                         Err(_) => {
                             return RpcMessage::error_response(
@@ -495,31 +536,33 @@ fn dispatch_request(
                             );
                         }
                     };
-
-                    if arguments.task.trim().is_empty() {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter is required and must be non-empty",
-                        );
-                    }
-                    if arguments.task.contains('\0') {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter contains invalid characters",
-                        );
-                    }
-                    const MAX_TASK_LENGTH: usize = 10_000;
-                    if arguments.task.len() > MAX_TASK_LENGTH {
-                        return RpcMessage::error_response(
-                            id.clone(),
-                            -32602,
-                            "task parameter exceeds maximum length",
-                        );
+                    // `task` is an optional traceability label; routing is
+                    // tier-based, so an absent/empty task must not change the
+                    // routing decision. Only validate when one is supplied.
+                    let task_label = raw_task
+                        .task
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|task| !task.is_empty());
+                    if let Some(task) = task_label {
+                        if task.contains('\0') {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "task parameter contains invalid characters",
+                            );
+                        }
+                        const MAX_TASK_LENGTH: usize = 10_000;
+                        if task.len() > MAX_TASK_LENGTH {
+                            return RpcMessage::error_response(
+                                id.clone(),
+                                -32602,
+                                "task parameter exceeds maximum length",
+                            );
+                        }
                     }
                     const MAX_TIER_LENGTH: usize = 64;
-                    if let Some(ref tier_str) = arguments.tier {
+                    if let Some(ref tier_str) = raw_task.tier {
                         if tier_str.len() > MAX_TIER_LENGTH {
                             return RpcMessage::error_response(
                                 id.clone(),
@@ -528,7 +571,7 @@ fn dispatch_request(
                             );
                         }
                     }
-                    let tier = match arguments.tier.as_deref() {
+                    let tier = match raw_task.tier.as_deref() {
                         None | Some("") | Some("auto") => Tier::Auto,
                         Some("fast") => Tier::Fast,
                         Some("strong") | Some("codex") => Tier::Strong,
@@ -547,14 +590,13 @@ fn dispatch_request(
                         }
                     };
 
-                    match ctx.route(&arguments.task, tier) {
+                    // Pass the validated label through. Routing ignores it
+                    // (RoutingContext::route never reads its task argument),
+                    // so results are byte-identical with or without a task.
+                    match ctx.route(task_label.unwrap_or(""), tier) {
                         Ok(route) => {
-                            if route.primary.is_empty() || route.reason.is_empty() {
-                                return RpcMessage::error_response(
-                                    id.clone(),
-                                    -32603,
-                                    "routing decision is empty — no valid model could be selected",
-                                );
+                            if let Some(response) = empty_route_response(id, &route) {
+                                return response;
                             }
                             let result = ToolCallResult {
                                 content: vec![
@@ -578,9 +620,8 @@ fn dispatch_request(
                                 serde_json::to_value(result).unwrap(),
                             )
                         }
-                        Err(e) => RpcMessage::error_response(
+                        Err(e) => RpcMessage::tool_error_response(
                             id.clone(),
-                            -32603,
                             &format!("tool execution failed: {e}"),
                         ),
                     }
@@ -694,11 +735,16 @@ fn dispatch_request(
                             })
                             .unwrap(),
                         ),
-                        Err(e) => RpcMessage::error_response(
-                            id.clone(),
-                            -32603,
-                            &format!("{} failed: {e}", args.name),
-                        ),
+                        Err(e) => {
+                            let socket = ctx.daemon_socket.display();
+                            RpcMessage::tool_error_response(
+                                id.clone(),
+                                &format!(
+                                    "{} failed: {e} (daemon socket: {socket}; if the socket is missing, start the daemon, e.g. `zeroclaw daemon start`, so the socket exists)",
+                                    args.name
+                                ),
+                            )
+                        }
                     }
                 }
                 unknown => RpcMessage::error_response(
@@ -708,6 +754,11 @@ fn dispatch_request(
                 ),
             }
         }
+
+        // ── ping ───────────────────────────────────────────────────────
+        // MCP liveness probe: valid at any time (also before initialize),
+        // answered with an empty result per the spec.
+        "ping" => RpcMessage::success_response(id.clone(), serde_json::json!({})),
 
         // ── Unknown method ───────────────────────────────────────────────
         _ => RpcMessage::error_response(id.clone(), -32601, "method not found"),
@@ -723,11 +774,11 @@ fn tools_list() -> Vec<Tool> {
     vec![
         Tool {
             name: "zoder_route".to_string(),
-            description: "Route a task to the best free model using zoder's smart router. Returns the recommended model, fallback chain, and reasoning.".to_string(),
+            description: "Select the best free model for the requested routing tier using zoder's router. Routing is tier-based (capability/health); the optional task label is only echoed for traceability. Returns the recommended model, fallback chain, and reasoning. A heuristic task-content classifier is future work.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "description": "The task description to route." },
+                    "task": { "type": "string", "description": "Optional task label for traceability; does not affect routing, which is tier-based." },
                     "tier": {
                         "type": "string",
                         "description": "Routing tier; defaults to auto.",
@@ -735,7 +786,7 @@ fn tools_list() -> Vec<Tool> {
                         "default": "auto"
                     }
                 },
-                "required": ["task"]
+                "required": []
             }),
         },
         Tool {
@@ -850,13 +901,12 @@ mod tests {
         }
         assert!(tools[0].input_schema["required"]
             .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("task")));
+            .is_none_or(|required| !required.contains(&serde_json::json!("task"))));
     }
 
-    /// Verify the tool input schema has the expected structure.
+    /// Verify that the tool input schema documents `task` as optional.
     #[test]
-    fn tool_input_schema_has_required_task_field() {
+    fn tool_input_schema_has_optional_task_field() {
         let tools = tools_list();
         let schema = &tools[0].input_schema;
         assert_eq!(schema["type"], "object");
@@ -1052,10 +1102,62 @@ mod tests {
             Some(&ctx),
             &tools,
         );
-        // No daemon is expected in a unit test; the important contract here is
-        // that the MCP wrapper recognizes the real SOP tool name rather than
-        // returning `unknown tool`.
-        assert_ne!(response["error"]["message"], "unknown tool: sop_list");
+        // No daemon is expected in a unit test; per MCP the failure must
+        // surface as a tool result with isError=true (readable by the
+        // calling model), not as a JSON-RPC protocol error.
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("sop_list failed"),
+            "tool error text should name the tool; got: {text}"
+        );
+        let socket = ctx.daemon_socket.display().to_string();
+        assert!(
+            text.contains(&socket),
+            "tool error text should name the socket path {socket}; got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("daemon"),
+            "tool error text should tell how to fix it; got: {text}"
+        );
+    }
+
+    #[test]
+    fn sop_list_failure_with_absent_socket_returns_is_error_result() {
+        // Regression test for NG2-ZD-005: with the daemon socket absent,
+        // tools/call sop_list must return result.isError=true with a text
+        // block naming the socket path and the fix — not an `error` member.
+        let mut ctx = RoutingContext::load_with_fixture();
+        ctx.daemon_socket =
+            std::path::PathBuf::from("/nonexistent-zoder-test-dir-8f3a2/daemon.sock");
+        let tools = tools_list();
+        let params = serde_json::json!({"name": SOP_LIST, "arguments": {}});
+        let response = dispatch_request(
+            "tools/call",
+            &Some(params),
+            &Value::Number(23.into()),
+            Some(&ctx),
+            &tools,
+        );
+        assert!(
+            response.get("error").is_none(),
+            "tool failure must not be a protocol error; got: {response}"
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("/nonexistent-zoder-test-dir-8f3a2/daemon.sock"),
+            "text must name the socket path; got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("daemon"),
+            "text must describe the fix; got: {text}"
+        );
     }
 
     #[test]
@@ -1212,9 +1314,64 @@ mod tests {
             .is_some_and(|s| s.contains("parse error")));
     }
 
-    /// Verify that tools/call rejects an empty task string.
+    /// Verify that calling without `task` succeeds and matches the same
+    /// routing decision as calling with a task (routing is tier-based).
     #[test]
-    fn dispatch_tools_call_rejects_empty_task() {
+    fn dispatch_tools_call_accepts_missing_task_and_matches_tasked_route() {
+        let ctx = RoutingContext::load_with_fixture();
+        let tools = tools_list();
+        for tier in [serde_json::json!({}), serde_json::json!({"tier": "fast"})] {
+            let mut tasked = tier.clone();
+            tasked["task"] = serde_json::json!("fix the login bug in auth.py");
+            let with_task = dispatch_request(
+                "tools/call",
+                &Some(serde_json::json!({"name": "zoder_route", "arguments": tasked})),
+                &Value::Number(20.into()),
+                Some(&ctx),
+                &tools,
+            );
+            let without_task = dispatch_request(
+                "tools/call",
+                &Some(serde_json::json!({"name": "zoder_route", "arguments": tier})),
+                &Value::Number(21.into()),
+                Some(&ctx),
+                &tools,
+            );
+            assert!(
+                with_task.get("error").is_none(),
+                "tasked call should succeed; got: {with_task}"
+            );
+            assert!(
+                without_task.get("error").is_none(),
+                "taskless call should succeed; got: {without_task}"
+            );
+            assert_eq!(
+                with_task["result"], without_task["result"],
+                "routing must be byte-identical with and without task"
+            );
+        }
+    }
+
+    /// Verify that the tool description no longer claims task-based routing.
+    #[test]
+    fn tool_description_documents_tier_based_routing() {
+        let tools = tools_list();
+        let description = tools[0].description.to_lowercase();
+        assert!(
+            description.contains("tier-based") || description.contains("tier based"),
+            "description should state routing is tier-based; got: {}",
+            tools[0].description
+        );
+        assert!(
+            !description.contains("route a task"),
+            "description must not claim task-based routing; got: {}",
+            tools[0].description
+        );
+    }
+
+    /// Verify that tools/call accepts an empty task label (task is optional).
+    #[test]
+    fn dispatch_tools_call_accepts_empty_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1231,17 +1388,13 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
-    /// Verify that tools/call rejects a whitespace-only task string.
+    /// Verify that tools/call accepts a whitespace-only task label.
     #[test]
-    fn dispatch_tools_call_rejects_whitespace_task() {
+    fn dispatch_tools_call_accepts_whitespace_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1258,17 +1411,13 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
-    /// Verify that tools/call rejects a missing task field.
+    /// Verify that tools/call accepts a missing task field (task is optional).
     #[test]
-    fn dispatch_tools_call_rejects_missing_task() {
+    fn dispatch_tools_call_accepts_missing_task() {
         let ctx = RoutingContext::load_with_fixture();
         let tools = tools_list();
         let params = serde_json::json!({
@@ -1283,12 +1432,8 @@ mod tests {
             &tools,
         );
 
-        assert_eq!(response["jsonrpc"], "2.0");
-        assert_eq!(response["error"]["code"], -32602);
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("task"));
+        assert!(response.get("error").is_none());
+        assert!(response["result"]["content"].as_array().is_some());
     }
 
     /// Verify that tools/call rejects a task containing a null byte.
@@ -1490,14 +1635,122 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 200);
-        // Should be an error (has "error" field, no "result" field)
-        assert!(response.get("error").is_some());
-        assert!(response.get("result").is_none());
-        assert_eq!(response["error"]["code"], -32603);
-        assert!(response["error"]["message"]
+        // Tool-level failure: success envelope with isError=true, no
+        // JSON-RPC protocol `error` member.
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
             .as_str()
-            .unwrap()
-            .contains("routing context not available"));
+            .unwrap_or("");
+        assert!(
+            text.contains("routing context not available"),
+            "tool error text should explain the failure; got: {text}"
+        );
+    }
+
+    /// Tool execution failure (router error) must surface as
+    /// result.isError=true, not a protocol error. Argument validation
+    /// errors (-32602) remain protocol errors.
+    #[test]
+    fn dispatch_tools_call_route_failure_returns_is_error_result() {
+        // A fixture context with no backed providers forces ctx.route to
+        // fail, exercising the execution-failure path.
+        let mut ctx = RoutingContext::load_with_fixture();
+        ctx.cfg.providers.clear();
+        let tools = tools_list();
+        let params = serde_json::json!({
+            "name": "zoder_route",
+            "arguments": {
+                "task": "fix the login bug in auth.py"
+            }
+        });
+        let response = dispatch_request(
+            "tools/call",
+            &Some(params),
+            &Value::Number(201.into()),
+            Some(&ctx),
+            &tools,
+        );
+
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("tool execution failed"),
+            "tool error text should describe the failure; got: {text}"
+        );
+    }
+
+    /// An empty routing decision must surface as result.isError=true, not
+    /// a JSON-RPC protocol error.
+    #[test]
+    fn empty_route_response_returns_is_error_result() {
+        let empty = Route {
+            primary: String::new(),
+            fallbacks: Vec::new(),
+            reason: String::new(),
+            host_cooldown: false,
+        };
+        let response =
+            empty_route_response(&Value::Number(202.into()), &empty).expect("empty route");
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("routing decision is empty"),
+            "tool error text should describe the failure; got: {text}"
+        );
+
+        let actionable = Route {
+            primary: "alpha/hello".to_string(),
+            fallbacks: Vec::new(),
+            reason: "test".to_string(),
+            host_cooldown: false,
+        };
+        assert!(empty_route_response(&Value::Number(203.into()), &actionable).is_none());
+    }
+
+    /// Regression (NG2-ZD-004): `ping` must answer `{"result":{}}` both
+    /// before and after initialize. Clients use it as a liveness probe, so
+    /// it previously made them conclude the server was dead (-32601).
+    #[test]
+    fn dispatch_ping_returns_empty_result() {
+        let tools = tools_list();
+        for id in [7, 8] {
+            let response = dispatch_request("ping", &None, &Value::Number(id.into()), None, &tools);
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"], serde_json::json!({}));
+            assert!(response.get("error").is_none());
+        }
+    }
+
+    /// Unknown methods must still return -32601 after adding the `ping` arm.
+    #[test]
+    fn dispatch_unknown_method_still_returns_method_not_found() {
+        let tools = tools_list();
+        let response =
+            dispatch_request("frobnicate", &None, &Value::Number(9.into()), None, &tools);
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response.get("result").is_none());
+    }
+
+    /// The not-initialized gate must let `ping` through (the probe may be
+    /// sent before `initialize`) while still rejecting other methods.
+    #[test]
+    fn pre_init_gate_allows_ping_only() {
+        assert!(method_allowed_before_init("initialize"));
+        assert!(method_allowed_before_init("notifications/initialized"));
+        assert!(method_allowed_before_init("ping"));
+        assert!(!method_allowed_before_init("tools/list"));
+        assert!(!method_allowed_before_init("tools/call"));
+        assert!(!method_allowed_before_init("frobnicate"));
     }
 }
 

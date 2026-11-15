@@ -72,6 +72,12 @@ pub const COOLDOWN_VERSION: u32 = 1;
 /// The `reason` recorded when the monthly spend cap tripped.
 pub const REASON_MONTHLY_CAP: &str = "monthly_cap";
 
+/// The `reason` recorded when the daily spend cap tripped (NG2-ZD-007).
+pub const REASON_DAILY_CAP: &str = "daily_cap";
+
+/// The `reason` recorded when the weekly spend cap tripped (NG2-ZD-007).
+pub const REASON_WEEKLY_CAP: &str = "weekly_cap";
+
 /// Default back-off length when the caller does not pick one.
 ///
 /// The monthly cap resets at the next UTC calendar month, so the back-off
@@ -289,16 +295,107 @@ pub fn trip_monthly_cap_cooldown(
     spent_usd: f64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<HostCooldown> {
+    trip_window_cap_cooldown(
+        ledger_path,
+        REASON_MONTHLY_CAP,
+        "monthly",
+        limit_usd,
+        spent_usd,
+        now,
+        month_end(now),
+    )
+}
+
+/// Build the marker for a tripped daily cap and write it beside
+/// `ledger_path` (NG2-ZD-007). The back-off runs until the end of the
+/// current UTC calendar day — the cap's own window.
+pub fn trip_daily_cap_cooldown(
+    ledger_path: &Path,
+    limit_usd: f64,
+    spent_usd: f64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<HostCooldown> {
+    trip_window_cap_cooldown(
+        ledger_path,
+        REASON_DAILY_CAP,
+        "daily",
+        limit_usd,
+        spent_usd,
+        now,
+        day_end(now),
+    )
+}
+
+/// Build the marker for a tripped weekly cap and write it beside
+/// `ledger_path` (NG2-ZD-007). The back-off runs until the end of the
+/// current UTC ISO week (next Monday 00:00 UTC) — the cap's own window.
+pub fn trip_weekly_cap_cooldown(
+    ledger_path: &Path,
+    limit_usd: f64,
+    spent_usd: f64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<HostCooldown> {
+    trip_window_cap_cooldown(
+        ledger_path,
+        REASON_WEEKLY_CAP,
+        "weekly",
+        limit_usd,
+        spent_usd,
+        now,
+        week_end(now),
+    )
+}
+
+/// Shared builder for a tripped spend-cap marker. The marker expires at the
+/// end of the tripped window so the host wakes up exactly when the cap
+/// resets.
+fn trip_window_cap_cooldown(
+    ledger_path: &Path,
+    reason: &str,
+    window: &str,
+    limit_usd: f64,
+    spent_usd: f64,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> anyhow::Result<HostCooldown> {
     let marker = HostCooldown {
         version: COOLDOWN_VERSION,
-        reason: REASON_MONTHLY_CAP.to_string(),
-        detail: format!("monthly spend cap reached: ${spent_usd:.2} spent of ${limit_usd:.2} cap"),
+        reason: reason.to_string(),
+        detail: format!("{window} spend cap reached: ${spent_usd:.2} spent of ${limit_usd:.2} cap"),
         limit_usd: Some(limit_usd),
         spent_usd: Some(spent_usd),
         created_at: now,
-        expires_at: month_end(now),
+        expires_at,
     };
     write_cooldown(ledger_path, &marker)
+}
+
+/// The first instant of the NEXT UTC calendar day — when a daily cap
+/// resets. Preserves sub-day precision of `now` the way `month_end` keeps
+/// the clock at midnight: day boundaries are whole days in UTC.
+fn day_end(now: DateTime<Utc>) -> DateTime<Utc> {
+    let next_day = now.date_naive().succ_opt().unwrap_or(now.date_naive());
+    next_day
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| naive.and_utc())
+        .unwrap_or_else(|| now + chrono::Duration::hours(25))
+}
+
+/// The first instant of the NEXT UTC ISO week (Monday 00:00 UTC) — when a
+/// weekly cap resets.
+fn week_end(now: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::Duration;
+    let days_to_monday = 7 - now.weekday().num_days_from_monday() as i64;
+    let days = if days_to_monday == 0 {
+        7
+    } else {
+        days_to_monday
+    };
+    let monday = now.date_naive() + Duration::days(days);
+    monday
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| naive.and_utc())
+        .unwrap_or_else(|| now + Duration::days(8))
 }
 
 /// The first instant of the NEXT UTC calendar month — when a monthly cap
@@ -319,9 +416,10 @@ fn month_end(now: DateTime<Utc>) -> DateTime<Utc> {
 /// The host-level back-off hook the budget gate calls after it decides.
 ///
 /// This is the ONE function that turns a budget decision into host state, so
-/// every writer of the marker agrees on what "the monthly cap tripped" means:
+/// every writer of the marker agrees on what "the spend cap tripped" means:
 ///
-/// * a MONTHLY cap trip writes/extend the marker beside `ledger_path` (the
+/// * a DAILY, WEEKLY or MONTHLY cap trip writes/extends the marker beside
+///   `ledger_path` with an expiry at the end of the tripped window (the
 ///   host-wide signal the sibling workers and the Hive worker read);
 /// * any other decline is NOT host-wide and never writes (a per-call cap, an
 ///   unpriceable model, an unreadable ledger — D8 step 12 exists to stop the
@@ -339,12 +437,27 @@ pub fn note_budget_decline(
     let Some(ledger_path) = ledger_path else {
         return Ok(None);
     };
-    let Some(decline) = decline.filter(|d| d.monthly_cap_tripped()) else {
+    let Some(decline) = decline.filter(|d| d.any_cap_tripped()) else {
         return Ok(None);
     };
     let limit_usd = decline.limit_usd.unwrap_or_default();
     let spent_usd = decline.spent_usd.unwrap_or_default();
-    trip_monthly_cap_cooldown(ledger_path, limit_usd, spent_usd, now).map(Some)
+    match decline.tripped {
+        Some(crate::budget::TrippedCap::Daily) => {
+            trip_daily_cap_cooldown(ledger_path, limit_usd, spent_usd, now).map(Some)
+        }
+        Some(crate::budget::TrippedCap::Weekly) => {
+            trip_weekly_cap_cooldown(ledger_path, limit_usd, spent_usd, now).map(Some)
+        }
+        Some(crate::budget::TrippedCap::Monthly) => {
+            trip_monthly_cap_cooldown(ledger_path, limit_usd, spent_usd, now).map(Some)
+        }
+        // Unreachable: the filter above rejected every non-window decline
+        // (per-call, unpriceable, unreadable ledger). Kept as a no-write
+        // arm so a future `TrippedCap` variant defaults to NOT parking the
+        // host rather than to a monthly marker.
+        Some(_) | None => Ok(None),
+    }
 }
 
 /// A live cooldown marker rendered for `zoder status` / `--json`.
@@ -507,6 +620,101 @@ mod tests {
             "a monthly cap resets at the next UTC month start"
         );
         assert_eq!(written.reason, REASON_MONTHLY_CAP);
+    }
+
+    /// NG2-ZD-007: a daily-cap trip expires at the next UTC midnight,
+    /// and a weekly-cap trip at the next Monday 00:00 UTC — each marker
+    /// lapses exactly when its own window resets.
+    #[test]
+    fn daily_and_weekly_trips_expire_at_their_own_window_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        // Wednesday 2026-11-18 13:50 UTC.
+        let now = Utc.with_ymd_and_hms(2026, 11, 18, 13, 50, 32).unwrap();
+        let daily = trip_daily_cap_cooldown(&ledger, 5.0, 5.5, now).unwrap();
+        assert_eq!(daily.reason, REASON_DAILY_CAP);
+        assert_eq!(
+            daily.expires_at,
+            Utc.with_ymd_and_hms(2026, 11, 19, 0, 0, 0).unwrap(),
+            "a daily cap resets at the next UTC midnight"
+        );
+        let weekly = trip_weekly_cap_cooldown(&ledger, 20.0, 21.0, now).unwrap();
+        assert_eq!(weekly.reason, REASON_WEEKLY_CAP);
+        assert_eq!(
+            weekly.expires_at,
+            Utc.with_ymd_and_hms(2026, 11, 23, 0, 0, 0).unwrap(),
+            "a weekly cap resets at the next Monday 00:00 UTC"
+        );
+        // A Sunday trip still lands on the coming Monday, not a week out.
+        let sunday = Utc.with_ymd_and_hms(2026, 11, 22, 23, 0, 0).unwrap();
+        let weekly = trip_weekly_cap_cooldown(&ledger, 20.0, 21.0, sunday).unwrap();
+        assert_eq!(
+            weekly.expires_at,
+            Utc.with_ymd_and_hms(2026, 11, 23, 0, 0, 0).unwrap(),
+            "a Sunday-night trip expires at Monday midnight, hours later"
+        );
+        // A Monday trip covers the full week ahead.
+        let monday = Utc.with_ymd_and_hms(2026, 11, 23, 0, 30, 0).unwrap();
+        let weekly = trip_weekly_cap_cooldown(&ledger, 20.0, 21.0, monday).unwrap();
+        assert_eq!(
+            weekly.expires_at,
+            Utc.with_ymd_and_hms(2026, 11, 30, 0, 0, 0).unwrap()
+        );
+    }
+
+    /// NG2-ZD-007: the decline hook writes a window marker for a daily or
+    /// weekly trip (not just the monthly one), and still writes nothing for
+    /// a per-call trip.
+    #[test]
+    fn note_decline_writes_a_marker_per_tripped_window() {
+        use crate::budget::{BudgetDecline, TrippedCap};
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        let now = Utc.with_ymd_and_hms(2026, 11, 18, 13, 50, 32).unwrap();
+        for (tripped, reason, expires) in [
+            (
+                TrippedCap::Daily,
+                REASON_DAILY_CAP,
+                Utc.with_ymd_and_hms(2026, 11, 19, 0, 0, 0).unwrap(),
+            ),
+            (
+                TrippedCap::Weekly,
+                REASON_WEEKLY_CAP,
+                Utc.with_ymd_and_hms(2026, 11, 23, 0, 0, 0).unwrap(),
+            ),
+            (
+                TrippedCap::Monthly,
+                REASON_MONTHLY_CAP,
+                Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap(),
+            ),
+        ] {
+            clear_cooldown(&ledger).unwrap();
+            let decline = BudgetDecline {
+                message: "over a cap".into(),
+                tripped: Some(tripped),
+                limit_usd: Some(10.0),
+                spent_usd: Some(12.0),
+            };
+            let marker = note_budget_decline(Some(&ledger), Some(&decline), now)
+                .expect("marker write must not fail")
+                .expect("a window-cap trip must leave a marker");
+            assert_eq!(marker.reason, reason);
+            assert_eq!(marker.expires_at, expires);
+        }
+        clear_cooldown(&ledger).unwrap();
+        let per_call = BudgetDecline {
+            message: "over the per-call cap".into(),
+            tripped: Some(TrippedCap::PerCall),
+            limit_usd: Some(0.10),
+            spent_usd: None,
+        };
+        assert!(
+            note_budget_decline(Some(&ledger), Some(&per_call), now)
+                .unwrap()
+                .is_none(),
+            "a per-call trip must not park the host"
+        );
+        assert!(!cooldown_active(&ledger));
     }
 
     #[test]
