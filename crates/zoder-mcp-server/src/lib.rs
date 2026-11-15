@@ -104,8 +104,40 @@ impl RpcMessage {
 // MCP types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// MCP protocol version the server supports.
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Latest MCP protocol version the server supports.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Every MCP protocol version whose behaviour the server really implements,
+/// in ascending (oldest-first) order.
+pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// Negotiate the protocol version for an `initialize` request.
+///
+/// Returns the highest supported version `<=` the client's requested
+/// version (versions are `YYYY-MM-DD` dates, so lexicographic comparison
+/// matches chronological order). An unknown, unparsable, or missing
+/// requested version falls back to the server's latest.
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some(r) if MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&r) => {
+            // Exact hit — `r` is one of the supported literals, so map it
+            // back to the canonical static string.
+            MCP_SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|v| **v == r)
+                .copied()
+                .unwrap_or(MCP_PROTOCOL_VERSION)
+        }
+        Some(r) => MCP_SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .filter(|v| *v < r)
+            .max()
+            .unwrap_or(MCP_PROTOCOL_VERSION),
+        None => MCP_PROTOCOL_VERSION,
+    }
+}
 
 /// Server capabilities (we expose tools only).
 #[derive(Debug, Serialize, Deserialize)]
@@ -396,8 +428,12 @@ fn dispatch_request(
     match method {
         // ── initialize ─────────────────────────────────────────────────
         "initialize" => {
+            let requested = params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str());
             let result = InitializeResult {
-                protocol_version: MCP_PROTOCOL_VERSION.to_string(),
+                protocol_version: negotiate_protocol_version(requested).to_string(),
                 server_info: ServerInfo {
                     name: "zoder".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
@@ -933,6 +969,56 @@ mod tests {
         assert_eq!(response["result"]["serverInfo"]["name"], "zoder");
         assert_eq!(response["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(response["result"]["capabilities"].get("tools").is_some());
+    }
+
+    /// Regression: `initialize` must negotiate the client's requested
+    /// protocolVersion (NG2-ZD-008).
+    #[test]
+    fn dispatch_initialize_negotiates_protocol_version() {
+        let ctx = RoutingContext::load_with_fixture();
+        let tools = tools_list();
+        let init = |version: Option<Value>| {
+            let params = version
+                .map(|v| serde_json::json!({ "protocolVersion": v }))
+                .or_else(|| Some(serde_json::json!({})));
+            dispatch_request(
+                "initialize",
+                &params,
+                &Value::Number(1.into()),
+                Some(&ctx),
+                &tools,
+            )
+        };
+        // Exact supported versions echo back.
+        for v in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+            let r = init(Some(Value::String(v.to_string())));
+            assert_eq!(r["result"]["protocolVersion"], v, "requested {v}");
+        }
+        // Newer-than-latest clamps to the server's latest.
+        let r = init(Some(Value::String("2026-01-01".to_string())));
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        // Between two supported versions picks the highest one below it.
+        let r = init(Some(Value::String("2025-04-01".to_string())));
+        assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
+        // Older than everything supported falls back to latest.
+        let r = init(Some(Value::String("2020-01-01".to_string())));
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        // Unknown string and missing params fall back to latest.
+        let r = init(Some(Value::String("banana".to_string())));
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        let r = init(None);
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        let r = dispatch_request(
+            "initialize",
+            &None,
+            &Value::Number(1.into()),
+            Some(&ctx),
+            &tools,
+        );
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        // Capabilities unchanged: tools only.
+        let r = init(Some(Value::String("2025-06-18".to_string())));
+        assert!(r["result"]["capabilities"].get("tools").is_some());
     }
 
     /// Verify that dispatching `tools/list` returns the tool definition.
