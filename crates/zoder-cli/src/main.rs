@@ -1082,7 +1082,9 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// Show the routing decision for a task without executing it.
+    /// Show the routing decision without executing it. Routing is
+    /// tier-based (capability/health); the optional prompt is only echoed
+    /// for traceability. A heuristic task-content classifier is future work.
     Route { prompt: Option<String> },
     /// Rank models for a human to pick from: health (circuit-breaker) + coding
     /// capability + SWE Elo — the same signals the router uses. Use `--json` for
