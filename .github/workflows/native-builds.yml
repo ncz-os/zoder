@@ -138,7 +138,44 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$ZODER_SHA"
+          # x86_64 baseline pin (POOL-ZD-001): the shipped 0.2.1 x86_64
+          # binary died with SIGILL on pool hosts without AVX2/BMI/FMA.
+          # The x86_64 artifact must target x86-64-v2; arm64 keeps the
+          # toolchain default (no flag). Mirrors the in-repo
+          # `.cargo/config.toml` pin so a config edit cannot silently lift
+          # the baseline.
+          if [ "$TRIPLE" = "x86_64-unknown-linux-gnu" ]; then
+            export RUSTFLAGS="-C target-cpu=x86-64-v2"
+          fi
           cargo build --release --locked --bin zoder --target "$TRIPLE"
+          # Baseline gate: compile a probe with the pinned
+          # `-C target-cpu=x86-64-v2` flag (same flag as RUSTFLAGS above and
+          # the `.cargo/config.toml` pin) and assert the v3 codegen features
+          # are all off. This checks the EMITTED TARGET FEATURES the flag
+          # selects — a raw `objdump` mnemonic grep would false-positive on
+          # ring's runtime-CPUID-dispatched AVX2 crypto assembly, which never
+          # executes on CPUs that lack the feature. The repo-level
+          # `scripts/tests/cpu-baseline-tests.py` separately asserts the pin
+          # itself is present in every build config.
+          if [ "$TRIPLE" = "x86_64-unknown-linux-gnu" ]; then
+            cat > /tmp/cpu-baseline-probe.rs <<'EOF'
+          fn main() {
+              let feats: &[(&str, bool)] = &[
+                  ("avx2", cfg!(target_feature = "avx2")),
+                  ("bmi1", cfg!(target_feature = "bmi1")),
+                  ("bmi2", cfg!(target_feature = "bmi2")),
+                  ("fma", cfg!(target_feature = "fma")),
+              ];
+              for (name, on) in feats {
+                  println!("{name}={on}");
+                  if *on { std::process::exit(1); }
+              }
+          }
+          EOF
+            rustc --edition 2021 -C target-cpu=x86-64-v2 /tmp/cpu-baseline-probe.rs -o /tmp/cpu-baseline-probe
+            /tmp/cpu-baseline-probe
+            echo "x86_64 baseline OK: no AVX2/BMI/FMA codegen features enabled"
+          fi
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper
           export GIT_CONFIG_VALUE_0='!f() { printf "username=%s\npassword=%s\n" "$ENGINE_USER" "$ENGINE_TOKEN"; }; f'
           export GIT_TERMINAL_PROMPT=0

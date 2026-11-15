@@ -127,6 +127,9 @@ corpus-tests:
     - python3 scripts/tests/convert-oplog-tests.py
     - python3 scripts/tests/rsc-util-tests.py
     - python3 scripts/tests/single-shot-fetch-retry-tests.py
+    # POOL-ZD-001: the x86_64 release baseline pin (x86-64-v2) plus the
+    # startup CPU guard. Fails when the pin or the guard regresses.
+    - python3 scripts/tests/cpu-baseline-tests.py
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"merge_request_event\""
     - if: "$CI_PIPELINE_SOURCE == \"push\" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"

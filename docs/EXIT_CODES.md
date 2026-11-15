@@ -118,6 +118,19 @@ internal-class outcome: nothing to fix, nothing to retry).
   before the classes above (`contract_exit_code`) and is not a review / loop
   rung.
 
+Outside the contract ladder, one process-entry code exists:
+
+- `69` (`EX_UNAVAILABLE`) — unsupported CPU: this binary needs CPU features
+  the host lacks (`main.rs`: `missing_cpu_features`,
+  `EXIT_UNSUPPORTED_CPU`; POOL-ZD-001). Checked at process entry, BEFORE
+  Clap parsing, so even `zoder --version` on an old CPU prints
+  `unsupported CPU: missing <flag...>` on stderr (flag names match
+  `/proc/cpuinfo`) instead of dying with SIGILL (exit 132). It is not a
+  review / loop rung and never appears in a `--json` failure envelope —
+  the process exits before any command runs. A fleet worker should treat it
+  as permanent for that host (install an older-baseline build or move the
+  workload), not retry the invocation.
+
 Every classified failure is NON-ZERO, so a caller that only tests "did it
 fail" (the fleet worker) is unaffected by the contract.
 
