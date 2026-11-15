@@ -3232,6 +3232,55 @@ fn unresolved_review_stops_loop(
     verdict == REVIEWER_UNAVAILABLE_VERDICT && !review_skipped_empty_diff
 }
 
+/// The whole-run deadline decision for every review the loop starts AFTER
+/// the first one (NG2-ZD-002): the located-finding re-ask and each of the two
+/// stall majority-vote samples. The first review is already gated by the
+/// pre-review deadline check; these re-reviews were not, so a run past its
+/// deadline could spend up to three more full `loop_timeout_secs` budgets
+/// before the iteration-top check could stop it.
+///
+/// The helper is pure (deadline state + whether the re-review is wanted) so
+/// the matrix is unit-testable without spawning a review. `resample_wanted`
+/// is `is_unlocated_block(&review)` at the re-ask site and `true` at each
+/// stall sample site.
+fn loop_resample_skip(deadline: &LoopDeadline, resample_wanted: bool) -> LoopResampleSkip {
+    if !resample_wanted {
+        return LoopResampleSkip::Proceed;
+    }
+    if deadline.expired() {
+        return LoopResampleSkip::DeadlineHit;
+    }
+    LoopResampleSkip::Proceed
+}
+
+/// The outcome of [`loop_resample_skip`]: start the extra review, or skip it
+/// because the whole-run deadline already fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopResampleSkip {
+    Proceed,
+    DeadlineHit,
+}
+
+impl LoopResampleSkip {
+    /// True when the extra review must be skipped AND the run must record a
+    /// whole-run deadline stop (`deadline_hit`, the unresolved
+    /// `reviewer_unavailable` iteration record, the
+    /// `abort_reason: whole-run deadline reached` acceptance field).
+    fn skip_with_deadline_hit(self) -> bool {
+        matches!(self, LoopResampleSkip::DeadlineHit)
+    }
+}
+
+/// The watchdog budget for an extra review sample started before the deadline
+/// (NG2-ZD-002): the full per-phase budget, clamped to what remains of the
+/// whole run so a sample never outlives the deadline it started under. The
+/// 1 s floor mirrors `phase_watchdog`'s `secs.max(1)`; callers only reach
+/// this helper when the deadline has not expired, so `remaining` is nonzero.
+fn loop_resample_budget_secs(loop_timeout_secs: u64, remaining: Duration) -> u64 {
+    let remaining_secs = remaining.as_secs().max(1);
+    loop_timeout_secs.max(1).min(remaining_secs)
+}
+
 /// The `zoder review` verdict gate (F4/FB111): the structured gate is the
 /// ONLY way to an approve.
 ///
@@ -11754,8 +11803,40 @@ diff is not a finished turn"
         // unknown verdict can never resolve) and exempt it from the
         // no-new-progress stall counter. An explicit block WITH a located
         // finding keeps today's semantics.
+        //
+        // NG2-ZD-002: the re-ask is skipped when the whole-run deadline has
+        // already expired — otherwise a run past its deadline spends another
+        // full `loop_timeout_secs` before the iteration-top check can stop
+        // it. The iteration is recorded as unresolved with the same
+        // deadline-reached record the pre-review check emits (the review
+        // phase never started, so `final_verdict`/`review_error` mirror that
+        // skip arm), and the helper decides the record/skip from pure state
+        // so the matrix is unit-testable without spawning a review.
+        let reask_skip = loop_resample_skip(&deadline, is_unlocated_block(&review));
         let mut review_unlocated_no_evidence = false;
-        if is_unlocated_block(&review) {
+        if reask_skip.skip_with_deadline_hit() {
+            deadline_hit = true;
+            crate::telemetry::note_deadline_hit();
+            if !cli.quiet {
+                crate::oplog!(
+                    "loop",
+                    "[loop] iter {i}: whole-run deadline of {}s reached before the located-finding \
+                     re-ask; skipping the second review and recording the iteration as unresolved",
+                    deadline.secs
+                );
+            }
+            review_error = Some("review skipped: the whole-run deadline was reached".into());
+            review = synthesize_reviewer_unavailable(
+                "review skipped: the whole-run deadline was reached",
+            );
+            // The first review completed, so `review_chunks` still names its
+            // chunk count; the re-ask never ran, so the iteration record must
+            // not pair the synthesized unavailable verdict with the discarded
+            // review's chunks. The pre-review deadline arm records 0.
+            review_chunks = 0;
+            reviewer_verdicts = Vec::new();
+            review_unlocated_no_evidence = false;
+        } else if is_unlocated_block(&review) {
             // D4.3: the re-ask used to end "Otherwise return approve or
             // comment", which invites an approve for a defect the reviewer
             // could not place — exactly the verdict the gate must not
@@ -11768,9 +11849,16 @@ A blocking defect MUST cite a concrete location (path:line). Re-review this diff
 request changes, include at least one finding with an exact location. Otherwise return approve \
 or comment together with an explicit statement that no blocking defect exists.\n"
             );
+            // NG2-ZD-002: the re-ask inherits the whole-run deadline. `remaining`
+            // is zero only when the deadline fired between the first review and
+            // now; that is checked by `reask_skip` above, so this clamp only
+            // shortens a review that would otherwise run past the deadline —
+            // never below the 1 s floor `phase_watchdog` enforces.
+            let reask_budget_secs =
+                loop_resample_budget_secs(loop_timeout_secs, deadline.remaining());
             let (r2, m2, c2, ch2, rv2) = match phase_watchdog(
                 LoopPhase::Review,
-                loop_timeout_secs,
+                reask_budget_secs,
                 cli.quiet,
                 run_loop_review(
                     cli,
@@ -12175,9 +12263,35 @@ approve)…"
                 }
                 let mut fresh: Vec<ReviewOutput> = Vec::with_capacity(2);
                 for _ in 0..2 {
+                    // NG2-ZD-002: each fresh majority sample inherits the
+                    // whole-run deadline. An expired deadline stops the
+                    // sampling with a fail-closed `reviewer_unavailable`
+                    // sample instead of spending another full
+                    // `loop_timeout_secs`; a live deadline only shortens the
+                    // sample's watchdog to what remains (never below the
+                    // 1 s floor `phase_watchdog` enforces).
+                    let sample_skip = loop_resample_skip(&deadline, true);
+                    if sample_skip.skip_with_deadline_hit() {
+                        deadline_hit = true;
+                        crate::telemetry::note_deadline_hit();
+                        if !cli.quiet {
+                            crate::oplog!(
+                                "loop",
+                                "[loop] iter {i}: whole-run deadline of {}s reached before a fresh \
+                                 majority sample; stopping the sampling fail-closed",
+                                deadline.secs
+                            );
+                        }
+                        fresh.push(synthesize_reviewer_unavailable(
+                            "review skipped: the whole-run deadline was reached",
+                        ));
+                        break;
+                    }
+                    let sample_budget_secs =
+                        loop_resample_budget_secs(loop_timeout_secs, deadline.remaining());
                     let (r, m, c, _ch, _rv) = match phase_watchdog(
                         LoopPhase::Review,
-                        loop_timeout_secs,
+                        sample_budget_secs,
                         cli.quiet,
                         run_loop_review(
                             cli,
@@ -12212,6 +12326,18 @@ approve)…"
                         reviewer_model = m;
                     }
                     fresh.push(r);
+                }
+                // A deadline stop above leaves one unavailable sample: pad to
+                // two so the majority decision and the record keep their
+                // `[current, fresh0, fresh1]` shape. The pad is itself an
+                // unavailable (non-approve) sample, so the fail-closed
+                // majority can never resolve on it — the loop records the
+                // verdicts and falls through to the terminal accounting,
+                // which reports the deadline via `deadline_hit`.
+                while fresh.len() < 2 {
+                    fresh.push(synthesize_reviewer_unavailable(
+                        "review skipped: the whole-run deadline was reached",
+                    ));
                 }
                 let fresh: [ReviewOutput; 2] = fresh
                     .try_into()
@@ -13216,6 +13342,174 @@ mod tests {
         let at = started + Duration::from_secs(deadline);
         assert!(dl.expired_at(at), "the run must stop at the deadline");
         assert!(dl.remaining_at(at).is_zero());
+    }
+
+    /// NG2-ZD-002: the located-finding re-ask must not run past the
+    /// whole-run deadline. Before the fix, a deadline already expired when
+    /// the first review returned an unlocated `request_changes` still
+    /// entered the re-ask: one more full `loop_timeout_secs` review before
+    /// the iteration-top check could stop the run.
+    ///
+    /// The loop's decision is `loop_resample_skip(&deadline, true)`; an
+    /// expired deadline is a skip-with-deadline-hit, which is exactly the
+    /// record the pre-review deadline arm emits: `deadline_hit`,
+    /// `verdict = reviewer_unavailable`, `review_error = "review skipped:
+    /// the whole-run deadline was reached"`, `abort_reason = "whole-run
+    /// deadline reached"`. The unavailable synthesis is fail-closed
+    /// (`loop_review_ok` rejects the unknown verdict), so the skipped
+    /// re-ask can never resolve.
+    #[test]
+    fn expired_deadline_skips_the_located_finding_reask() {
+        let started = Instant::now() - Duration::from_secs(3600);
+        let deadline = LoopDeadline::new(10, started);
+        assert!(
+            deadline.expired(),
+            "the fixture deadline must already be spent"
+        );
+
+        // The first review returned an unlocated block, so the re-ask is
+        // wanted — and the expired deadline refuses it.
+        let skip = loop_resample_skip(&deadline, true);
+        assert!(
+            skip.skip_with_deadline_hit(),
+            "an expired deadline must skip the re-ask instead of spending \
+             another full loop_timeout_secs review"
+        );
+
+        // The skip records the iteration exactly as the pre-review deadline
+        // arm does: unresolved, reviewer_unavailable, deadline-reached, with
+        // no chunks and no per-reviewer verdicts — the re-ask never ran, so
+        // the record must not pair the synthesized verdict with the
+        // discarded first review's evidence.
+        let detail = "review skipped: the whole-run deadline was reached";
+        let review = synthesize_reviewer_unavailable(detail);
+        let record = serde_json::json!({
+            "review_error": detail,
+            "review_complete": false,
+            "review_chunks": 0,
+            "reviewer_verdicts": [],
+            "verdict": review.verdict,
+            "resolved": false,
+            "abort_reason": "whole-run deadline reached",
+        });
+        assert_eq!(record["verdict"], REVIEWER_UNAVAILABLE_VERDICT);
+        assert_eq!(record["abort_reason"], "whole-run deadline reached");
+        assert_eq!(
+            record["review_chunks"], 0,
+            "a skipped re-ask records zero chunks, like the pre-review deadline arm"
+        );
+        assert!(
+            record["reviewer_verdicts"]
+                .as_array()
+                .is_some_and(|v| v.is_empty()),
+            "a skipped re-ask carries no reviewer verdicts"
+        );
+        assert!(
+            !loop_review_ok(&review, 0),
+            "the skipped re-ask must stay fail-closed"
+        );
+    }
+
+    /// NG2-ZD-002: same gate for the stall majority vote. Before the fix,
+    /// each of the two fresh samples in the `for _ in 0..2` loop ran under
+    /// a full `loop_timeout_secs` with no `deadline.expired()` test, so a
+    /// run past its deadline could spend two more review budgets before
+    /// reaching the iteration-top check.
+    ///
+    /// After the fix the loop checks the deadline before each fresh sample
+    /// and stops the sampling with a fail-closed `reviewer_unavailable`
+    /// sample: the padded 3-sample `[current, unavailable, unavailable]`
+    /// majority can never resolve (`majority_resolves_on_unchanged_diff`
+    /// needs BOTH fresh samples to approve), so the verdict stays
+    /// `reviewer_unavailable` and the terminal accounting reports the
+    /// deadline via `deadline_hit`.
+    #[test]
+    fn expired_deadline_stops_the_stall_majority_sampling() {
+        let started = Instant::now() - Duration::from_secs(3600);
+        let deadline = LoopDeadline::new(10, started);
+        assert!(
+            deadline.expired(),
+            "the fixture deadline must already be spent"
+        );
+
+        // Each fresh sample asks first: an expired deadline stops the
+        // sampling instead of starting another full-budget review.
+        let mut fresh: Vec<ReviewOutput> = Vec::new();
+        for _ in 0..2 {
+            assert!(
+                loop_resample_skip(&deadline, true).skip_with_deadline_hit(),
+                "an expired deadline must stop each fresh sample"
+            );
+            fresh.push(synthesize_reviewer_unavailable(
+                "review skipped: the whole-run deadline was reached",
+            ));
+            break;
+        }
+        while fresh.len() < 2 {
+            fresh.push(synthesize_reviewer_unavailable(
+                "review skipped: the whole-run deadline was reached",
+            ));
+        }
+
+        // The padded samples are fail-closed non-approves: the majority can
+        // never resolve on them.
+        let fresh: [ReviewOutput; 2] = fresh.try_into().expect("two fresh samples");
+        assert!(
+            fresh
+                .iter()
+                .all(|r| r.verdict == REVIEWER_UNAVAILABLE_VERDICT),
+            "deadline-stopped samples must be reviewer_unavailable"
+        );
+        let current = review_with("request_changes", vec![]);
+        assert!(
+            !majority_resolves_on_unchanged_diff(&current, &fresh, true, true),
+            "a deadline stop must be a verdict of reviewer_unavailable, never a resolve"
+        );
+    }
+
+    /// NG2-ZD-002: a live deadline is left alone, and a sample started under
+    /// it is clamped to what remains. A re-review wanted with time left
+    /// proceeds at the full per-phase budget; with less than a full budget
+    /// left it is clamped to the remainder (never below the 1 s floor
+    /// `phase_watchdog` enforces); and nothing is skipped while time
+    /// remains.
+    #[test]
+    fn live_deadline_proceeds_and_clamps_extra_review_budgets() {
+        let started = Instant::now();
+        // An unlocated block with nine minutes left: the re-ask proceeds.
+        let ample = LoopDeadline::new(600, started);
+        assert!(!ample.expired());
+        assert!(
+            !loop_resample_skip(&ample, true).skip_with_deadline_hit(),
+            "a live deadline must not skip a wanted re-review"
+        );
+        // No re-review wanted (a located block): nothing to skip, deadline or not.
+        assert!(
+            !loop_resample_skip(&ample, false).skip_with_deadline_hit(),
+            "an unwanted re-review is not a deadline stop"
+        );
+        let expired = LoopDeadline::new(10, started - Duration::from_secs(3600));
+        assert!(
+            !loop_resample_skip(&expired, false).skip_with_deadline_hit(),
+            "an unwanted re-review is not a deadline stop even past the deadline"
+        );
+
+        // Full budget when plenty remains; clamped to the remainder when not.
+        assert_eq!(
+            loop_resample_budget_secs(900, Duration::from_secs(5000)),
+            900,
+            "ample time left keeps the full per-phase budget"
+        );
+        assert_eq!(
+            loop_resample_budget_secs(900, Duration::from_secs(37)),
+            37,
+            "a sample started with 37 s left must not outlive the deadline"
+        );
+        assert_eq!(
+            loop_resample_budget_secs(900, Duration::from_millis(500)),
+            1,
+            "a sub-second remainder clamps to the 1 s watchdog floor, never zero"
+        );
     }
 
     /// The "strictly below the worker's timeout" invariant is a property of the
