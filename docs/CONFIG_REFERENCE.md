@@ -30,6 +30,8 @@ no fleet addresses, no keys.
 | `[[providers]].max_context_tokens` |
 | `[model_families]` |
 | `[budget].max_cost_per_call_usd` |
+| `[budget].daily_cap_usd` |
+| `[budget].weekly_cap_usd` |
 | `[budget].monthly_cap_usd` |
 | `[budget].est_output_tokens` |
 | `[review].max_diff_bytes` |
@@ -96,17 +98,20 @@ no fleet addresses, no keys.
   keys are load-time errors (`config.rs` model-family validation).
 - `[budget]` fields: `max_cost_per_call_usd` (per-call estimate
   ceiling; gated by confirmation or `--allow-paid`),
-  `monthly_cap_usd` (rolling month-to-date cap against the local
-  ledger), `est_output_tokens` (default 1024)
+  `daily_cap_usd` (UTC-day spend cap), `weekly_cap_usd` (UTC ISO-week
+  spend cap), `monthly_cap_usd` (rolling month-to-date cap against the
+  local ledger), `est_output_tokens` (default 1024)
   (`budget.rs:Budget`). Caps gate paid calls only; `0` or absent
   disables a cap (`config.standalone.toml` budget comment).
-- A trip of `monthly_cap_usd` is a HOST-wide event: it writes the
-  cooldown marker `<ledger path>.cooldown.json` beside the ledger, and
-  every worker on the host then skips metered routes until it expires
+- A trip of `daily_cap_usd`, `weekly_cap_usd` or `monthly_cap_usd` is a
+  HOST-wide event: it writes the cooldown marker
+  `<ledger path>.cooldown.json` beside the ledger (expiring at the end of
+  the tripped window — UTC midnight, Monday 00:00 UTC, or month start),
+  and every worker on the host then skips metered routes until it expires
   or a call fits again. No key configures it — the marker is derived
   from the cap and the ledger path. Format and reader contract:
   [`HOST_COOLDOWN.md`](HOST_COOLDOWN.md)
-  (`budget.rs:Budget::evaluate_call_with_host_cooldown`,
+  (`budget.rs:Budget::evaluate_call_windows_with_host_cooldown`,
   `host_cooldown.rs`).
 - `[review]`: `max_diff_bytes` (CLI `--max-diff-bytes`),
   `max_hunk_bytes` (CLI `--max-hunk-bytes`), `exclude` globs (plus

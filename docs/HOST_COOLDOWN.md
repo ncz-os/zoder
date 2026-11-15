@@ -1,8 +1,9 @@
 # Host cooldown: the spend-cap back-off marker
 
-Decision D8 step 12. One host-local file that says **"this host tripped its
-monthly spend cap — do not start another metered call"**, written when the
-monthly cap trips and read by every worker that starts afterwards.
+Decision D8 step 12, extended by NG2-ZD-007 to the daily and weekly caps.
+One host-local file that says **"this host tripped its spend cap — do not
+start another metered call"**, written when a daily, weekly or monthly cap
+trips and read by every worker that starts afterwards.
 
 Source of truth: `crates/zoder-core/src/host_cooldown.rs`. This page is the
 contract; that module is the implementation. Nothing here is zoder-specific on
@@ -11,7 +12,7 @@ the READ side — it is plain JSON on disk, so the Hive worker's budget back-off
 
 ## Why it exists
 
-The monthly cap is a per-HOST condition, but the refusal used to be per-WORKER:
+A spend-window cap is a per-HOST condition, but the refusal used to be per-WORKER:
 each sibling re-read the ledger, re-derived the same "over budget" verdict,
 re-prompted and re-refused. One incident counted 49 identical refusals for one
 cap trip. The refusal is right — the cap is real — but only the FIRST trip has
@@ -24,11 +25,12 @@ host:
 - **The read path fails OPEN.** A missing, expired, corrupt, oversized or
   unknown-version marker means "no cooldown". A broken sidecar can degrade the
   optimisation; it can never park the host.
-- **Only a MONTHLY cap trip writes it.** A per-call cap, an unpriceable model
-  and an unreadable ledger are per-CALL conditions (the next cheap call may fit
-  under the per-call cap) — backing off the host on one of those is the phantom
-  back-off this decision exists to prevent. The distinction is typed, not
-  parsed out of prose: `budget::TrippedCap::Monthly`.
+- **Only a DAILY, WEEKLY or MONTHLY cap trip writes it.** A per-call cap, an
+  unpriceable model and an unreadable ledger are per-CALL conditions (the next
+  cheap call may fit under the per-call cap) — backing off the host on one of
+  those is the phantom back-off this decision exists to prevent. The
+  distinction is typed, not parsed out of prose: `budget::TrippedCap::Daily |
+  Weekly | Monthly`.
 
 ## File
 
@@ -52,10 +54,10 @@ A single JSON object. Keys, all required except where noted:
 | key          | type             | meaning                                                       |
 | ------------ | ---------------- | ------------------------------------------------------------- |
 | `version`    | integer          | format version, currently `1`                                  |
-| `reason`     | string           | short machine-ish reason; `"monthly_cap"` for a spend-cap trip |
+| `reason`     | string           | short machine-ish reason; `"daily_cap"`, `"weekly_cap"` or `"monthly_cap"` for a spend-cap trip |
 | `detail`     | string (default `""`) | human-readable detail (cap, spend); never parsed for a decision |
-| `limit_usd`  | number (optional) | the configured monthly cap in USD                             |
-| `spent_usd`  | number (optional) | month-to-date **billed** spend in USD when the cap tripped    |
+| `limit_usd`  | number (optional) | the configured window cap in USD                              |
+| `spent_usd`  | number (optional) | window-to-date **billed** spend in USD when the cap tripped   |
 | `created_at` | string, RFC 3339 | UTC instant the marker was written                            |
 | `expires_at` | string, RFC 3339 | UTC instant the back-off lapses                               |
 
@@ -73,9 +75,10 @@ Example:
 }
 ```
 
-`expires_at` defaults to the first instant of the next UTC calendar month —
-the cap's own reset — so one trip holds the host off until the cap actually
-rolls over.
+`expires_at` defaults to the end of the tripped window — the next UTC
+midnight for a daily cap, the next Monday 00:00 UTC for a weekly cap, the
+first instant of the next UTC calendar month for a monthly cap — so one trip
+holds the host off until the cap actually rolls over.
 
 ## The reader contract (what a sibling must implement)
 
@@ -112,17 +115,20 @@ def host_cooldown(ledger_path: str) -> dict | None:
 
 ## The writer contract (what zoder does)
 
-- Entry point: `Budget::evaluate_call_with_host_cooldown` (and the two-number
-  `Budget::evaluate_with_host_cooldown`) — the pre-call budget gate `zoder
-  oneshot` and `zoder exec`/agentic already run.
-- A monthly cap trip **writes or extends** the marker beside
-  `cfg.ledger_path`. A second trip never SHORTENS a live marker, so concurrent
-  trips cannot cut each other's hold-off short.
+- Entry point: `Budget::evaluate_call_windows_with_host_cooldown` (and the
+  two-number `Budget::evaluate_windows_with_host_cooldown`; the month-only
+  `evaluate_call_with_host_cooldown` / `evaluate_with_host_cooldown` shapes
+  remain for callers with only the month read) — the pre-call budget gate
+  `zoder oneshot` and `zoder exec`/agentic already run.
+- A daily, weekly or monthly cap trip **writes or extends** the marker beside
+  `cfg.ledger_path`, expiring at the end of the tripped window. A second trip
+  never SHORTENS a live marker, so concurrent trips cannot cut each other's
+  hold-off short.
 - A **metered** call that **fits** clears a live marker: it read the
-  month-to-date spend, so the cap is by definition not tripped any more, and a
-  stale hold-off must not keep parking the host after the month resets.
+  window spend, so no cap is by definition tripped any more, and a stale
+  hold-off must not keep parking the host after the window resets.
 - A **free** call (or a $0 estimate) never touches the marker. It is never
-  gated, so it never reads month-to-date spend — and "I did not look" is not
+  gated, so it never reads window spend — and "I did not look" is not
   evidence the cap stopped tripping. Clearing on it used to delete a live
   marker while billed spend was still over the cap, so the next metered
   sibling re-derived the same refusal: the per-worker loop this feature
@@ -136,8 +142,12 @@ def host_cooldown(ledger_path: str) -> dict | None:
 ## Where it shows up
 
 - `zoder status` prints one line when the host is in cooldown (`host cooldown
-  ACTIVE (monthly_cap) … metered routes skipped until …`). In `--json` mode
+  ACTIVE (monthly_cap) … metered routes skipped until …` — `daily_cap` or
+  `weekly_cap` when a narrower window tripped). In `--json` mode
   that line goes to **stderr** and stdout stays the job list.
+- `zoder budget status [--json]` shows the configured caps against current
+  day/week/month ledger spend, the per-window trip state, and the live
+  cooldown marker.
 - **`zoder status --json` output shape is stable.** Without a job id the
   top level is ALWAYS the job array — empty, ten entries, or a live cooldown,
   it is an array. Callers may index it (`json.loads(stdout)[0]`) or iterate
