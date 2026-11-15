@@ -100,7 +100,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Create multi-arch manifest (weekly-<ISOweek> + latest)
+      - name: Create multi-arch manifest (weekly-<ISOweek> + edge)
         run: |
           set -euo pipefail
           WEEK="$(date -u +%G-W%V)"
@@ -109,9 +109,14 @@ jobs:
             refs="$refs ${IMAGE}@$(cat "$f")"
           done
           echo "manifest members:$refs"
+          # Channel tags only: weekly-<ISO week> and edge. NEVER :latest, :X
+          # or :X.Y here — :latest tracks the newest stable vX.Y.Z tag push
+          # (a branch build must not move it), and :X / :X.Y are immutable
+          # release aliases. This weekly build is a channel snapshot, not a
+          # release.
           docker buildx imagetools create \
             -t "${IMAGE}:weekly-${WEEK}" \
-            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:edge" \
             $refs
           docker buildx imagetools inspect "${IMAGE}:weekly-${WEEK}"
-          echo "published ${IMAGE}:weekly-${WEEK} (+ :latest) — linux/amd64 + linux/arm64" >> "$GITHUB_STEP_SUMMARY"
+          echo "published ${IMAGE}:weekly-${WEEK} + :edge (channel snapshot) — linux/amd64 + linux/arm64" >> "$GITHUB_STEP_SUMMARY"
