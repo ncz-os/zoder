@@ -98,6 +98,25 @@ impl RpcMessage {
             "result": result,
         })
     }
+
+    /// Build a `tools/call` tool-level failure: per MCP, a tool that ran
+    /// and failed must return `result.isError=true` with readable text so
+    /// the calling model can react — not a JSON-RPC protocol `error`,
+    /// which clients typically hide from the model. Argument validation
+    /// problems (-32602) stay protocol errors.
+    fn tool_error_response(id: Value, message: &str) -> Value {
+        // Built as literal JSON so the failure path itself cannot panic on
+        // serialization; the shape matches `ToolCallResult` with
+        // `is_error: Some(true)`.
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": message }],
+                "isError": true,
+            },
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,9 +195,10 @@ pub struct ToolCallArguments {
 /// `tools/call` response — the routing decision structured as JSON.
 #[derive(Debug, Serialize)]
 pub struct ToolCallResult {
-    /// Whether the tool call succeeded.
+    /// Tool content blocks.
     pub content: Vec<ContentBlock>,
-    /// `false` when an error occurred during tool execution.
+    /// `Some(true)` when the tool ran and failed; `None` (omitted) on
+    /// success, per MCP convention.
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
@@ -385,6 +405,20 @@ pub fn run_server(ctx: Result<RoutingContext, anyhow::Error>) -> anyhow::Result<
     Ok(())
 }
 
+/// Return the `tools/call` tool-level failure when a routing decision came
+/// back empty (no usable model), or `None` when the route is actionable.
+/// Split out so the empty-route arm is directly unit-testable.
+fn empty_route_response(id: &Value, route: &Route) -> Option<Value> {
+    if route.primary.is_empty() || route.reason.is_empty() {
+        Some(RpcMessage::tool_error_response(
+            id.clone(),
+            "routing decision is empty — no valid model could be selected",
+        ))
+    } else {
+        None
+    }
+}
+
 /// Dispatch a single JSON-RPC request to the appropriate handler.
 fn dispatch_request(
     method: &str,
@@ -420,9 +454,8 @@ fn dispatch_request(
         // ── tools/call ───────────────────────────────────────────────────
         "tools/call" => {
             let Some(ctx) = ctx else {
-                return RpcMessage::error_response(
+                return RpcMessage::tool_error_response(
                     id.clone(),
-                    -32603,
                     "routing context not available — config or corpus could not be loaded",
                 );
             };
@@ -513,12 +546,8 @@ fn dispatch_request(
 
                     match ctx.route(&arguments.task, tier) {
                         Ok(route) => {
-                            if route.primary.is_empty() || route.reason.is_empty() {
-                                return RpcMessage::error_response(
-                                    id.clone(),
-                                    -32603,
-                                    "routing decision is empty — no valid model could be selected",
-                                );
+                            if let Some(response) = empty_route_response(id, &route) {
+                                return response;
                             }
                             let result = ToolCallResult {
                                 content: vec![
@@ -542,9 +571,8 @@ fn dispatch_request(
                                 serde_json::to_value(result).unwrap(),
                             )
                         }
-                        Err(e) => RpcMessage::error_response(
+                        Err(e) => RpcMessage::tool_error_response(
                             id.clone(),
-                            -32603,
                             &format!("tool execution failed: {e}"),
                         ),
                     }
@@ -658,11 +686,16 @@ fn dispatch_request(
                             })
                             .unwrap(),
                         ),
-                        Err(e) => RpcMessage::error_response(
-                            id.clone(),
-                            -32603,
-                            &format!("{} failed: {e}", args.name),
-                        ),
+                        Err(e) => {
+                            let socket = ctx.daemon_socket.display();
+                            RpcMessage::tool_error_response(
+                                id.clone(),
+                                &format!(
+                                    "{} failed: {e} (daemon socket: {socket}; if the socket is missing, start the daemon, e.g. `zeroclaw daemon start`, so the socket exists)",
+                                    args.name
+                                ),
+                            )
+                        }
                     }
                 }
                 unknown => RpcMessage::error_response(
@@ -966,10 +999,62 @@ mod tests {
             Some(&ctx),
             &tools,
         );
-        // No daemon is expected in a unit test; the important contract here is
-        // that the MCP wrapper recognizes the real SOP tool name rather than
-        // returning `unknown tool`.
-        assert_ne!(response["error"]["message"], "unknown tool: sop_list");
+        // No daemon is expected in a unit test; per MCP the failure must
+        // surface as a tool result with isError=true (readable by the
+        // calling model), not as a JSON-RPC protocol error.
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("sop_list failed"),
+            "tool error text should name the tool; got: {text}"
+        );
+        let socket = ctx.daemon_socket.display().to_string();
+        assert!(
+            text.contains(&socket),
+            "tool error text should name the socket path {socket}; got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("daemon"),
+            "tool error text should tell how to fix it; got: {text}"
+        );
+    }
+
+    #[test]
+    fn sop_list_failure_with_absent_socket_returns_is_error_result() {
+        // Regression test for NG2-ZD-005: with the daemon socket absent,
+        // tools/call sop_list must return result.isError=true with a text
+        // block naming the socket path and the fix — not an `error` member.
+        let mut ctx = RoutingContext::load_with_fixture();
+        ctx.daemon_socket =
+            std::path::PathBuf::from("/nonexistent-zoder-test-dir-8f3a2/daemon.sock");
+        let tools = tools_list();
+        let params = serde_json::json!({"name": SOP_LIST, "arguments": {}});
+        let response = dispatch_request(
+            "tools/call",
+            &Some(params),
+            &Value::Number(23.into()),
+            Some(&ctx),
+            &tools,
+        );
+        assert!(
+            response.get("error").is_none(),
+            "tool failure must not be a protocol error; got: {response}"
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("/nonexistent-zoder-test-dir-8f3a2/daemon.sock"),
+            "text must name the socket path; got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("daemon"),
+            "text must describe the fix; got: {text}"
+        );
     }
 
     #[test]
@@ -1404,14 +1489,83 @@ mod tests {
 
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 200);
-        // Should be an error (has "error" field, no "result" field)
-        assert!(response.get("error").is_some());
-        assert!(response.get("result").is_none());
-        assert_eq!(response["error"]["code"], -32603);
-        assert!(response["error"]["message"]
+        // Tool-level failure: success envelope with isError=true, no
+        // JSON-RPC protocol `error` member.
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
             .as_str()
-            .unwrap()
-            .contains("routing context not available"));
+            .unwrap_or("");
+        assert!(
+            text.contains("routing context not available"),
+            "tool error text should explain the failure; got: {text}"
+        );
+    }
+
+    /// Tool execution failure (router error) must surface as
+    /// result.isError=true, not a protocol error. Argument validation
+    /// errors (-32602) remain protocol errors.
+    #[test]
+    fn dispatch_tools_call_route_failure_returns_is_error_result() {
+        // A fixture context with no backed providers forces ctx.route to
+        // fail, exercising the execution-failure path.
+        let mut ctx = RoutingContext::load_with_fixture();
+        ctx.cfg.providers.clear();
+        let tools = tools_list();
+        let params = serde_json::json!({
+            "name": "zoder_route",
+            "arguments": {
+                "task": "fix the login bug in auth.py"
+            }
+        });
+        let response = dispatch_request(
+            "tools/call",
+            &Some(params),
+            &Value::Number(201.into()),
+            Some(&ctx),
+            &tools,
+        );
+
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("tool execution failed"),
+            "tool error text should describe the failure; got: {text}"
+        );
+    }
+
+    /// An empty routing decision must surface as result.isError=true, not
+    /// a JSON-RPC protocol error.
+    #[test]
+    fn empty_route_response_returns_is_error_result() {
+        let empty = Route {
+            primary: String::new(),
+            fallbacks: Vec::new(),
+            reason: String::new(),
+            host_cooldown: false,
+        };
+        let response =
+            empty_route_response(&Value::Number(202.into()), &empty).expect("empty route");
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            text.contains("routing decision is empty"),
+            "tool error text should describe the failure; got: {text}"
+        );
+
+        let actionable = Route {
+            primary: "alpha/hello".to_string(),
+            fallbacks: Vec::new(),
+            reason: "test".to_string(),
+            host_cooldown: false,
+        };
+        assert!(empty_route_response(&Value::Number(203.into()), &actionable).is_none());
     }
 }
 
