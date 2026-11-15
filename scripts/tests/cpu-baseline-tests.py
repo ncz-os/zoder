@@ -182,7 +182,6 @@ def test_runtime_guard_present() -> None:
     for token in (
         '"sse4.2"',
         '"popcnt"',
-        '"avx"',
         'cfg!(target_feature = "avx2")',
         'cfg!(target_feature = "bmi1")',
         'cfg!(target_feature = "bmi2")',
@@ -200,7 +199,7 @@ def test_runtime_guard_present() -> None:
     # `zoder --version` on an old CPU reports cleanly instead of SIGILL).
     # NOTE: search the call site AFTER main's definition — the function's
     # own `fn missing_cpu_features()` definition precedes main().
-    # NOTE 2: the guard requires the full v2 floor (sse4.2/popcnt/avx)
+    # NOTE 2: the guard requires the full v2 floor (sse4.2/popcnt)
     # unconditionally, plus any v3 feature (avx2/bmi1/bmi2/fma) the binary
     # was compiled to assume — so all of these tokens must appear.
     main_fn = text.find("async fn main()")
@@ -208,7 +207,9 @@ def test_runtime_guard_present() -> None:
     parse = text.find("Cli::parse()", main_fn)
     if main_fn == -1 or call == -1:
         fail_("CPU guard is not wired into main()")
-    elif parse != -1 and not (main_fn < call < parse):
+    elif parse == -1:
+        fail_("Cli::parse() not found in main(); ordering check cannot be verified")
+    elif not (main_fn < call < parse):
         fail_("CPU guard does not run before CLI parsing in main()")
     else:
         pass_("CPU guard runs at process entry, before CLI parsing")
