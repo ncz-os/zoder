@@ -29,7 +29,9 @@ job packages the two Linux targets and uploads them. It runs when:
 
 A manual dispatch without that input builds and attaches the `.deb` files as
 workflow artifacts but does **not** touch the live registry, so the packaging
-can be exercised without shipping.
+can be exercised without shipping. (An explicit manual dispatch with
+`publish_apt: true` publishes whatever was built — it is a deliberate human
+override, not the automatic tag path.)
 
 The job is additionally guarded on the `BUILDKITE_PACKAGES_TOKEN` secret being
 present; if it is missing the job is skipped rather than failed, so an
@@ -38,6 +40,18 @@ unconfigured registry never turns a green release red.
 ### Versioning
 
 - Tag build (`v0.2.1`) → deb version `0.2.1`.
+- Release-candidate tag (`v0.3.0-rc1`) → deb version `0.3.0~rc1`.
+  The `~` makes the RC sort *below* the matching final release in Debian
+  version comparison (`0.3.0~rc1` < `0.3.0`), so an RC can never shadow
+  the real release for `apt upgrade`. A `-rc1` suffix would sort *above*
+  the final release — which is why the raw tag is never used verbatim.
+  The mapping lives in `packaging/deb/deb-version.sh`; anything that is
+  not `vX.Y.Z` or `vX.Y.0-rcN` (RCs only on `.0`) is rejected before
+  anything is built or published.
+- Release candidates are built and attached to the GitHub release as
+  artifacts, but the `publish-apt` job skips them — only final-release
+  tags (and explicit manual `publish_apt` dispatches) reach the live
+  registry.
 - Manual dispatch → `0.2.1~dev<YYYYMMDD>.<short-sha>`. The `~` makes the dev
   build sort *below* the matching release in Debian version comparison, so a
   dispatch build can never shadow a real release for `apt upgrade`.

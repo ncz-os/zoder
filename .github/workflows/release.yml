@@ -54,8 +54,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            # v0.2.1 -> 0.2.1
-            DEB_VERSION="${GITHUB_REF_NAME#v}"
+            # Release tags are `vX.Y.Z`, release candidates `vX.Y.0-rcN`.
+            # The helper maps vX.Y.0-rcN -> X.Y.0~rcN (`~` sorts BELOW the
+            # final release in Debian comparison; `-rcN` would sort above
+            # it) and rejects anything else before anything is published.
+            DEB_VERSION="$(packaging/deb/deb-version.sh "${GITHUB_REF_NAME}")"
           else
             CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
             # `sed | head` exits 0 on no match, so pipefail won't catch a miss;
@@ -82,15 +85,17 @@ jobs:
 
   # Ship the Linux .debs to https://packages.buildkite.com/ncz-os/ncz.
   #
-  # Publishing is deliberately narrow: a `v*` tag always publishes, and a manual
-  # run only publishes when explicitly asked for. That keeps the packaging path
-  # exercisable (artifacts are produced on every run) without any run being able
-  # to push to the live registry by accident.
+  # Publishing is deliberately narrow: a final-release `v*` tag publishes,
+  # and a manual run only publishes when explicitly asked for. Release
+  # candidates (`vX.Y.0-rcN`) are built and attached to the release but
+  # never reach the live registry. That keeps the packaging path
+  # exercisable (artifacts are produced on every run) without any run being
+  # able to push an RC or an accident to the live registry.
   publish-apt:
     name: publish to ncz-os/ncz APT registry
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref_type == 'tag' || inputs.publish_apt
+    if: (github.ref_type == 'tag' && !contains(github.ref_name, '-rc')) || inputs.publish_apt
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
