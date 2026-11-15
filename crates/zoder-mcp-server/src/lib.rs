@@ -515,7 +515,10 @@ fn dispatch_request(
                         }
                     };
 
-                    match ctx.route("", tier) {
+                    // Pass the validated label through. Routing ignores it
+                    // (RoutingContext::route never reads its task argument),
+                    // so results are byte-identical with or without a task.
+                    match ctx.route(task_label.unwrap_or(""), tier) {
                         Ok(route) => {
                             if route.primary.is_empty() || route.reason.is_empty() {
                                 return RpcMessage::error_response(
