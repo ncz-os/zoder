@@ -46,14 +46,13 @@ jobs:
           cargo build --release --locked --bin zoder --target "${{ matrix.target }}"
       - name: Verify x86_64 baseline (no AVX2/BMI/FMA codegen)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64-v2
         shell: bash
         run: |
           set -euo pipefail
-          # Guards the x86_64 baseline: compile a probe with the same RUSTFLAGS
-          # used for cargo (pinned `-C target-cpu=x86-64-v2` via RUSTFLAGS and
-          # the `.cargo/config.toml` pin) and assert the v3 codegen features
+          # Guards the x86_64 baseline: compile a probe with the same pinned
+          # flag cargo uses (`-C target-cpu=x86-64-v2`, carried in the Build
+          # step's RUSTFLAGS and in `.cargo/config.toml`) and assert the v3
+          # codegen features
           # are all off. This checks the EMITTED TARGET FEATURES the flag
           # selects — a raw `objdump` mnemonic grep would false-positive on
           # ring's runtime-CPUID-dispatched AVX2 crypto assembly, which never
@@ -74,7 +73,10 @@ jobs:
               }
           }
           EOF
-          rustc --edition 2021 $RUSTFLAGS /tmp/cpu-baseline-probe.rs -o /tmp/cpu-baseline-probe
+          # The flag is hard-coded here (not taken from $RUSTFLAGS) so the
+          # step never fails on an unbound variable under `set -u`; it is
+          # identical to the Build step's RUSTFLAGS and the in-repo pin.
+          rustc --edition 2021 -C target-cpu=x86-64-v2 /tmp/cpu-baseline-probe.rs -o /tmp/cpu-baseline-probe
           /tmp/cpu-baseline-probe
       - name: Package
         shell: bash

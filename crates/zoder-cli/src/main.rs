@@ -2802,7 +2802,7 @@ fn refuse_unsupported_cpu() -> ! {
     let missing = missing_cpu_features();
     eprintln!("{}", unsupported_cpu_message(&missing));
     eprintln!(
-        "this zoder binary requires x86-64-v2 (SSE4.2/POPCNT/AVX); \
+        "this zoder binary requires CPU features this host lacks; \
          install a build for an older baseline or run on a newer host"
     );
     std::process::exit(EXIT_UNSUPPORTED_CPU);
