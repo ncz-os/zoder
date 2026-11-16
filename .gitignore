@@ -48,6 +48,7 @@ bench/raw/
 # development artifacts — never commit them.
 /t
 /.tmpbuild/
+/.tmp-cpu-baseline/
 
 # Local build target for this job workspace (kept on local disk, never /tmp).
 /.build-target/

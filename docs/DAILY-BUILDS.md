@@ -8,6 +8,21 @@ The active nightly is GitHub Actions [`native-builds.yml`](../.github/workflows/
 - The engine is the latest canonical GitLab `ncz-os/zeroclaw` **master**, including the fork's integration changes. The source gate also resolves upstream master once and requires it to be an ancestor of that fork commit. A delayed or failed source sync makes the nightly fail clearly rather than silently shipping a stale engine; cron times alone do not establish ordering.
 - The fork is reconciled by the scheduled GitLab job [`zeroclaw-fork-sync`](../.gitlab-ci.yml) (`scripts/ci/zeroclaw-fork-sync.sh`), which merges upstream into the fork on the reliable 09:00 UTC GitLab schedule — an hour before this build. The fork's own GitHub `daily-master-sync` is a second, best-effort driver; GitHub silently auto-disables scheduled workflows on forks/inactive repositories, so it is not the guarantee. A sync conflict fails that GitLab pipeline without pushing, and `buildwatch_gitlab` files it to MNEMOS.
 - Both full SHAs are resolved once and shared by all matrix legs. Every Cargo build uses `--locked`; dependency drift fails the build.
+- x86_64 CPU baseline (POOL-ZD-001): the x86_64 artifact targets **x86-64-v2**
+  (SSE4.2/POPCNT/AVX, no AVX2/BMI/FMA required) — the floor older pool hosts meet
+  (the Dell pool host has AVX only). The pin lives in `.cargo/config.toml`
+  (`target.x86_64-unknown-linux-gnu.rustflags = -C target-cpu=x86-64-v2`)
+  and is re-exported as `RUSTFLAGS` in both `release.yml` and this workflow,
+  so a config edit cannot silently lift the baseline. Non-x86 targets keep
+  the toolchain default (no flag). Each x86_64 build then compiles a probe
+  with the same flags and fails when any v3 codegen feature (AVX2/BMI/FMA)
+  is enabled — an emitted-features check, not a raw disassembly grep (which
+  would false-positive on ring's runtime-CPUID-dispatched AVX2 crypto).
+  As a backstop, `zoder` checks CPUID at startup and exits 69 with
+  `unsupported CPU: missing <flag>` (stderr) when a binary built for a
+  higher baseline lands on an older CPU — instead of dying with SIGILL
+  (exit 132). `scripts/tests/cpu-baseline-tests.py` pins all of this.
+  Tagged releases (`release.yml`) carry the same pin and gate.
 - Every archive contains `manifest.json`: exact repository/commit pairs, target, run URL, immutable channel, and SHA-256 hashes of all three binaries. The raw package channel also contains `manifest.json-<target>` plus its checksum.
 - Each run publishes `run-<run-id>-<source-job-attempt>` alongside the legacy date/master binary paths. After every target and both publishers succeed, `master/release.json` activates that complete immutable snapshot. Fleet pullers read this pointer once, verify its target manifest hash and source identity, then verify the three binary hashes from the immutable channel. A partial publish never activates the new snapshot.
 - Both targets must succeed before publication begins. Existing GitHub downloads remain available during compilation. Uploads across the package service and GitHub are not an atomic transaction; publication errors fail the run and must be retried.

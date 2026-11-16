@@ -2739,9 +2739,106 @@ pub(crate) fn process_start_instant() -> std::time::Instant {
     *START.get_or_init(std::time::Instant::now)
 }
 
+/// The x86-64 baseline every release artifact targets (POOL-ZD-001).
+///
+/// The shipped zoder 0.2.1 x86_64 binary died with SIGILL (exit 132) on pool
+/// hosts without AVX2/BMI/FMA (Dell test host: AVX only), so even
+/// `zoder config --validate` killed the fleet deploy. The build pin
+/// (`.cargo/config.toml` + the release/nightly workflows) keeps new
+/// artifacts on this floor; this guard is the backstop for a binary built
+/// for a HIGHER baseline landing on an older CPU: fail fast with a readable
+/// message instead of dying mid-command on an illegal instruction.
+///
+/// Returns the missing feature names (e.g. `["avx2", "bmi1"]`). Empty means
+/// the CPU can run this binary. x86-only by construction: non-x86 targets
+/// take the fallback arm, which reports nothing.
+#[cfg(target_arch = "x86_64")]
+fn missing_cpu_features() -> Vec<&'static str> {
+    // std-only CPUID detection: `std::arch::is_x86_feature_detected!`
+    // works on every x86_64 target with no extra dependency.
+    let mut missing = Vec::new();
+    // The x86-64-v2 floor this binary needs on the host: SSE4.2 + POPCNT
+    // + AVX. (AVX is required: the pin targets full v2, and the first
+    // 3-operand VEX instruction SIGILLs an AVX-less CPU just as dead as
+    // AVX2 does an AVX-only one.)
+    if !std::arch::is_x86_feature_detected!("sse4.2") {
+        missing.push("sse4.2");
+    }
+    if !std::arch::is_x86_feature_detected!("popcnt") {
+        missing.push("popcnt");
+    }
+    if !std::arch::is_x86_feature_detected!("avx") {
+        missing.push("avx");
+    }
+    // Plus whatever THIS binary was compiled to assume: when the baseline
+    // pin regresses (e.g. a `-C target-cpu=x86-64-v3` or `-mcpu=native`
+    // build), the binary carries its own assumption and reports the gap
+    // at startup instead of SIGILLing on the Dell host. Under the pin
+    // these `cfg!`s are all false, so the guard requires exactly v2.
+    if cfg!(target_feature = "avx2") && !std::arch::is_x86_feature_detected!("avx2") {
+        missing.push("avx2");
+    }
+    if cfg!(target_feature = "bmi1") && !std::arch::is_x86_feature_detected!("bmi1") {
+        missing.push("bmi1");
+    }
+    if cfg!(target_feature = "bmi2") && !std::arch::is_x86_feature_detected!("bmi2") {
+        missing.push("bmi2");
+    }
+    if cfg!(target_feature = "fma") && !std::arch::is_x86_feature_detected!("fma") {
+        missing.push("fma");
+    }
+    missing
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn missing_cpu_features() -> Vec<&'static str> {
+    Vec::new()
+}
+
+/// Exit code for "this CPU cannot run this binary".
+///
+/// `69` is `EX_UNAVAILABLE` in BSD sysexits.h — "service unavailable".
+/// A too-new binary on a too-old CPU is exactly that: nothing is
+/// misconfigured and nothing is transient, the binary simply cannot run
+/// here. Distinct from every rung in `docs/EXIT_CODES.md` (10/20/30/40/50/
+/// 60) and from the generic `1`, so a fleet deploy can branch on it.
+const EXIT_UNSUPPORTED_CPU: i32 = 69;
+
+/// The stderr body for an unsupported-CPU refusal, minus the trailing hint.
+///
+/// Split out so it is unit-testable: the test asserts on THIS function, not
+/// on a re-typed copy of the string.
+fn unsupported_cpu_message(missing: &[&str]) -> String {
+    format!("unsupported CPU: missing {}", missing.join(" "))
+}
+
+/// Fail fast when this binary needs CPU features the host lacks.
+///
+/// Runs at process entry, BEFORE Clap parsing, so even `zoder --version`
+/// on an old CPU reports cleanly instead of dying with SIGILL halfway
+/// through the command. Prints `unsupported CPU: missing <flag...>` on
+/// stderr: the exact `<flag>` tokens (`sse4.2`, `popcnt`, `avx`, `avx2`,
+/// ...) match `/proc/cpuinfo` names, so an operator can compare directly.
+fn refuse_unsupported_cpu() -> ! {
+    let missing = missing_cpu_features();
+    eprintln!("{}", unsupported_cpu_message(&missing));
+    eprintln!(
+        "this zoder binary requires CPU features this host lacks; \
+         install a build for an older baseline or run on a newer host"
+    );
+    std::process::exit(EXIT_UNSUPPORTED_CPU);
+}
+
 #[tokio::main]
 async fn main() {
     let _ = process_start_instant();
+    // POOL-ZD-001: a binary built for a higher baseline than the host CPU
+    // dies with SIGILL (exit 132) on the first AVX2/BMI/FMA instruction —
+    // with no message. Check BEFORE anything else (Clap parsing, tracing,
+    // telemetry) so the failure names the missing feature.
+    if !missing_cpu_features().is_empty() {
+        refuse_unsupported_cpu();
+    }
     // Restore default SIGPIPE handling so piping into `head`/`less` (which close
     // the reader early) ends the process quietly instead of panicking on a
     // broken pipe mid-table.
@@ -25033,6 +25130,78 @@ mod exec_error_detail_tests {
 #[cfg(test)]
 mod budget_decline_exit_tests {
     use super::*;
+
+    /// POOL-ZD-001: the x86_64 release baseline is x86-64-v2, and a binary
+    /// built for a higher baseline must fail fast with
+    /// `unsupported CPU: missing <flag>` (exit 69) instead of SIGILL.
+    ///
+    /// Field complaint: the shipped zoder 0.2.1 x86_64 binary died with
+    /// SIGILL (exit 132) on pool hosts without AVX2/BMI/FMA (Dell test
+    /// host: AVX only), so `zoder config --validate` killed the fleet
+    /// config deploy with no message.
+    #[test]
+    fn the_unsupported_cpu_exit_code_is_distinct() {
+        // 69 is EX_UNAVAILABLE: distinct from the generic 1, the budget 78,
+        // and every failure-contract rung (10/20/30/40/50/60).
+        assert_eq!(EXIT_UNSUPPORTED_CPU, 69);
+        assert_ne!(EXIT_UNSUPPORTED_CPU, 1);
+        assert_ne!(EXIT_UNSUPPORTED_CPU, EXIT_BUDGET_EXCEEDED);
+        for contract_code in [10, 20, 30, 40, 50, 60] {
+            assert_ne!(EXIT_UNSUPPORTED_CPU, contract_code);
+        }
+    }
+
+    /// On this build host the CPU meets the baseline, so the guard reports
+    /// nothing missing. (A host that genuinely lacks SSE4.2/POPCNT cannot
+    /// run the test binary either; the missing-flag path is covered by the
+    /// message-format assertion below and the python baseline suite.)
+    #[test]
+    fn a_baseline_cpu_reports_no_missing_features() {
+        assert!(
+            missing_cpu_features().is_empty(),
+            "this host must meet the baseline to run the suite: missing {:?}",
+            missing_cpu_features()
+        );
+    }
+
+    /// The guard message names the missing flags in `/proc/cpuinfo` spelling
+    /// (`sse4.2`, `popcnt`, `avx`, `avx2`, ...), so an operator can compare
+    /// directly. Asserts on the REAL message helper, not a re-typed copy.
+    #[test]
+    fn the_guard_message_names_cpuinfo_flags() {
+        assert_eq!(
+            unsupported_cpu_message(&["sse4.2", "popcnt"]),
+            "unsupported CPU: missing sse4.2 popcnt"
+        );
+        assert_eq!(
+            unsupported_cpu_message(&["avx2", "bmi1", "bmi2", "fma"]),
+            "unsupported CPU: missing avx2 bmi1 bmi2 fma"
+        );
+        // The refusal path prints exactly this message: keep the two in
+        // sync by construction (both call `unsupported_cpu_message`).
+        assert!(unsupported_cpu_message(&["avx"]).contains("avx"));
+    }
+
+    /// The guard requires the full v2 floor (SSE4.2/POPCNT/AVX): a binary
+    /// built for a HIGHER baseline carries its own compile-time assumption
+    /// (`cfg!(target_feature = ...)`) and reports the gap instead of
+    /// SIGILLing. Under the repo's v2 pin none of the v3 assumptions are
+    /// compiled in, so the v3 arms contribute nothing here.
+    #[test]
+    fn the_guard_covers_the_v3_extensions_when_compiled_in() {
+        // Under the x86-64-v2 pin the binary assumes no v3 feature: the
+        // only requirements are the v2 floor, which this host meets.
+        // (`cfg!` is a compile-time constant, so assert on the tuple, not
+        // on four constant asserts — clippy's `missing_const_for_fn`
+        // family flags constant-value assertions.)
+        let assumed_v3 = (
+            cfg!(target_feature = "avx2"),
+            cfg!(target_feature = "bmi1"),
+            cfg!(target_feature = "bmi2"),
+            cfg!(target_feature = "fma"),
+        );
+        assert_eq!(assumed_v3, (false, false, false, false));
+    }
 
     /// D2/D8 fix (6): an over-budget decline is reported with a DISTINCT exit
     /// code, not the generic `1`.

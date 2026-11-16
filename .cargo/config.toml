@@ -1,0 +1,14 @@
+# x86_64 release baseline pin (POOL-ZD-001): the shipped zoder 0.2.1 x86_64
+# binary died with SIGILL (exit 132) on pool hosts without AVX2/BMI/FMA
+# (Dell test host: AVX only), so `zoder config --validate` killed the fleet
+# config deploy. Rust defaults the target CPU to the *build host's* CPU
+# unless told otherwise, so the artifact's ISA floated with the builder.
+#
+# Pin the x86_64 baseline to x86-64-v2 (SSE4.2/POPCNT/SSSE3/AVX, no AVX2/
+# BMI/FMA required): the documented floor every release artifact targets.
+# Cargo applies these rustflags to every x86_64-unknown-linux-gnu build
+# from this repo (local, CI, containers); the release/nightly workflows
+# export the same flag explicitly so a workflow edit cannot silently drop
+# the pin. Non-x86 targets are deliberately untouched.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
