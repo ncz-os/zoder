@@ -32,6 +32,8 @@ jobs:
           rustup default 1.96.1
           rustup target add "${{ matrix.target }}"
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C target-cpu=x86-64-v2' || '' }}
         shell: bash
         # x86_64 baseline pin (POOL-ZD-001): the shipped 0.2.1 x86_64 binary
         # died with SIGILL on pool hosts without AVX2/BMI/FMA. The x86_64
@@ -41,13 +43,11 @@ jobs:
         # keeps the workflow self-describing so a config edit cannot
         # silently lift the baseline.
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> $GITHUB_ENV
-            export RUSTFLAGS="-C target-cpu=x86-64-v2"
-          fi
           cargo build --release --locked --bin zoder --target "${{ matrix.target }}"
       - name: Verify x86_64 baseline (no AVX2/BMI/FMA codegen)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v2
         shell: bash
         run: |
           set -euo pipefail
