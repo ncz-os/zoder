@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-15",
+  "generated": "2026-11-16",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "abliteration/abliterated-model": {
@@ -5984,31 +5984,31 @@
       }
     },
     "deepseek/deepseek-v4.1-flash": {
-      "input_usd_per_mtok": 0.050699999999999995,
-      "output_usd_per_mtok": 0.20279999999999998,
+      "input_usd_per_mtok": 0.14,
+      "output_usd_per_mtok": 0.42,
       "off_peak": {
-        "input_usd_per_mtok": 0.02535,
-        "output_usd_per_mtok": 0.1014,
+        "input_usd_per_mtok": 0.07,
+        "output_usd_per_mtok": 0.21,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
     },
     "deepseek/deepseek-v4.1-flash-1017": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6,
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2,
       "off_peak": {
-        "input_usd_per_mtok": 0.075,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.6,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
     },
     "deepseek/deepseek-v4.1-flash-1017:batch": {
-      "input_usd_per_mtok": 0.023,
-      "output_usd_per_mtok": 0.19999999999999998,
+      "input_usd_per_mtok": 0.043000000000000003,
+      "output_usd_per_mtok": 0.384,
       "off_peak": {
-        "input_usd_per_mtok": 0.0115,
-        "output_usd_per_mtok": 0.1,
+        "input_usd_per_mtok": 0.0215,
+        "output_usd_per_mtok": 0.192,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -9838,8 +9838,8 @@
       "output_usd_per_mtok": 0.09999999999999999
     },
     "google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.0675,
-      "output_usd_per_mtok": 0.22499999999999998
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.3
     },
     "google/gemma-4-26b-a4b-it:free": {
       "input_usd_per_mtok": 0.0,
@@ -10399,7 +10399,7 @@
     },
     "ibm-granite/granite-4.2-8b": {
       "input_usd_per_mtok": 0.06,
-      "output_usd_per_mtok": 0.25
+      "output_usd_per_mtok": 0.15
     },
     "in.moonshotai.kimi-k3": {
       "input_usd_per_mtok": 3.3000000000000003,
@@ -11686,8 +11686,8 @@
       "cache_read_usd_per_mtok": 0.015
     },
     "minimax/minimax-m2.5": {
-      "input_usd_per_mtok": 0.27,
-      "output_usd_per_mtok": 0.95
+      "input_usd_per_mtok": 0.295,
+      "output_usd_per_mtok": 1.2
     },
     "minimax/minimax-m2.7": {
       "input_usd_per_mtok": 0.21,
@@ -12218,12 +12218,12 @@
       "output_usd_per_mtok": 16.0
     },
     "moonshotai/kimi-k3.1-pro": {
-      "input_usd_per_mtok": 0.22319999999999998,
-      "output_usd_per_mtok": 8.4114
+      "input_usd_per_mtok": 0.2403,
+      "output_usd_per_mtok": 8.402299999999999
     },
     "moonshotai/kimi-k3.1-pro:batch": {
-      "input_usd_per_mtok": 0.33,
-      "output_usd_per_mtok": 4.95
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 6.0
     },
     "moonshotai/kimi-k3:batch": {
       "input_usd_per_mtok": 2.2800000000000002,
@@ -14052,8 +14052,8 @@
       "output_usd_per_mtok": 0.6
     },
     "openai/gpt-5.6-sol": {
-      "input_usd_per_mtok": 4.4,
-      "output_usd_per_mtok": 22.0
+      "input_usd_per_mtok": 4.0,
+      "output_usd_per_mtok": 20.0
     },
     "openai/gpt-5.6-sol-pro": {
       "input_usd_per_mtok": 4.0,
@@ -14188,8 +14188,8 @@
       "output_usd_per_mtok": 0.136
     },
     "openai/gpt-oss-20b": {
-      "input_usd_per_mtok": 0.03,
-      "output_usd_per_mtok": 0.13
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.3
     },
     "openai/gpt-oss-20b:batch": {
       "input_usd_per_mtok": 0.024,
@@ -14756,10 +14756,6 @@
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.6
     },
-    "qwen/qwen3-vl-30b-a3b-thinking": {
-      "input_usd_per_mtok": 0.29,
-      "output_usd_per_mtok": 1.0
-    },
     "qwen/qwen3-vl-8b-instruct": {
       "input_usd_per_mtok": 0.25,
       "output_usd_per_mtok": 0.75
@@ -14777,12 +14773,12 @@
       "output_usd_per_mtok": 1.0
     },
     "qwen/qwen3.5-397b-a17b": {
-      "input_usd_per_mtok": 0.6,
-      "output_usd_per_mtok": 3.5999999999999996
+      "input_usd_per_mtok": 0.44999999999999996,
+      "output_usd_per_mtok": 3.0
     },
     "qwen/qwen3.5-9b": {
-      "input_usd_per_mtok": 0.065,
-      "output_usd_per_mtok": 0.096
+      "input_usd_per_mtok": 0.027,
+      "output_usd_per_mtok": 0.039
     },
     "qwen/qwen3.5-flash-02-23": {
       "input_usd_per_mtok": 0.065,
@@ -14859,6 +14855,10 @@
     "qwen/qwen3.8-omni-flash": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.47
+    },
+    "qwen/qwen4-max": {
+      "input_usd_per_mtok": 1.5,
+      "output_usd_per_mtok": 4.5
     },
     "qwen_ai_platform/deepseek-v4-flash": {
       "input_usd_per_mtok": 0.19999999999999998,
@@ -15915,10 +15915,6 @@
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 0.72
     },
-    "stepfun/step-3.5-flash": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.3
-    },
     "stepfun/step-3.7-flash": {
       "input_usd_per_mtok": 0.19999999999999998,
       "output_usd_per_mtok": 1.15
@@ -16185,10 +16181,6 @@
       "input_usd_per_mtok": 0.37,
       "output_usd_per_mtok": 1.25,
       "cache_read_usd_per_mtok": 0.075
-    },
-    "tencent/hunyuan-a13b-instruct": {
-      "input_usd_per_mtok": 0.14,
-      "output_usd_per_mtok": 0.5700000000000001
     },
     "tencent/hy-mt2-1.8b": {
       "input_usd_per_mtok": 0.044,
@@ -18855,8 +18847,8 @@
       "output_usd_per_mtok": 2.2
     },
     "z-ai/glm-4.5-air": {
-      "input_usd_per_mtok": 0.19999999999999998,
-      "output_usd_per_mtok": 1.1
+      "input_usd_per_mtok": 0.13,
+      "output_usd_per_mtok": 0.85
     },
     "z-ai/glm-4.5v": {
       "input_usd_per_mtok": 0.6,
@@ -18895,8 +18887,8 @@
       "output_usd_per_mtok": 6.8
     },
     "z-ai/glm-5.3": {
-      "input_usd_per_mtok": 0.08399999999999999,
-      "output_usd_per_mtok": 3.5999999999999996
+      "input_usd_per_mtok": 0.0699,
+      "output_usd_per_mtok": 1.4
     },
     "z-ai/glm-5.3-flash": {
       "input_usd_per_mtok": 0.0399,
@@ -18919,8 +18911,8 @@
       "output_usd_per_mtok": 8.8
     },
     "z-ai/glm-5.3:batch": {
-      "input_usd_per_mtok": 0.257,
-      "output_usd_per_mtok": 0.791
+      "input_usd_per_mtok": 0.44999999999999996,
+      "output_usd_per_mtok": 2.0
     },
     "z-ai/glm-5v-turbo": {
       "input_usd_per_mtok": 1.2,
@@ -19102,10 +19094,10 @@
       "output_usd_per_mtok": 10.0
     },
     "~deepseek/deepseek-flash-latest": {
-      "input_usd_per_mtok": 0.019,
+      "input_usd_per_mtok": 0.018,
       "output_usd_per_mtok": 0.25,
       "peak": {
-        "input_usd_per_mtok": 0.038,
+        "input_usd_per_mtok": 0.036,
         "output_usd_per_mtok": 0.5,
         "windows": [
           {
