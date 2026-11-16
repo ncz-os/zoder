@@ -50,8 +50,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Guards the x86_64 baseline: compile a probe with the same RUSTFLAGS
-          # used for cargo (pinned `-C target-cpu=x86-64-v2` via RUSTFLAGS and
+          # Guards the x86_64 baseline: compile a probe with the pinned
+          # `-C target-cpu=x86-64-v2` flag (same flag as RUSTFLAGS above and
           # the `.cargo/config.toml` pin) and assert the v3 codegen features
           # are all off. This checks the EMITTED TARGET FEATURES the flag
           # selects — a raw `objdump` mnemonic grep would false-positive on
@@ -73,7 +73,7 @@ jobs:
               }
           }
           EOF
-          rustc --edition 2021 $RUSTFLAGS /tmp/cpu-baseline-probe.rs -o /tmp/cpu-baseline-probe
+          rustc --edition 2021 -C target-cpu=x86-64-v2 /tmp/cpu-baseline-probe.rs -o /tmp/cpu-baseline-probe
           /tmp/cpu-baseline-probe
       - name: Package
         shell: bash
