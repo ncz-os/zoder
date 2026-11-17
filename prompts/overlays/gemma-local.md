@@ -49,7 +49,7 @@ with a trailing comma, which fails JSON parsing and costs a retry.
 | Claim | Kind | Source |
 |-------|------|--------|
 | gemma ids in the served corpus | MEASURED | `corpus/model_corpus.json` (`aiand/google/gemma-4-31b-it`, `aihubmix/gemma-4-26b-a4b-it`, …) |
-| gemma is a known local reviewer route on this host (`custom.reviewer` serves `cerberus-reviewer` on the gemma-family vLLM box) | MEASURED | `~/.zoder/config.toml` `[providers.models.custom.reviewer]` + the fleet topology |
+| gemma is a known local reviewer route on this host (`custom.reviewer` serves the local reviewer on the gemma-family vLLM box) | MEASURED | `~/.zoder/config.toml` `[providers.models.custom.reviewer]` + the fleet topology |
 | W1 (turn ends on a status line) | **UNVERIFIED** | observed family behaviour, not logged |
 | W2 (over-asking) | **UNVERIFIED** | observed family behaviour, not logged |
 | W3 (malformed tool arguments) | **UNVERIFIED** | observed family behaviour, not logged |

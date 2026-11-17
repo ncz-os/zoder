@@ -129,8 +129,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Every MCP protocol version whose behaviour the server really implements,
 /// in ascending (oldest-first) order.
-pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2024-11-05", "2025-03-26", "2025-06-18"];
+pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 /// Negotiate the protocol version for an `initialize` request.
 ///

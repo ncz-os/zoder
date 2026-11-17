@@ -119,6 +119,7 @@ corpus-tests:
     TMPDIR: "$CI_PROJECT_DIR/.tmp"
   before_script:
     - mkdir -p "$CI_PROJECT_DIR/.tmp"
+    - pip install --quiet -r scripts/ci/corpus-requirements.txt
   script:
     - python3 scripts/tests/corpus-freshness-tests.py
     - python3 scripts/tests/corpus-gate-split-tests.py
