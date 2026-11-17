@@ -754,6 +754,18 @@
   },
   "w_swe": 0.58
  },
+ "ember-1": {
+  "agentic_score": 0.218,
+  "capability": {
+   "terminal_bench": {
+    "acc": 21.82,
+    "date": "2026-09-24",
+    "harness": "mini-swe-agent",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.609
+ },
  "fable-5": {
   "agentic_score": 0.556,
   "capability": {
@@ -918,7 +930,7 @@
   "w_swe": 0.882
  },
  "gemini-3-1": {
-  "agentic_score": 0.51,
+  "agentic_score": 0.394,
   "arena_coding_elo": 1446.4,
   "arena_webdev_elo": 1446.4,
   "capability": {
@@ -931,6 +943,12 @@
     "cost_per_test": 0.7834,
     "latency_s": 312.3,
     "source": "vals.ai"
+   },
+   "terminal_bench": {
+    "acc": 2.73,
+    "date": "2026-02-19",
+    "harness": "Antigravity CLI",
+    "source": "terminal-bench"
    }
   },
   "preference": {
