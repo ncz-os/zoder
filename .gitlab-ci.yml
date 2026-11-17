@@ -356,8 +356,8 @@ zeroclaw-fork-sync:
 # whose CPU has no AVX2, then runs the binary there. That is the SIGILL
 # regression test no shared runner can give us (they all have AVX2).
 # Only a protected-ref pipeline can reach this runner, and it only takes jobs
-# tagged ncz-legacy-x86. Output publication is done by the runner host's own
-# build script, not by this file.
+# tagged ncz-legacy-x86. The host build script writes the binary to
+# NCZ_LEGACY_BINARY (target/release/zoder); this job publishes it after smoke.
 legacy-x86-build:
   stage: legacy
   tags:
@@ -369,7 +369,11 @@ legacy-x86-build:
     GIT_DEPTH: "1"
   script:
     - export NCZ_ZODER_SRC="$CI_PROJECT_DIR"
+    - export NCZ_LEGACY_BINARY="$CI_PROJECT_DIR/target/release/zoder"
     - flock -w 7200 "$HOME/.cache/legacy-zoder-build.lock" "$HOME/bin/ncz-legacy-zoder-build"
+    - python3 scripts/tests/legacy-release-tests.py
+    - python3 scripts/ci/legacy-release.py "$NCZ_LEGACY_BINARY"
+    - printf '%s\n' "$NCZ_LEGACY_BINARY"
   rules:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
     - if: "$CI_PIPELINE_SOURCE == \"web\""
