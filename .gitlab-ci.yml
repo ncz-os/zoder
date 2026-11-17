@@ -7,6 +7,7 @@ stages:
   - test
   - security
   - upstream
+  - legacy
 
 # -- corpus: daily model / pricing / bench sync -------------------------------
 # Refreshes the public artifacts every zoder client raw-pulls from master:
@@ -349,3 +350,26 @@ zeroclaw-fork-sync:
     - if: "$CI_PIPELINE_SOURCE == \"schedule\""
     - if: "$CI_PIPELINE_SOURCE == \"web\""
       when: manual
+
+# -- legacy-x86-build: real old-CPU build + smoke test -----------------------
+# Builds zoder with the repo's x86-64-v2 baseline pin on a dedicated runner
+# whose CPU has no AVX2, then runs the binary there. That is the SIGILL
+# regression test no shared runner can give us (they all have AVX2).
+# Only a protected-ref pipeline can reach this runner, and it only takes jobs
+# tagged ncz-legacy-x86. Output publication is done by the runner host's own
+# build script, not by this file.
+legacy-x86-build:
+  stage: legacy
+  tags:
+    - ncz-legacy-x86
+  needs: []
+  cache: {}
+  timeout: 3h
+  variables:
+    GIT_DEPTH: "1"
+  script:
+    - export NCZ_ZODER_SRC="$CI_PROJECT_DIR"
+    - flock -w 7200 "$HOME/.cache/legacy-zoder-build.lock" "$HOME/bin/ncz-legacy-zoder-build"
+  rules:
+    - if: "$CI_PIPELINE_SOURCE == \"schedule\""
+    - if: "$CI_PIPELINE_SOURCE == \"web\""
