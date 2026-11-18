@@ -1787,6 +1787,10 @@
       "output_usd_per_mtok": 4.4,
       "cache_read_usd_per_mtok": 0.275
     },
+    "azure/us-gov/gpt-4-turbo": {
+      "input_usd_per_mtok": 12.5,
+      "output_usd_per_mtok": 37.5
+    },
     "azure/us-gov/gpt-4.1": {
       "input_usd_per_mtok": 2.75,
       "output_usd_per_mtok": 11.0,
@@ -1801,6 +1805,20 @@
       "input_usd_per_mtok": 3.438,
       "output_usd_per_mtok": 13.75,
       "cache_read_usd_per_mtok": 1.719
+    },
+    "azure/us-gov/gpt-4o-2024-05-13": {
+      "input_usd_per_mtok": 6.25,
+      "output_usd_per_mtok": 18.75
+    },
+    "azure/us-gov/gpt-4o-2024-11-20": {
+      "input_usd_per_mtok": 3.438,
+      "output_usd_per_mtok": 13.75,
+      "cache_read_usd_per_mtok": 1.719
+    },
+    "azure/us-gov/gpt-4o-mini": {
+      "input_usd_per_mtok": 0.207,
+      "output_usd_per_mtok": 0.8250000000000001,
+      "cache_read_usd_per_mtok": 0.10400000000000001
     },
     "azure/us-gov/gpt-5.1": {
       "input_usd_per_mtok": 1.71875,
@@ -1823,6 +1841,11 @@
       "cache_read_usd_per_mtok": 0.275
     },
     "azure/us-gov/o3-mini": {
+      "input_usd_per_mtok": 1.513,
+      "output_usd_per_mtok": 6.05,
+      "cache_read_usd_per_mtok": 0.757
+    },
+    "azure/us-gov/o3-mini-2025-01-31": {
       "input_usd_per_mtok": 1.513,
       "output_usd_per_mtok": 6.05,
       "cache_read_usd_per_mtok": 0.757
@@ -2920,6 +2943,30 @@
       "output_usd_per_mtok": 0.5,
       "cache_read_usd_per_mtok": 0.03
     },
+    "bedrock/ap-east-2/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 3.01
+    },
+    "bedrock/ap-northeast-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.396,
+      "output_usd_per_mtok": 3.311,
+      "cache_read_usd_per_mtok": 0.099
+    },
+    "bedrock/ap-northeast-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288,
+      "cache_read_usd_per_mtok": 0.018
+    },
+    "bedrock/ap-northeast-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.041999999999999996,
+      "output_usd_per_mtok": 0.16799999999999998,
+      "cache_read_usd_per_mtok": 0.010499999999999999
+    },
+    "bedrock/ap-northeast-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.96,
+      "output_usd_per_mtok": 3.84,
+      "cache_read_usd_per_mtok": 0.24
+    },
     "bedrock/ap-northeast-1/anthropic.claude-instant-v1": {
       "input_usd_per_mtok": 2.23,
       "output_usd_per_mtok": 7.55
@@ -2932,9 +2979,43 @@
       "input_usd_per_mtok": 8.0,
       "output_usd_per_mtok": 24.0
     },
+    "bedrock/ap-northeast-1/apac.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288,
+      "cache_read_usd_per_mtok": 0.018
+    },
+    "bedrock/ap-northeast-1/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.96,
+      "output_usd_per_mtok": 3.84,
+      "cache_read_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-northeast-1/deepseek.v3-v1:0": {
+      "input_usd_per_mtok": 0.701666,
+      "output_usd_per_mtok": 2.0324109999999997
+    },
     "bedrock/ap-northeast-1/deepseek.v3.2": {
       "input_usd_per_mtok": 0.74,
       "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/ap-northeast-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 3.01
+    },
+    "bedrock/ap-northeast-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/ap-northeast-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.28,
+      "output_usd_per_mtok": 0.45999999999999996
+    },
+    "bedrock/ap-northeast-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09999999999999999
+    },
+    "bedrock/ap-northeast-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.4500000000000002
     },
     "bedrock/ap-northeast-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
@@ -2944,6 +3025,30 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/ap-northeast-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/ap-northeast-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock/ap-northeast-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-northeast-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock/ap-northeast-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock/ap-northeast-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
     "bedrock/ap-northeast-1/mistral.voxtral-mini-3b-2507": {
       "input_usd_per_mtok": 0.049999999999999996,
       "output_usd_per_mtok": 0.049999999999999996
@@ -2951,6 +3056,10 @@
     "bedrock/ap-northeast-1/mistral.voxtral-small-24b-2507": {
       "input_usd_per_mtok": 0.12,
       "output_usd_per_mtok": 0.36
+    },
+    "bedrock/ap-northeast-1/moonshot.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.73,
+      "output_usd_per_mtok": 3.03
     },
     "bedrock/ap-northeast-1/moonshotai.kimi-k2-thinking": {
       "input_usd_per_mtok": 0.73,
@@ -2960,6 +3069,50 @@
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 3.5999999999999996
     },
+    "bedrock/ap-northeast-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/ap-northeast-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.29
+    },
+    "bedrock/ap-northeast-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock/ap-northeast-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/ap-northeast-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/ap-northeast-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock/ap-northeast-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/ap-northeast-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-northeast-1/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 1.06
+    },
+    "bedrock/ap-northeast-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/ap-northeast-1/qwen.qwen3-coder-480b-a35b-v1:0": {
+      "input_usd_per_mtok": 0.54,
+      "output_usd_per_mtok": 2.1799999999999997
+    },
     "bedrock/ap-northeast-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
@@ -2968,9 +3121,103 @@
       "input_usd_per_mtok": 0.18,
       "output_usd_per_mtok": 1.4500000000000002
     },
+    "bedrock/ap-northeast-1/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 3.22
+    },
+    "bedrock/ap-northeast-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/ap-northeast-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/ap-northeast-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/ap-northeast-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/ap-northeast-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.071,
+      "output_usd_per_mtok": 0.284,
+      "cache_read_usd_per_mtok": 0.01775
+    },
+    "bedrock/ap-northeast-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.041,
+      "output_usd_per_mtok": 0.164,
+      "cache_read_usd_per_mtok": 0.01025
+    },
+    "bedrock/ap-northeast-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.95,
+      "output_usd_per_mtok": 3.8,
+      "cache_read_usd_per_mtok": 0.2375
+    },
+    "bedrock/ap-northeast-2/apac.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.071,
+      "output_usd_per_mtok": 0.284,
+      "cache_read_usd_per_mtok": 0.01775
+    },
+    "bedrock/ap-northeast-2/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.95,
+      "output_usd_per_mtok": 3.8,
+      "cache_read_usd_per_mtok": 0.2375
+    },
+    "bedrock/ap-northeast-2/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 2.96
+    },
+    "bedrock/ap-south-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.071,
+      "output_usd_per_mtok": 0.284,
+      "cache_read_usd_per_mtok": 0.01775
+    },
+    "bedrock/ap-south-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.041,
+      "output_usd_per_mtok": 0.164,
+      "cache_read_usd_per_mtok": 0.01025
+    },
+    "bedrock/ap-south-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.94,
+      "output_usd_per_mtok": 3.76,
+      "cache_read_usd_per_mtok": 0.235
+    },
+    "bedrock/ap-south-1/apac.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.071,
+      "output_usd_per_mtok": 0.284,
+      "cache_read_usd_per_mtok": 0.01775
+    },
+    "bedrock/ap-south-1/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.94,
+      "output_usd_per_mtok": 3.76,
+      "cache_read_usd_per_mtok": 0.235
+    },
+    "bedrock/ap-south-1/deepseek.v3-v1:0": {
+      "input_usd_per_mtok": 0.682424,
+      "output_usd_per_mtok": 1.976678
+    },
     "bedrock/ap-south-1/deepseek.v3.2": {
       "input_usd_per_mtok": 0.74,
       "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/ap-south-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 2.95
+    },
+    "bedrock/ap-south-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock/ap-south-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock/ap-south-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
     },
     "bedrock/ap-south-1/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 3.18,
@@ -2980,6 +3227,10 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 0.72
     },
+    "bedrock/ap-south-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
+    },
     "bedrock/ap-south-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
@@ -2987,6 +3238,54 @@
     "bedrock/ap-south-1/minimax.minimax-m2.5": {
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
+    },
+    "bedrock/ap-south-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/ap-south-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock/ap-south-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-south-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock/ap-south-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock/ap-south-1/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-south-1/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 4.8,
+      "output_usd_per_mtok": 14.399999999999999
+    },
+    "bedrock/ap-south-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock/ap-south-1/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.54,
+      "output_usd_per_mtok": 0.84
+    },
+    "bedrock/ap-south-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock/ap-south-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/ap-south-1/moonshot.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.71,
+      "output_usd_per_mtok": 2.94
     },
     "bedrock/ap-south-1/moonshotai.kimi-k2-thinking": {
       "input_usd_per_mtok": 0.71,
@@ -2996,6 +3295,50 @@
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 3.5999999999999996
     },
+    "bedrock/ap-south-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock/ap-south-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock/ap-south-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock/ap-south-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/ap-south-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock/ap-south-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/ap-south-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock/ap-south-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/ap-south-1/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.26,
+      "output_usd_per_mtok": 1.04
+    },
+    "bedrock/ap-south-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock/ap-south-1/qwen.qwen3-coder-480b-a35b-v1:0": {
+      "input_usd_per_mtok": 0.53,
+      "output_usd_per_mtok": 2.12
+    },
     "bedrock/ap-south-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
@@ -3004,9 +3347,101 @@
       "input_usd_per_mtok": 0.18,
       "output_usd_per_mtok": 1.4100000000000001
     },
+    "bedrock/ap-south-1/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.13
+    },
+    "bedrock/ap-south-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/ap-south-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/ap-south-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/ap-south-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/ap-southeast-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.081,
+      "output_usd_per_mtok": 0.324,
+      "cache_read_usd_per_mtok": 0.02025
+    },
+    "bedrock/ap-southeast-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.047,
+      "output_usd_per_mtok": 0.188,
+      "cache_read_usd_per_mtok": 0.01175
+    },
+    "bedrock/ap-southeast-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.08,
+      "output_usd_per_mtok": 4.32,
+      "cache_read_usd_per_mtok": 0.27
+    },
+    "bedrock/ap-southeast-1/apac.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.081,
+      "output_usd_per_mtok": 0.324,
+      "cache_read_usd_per_mtok": 0.02025
+    },
+    "bedrock/ap-southeast-1/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.08,
+      "output_usd_per_mtok": 4.32,
+      "cache_read_usd_per_mtok": 0.27
+    },
+    "bedrock/ap-southeast-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.41,
+      "output_usd_per_mtok": 3.39
+    },
+    "bedrock/ap-southeast-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.063,
+      "output_usd_per_mtok": 0.252,
+      "cache_read_usd_per_mtok": 0.01575
+    },
+    "bedrock/ap-southeast-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.037,
+      "output_usd_per_mtok": 0.148,
+      "cache_read_usd_per_mtok": 0.00925
+    },
+    "bedrock/ap-southeast-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.84,
+      "output_usd_per_mtok": 3.36,
+      "cache_read_usd_per_mtok": 0.21
+    },
+    "bedrock/ap-southeast-2/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 1.91
+    },
+    "bedrock/ap-southeast-2/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.32,
+      "output_usd_per_mtok": 2.63
+    },
+    "bedrock/ap-southeast-2/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 1.24
+    },
     "bedrock/ap-southeast-2/minimax.minimax-m2.5": {
       "input_usd_per_mtok": 0.31,
       "output_usd_per_mtok": 1.24
+    },
+    "bedrock/ap-southeast-2/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.41,
+      "output_usd_per_mtok": 2.06
+    },
+    "bedrock/ap-southeast-2/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.26
+    },
+    "bedrock/ap-southeast-2/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 5.2,
+      "output_usd_per_mtok": 15.6
+    },
+    "bedrock/ap-southeast-2/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 0.9099999999999999
     },
     "bedrock/ap-southeast-2/mistral.voxtral-mini-3b-2507": {
       "input_usd_per_mtok": 0.0412,
@@ -3016,13 +3451,49 @@
       "input_usd_per_mtok": 0.103,
       "output_usd_per_mtok": 0.309
     },
+    "bedrock/ap-southeast-2/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.09
+    },
+    "bedrock/ap-southeast-2/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.67
+    },
+    "bedrock/ap-southeast-2/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.52,
+      "output_usd_per_mtok": 1.24
+    },
     "bedrock/ap-southeast-2/qwen.qwen3-next-80b-a3b": {
       "input_usd_per_mtok": 0.1545,
       "output_usd_per_mtok": 1.236
     },
+    "bedrock/ap-southeast-2/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock/ap-southeast-2/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 2.27
+    },
+    "bedrock/ap-southeast-2/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.41
+    },
+    "bedrock/ap-southeast-2/zai.glm-5": {
+      "input_usd_per_mtok": 1.03,
+      "output_usd_per_mtok": 3.3000000000000003
+    },
+    "bedrock/ap-southeast-3/deepseek.v3-v1:0": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.74
+    },
     "bedrock/ap-southeast-3/deepseek.v3.2": {
       "input_usd_per_mtok": 0.74,
       "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/ap-southeast-3/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.32,
+      "output_usd_per_mtok": 2.64
     },
     "bedrock/ap-southeast-3/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
@@ -3032,13 +3503,112 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/ap-southeast-3/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
     "bedrock/ap-southeast-3/moonshotai.kimi-k2.5": {
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 3.5999999999999996
     },
+    "bedrock/ap-southeast-3/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/ap-southeast-3/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock/ap-southeast-3/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock/ap-southeast-3/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9099999999999999
+    },
+    "bedrock/ap-southeast-3/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock/ap-southeast-3/qwen.qwen3-coder-480b-a35b-v1:0": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.87
+    },
     "bedrock/ap-southeast-3/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
+    },
+    "bedrock/ap-southeast-3/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/ap-southeast-3/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/ap-southeast-3/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/ap-southeast-3/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/ap-southeast-4/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.065,
+      "output_usd_per_mtok": 0.26,
+      "cache_read_usd_per_mtok": 0.01625
+    },
+    "bedrock/ap-southeast-4/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.87,
+      "output_usd_per_mtok": 3.48,
+      "cache_read_usd_per_mtok": 0.2175
+    },
+    "bedrock/ap-southeast-4/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.87,
+      "output_usd_per_mtok": 3.48,
+      "cache_read_usd_per_mtok": 0.2175
+    },
+    "bedrock/ap-southeast-4/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.71
+    },
+    "bedrock/ap-southeast-5/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288,
+      "cache_read_usd_per_mtok": 0.018
+    },
+    "bedrock/ap-southeast-5/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.41,
+      "output_usd_per_mtok": 3.39
+    },
+    "bedrock/ap-southeast-6/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.32,
+      "output_usd_per_mtok": 2.63
+    },
+    "bedrock/ap-southeast-7/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288,
+      "cache_read_usd_per_mtok": 0.018
+    },
+    "bedrock/ap-southeast-7/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.41,
+      "output_usd_per_mtok": 3.39
+    },
+    "bedrock/ca-central-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.352,
+      "output_usd_per_mtok": 2.9699999999999998,
+      "cache_read_usd_per_mtok": 0.088
+    },
+    "bedrock/ca-central-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.064,
+      "output_usd_per_mtok": 0.256,
+      "cache_read_usd_per_mtok": 0.016
+    },
+    "bedrock/ca-central-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.32,
+      "output_usd_per_mtok": 2.67
     },
     "bedrock/ca-central-1/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 3.05,
@@ -3047,6 +3617,27 @@
     "bedrock/ca-central-1/meta.llama3-8b-instruct-v1:0": {
       "input_usd_per_mtok": 0.35,
       "output_usd_per_mtok": 0.69
+    },
+    "bedrock/ca-central-1/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.16999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/ca-central-1/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 4.6,
+      "output_usd_per_mtok": 13.8
+    },
+    "bedrock/ca-central-1/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.52,
+      "output_usd_per_mtok": 0.8099999999999999
+    },
+    "bedrock/ca-west-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.374,
+      "output_usd_per_mtok": 3.091,
+      "cache_read_usd_per_mtok": 0.0935
+    },
+    "bedrock/ca-west-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33999999999999997,
+      "output_usd_per_mtok": 2.81
     },
     "bedrock/claude_platform/claude-fable-5": {
       "input_usd_per_mtok": 10.0,
@@ -3123,6 +3714,26 @@
       "output_usd_per_mtok": 10.0,
       "cache_read_usd_per_mtok": 0.09999999999999999
     },
+    "bedrock/eu-central-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.429,
+      "output_usd_per_mtok": 3.597,
+      "cache_read_usd_per_mtok": 0.10725
+    },
+    "bedrock/eu-central-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.078,
+      "output_usd_per_mtok": 0.312,
+      "cache_read_usd_per_mtok": 0.0195
+    },
+    "bedrock/eu-central-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.046,
+      "output_usd_per_mtok": 0.184,
+      "cache_read_usd_per_mtok": 0.0115
+    },
+    "bedrock/eu-central-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.0499999999999998,
+      "output_usd_per_mtok": 4.199999999999999,
+      "cache_read_usd_per_mtok": 0.26249999999999996
+    },
     "bedrock/eu-central-1/anthropic.claude-instant-v1": {
       "input_usd_per_mtok": 2.48,
       "output_usd_per_mtok": 8.379999999999999
@@ -3135,6 +3746,22 @@
       "input_usd_per_mtok": 8.0,
       "output_usd_per_mtok": 24.0
     },
+    "bedrock/eu-central-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/eu-central-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.39,
+      "output_usd_per_mtok": 3.27
+    },
+    "bedrock/eu-central-1/meta.llama3-2-1b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.13,
+      "output_usd_per_mtok": 0.13
+    },
+    "bedrock/eu-central-1/meta.llama3-2-3b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.19,
+      "output_usd_per_mtok": 0.19
+    },
     "bedrock/eu-central-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
@@ -3143,13 +3770,101 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/eu-central-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/eu-central-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock/eu-central-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/eu-central-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock/eu-central-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.39999999999999997
+    },
+    "bedrock/eu-central-1/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.29,
+      "output_usd_per_mtok": 1.16
+    },
+    "bedrock/eu-central-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
     "bedrock/eu-central-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/eu-central-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/eu-central-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/eu-central-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/eu-central-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/eu-north-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.363,
+      "output_usd_per_mtok": 2.992,
+      "cache_read_usd_per_mtok": 0.09075
+    },
+    "bedrock/eu-north-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.065,
+      "output_usd_per_mtok": 0.26,
+      "cache_read_usd_per_mtok": 0.01625
+    },
+    "bedrock/eu-north-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.038000000000000006,
+      "output_usd_per_mtok": 0.15200000000000002,
+      "cache_read_usd_per_mtok": 0.009500000000000001
+    },
+    "bedrock/eu-north-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.87,
+      "output_usd_per_mtok": 3.48,
+      "cache_read_usd_per_mtok": 0.2175
+    },
     "bedrock/eu-north-1/deepseek.v3.2": {
       "input_usd_per_mtok": 0.74,
       "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/eu-north-1/eu.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.363,
+      "output_usd_per_mtok": 2.992,
+      "cache_read_usd_per_mtok": 0.09075
+    },
+    "bedrock/eu-north-1/eu.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.065,
+      "output_usd_per_mtok": 0.26,
+      "cache_read_usd_per_mtok": 0.01625
+    },
+    "bedrock/eu-north-1/eu.amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.038000000000000006,
+      "output_usd_per_mtok": 0.15200000000000002,
+      "cache_read_usd_per_mtok": 0.009500000000000001
+    },
+    "bedrock/eu-north-1/eu.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.87,
+      "output_usd_per_mtok": 3.48,
+      "cache_read_usd_per_mtok": 0.2175
+    },
+    "bedrock/eu-north-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.7199999999999998
     },
     "bedrock/eu-north-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
@@ -3159,9 +3874,101 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/eu-north-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
     "bedrock/eu-north-1/moonshotai.kimi-k2.5": {
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock/eu-north-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/eu-north-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock/eu-north-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/eu-north-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/eu-north-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/eu-north-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/eu-south-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.5279999999999999,
+      "output_usd_per_mtok": 4.411,
+      "cache_read_usd_per_mtok": 0.13199999999999998
+    },
+    "bedrock/eu-south-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.096,
+      "output_usd_per_mtok": 0.384,
+      "cache_read_usd_per_mtok": 0.024
+    },
+    "bedrock/eu-south-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.056,
+      "output_usd_per_mtok": 0.224,
+      "cache_read_usd_per_mtok": 0.014
+    },
+    "bedrock/eu-south-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.28,
+      "output_usd_per_mtok": 5.21,
+      "cache_read_usd_per_mtok": 0.32
+    },
+    "bedrock/eu-south-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/eu-south-1/eu.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.5279999999999999,
+      "output_usd_per_mtok": 4.411,
+      "cache_read_usd_per_mtok": 0.13199999999999998
+    },
+    "bedrock/eu-south-1/eu.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.096,
+      "output_usd_per_mtok": 0.384,
+      "cache_read_usd_per_mtok": 0.024
+    },
+    "bedrock/eu-south-1/eu.amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.056,
+      "output_usd_per_mtok": 0.224,
+      "cache_read_usd_per_mtok": 0.014
+    },
+    "bedrock/eu-south-1/eu.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.28,
+      "output_usd_per_mtok": 5.21,
+      "cache_read_usd_per_mtok": 0.32
+    },
+    "bedrock/eu-south-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.48100000000000004,
+      "output_usd_per_mtok": 4.1
+    },
+    "bedrock/eu-south-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock/eu-south-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock/eu-south-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
+    },
+    "bedrock/eu-south-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
     },
     "bedrock/eu-south-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
@@ -3171,9 +3978,221 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/eu-south-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/eu-south-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock/eu-south-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-south-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock/eu-south-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock/eu-south-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock/eu-south-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/eu-south-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock/eu-south-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock/eu-south-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock/eu-south-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock/eu-south-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/eu-south-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock/eu-south-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.39999999999999997
+    },
+    "bedrock/eu-south-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock/eu-south-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-south-1/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.29,
+      "output_usd_per_mtok": 1.16
+    },
+    "bedrock/eu-south-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
     "bedrock/eu-south-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
+    },
+    "bedrock/eu-south-1/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.12
+    },
+    "bedrock/eu-south-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/eu-south-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/eu-south-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/eu-south-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/eu-south-2/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.363,
+      "output_usd_per_mtok": 3.2049999999999996,
+      "cache_read_usd_per_mtok": 0.09075
+    },
+    "bedrock/eu-south-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06599999999999999,
+      "output_usd_per_mtok": 0.26399999999999996,
+      "cache_read_usd_per_mtok": 0.016499999999999997
+    },
+    "bedrock/eu-south-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.039,
+      "output_usd_per_mtok": 0.156,
+      "cache_read_usd_per_mtok": 0.00975
+    },
+    "bedrock/eu-south-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.88,
+      "output_usd_per_mtok": 3.52,
+      "cache_read_usd_per_mtok": 0.22
+    },
+    "bedrock/eu-south-2/eu.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.363,
+      "output_usd_per_mtok": 3.2049999999999996,
+      "cache_read_usd_per_mtok": 0.09075
+    },
+    "bedrock/eu-south-2/eu.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06599999999999999,
+      "output_usd_per_mtok": 0.26399999999999996,
+      "cache_read_usd_per_mtok": 0.016499999999999997
+    },
+    "bedrock/eu-south-2/eu.amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.039,
+      "output_usd_per_mtok": 0.156,
+      "cache_read_usd_per_mtok": 0.00975
+    },
+    "bedrock/eu-south-2/eu.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.88,
+      "output_usd_per_mtok": 3.52,
+      "cache_read_usd_per_mtok": 0.22
+    },
+    "bedrock/eu-south-2/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.75
+    },
+    "bedrock/eu-west-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.374,
+      "output_usd_per_mtok": 3.157,
+      "cache_read_usd_per_mtok": 0.0935
+    },
+    "bedrock/eu-west-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06899999999999999,
+      "output_usd_per_mtok": 0.27599999999999997,
+      "cache_read_usd_per_mtok": 0.017249999999999998
+    },
+    "bedrock/eu-west-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.04,
+      "output_usd_per_mtok": 0.16,
+      "cache_read_usd_per_mtok": 0.01
+    },
+    "bedrock/eu-west-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.9199999999999999,
+      "output_usd_per_mtok": 3.6799999999999997,
+      "cache_read_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-west-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock/eu-west-1/eu.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.374,
+      "output_usd_per_mtok": 3.157,
+      "cache_read_usd_per_mtok": 0.0935
+    },
+    "bedrock/eu-west-1/eu.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06899999999999999,
+      "output_usd_per_mtok": 0.27599999999999997,
+      "cache_read_usd_per_mtok": 0.017249999999999998
+    },
+    "bedrock/eu-west-1/eu.amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.04,
+      "output_usd_per_mtok": 0.16,
+      "cache_read_usd_per_mtok": 0.01
+    },
+    "bedrock/eu-west-1/eu.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.9199999999999999,
+      "output_usd_per_mtok": 3.6799999999999997,
+      "cache_read_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-west-1/eu.meta.llama3-2-1b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.11
+    },
+    "bedrock/eu-west-1/eu.meta.llama3-2-3b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.16999999999999998,
+      "output_usd_per_mtok": 0.16999999999999998
+    },
+    "bedrock/eu-west-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33999999999999997,
+      "output_usd_per_mtok": 2.87
+    },
+    "bedrock/eu-west-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock/eu-west-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock/eu-west-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
+    },
+    "bedrock/eu-west-1/meta.llama3-2-1b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.11
+    },
+    "bedrock/eu-west-1/meta.llama3-2-3b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.16999999999999998,
+      "output_usd_per_mtok": 0.16999999999999998
     },
     "bedrock/eu-west-1/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 2.8600000000000003,
@@ -3183,6 +4202,10 @@
       "input_usd_per_mtok": 0.32,
       "output_usd_per_mtok": 0.65
     },
+    "bedrock/eu-west-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
+    },
     "bedrock/eu-west-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
@@ -3190,6 +4213,86 @@
     "bedrock/eu-west-1/minimax.minimax-m2.5": {
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
+    },
+    "bedrock/eu-west-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/eu-west-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock/eu-west-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-west-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock/eu-west-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock/eu-west-1/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.22
+    },
+    "bedrock/eu-west-1/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 4.300000000000001,
+      "output_usd_per_mtok": 13.0
+    },
+    "bedrock/eu-west-1/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.49,
+      "output_usd_per_mtok": 0.76
+    },
+    "bedrock/eu-west-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock/eu-west-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/eu-west-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock/eu-west-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock/eu-west-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock/eu-west-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock/eu-west-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/eu-west-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock/eu-west-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/eu-west-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock/eu-west-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-west-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
     },
     "bedrock/eu-west-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
@@ -3199,6 +4302,62 @@
       "input_usd_per_mtok": 0.18,
       "output_usd_per_mtok": 1.4100000000000001
     },
+    "bedrock/eu-west-1/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.12
+    },
+    "bedrock/eu-west-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/eu-west-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/eu-west-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/eu-west-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/eu-west-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.08399999999999999,
+      "output_usd_per_mtok": 0.33599999999999997
+    },
+    "bedrock/eu-west-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.049,
+      "output_usd_per_mtok": 0.196
+    },
+    "bedrock/eu-west-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.13,
+      "output_usd_per_mtok": 4.52
+    },
+    "bedrock/eu-west-2/deepseek.v3-v1:0": {
+      "input_usd_per_mtok": 0.8999849999999999,
+      "output_usd_per_mtok": 2.606853
+    },
+    "bedrock/eu-west-2/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.961,
+      "output_usd_per_mtok": 2.8675
+    },
+    "bedrock/eu-west-2/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.42,
+      "output_usd_per_mtok": 3.52
+    },
+    "bedrock/eu-west-2/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.14,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock/eu-west-2/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 0.59
+    },
+    "bedrock/eu-west-2/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.12
+    },
     "bedrock/eu-west-2/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 3.45,
       "output_usd_per_mtok": 4.55
@@ -3206,6 +4365,10 @@
     "bedrock/eu-west-2/meta.llama3-8b-instruct-v1:0": {
       "input_usd_per_mtok": 0.39,
       "output_usd_per_mtok": 0.78
+    },
+    "bedrock/eu-west-2/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.8599999999999999
     },
     "bedrock/eu-west-2/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.47,
@@ -3215,6 +4378,38 @@
       "input_usd_per_mtok": 0.47,
       "output_usd_per_mtok": 1.8599999999999999
     },
+    "bedrock/eu-west-2/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.1
+    },
+    "bedrock/eu-west-2/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.78,
+      "output_usd_per_mtok": 2.33
+    },
+    "bedrock/eu-west-2/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock/eu-west-2/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.16
+    },
+    "bedrock/eu-west-2/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock/eu-west-2/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.26
+    },
+    "bedrock/eu-west-2/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 5.2,
+      "output_usd_per_mtok": 15.6
+    },
+    "bedrock/eu-west-2/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 0.9099999999999999
+    },
     "bedrock/eu-west-2/mistral.voxtral-mini-3b-2507": {
       "input_usd_per_mtok": 0.06,
       "output_usd_per_mtok": 0.06
@@ -3223,9 +4418,53 @@
       "input_usd_per_mtok": 0.16,
       "output_usd_per_mtok": 0.47
     },
+    "bedrock/eu-west-2/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 4.65
+    },
+    "bedrock/eu-west-2/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock/eu-west-2/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.37
+    },
+    "bedrock/eu-west-2/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.36
+    },
     "bedrock/eu-west-2/nvidia.nemotron-super-3-120b": {
       "input_usd_per_mtok": 0.22999999999999998,
       "output_usd_per_mtok": 1.01
+    },
+    "bedrock/eu-west-2/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock/eu-west-2/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.47
+    },
+    "bedrock/eu-west-2/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock/eu-west-2/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock/eu-west-2/qwen.qwen3-235b-a22b-2507-v1:0": {
+      "input_usd_per_mtok": 0.33999999999999997,
+      "output_usd_per_mtok": 1.37
+    },
+    "bedrock/eu-west-2/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock/eu-west-2/qwen.qwen3-coder-480b-a35b-v1:0": {
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 2.79
     },
     "bedrock/eu-west-2/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.78,
@@ -3234,6 +4473,82 @@
     "bedrock/eu-west-2/qwen.qwen3-next-80b-a3b": {
       "input_usd_per_mtok": 0.22999999999999998,
       "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock/eu-west-2/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.82,
+      "output_usd_per_mtok": 4.12
+    },
+    "bedrock/eu-west-2/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock/eu-west-2/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 3.41
+    },
+    "bedrock/eu-west-2/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock/eu-west-2/zai.glm-5": {
+      "input_usd_per_mtok": 1.55,
+      "output_usd_per_mtok": 4.96
+    },
+    "bedrock/eu-west-3/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.48400000000000004,
+      "output_usd_per_mtok": 4.058999999999999,
+      "cache_read_usd_per_mtok": 0.12100000000000001
+    },
+    "bedrock/eu-west-3/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.088,
+      "output_usd_per_mtok": 0.352,
+      "cache_read_usd_per_mtok": 0.022
+    },
+    "bedrock/eu-west-3/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.052000000000000005,
+      "output_usd_per_mtok": 0.20800000000000002,
+      "cache_read_usd_per_mtok": 0.013000000000000001
+    },
+    "bedrock/eu-west-3/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.18,
+      "output_usd_per_mtok": 4.72,
+      "cache_read_usd_per_mtok": 0.295
+    },
+    "bedrock/eu-west-3/eu.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.48400000000000004,
+      "output_usd_per_mtok": 4.058999999999999,
+      "cache_read_usd_per_mtok": 0.12100000000000001
+    },
+    "bedrock/eu-west-3/eu.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.088,
+      "output_usd_per_mtok": 0.352,
+      "cache_read_usd_per_mtok": 0.022
+    },
+    "bedrock/eu-west-3/eu.amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.052000000000000005,
+      "output_usd_per_mtok": 0.20800000000000002,
+      "cache_read_usd_per_mtok": 0.013000000000000001
+    },
+    "bedrock/eu-west-3/eu.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.18,
+      "output_usd_per_mtok": 4.72,
+      "cache_read_usd_per_mtok": 0.295
+    },
+    "bedrock/eu-west-3/eu.meta.llama3-2-3b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.19999999999999998
+    },
+    "bedrock/eu-west-3/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.44,
+      "output_usd_per_mtok": 3.69
+    },
+    "bedrock/eu-west-3/meta.llama3-2-1b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.13,
+      "output_usd_per_mtok": 0.13
+    },
+    "bedrock/eu-west-3/meta.llama3-2-3b-instruct-v1:0": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.19999999999999998
     },
     "bedrock/eu-west-3/mistral.mistral-7b-instruct-v0:2": {
       "input_usd_per_mtok": 0.19999999999999998,
@@ -3246,6 +4561,35 @@
     "bedrock/eu-west-3/mistral.mixtral-8x7b-instruct-v0:1": {
       "input_usd_per_mtok": 0.59,
       "output_usd_per_mtok": 0.9099999999999999
+    },
+    "bedrock/il-central-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.3,
+      "cache_read_usd_per_mtok": 0.01875
+    },
+    "bedrock/il-central-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.044,
+      "output_usd_per_mtok": 0.176,
+      "cache_read_usd_per_mtok": 0.011
+    },
+    "bedrock/il-central-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 4.0,
+      "cache_read_usd_per_mtok": 0.25
+    },
+    "bedrock/il-central-1/apac.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.3,
+      "cache_read_usd_per_mtok": 0.01875
+    },
+    "bedrock/il-central-1/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 4.0,
+      "cache_read_usd_per_mtok": 0.25
+    },
+    "bedrock/il-central-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.38,
+      "output_usd_per_mtok": 3.13
     },
     "bedrock/invoke/anthropic.claude-3-5-sonnet-20240620-v1:0": {
       "input_usd_per_mtok": 3.0,
@@ -3261,11 +4605,6 @@
       "input_usd_per_mtok": 1.1,
       "output_usd_per_mtok": 5.5,
       "cache_read_usd_per_mtok": 0.11
-    },
-    "bedrock/mantle/anthropic.claude-haiku-5-5": {
-      "input_usd_per_mtok": 0.11,
-      "output_usd_per_mtok": 0.55,
-      "cache_read_usd_per_mtok": 0.011
     },
     "bedrock/mantle/anthropic.claude-mythos-5": {
       "input_usd_per_mtok": 11.0,
@@ -3297,10 +4636,25 @@
       "output_usd_per_mtok": 11.0,
       "cache_read_usd_per_mtok": 0.22
     },
-    "bedrock/mantle/anthropic.claude-sonnet-5-5": {
-      "input_usd_per_mtok": 2.2,
-      "output_usd_per_mtok": 11.0,
-      "cache_read_usd_per_mtok": 0.11
+    "bedrock/me-central-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.24,
+      "cache_read_usd_per_mtok": 0.015
+    },
+    "bedrock/me-central-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.035,
+      "output_usd_per_mtok": 0.14,
+      "cache_read_usd_per_mtok": 0.00875
+    },
+    "bedrock/me-central-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.7999999999999999,
+      "output_usd_per_mtok": 3.1999999999999997,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "bedrock/me-central-1/apac.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.7999999999999999,
+      "output_usd_per_mtok": 3.1999999999999997,
+      "cache_read_usd_per_mtok": 0.19999999999999998
     },
     "bedrock/moonshotai.kimi-k2-thinking": {
       "input_usd_per_mtok": 0.6,
@@ -3314,6 +4668,18 @@
       "input_usd_per_mtok": 0.74,
       "output_usd_per_mtok": 2.2199999999999998
     },
+    "bedrock/sa-east-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock/sa-east-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.28,
+      "output_usd_per_mtok": 0.45999999999999996
+    },
+    "bedrock/sa-east-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09999999999999999
+    },
     "bedrock/sa-east-1/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 4.45,
       "output_usd_per_mtok": 5.88
@@ -3321,6 +4687,10 @@
     "bedrock/sa-east-1/meta.llama3-8b-instruct-v1:0": {
       "input_usd_per_mtok": 0.5,
       "output_usd_per_mtok": 1.01
+    },
+    "bedrock/sa-east-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.4500000000000002
     },
     "bedrock/sa-east-1/minimax.minimax-m2.1": {
       "input_usd_per_mtok": 0.36,
@@ -3330,6 +4700,54 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 1.44
     },
+    "bedrock/sa-east-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock/sa-east-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock/sa-east-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/sa-east-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock/sa-east-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock/sa-east-1/mistral.mistral-7b-instruct-v0:2": {
+      "input_usd_per_mtok": 0.25,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock/sa-east-1/mistral.mistral-large-2402-v1:0": {
+      "input_usd_per_mtok": 6.7,
+      "output_usd_per_mtok": 20.2
+    },
+    "bedrock/sa-east-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock/sa-east-1/mistral.mixtral-8x7b-instruct-v0:1": {
+      "input_usd_per_mtok": 0.76,
+      "output_usd_per_mtok": 1.18
+    },
+    "bedrock/sa-east-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock/sa-east-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock/sa-east-1/moonshot.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.73,
+      "output_usd_per_mtok": 3.03
+    },
     "bedrock/sa-east-1/moonshotai.kimi-k2-thinking": {
       "input_usd_per_mtok": 0.73,
       "output_usd_per_mtok": 3.03
@@ -3338,6 +4756,42 @@
       "input_usd_per_mtok": 0.72,
       "output_usd_per_mtok": 3.5999999999999996
     },
+    "bedrock/sa-east-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/sa-east-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.29
+    },
+    "bedrock/sa-east-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock/sa-east-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock/sa-east-1/openai.gpt-oss-120b-1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/sa-east-1/openai.gpt-oss-20b-1:0": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock/sa-east-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock/sa-east-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock/sa-east-1/qwen.qwen3-32b-v1:0": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
     "bedrock/sa-east-1/qwen.qwen3-coder-next": {
       "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 1.44
@@ -3345,6 +4799,46 @@
     "bedrock/sa-east-1/qwen.qwen3-next-80b-a3b": {
       "input_usd_per_mtok": 0.18,
       "output_usd_per_mtok": 1.4500000000000002
+    },
+    "bedrock/sa-east-1/qwen.qwen3-vl-235b-a22b": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 3.22
+    },
+    "bedrock/sa-east-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock/sa-east-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock/sa-east-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock/sa-east-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock/us-east-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.75,
+      "cache_read_usd_per_mtok": 0.0825
+    },
+    "bedrock/us-east-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.24,
+      "cache_read_usd_per_mtok": 0.015
+    },
+    "bedrock/us-east-1/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.035,
+      "output_usd_per_mtok": 0.14,
+      "cache_read_usd_per_mtok": 0.00875
+    },
+    "bedrock/us-east-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.7999999999999999,
+      "output_usd_per_mtok": 3.1999999999999997,
+      "cache_read_usd_per_mtok": 0.19999999999999998
     },
     "bedrock/us-east-1/anthropic.claude-instant-v1": {
       "input_usd_per_mtok": 0.7999999999999999,
@@ -3405,6 +4899,26 @@
     "bedrock/us-east-1/zai.glm-5": {
       "input_usd_per_mtok": 1.0,
       "output_usd_per_mtok": 3.1999999999999997
+    },
+    "bedrock/us-east-2/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.75,
+      "cache_read_usd_per_mtok": 0.0825
+    },
+    "bedrock/us-east-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.24,
+      "cache_read_usd_per_mtok": 0.015
+    },
+    "bedrock/us-east-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.035,
+      "output_usd_per_mtok": 0.14,
+      "cache_read_usd_per_mtok": 0.00875
+    },
+    "bedrock/us-east-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.7999999999999999,
+      "output_usd_per_mtok": 3.1999999999999997,
+      "cache_read_usd_per_mtok": 0.19999999999999998
     },
     "bedrock/us-east-2/deepseek.v3.2": {
       "input_usd_per_mtok": 0.62,
@@ -3684,6 +5198,23 @@
       "input_usd_per_mtok": 0.08399999999999999,
       "output_usd_per_mtok": 0.36
     },
+    "bedrock/us-west-1/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.429,
+      "output_usd_per_mtok": 3.351,
+      "cache_read_usd_per_mtok": 0.10725
+    },
+    "bedrock/us-west-1/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.077,
+      "output_usd_per_mtok": 0.308
+    },
+    "bedrock/us-west-1/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.03,
+      "output_usd_per_mtok": 4.12
+    },
+    "bedrock/us-west-1/global.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.39,
+      "output_usd_per_mtok": 3.21
+    },
     "bedrock/us-west-1/meta.llama3-70b-instruct-v1:0": {
       "input_usd_per_mtok": 2.65,
       "output_usd_per_mtok": 3.5
@@ -3691,6 +5222,39 @@
     "bedrock/us-west-1/meta.llama3-8b-instruct-v1:0": {
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 0.6
+    },
+    "bedrock/us-west-1/us.amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.429,
+      "output_usd_per_mtok": 3.351,
+      "cache_read_usd_per_mtok": 0.10725
+    },
+    "bedrock/us-west-1/us.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.077,
+      "output_usd_per_mtok": 0.308
+    },
+    "bedrock/us-west-1/us.amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 1.03,
+      "output_usd_per_mtok": 4.12
+    },
+    "bedrock/us-west-2/amazon.nova-2-lite-v1:0": {
+      "input_usd_per_mtok": 0.33,
+      "output_usd_per_mtok": 2.75,
+      "cache_read_usd_per_mtok": 0.0825
+    },
+    "bedrock/us-west-2/amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.24,
+      "cache_read_usd_per_mtok": 0.015
+    },
+    "bedrock/us-west-2/amazon.nova-micro-v1:0": {
+      "input_usd_per_mtok": 0.035,
+      "output_usd_per_mtok": 0.14,
+      "cache_read_usd_per_mtok": 0.00875
+    },
+    "bedrock/us-west-2/amazon.nova-pro-v1:0": {
+      "input_usd_per_mtok": 0.7999999999999999,
+      "output_usd_per_mtok": 3.1999999999999997,
+      "cache_read_usd_per_mtok": 0.19999999999999998
     },
     "bedrock/us-west-2/anthropic.claude-instant-v1": {
       "input_usd_per_mtok": 0.7999999999999999,
@@ -3799,6 +5363,594 @@
       "output_usd_per_mtok": 11.0,
       "cache_read_usd_per_mtok": 0.11
     },
+    "bedrock_mantle/ap-northeast-1/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.701666,
+      "output_usd_per_mtok": 2.0324109999999997
+    },
+    "bedrock_mantle/ap-northeast-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock_mantle/ap-northeast-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/ap-northeast-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.28,
+      "output_usd_per_mtok": 0.45999999999999996
+    },
+    "bedrock_mantle/ap-northeast-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09999999999999999
+    },
+    "bedrock_mantle/ap-northeast-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.4500000000000002
+    },
+    "bedrock_mantle/ap-northeast-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-northeast-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock_mantle/ap-northeast-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/ap-northeast-1/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.73,
+      "output_usd_per_mtok": 3.03
+    },
+    "bedrock_mantle/ap-northeast-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock_mantle/ap-northeast-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/ap-northeast-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.29
+    },
+    "bedrock_mantle/ap-northeast-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock_mantle/ap-northeast-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/ap-northeast-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/ap-northeast-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/ap-northeast-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/ap-northeast-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 1.06
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.54,
+      "output_usd_per_mtok": 2.1799999999999997
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-northeast-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 3.22
+    },
+    "bedrock_mantle/ap-northeast-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/ap-northeast-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock_mantle/ap-northeast-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/ap-northeast-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock_mantle/ap-south-1/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.682424,
+      "output_usd_per_mtok": 1.976678
+    },
+    "bedrock_mantle/ap-south-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock_mantle/ap-south-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock_mantle/ap-south-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock_mantle/ap-south-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
+    },
+    "bedrock_mantle/ap-south-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
+    },
+    "bedrock_mantle/ap-south-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-south-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-south-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/ap-south-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock_mantle/ap-south-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-south-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/ap-south-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/ap-south-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock_mantle/ap-south-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock_mantle/ap-south-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/ap-south-1/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.71,
+      "output_usd_per_mtok": 2.94
+    },
+    "bedrock_mantle/ap-south-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock_mantle/ap-south-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock_mantle/ap-south-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock_mantle/ap-south-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock_mantle/ap-south-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/ap-south-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock_mantle/ap-south-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/ap-south-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock_mantle/ap-south-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.26,
+      "output_usd_per_mtok": 1.04
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.71
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.53,
+      "output_usd_per_mtok": 2.12
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-south-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.13
+    },
+    "bedrock_mantle/ap-south-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/ap-south-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock_mantle/ap-south-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/ap-south-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock_mantle/ap-southeast-2/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.5974,
+      "output_usd_per_mtok": 1.7304
+    },
+    "bedrock_mantle/ap-southeast-2/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 1.91
+    },
+    "bedrock_mantle/ap-southeast-2/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.0927,
+      "output_usd_per_mtok": 0.2987
+    },
+    "bedrock_mantle/ap-southeast-2/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.2369,
+      "output_usd_per_mtok": 0.3914
+    },
+    "bedrock_mantle/ap-southeast-2/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.0412,
+      "output_usd_per_mtok": 0.0824
+    },
+    "bedrock_mantle/ap-southeast-2/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.309,
+      "output_usd_per_mtok": 1.236
+    },
+    "bedrock_mantle/ap-southeast-2/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 1.24
+    },
+    "bedrock_mantle/ap-southeast-2/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 1.24
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.41,
+      "output_usd_per_mtok": 2.06
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.515,
+      "output_usd_per_mtok": 1.545
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.206,
+      "output_usd_per_mtok": 0.206
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.103,
+      "output_usd_per_mtok": 0.103
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.1545,
+      "output_usd_per_mtok": 0.1545
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.515,
+      "output_usd_per_mtok": 1.545
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.0412,
+      "output_usd_per_mtok": 0.0412
+    },
+    "bedrock_mantle/ap-southeast-2/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.103,
+      "output_usd_per_mtok": 0.309
+    },
+    "bedrock_mantle/ap-southeast-2/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.618,
+      "output_usd_per_mtok": 2.5749999999999997
+    },
+    "bedrock_mantle/ap-southeast-2/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.09
+    },
+    "bedrock_mantle/ap-southeast-2/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.206,
+      "output_usd_per_mtok": 0.618
+    },
+    "bedrock_mantle/ap-southeast-2/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.0618,
+      "output_usd_per_mtok": 0.2472
+    },
+    "bedrock_mantle/ap-southeast-2/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.0618,
+      "output_usd_per_mtok": 0.2369
+    },
+    "bedrock_mantle/ap-southeast-2/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.67
+    },
+    "bedrock_mantle/ap-southeast-2/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.1545,
+      "output_usd_per_mtok": 0.618
+    },
+    "bedrock_mantle/ap-southeast-2/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.0721,
+      "output_usd_per_mtok": 0.309
+    },
+    "bedrock_mantle/ap-southeast-2/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.1545,
+      "output_usd_per_mtok": 0.618
+    },
+    "bedrock_mantle/ap-southeast-2/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.0721,
+      "output_usd_per_mtok": 0.206
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.2266,
+      "output_usd_per_mtok": 0.9064
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.1545,
+      "output_usd_per_mtok": 0.618
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.1545,
+      "output_usd_per_mtok": 0.618
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.46349999999999997,
+      "output_usd_per_mtok": 1.8539999999999999
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.52,
+      "output_usd_per_mtok": 1.24
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.1442,
+      "output_usd_per_mtok": 1.236
+    },
+    "bedrock_mantle/ap-southeast-2/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.5459,
+      "output_usd_per_mtok": 2.7398
+    },
+    "bedrock_mantle/ap-southeast-2/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock_mantle/ap-southeast-2/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 2.27
+    },
+    "bedrock_mantle/ap-southeast-2/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.41
+    },
+    "bedrock_mantle/ap-southeast-2/zai.glm-5": {
+      "input_usd_per_mtok": 1.03,
+      "output_usd_per_mtok": 3.3000000000000003
+    },
+    "bedrock_mantle/ap-southeast-3/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.74
+    },
+    "bedrock_mantle/ap-southeast-3/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock_mantle/ap-southeast-3/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.108,
+      "output_usd_per_mtok": 0.348
+    },
+    "bedrock_mantle/ap-southeast-3/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27599999999999997,
+      "output_usd_per_mtok": 0.456
+    },
+    "bedrock_mantle/ap-southeast-3/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.096
+    },
+    "bedrock_mantle/ap-southeast-3/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-southeast-3/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-southeast-3/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.7999999999999998
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.048
+    },
+    "bedrock_mantle/ap-southeast-3/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/ap-southeast-3/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.0
+    },
+    "bedrock_mantle/ap-southeast-3/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock_mantle/ap-southeast-3/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/ap-southeast-3/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288
+    },
+    "bedrock_mantle/ap-southeast-3/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.27599999999999997
+    },
+    "bedrock_mantle/ap-southeast-3/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/ap-southeast-3/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock_mantle/ap-southeast-3/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock_mantle/ap-southeast-3/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/ap-southeast-3/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08399999999999999,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9099999999999999
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.87
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/ap-southeast-3/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.636,
+      "output_usd_per_mtok": 3.192
+    },
+    "bedrock_mantle/ap-southeast-3/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/ap-southeast-3/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock_mantle/ap-southeast-3/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/ap-southeast-3/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
     "bedrock_mantle/deepseek.v3.1": {
       "input_usd_per_mtok": 0.58,
       "output_usd_per_mtok": 1.68
@@ -3806,6 +5958,626 @@
     "bedrock_mantle/deepseek.v3.2": {
       "input_usd_per_mtok": 0.62,
       "output_usd_per_mtok": 1.85
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.108,
+      "output_usd_per_mtok": 0.348
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27599999999999997,
+      "output_usd_per_mtok": 0.456
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.096
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-4-26b-a4b": {
+      "input_usd_per_mtok": 0.156,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-4-31b": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-central-1/google.gemma-4-e2b": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.096
+    },
+    "bedrock_mantle/eu-central-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-central-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-central-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-central-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/eu-central-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.7999999999999998
+    },
+    "bedrock_mantle/eu-central-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/eu-central-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/eu-central-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/eu-central-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.048
+    },
+    "bedrock_mantle/eu-central-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/eu-central-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-central-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288
+    },
+    "bedrock_mantle/eu-central-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.27599999999999997
+    },
+    "bedrock_mantle/eu-central-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/eu-central-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-central-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.39999999999999997
+    },
+    "bedrock_mantle/eu-central-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-central-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08399999999999999,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.29,
+      "output_usd_per_mtok": 1.16
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-central-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.636,
+      "output_usd_per_mtok": 3.192
+    },
+    "bedrock_mantle/eu-central-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-central-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-north-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock_mantle/eu-north-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.108,
+      "output_usd_per_mtok": 0.348
+    },
+    "bedrock_mantle/eu-north-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27599999999999997,
+      "output_usd_per_mtok": 0.456
+    },
+    "bedrock_mantle/eu-north-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.096
+    },
+    "bedrock_mantle/eu-north-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-north-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-north-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-north-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/eu-north-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.7999999999999998
+    },
+    "bedrock_mantle/eu-north-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/eu-north-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/eu-north-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/eu-north-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.048,
+      "output_usd_per_mtok": 0.048
+    },
+    "bedrock_mantle/eu-north-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/eu-north-1/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.0
+    },
+    "bedrock_mantle/eu-north-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock_mantle/eu-north-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-north-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.288
+    },
+    "bedrock_mantle/eu-north-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.072,
+      "output_usd_per_mtok": 0.27599999999999997
+    },
+    "bedrock_mantle/eu-north-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/eu-north-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-north-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08399999999999999,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/eu-north-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-north-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-north-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.636,
+      "output_usd_per_mtok": 3.192
+    },
+    "bedrock_mantle/eu-north-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-north-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock_mantle/eu-north-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-north-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
+    "bedrock_mantle/eu-south-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock_mantle/eu-south-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock_mantle/eu-south-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
+    },
+    "bedrock_mantle/eu-south-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
+    },
+    "bedrock_mantle/eu-south-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-south-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-south-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/eu-south-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock_mantle/eu-south-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock_mantle/eu-south-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/eu-south-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/eu-south-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock_mantle/eu-south-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/eu-south-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-south-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock_mantle/eu-south-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock_mantle/eu-south-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/eu-south-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-south-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.39999999999999997
+    },
+    "bedrock_mantle/eu-south-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-south-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.29,
+      "output_usd_per_mtok": 1.16
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 0.7899999999999999
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-south-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.12
+    },
+    "bedrock_mantle/eu-south-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-south-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-west-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.33999999999999997
+    },
+    "bedrock_mantle/eu-west-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.27,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock_mantle/eu-west-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09
+    },
+    "bedrock_mantle/eu-west-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.35,
+      "output_usd_per_mtok": 1.4100000000000001
+    },
+    "bedrock_mantle/eu-west-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-west-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-west-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/eu-west-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.59,
+      "output_usd_per_mtok": 1.76
+    },
+    "bedrock_mantle/eu-west-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock_mantle/eu-west-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/eu-west-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/eu-west-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock_mantle/eu-west-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/eu-west-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-west-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock_mantle/eu-west-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.27
+    },
+    "bedrock_mantle/eu-west-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/eu-west-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-west-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/eu-west-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-west-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.26399999999999996,
+      "output_usd_per_mtok": 1.0559999999999998
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.7
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/eu-west-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.12
+    },
+    "bedrock_mantle/eu-west-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/eu-west-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/eu-west-2/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.8999849999999999,
+      "output_usd_per_mtok": 2.606853
+    },
+    "bedrock_mantle/eu-west-2/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.961,
+      "output_usd_per_mtok": 2.8675
+    },
+    "bedrock_mantle/eu-west-2/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.14,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
+    "bedrock_mantle/eu-west-2/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 0.59
+    },
+    "bedrock_mantle/eu-west-2/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/eu-west-2/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock_mantle/eu-west-2/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock_mantle/eu-west-2/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.47,
+      "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock_mantle/eu-west-2/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.62,
+      "output_usd_per_mtok": 3.1
+    },
+    "bedrock_mantle/eu-west-2/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.78,
+      "output_usd_per_mtok": 2.33
+    },
+    "bedrock_mantle/eu-west-2/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock_mantle/eu-west-2/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.16
+    },
+    "bedrock_mantle/eu-west-2/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.22999999999999998
+    },
+    "bedrock_mantle/eu-west-2/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.06
+    },
+    "bedrock_mantle/eu-west-2/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.16,
+      "output_usd_per_mtok": 0.47
+    },
+    "bedrock_mantle/eu-west-2/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 3.875
+    },
+    "bedrock_mantle/eu-west-2/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 4.65
+    },
+    "bedrock_mantle/eu-west-2/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.31,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.37
+    },
+    "bedrock_mantle/eu-west-2/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/eu-west-2/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 1.01
+    },
+    "bedrock_mantle/eu-west-2/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.47
+    },
+    "bedrock_mantle/eu-west-2/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.31
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.33999999999999997,
+      "output_usd_per_mtok": 1.37
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 2.79
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.78,
+      "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.217,
+      "output_usd_per_mtok": 1.8599999999999999
+    },
+    "bedrock_mantle/eu-west-2/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.82,
+      "output_usd_per_mtok": 4.12
+    },
+    "bedrock_mantle/eu-west-2/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.22999999999999998,
+      "output_usd_per_mtok": 0.9299999999999999
+    },
+    "bedrock_mantle/eu-west-2/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.9299999999999999,
+      "output_usd_per_mtok": 3.41
+    },
+    "bedrock_mantle/eu-west-2/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.62
+    },
+    "bedrock_mantle/eu-west-2/zai.glm-5": {
+      "input_usd_per_mtok": 1.55,
+      "output_usd_per_mtok": 4.96
     },
     "bedrock_mantle/google.gemma-3-12b-it": {
       "input_usd_per_mtok": 0.09,
@@ -3943,6 +6715,154 @@
       "input_usd_per_mtok": 0.53,
       "output_usd_per_mtok": 2.66
     },
+    "bedrock_mantle/sa-east-1/deepseek.v3.1": {
+      "input_usd_per_mtok": 0.696,
+      "output_usd_per_mtok": 2.016
+    },
+    "bedrock_mantle/sa-east-1/deepseek.v3.2": {
+      "input_usd_per_mtok": 0.74,
+      "output_usd_per_mtok": 2.2199999999999998
+    },
+    "bedrock_mantle/sa-east-1/google.gemma-3-12b-it": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.35
+    },
+    "bedrock_mantle/sa-east-1/google.gemma-3-27b-it": {
+      "input_usd_per_mtok": 0.28,
+      "output_usd_per_mtok": 0.45999999999999996
+    },
+    "bedrock_mantle/sa-east-1/google.gemma-3-4b-it": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.09999999999999999
+    },
+    "bedrock_mantle/sa-east-1/minimax.minimax-m2": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.4500000000000002
+    },
+    "bedrock_mantle/sa-east-1/minimax.minimax-m2.1": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/sa-east-1/minimax.minimax-m2.5": {
+      "input_usd_per_mtok": 0.36,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/sa-east-1/mistral.devstral-2-123b": {
+      "input_usd_per_mtok": 0.48,
+      "output_usd_per_mtok": 2.4
+    },
+    "bedrock_mantle/sa-east-1/mistral.magistral-small-2509": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock_mantle/sa-east-1/mistral.ministral-3-14b-instruct": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/sa-east-1/mistral.ministral-3-3b-instruct": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.12
+    },
+    "bedrock_mantle/sa-east-1/mistral.ministral-3-8b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.18
+    },
+    "bedrock_mantle/sa-east-1/mistral.mistral-large-3-675b-instruct": {
+      "input_usd_per_mtok": 0.61,
+      "output_usd_per_mtok": 1.8199999999999998
+    },
+    "bedrock_mantle/sa-east-1/mistral.voxtral-mini-3b-2507": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.049999999999999996
+    },
+    "bedrock_mantle/sa-east-1/mistral.voxtral-small-24b-2507": {
+      "input_usd_per_mtok": 0.12,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/sa-east-1/moonshotai.kimi-k2-thinking": {
+      "input_usd_per_mtok": 0.73,
+      "output_usd_per_mtok": 3.03
+    },
+    "bedrock_mantle/sa-east-1/moonshotai.kimi-k2.5": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 3.5999999999999996
+    },
+    "bedrock_mantle/sa-east-1/nvidia.nemotron-nano-12b-v2": {
+      "input_usd_per_mtok": 0.24,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/sa-east-1/nvidia.nemotron-nano-3-30b": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.29
+    },
+    "bedrock_mantle/sa-east-1/nvidia.nemotron-nano-9b-v2": {
+      "input_usd_per_mtok": 0.07,
+      "output_usd_per_mtok": 0.28
+    },
+    "bedrock_mantle/sa-east-1/nvidia.nemotron-super-3-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.78
+    },
+    "bedrock_mantle/sa-east-1/openai.gpt-oss-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/sa-east-1/openai.gpt-oss-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.36
+    },
+    "bedrock_mantle/sa-east-1/openai.gpt-oss-safeguard-120b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/sa-east-1/openai.gpt-oss-safeguard-20b": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-235b-a22b-2507": {
+      "input_usd_per_mtok": 0.26399999999999996,
+      "output_usd_per_mtok": 1.0559999999999998
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-32b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-coder-30b-a3b-instruct": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.73
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-coder-480b-a35b-instruct": {
+      "input_usd_per_mtok": 0.54,
+      "output_usd_per_mtok": 2.16
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-coder-next": {
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-next-80b-a3b-instruct": {
+      "input_usd_per_mtok": 0.16799999999999998,
+      "output_usd_per_mtok": 1.44
+    },
+    "bedrock_mantle/sa-east-1/qwen.qwen3-vl-235b-a22b-instruct": {
+      "input_usd_per_mtok": 0.64,
+      "output_usd_per_mtok": 3.22
+    },
+    "bedrock_mantle/sa-east-1/writer.palmyra-vision-7b": {
+      "input_usd_per_mtok": 0.18,
+      "output_usd_per_mtok": 0.72
+    },
+    "bedrock_mantle/sa-east-1/zai.glm-4.7": {
+      "input_usd_per_mtok": 0.72,
+      "output_usd_per_mtok": 2.64
+    },
+    "bedrock_mantle/sa-east-1/zai.glm-4.7-flash": {
+      "input_usd_per_mtok": 0.08,
+      "output_usd_per_mtok": 0.48
+    },
+    "bedrock_mantle/sa-east-1/zai.glm-5": {
+      "input_usd_per_mtok": 1.2,
+      "output_usd_per_mtok": 3.84
+    },
     "bedrock_mantle/us-gov-east-1/nvidia.nemotron-nano-12b-v2": {
       "input_usd_per_mtok": 0.24,
       "output_usd_per_mtok": 0.72
@@ -3977,14 +6897,34 @@
       "output_usd_per_mtok": 7.920000000000001,
       "cache_read_usd_per_mtok": 0.66
     },
+    "bedrock_mantle/us-gov-west-1/anthropic.claude-fable-5-1": {
+      "input_usd_per_mtok": 12.0,
+      "output_usd_per_mtok": 60.0,
+      "cache_read_usd_per_mtok": 0.3
+    },
     "bedrock_mantle/us-gov-west-1/anthropic.claude-haiku-5-5": {
       "input_usd_per_mtok": 0.12,
       "output_usd_per_mtok": 0.6,
       "cache_read_usd_per_mtok": 0.012
     },
+    "bedrock_mantle/us-gov-west-1/anthropic.claude-opus-4-8": {
+      "input_usd_per_mtok": 6.0,
+      "output_usd_per_mtok": 30.0,
+      "cache_read_usd_per_mtok": 0.6
+    },
+    "bedrock_mantle/us-gov-west-1/anthropic.claude-opus-5": {
+      "input_usd_per_mtok": 6.0,
+      "output_usd_per_mtok": 30.0,
+      "cache_read_usd_per_mtok": 0.6
+    },
     "bedrock_mantle/us-gov-west-1/anthropic.claude-opus-5-5": {
       "input_usd_per_mtok": 4.8,
       "output_usd_per_mtok": 24.0,
+      "cache_read_usd_per_mtok": 0.24
+    },
+    "bedrock_mantle/us-gov-west-1/anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 2.4,
+      "output_usd_per_mtok": 12.0,
       "cache_read_usd_per_mtok": 0.24
     },
     "bedrock_mantle/us-gov-west-1/anthropic.claude-sonnet-5-5": {
@@ -4108,6 +7048,21 @@
     "c4ai-aya-expanse-32b": {
       "input_usd_per_mtok": 0.5,
       "output_usd_per_mtok": 1.5
+    },
+    "ca.amazon.nova-lite-v1:0": {
+      "input_usd_per_mtok": 0.064,
+      "output_usd_per_mtok": 0.256,
+      "cache_read_usd_per_mtok": 0.016
+    },
+    "ca.anthropic.claude-haiku-5-5": {
+      "input_usd_per_mtok": 0.11,
+      "output_usd_per_mtok": 0.55,
+      "cache_read_usd_per_mtok": 0.011
+    },
+    "ca.anthropic.claude-sonnet-5-5": {
+      "input_usd_per_mtok": 2.2,
+      "output_usd_per_mtok": 11.0,
+      "cache_read_usd_per_mtok": 0.11
     },
     "cerebras/gemma-4-31b": {
       "input_usd_per_mtok": 0.9900000000000001,
@@ -6107,11 +9062,11 @@
       }
     },
     "deepseek/deepseek-r1-0528": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 2.1500000000000004,
+      "input_usd_per_mtok": 0.5710000000000001,
+      "output_usd_per_mtok": 2.2859999999999996,
       "off_peak": {
-        "input_usd_per_mtok": 0.125,
-        "output_usd_per_mtok": 0.5375,
+        "input_usd_per_mtok": 0.14275,
+        "output_usd_per_mtok": 0.5715,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -6239,11 +9194,11 @@
       }
     },
     "deepseek/deepseek-v4.1-flash": {
-      "input_usd_per_mtok": 0.051,
-      "output_usd_per_mtok": 0.5670000000000001,
+      "input_usd_per_mtok": 0.050699999999999995,
+      "output_usd_per_mtok": 0.20279999999999998,
       "off_peak": {
-        "input_usd_per_mtok": 0.0255,
-        "output_usd_per_mtok": 0.2835,
+        "input_usd_per_mtok": 0.02535,
+        "output_usd_per_mtok": 0.1014,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -10444,9 +13399,9 @@
       "cache_read_usd_per_mtok": 0.01
     },
     "gpt-6-rosalind": {
-      "input_usd_per_mtok": 15.0,
-      "output_usd_per_mtok": 75.0,
-      "cache_read_usd_per_mtok": 1.5
+      "input_usd_per_mtok": 10.0,
+      "output_usd_per_mtok": 50.0,
+      "cache_read_usd_per_mtok": 1.0
     },
     "gpt-6-sol": {
       "input_usd_per_mtok": 2.0,
@@ -10690,6 +13645,16 @@
     "ibm-granite/granite-4.2-8b": {
       "input_usd_per_mtok": 0.06,
       "output_usd_per_mtok": 0.15
+    },
+    "in.anthropic.claude-opus-5": {
+      "input_usd_per_mtok": 5.5,
+      "output_usd_per_mtok": 27.5,
+      "cache_read_usd_per_mtok": 0.55
+    },
+    "in.anthropic.claude-sonnet-5": {
+      "input_usd_per_mtok": 2.2,
+      "output_usd_per_mtok": 11.0,
+      "cache_read_usd_per_mtok": 0.22
     },
     "in.moonshotai.kimi-k3": {
       "input_usd_per_mtok": 3.3000000000000003,
@@ -11988,8 +14953,8 @@
       "output_usd_per_mtok": 1.2
     },
     "minimax/minimax-m3.1-flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.3
     },
     "minimax/minimax-m3:batch": {
       "input_usd_per_mtok": 0.224,
@@ -12197,9 +15162,9 @@
       "cache_read_usd_per_mtok": 0.07
     },
     "mistral/mistral-large-latest": {
-      "input_usd_per_mtok": 0.5,
-      "output_usd_per_mtok": 1.5,
-      "cache_read_usd_per_mtok": 0.049999999999999996
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 2.0999999999999996,
+      "cache_read_usd_per_mtok": 0.07
     },
     "mistral/mistral-medium": {
       "input_usd_per_mtok": 1.5,
@@ -12500,7 +15465,7 @@
       "output_usd_per_mtok": 3.41
     },
     "moonshotai/kimi-k2.7-code": {
-      "input_usd_per_mtok": 0.8125,
+      "input_usd_per_mtok": 0.6,
       "output_usd_per_mtok": 3.5
     },
     "moonshotai/kimi-k3": {
@@ -16057,6 +19022,41 @@
       "input_usd_per_mtok": 0.85,
       "output_usd_per_mtok": 0.85
     },
+    "sarvam/deepseekv4.1-flash-1017": {
+      "input_usd_per_mtok": 0.1489361702,
+      "output_usd_per_mtok": 0.585106383,
+      "cache_read_usd_per_mtok": 0.002659574468
+    },
+    "sarvam/deepseekv4.1-flash-1017-interactive": {
+      "input_usd_per_mtok": 0.2659574468,
+      "output_usd_per_mtok": 1.117021277,
+      "cache_read_usd_per_mtok": 0.005319148936
+    },
+    "sarvam/gemma4": {
+      "input_usd_per_mtok": 0.3723404255,
+      "output_usd_per_mtok": 0.9574468085000001,
+      "cache_read_usd_per_mtok": 0.1063829787
+    },
+    "sarvam/glm5.3": {
+      "input_usd_per_mtok": 1.340425532,
+      "output_usd_per_mtok": 4.14893617,
+      "cache_read_usd_per_mtok": 0.2127659574
+    },
+    "sarvam/glm5.3-flash": {
+      "input_usd_per_mtok": 0.14361702129999998,
+      "output_usd_per_mtok": 0.47872340429999993,
+      "cache_read_usd_per_mtok": 0.02659574468
+    },
+    "sarvam/sarvam-105b": {
+      "input_usd_per_mtok": 0.1063829787,
+      "output_usd_per_mtok": 0.2659574468,
+      "cache_read_usd_per_mtok": 0.002659574468
+    },
+    "sarvam/sarvam-105b-conversations": {
+      "input_usd_per_mtok": 0.1063829787,
+      "output_usd_per_mtok": 0.2659574468,
+      "cache_read_usd_per_mtok": 0.002659574468
+    },
     "sarvam/sarvam-m": {
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.0
@@ -16194,6 +19194,41 @@
       "output_usd_per_mtok": 5.0,
       "cache_read_usd_per_mtok": 0.09999999999999999
     },
+    "snowflake/claude-haiku-5-5": {
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.5,
+      "cache_read_usd_per_mtok": 0.01
+    },
+    "snowflake/claude-opus-4-5": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "snowflake/claude-opus-4-6": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "snowflake/claude-opus-4-7": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "snowflake/claude-opus-4-8": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "snowflake/claude-opus-5": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "snowflake/claude-opus-5-5": {
+      "input_usd_per_mtok": 4.0,
+      "output_usd_per_mtok": 20.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
     "snowflake/claude-sonnet-4-5": {
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0,
@@ -16203,6 +19238,16 @@
       "input_usd_per_mtok": 3.0,
       "output_usd_per_mtok": 15.0,
       "cache_read_usd_per_mtok": 0.3
+    },
+    "snowflake/claude-sonnet-5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "snowflake/claude-sonnet-5-5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.09999999999999999
     },
     "snowflake/deepseek-r1": {
       "input_usd_per_mtok": 1.35,
@@ -16554,8 +19599,8 @@
       "output_usd_per_mtok": 0.295
     },
     "tencent/hy3": {
-      "input_usd_per_mtok": 0.13199999999999998,
-      "output_usd_per_mtok": 0.5279999999999999
+      "input_usd_per_mtok": 0.0825,
+      "output_usd_per_mtok": 0.33
     },
     "tencent/hy3-preview": {
       "input_usd_per_mtok": 0.18,
@@ -17028,6 +20073,11 @@
       "output_usd_per_mtok": 1.0,
       "cache_read_usd_per_mtok": 0.03
     },
+    "together_ai/thinkingmachines/inkling": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 4.05,
+      "cache_read_usd_per_mtok": 0.16999999999999998
+    },
     "together_ai/together/Tev1-4B-experimental": {
       "input_usd_per_mtok": 0.041999999999999996,
       "output_usd_per_mtok": 0.0
@@ -17161,6 +20211,21 @@
     "us-gov.nvidia.nemotron-super-3-120b": {
       "input_usd_per_mtok": 0.18,
       "output_usd_per_mtok": 0.78
+    },
+    "us-gov.openai.gpt-5.4": {
+      "input_usd_per_mtok": 3.3000000000000003,
+      "output_usd_per_mtok": 19.8,
+      "cache_read_usd_per_mtok": 0.33
+    },
+    "us-gov.openai.gpt-5.6-luna": {
+      "input_usd_per_mtok": 0.26399999999999996,
+      "output_usd_per_mtok": 1.584,
+      "cache_read_usd_per_mtok": 0.0264
+    },
+    "us-gov.openai.gpt-5.6-terra": {
+      "input_usd_per_mtok": 2.64,
+      "output_usd_per_mtok": 15.840000000000002,
+      "cache_read_usd_per_mtok": 0.26399999999999996
     },
     "us-gov.openai.gpt-oss-120b-1:0": {
       "input_usd_per_mtok": 0.18,
@@ -19295,8 +22360,8 @@
       "output_usd_per_mtok": 1.4
     },
     "z-ai/glm-5.3-flash": {
-      "input_usd_per_mtok": 0.0399,
-      "output_usd_per_mtok": 0.0784
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.5
     },
     "z-ai/glm-5.3-flash:batch": {
       "input_usd_per_mtok": 0.024,
