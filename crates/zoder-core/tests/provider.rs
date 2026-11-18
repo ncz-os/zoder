@@ -1609,7 +1609,6 @@ async fn responses_request_hits_v1_responses_with_correct_headers_and_body() {
                 { "role": "user", "content": "hi" }
             ],
             "max_output_tokens": 32,
-            "temperature": 0.25,
             "stream": false,
             "reasoning": { "effort": "low" }
         })))
@@ -1634,6 +1633,14 @@ async fn responses_request_hits_v1_responses_with_correct_headers_and_body() {
         .await
         .unwrap();
     assert_eq!(res.content, "ok");
+    // gpt-5 is a reasoning model: the request must not carry a sampling
+    // temperature even though the caller set one.
+    let sent = server.received_requests().await.unwrap();
+    let body: serde_json::Value = sent[0].body_json().unwrap();
+    assert!(
+        body.get("temperature").is_none(),
+        "temperature sent to a reasoning model: {body}"
+    );
 }
 
 /// Task-pinned test (item 1b): the openai-chat path must remain
