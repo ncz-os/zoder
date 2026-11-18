@@ -67,3 +67,9 @@ bench/raw/
 
 # zoder review scratch (2026-11-11: a worker WIP commit landed .zoder-scratch/ in master)
 .zoder-scratch/
+
+# Root-level planning and review notes are not public artifacts.
+/PLAN-*.md
+/REFRESH-*.md
+/REVIEW-*.md
+/REVIEW_VERDICT_*.json

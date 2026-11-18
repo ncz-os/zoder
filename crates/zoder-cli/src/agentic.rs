@@ -1585,6 +1585,8 @@ async fn run_loop_review(
 /// the diff does not touch `[review.escalate].paths`. A high-risk diff with
 /// no non-local candidate fails closed: the additional review was required,
 /// and silently skipping it would leave the escalation claim false.
+// The existing call boundary keeps reviewer selection inputs explicit.
+#[allow(clippy::too_many_arguments)]
 fn high_risk_second_reviewer(
     cli: &crate::Cli,
     eng: &Engine,
@@ -1759,7 +1761,7 @@ pub(crate) fn build_reviewer_plan(
         // AGENT alias (`reviewer`, `coder`) first, then a provider-neutral
         // MODEL alias from the corpus overlay (`codex:sol` -> `gpt-6-sol`).
         // A string that is neither passes through unchanged.
-        crate::configured_model_for_agent(&eng, Some(s))
+        crate::configured_model_for_agent(eng, Some(s))
             .map(|m| eng.corpus.resolve_alias(&m).to_string())
             .unwrap_or_else(|| eng.corpus.resolve_alias(s).to_string())
     };
@@ -1782,7 +1784,7 @@ pub(crate) fn build_reviewer_plan(
     // run through alias resolution.
     if out.is_empty() {
         let health = crate::config_cache::health_store(&eng.cfg.health_path);
-        let routes = crate::resolve_chain(cli, &eng, &health)?;
+        let routes = crate::resolve_chain(cli, eng, &health)?;
         let author = routes.primary.first().cloned().unwrap_or_default();
         let default = crate::default_cross_family_reviewer(&author).to_string();
         push_unique(&mut out, &default);
@@ -1829,7 +1831,7 @@ pub(crate) fn build_reviewer_plan(
             // say THAT (with the configured routes and a suggestion) instead
             // of the misleading "outside the allowlist" (blackhole2 F1).
             let Some(provider) = routing.real_provider_for_model(&eng.cfg, model) else {
-                anyhow::bail!(no_reviewer_provider_message(cli, &eng, &routing, model));
+                anyhow::bail!(no_reviewer_provider_message(cli, eng, &routing, model));
             };
             if !permitted(model) {
                 let allowed = reviewer_allowed.as_ref().or(global_allowed.as_ref());
@@ -1858,7 +1860,7 @@ pub(crate) fn build_reviewer_plan(
         let pool = crate::parse_route_list(raw_pool, "--reviewer-pool-routes")?;
         let routing = crate::RoutingContext::load(&eng.cfg)?;
         let health = crate::config_cache::health_store(&eng.cfg.health_path);
-        let author_routes = crate::resolve_chain(cli, &eng, &health)?;
+        let author_routes = crate::resolve_chain(cli, eng, &health)?;
         let primary = out.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("reviewer pool requires a primary reviewer outside the pool")
         })?;
@@ -9892,7 +9894,7 @@ fn loop_failure(
     // the engine's reason, and left no work (substance `Empty`) is the root
     // cause too, even though it produced a model: the review that follows
     // only reviewed the unchanged base. A context-window refusal after a few
-    // tool calls is the field case (37 of 38 Muse author jobs on HYDRA);
+    // tool calls is the field case (37 of 38 author jobs on a build host);
     // without this it was filed `loop_exhausted` / "no commits on top of
     // base" and the reason was never the headline.
     let author_turn_failed_without_work = field("author_outcome").as_deref() == Some("failed")
@@ -13436,7 +13438,7 @@ mod tests {
         // Each fresh sample asks first: an expired deadline stops the
         // sampling instead of starting another full-budget review.
         let mut fresh: Vec<ReviewOutput> = Vec::new();
-        for _ in 0..2 {
+        {
             assert!(
                 loop_resample_skip(&deadline, true).skip_with_deadline_hit(),
                 "an expired deadline must stop each fresh sample"
@@ -13444,7 +13446,6 @@ mod tests {
             fresh.push(synthesize_reviewer_unavailable(
                 "review skipped: the whole-run deadline was reached",
             ));
-            break;
         }
         while fresh.len() < 2 {
             fresh.push(synthesize_reviewer_unavailable(
@@ -19276,11 +19277,11 @@ mod loop_resolution_tests {
     fn iteration_record_names_the_reviewer_that_answered() {
         let verdicts = vec![
             json!({"model": "", "verdict": "comment"}),
-            json!({"model": "cerberus-reviewer", "verdict": "comment"}),
+            json!({"model": "reviewer-a", "verdict": "comment"}),
         ];
         assert_eq!(
             reviewer_model_from_verdicts(&verdicts).as_deref(),
-            Some("cerberus-reviewer")
+            Some("reviewer-a")
         );
         assert_eq!(reviewer_model_from_verdicts(&[]), None);
         // A slot without a verdict (a skip record) is not evidence of who

@@ -6283,7 +6283,7 @@ mod tests {
 
     /// The engine's verbatim `turn_complete.content` for a turn whose next
     /// request did not fit the model's context window (zeroclaw
-    /// `turn-context-window-exceeded-error`), captured from HYDRA session
+    /// `turn-context-window-exceeded-error`), captured from a build host session
     /// 3163 on 2026-11-11.
     const ZEROCLAW_CONTEXT_WINDOW_FAILURE: &str = "Agent turn failed: This request exceeds the \
         selected model's context window. Reduce the request or enabled tools, or choose a \
@@ -13921,7 +13921,7 @@ mod tests {
         server.abort();
     }
 
-    /// 2026-11-11 (HYDRA, Hive author jobs on `muse_contrib`): the engine
+    /// 2026-11-11 (author jobs on a build host): the engine
     /// failed the author turn with its context-window refusal AFTER the model
     /// had streamed text, and `run_agent` returned `failure_detail: None`, so
     /// the loop recorded `author_outcome: failed`, `author_error: null`. The

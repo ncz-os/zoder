@@ -235,7 +235,7 @@ fn corpus_rejects_enum_knob_without_enum_values() {
     // naming `enum_values` — the "error names the field" contract is NOT met
     // by validate_v1 for knob-shape errors. Pinned here so any future improvement
     // of the validator's reporting fails loudly instead of silently.
-    let schema_err = validate_v1(&v).err().expect("must reject");
+    let schema_err = validate_v1(&v).expect_err("must reject");
     validate_and_parse(&v).expect_err("must reject via schema too");
     let text = schema_err.to_string();
     assert!(
@@ -295,7 +295,7 @@ fn corpus_rejects_unknown_top_level_field_with_deny() {
     let mut v = base_l1();
     v.as_object_mut().unwrap().insert("bogus".into(), json!(1));
     // Schema denies; serde side (deny_unknown_fields) names the field in backticks.
-    let parse_err = validate_and_parse(&v).err().expect("must be rejected");
+    let parse_err = validate_and_parse(&v).expect_err("must be rejected");
     let text = format!("{parse_err}");
     assert!(
         text.contains("bogus"),
@@ -307,7 +307,7 @@ fn corpus_rejects_unknown_top_level_field_with_deny() {
 fn corpus_rejects_unknown_connection_field_with_deny() {
     let mut v = base_l1();
     v["connection"]["extra_thing"] = json!(7);
-    let parse_err = validate_and_parse(&v).err().expect("must be rejected");
+    let parse_err = validate_and_parse(&v).expect_err("must be rejected");
     let text = format!("{parse_err}");
     assert!(
         text.contains("extra_thing"),
@@ -319,7 +319,7 @@ fn corpus_rejects_unknown_connection_field_with_deny() {
 fn corpus_rejects_missing_required_field_and_names_it() {
     let mut v = base_l1();
     v.as_object_mut().unwrap().remove("connection");
-    let parse_err = validate_and_parse(&v).err().expect("must be rejected");
+    let parse_err = validate_and_parse(&v).expect_err("must be rejected");
     let text = format!("{parse_err}");
     assert!(
         text.contains("connection"),
@@ -331,7 +331,7 @@ fn corpus_rejects_missing_required_field_and_names_it() {
 fn corpus_rejects_wrong_scalar_type_and_names_the_field() {
     let mut v = base_l1();
     v["schema_version"] = json!("one");
-    let parse_err = validate_and_parse(&v).err().expect("must be rejected");
+    let parse_err = validate_and_parse(&v).expect_err("must be rejected");
     let text = format!("{parse_err}");
     assert!(
         text.contains("schema_version"),
@@ -576,7 +576,7 @@ fn validation_error_variants_are_displayable_and_debuggable() {
     // Smoke: every construction path of ValidationError produces sane text.
     let mut v = base_l1();
     v["conformance_level"] = json!(3);
-    let err = validate_v1(&v).err().expect("rejected");
+    let err = validate_v1(&v).expect_err("rejected");
     let text = format!("{err:?}");
     assert!(text.contains("Schema"));
     // Distinguishable from the compile variant:

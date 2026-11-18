@@ -19761,10 +19761,10 @@ mod probe_skip_class_tests {
 
     /// `health --probe --all` on a shared gateway: the live catalog is cut to
     /// the provider's `serves` allow-list, so models the fleet must not call
-    /// are never pinged (2026-11-11: 50 EIH catalog models were probed).
+    /// are never pinged (2026-11-11: 50 hosted gateway catalog models were probed).
     #[test]
     fn probe_all_targets_stay_inside_the_serves_allow_list() {
-        let gateway = mk_provider("nvidia-eih", &["nvidia/nemotron-3-ultra"]);
+        let gateway = mk_provider("hosted-gateway", &["nvidia/nemotron-3-ultra"]);
         let catalog = vec![
             "01-ai/yi-large".to_string(),
             "deepseek-ai/deepseek-v4.1-flash".to_string(),
@@ -26000,9 +26000,9 @@ mod engine_cost_accounting_tests {
         let out = engine_catalog(&cat, &cfg);
         assert!(out.models.contains_key("local/qwen3.8-coder"));
         assert!(
-            !out.models
+            out.models
                 .get("local/qwen3.8-coder-max")
-                .is_some_and(|p| p.source == FREE_ENGINE_ENTRY_SOURCE),
+                .is_none_or(|p| p.source != FREE_ENGINE_ENTRY_SOURCE),
             "a full id must not prefix-match its neighbours"
         );
     }

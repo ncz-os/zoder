@@ -35,8 +35,7 @@ branch's own commit SHA** — the trailer names the exact source commit:
 
 `git merge-base --is-ancestor` confirms all three are ancestors of
 `origin/master`. The re-application was deliberate and is documented on
-`master` itself: `PLAN-FB108.md` ("FB96's 56088d6 build-repair commit is
-already on master (upstream merged it); not cherry-picked").
+`master` itself: FB96's 56088d6 build-repair commit was already on master and was not cherry-picked.
 
 Content check, not just commit identity:
 

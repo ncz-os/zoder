@@ -525,7 +525,7 @@ static UNREACHABLE: std::sync::LazyLock<Mutex<HashSet<String>>> =
 /// The reaper's own [`UnconfirmedCancelOutcome`] stays here: it carries the
 /// ATTEMPT COUNT, which is a fact about this module's retry sequence and has
 /// no meaning in the loop.
-
+///
 /// Sessions whose cancel was never confirmed and whose daemon could not be
 /// identified: the socket answered, but there is no pid record that proves
 /// nothing is still running.

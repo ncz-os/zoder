@@ -158,7 +158,6 @@ shares a mechanism. No change is warranted unless stated.
   `month_to_date_usd_month_boundary_pinned` (ledger.rs:2233) and the ignored
   RED demonstration (ledger.rs:2282). No production signature changed here
   (the `_at` form already existed).
-- `PLAN-FB80.md` — plan (repo root, task workspace).
 
 Suite evidence (zoder-core lib):
 - before: 919 passed / 1 failed (`month_to_date_usd_month_boundary_pinned` before

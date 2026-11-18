@@ -3,7 +3,7 @@
 Scope: every concrete claim in zoder's `docs/` (flags, env vars, defaults,
 exit codes, config keys, file paths, budget rules) verified against the Rust
 sources on the same tree (`master` `1cbe935`). README.md is outside `docs/`
-and was not verified (exclusion noted in PLAN-FB82.md).
+and was not verified.
 
 Base caveat: `1cbe935` was the branch point of `freebuff/fb82-20261101`.
 `master` has since moved on (it gained the `infrastructure` class /

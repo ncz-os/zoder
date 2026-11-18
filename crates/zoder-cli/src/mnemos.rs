@@ -181,7 +181,7 @@ pub(crate) fn event_blocking(job_id: Option<&str>, phase: &str, payload: Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -219,7 +219,7 @@ mod tests {
     }
     #[tokio::test]
     async fn loop_event_is_recorded_with_job_metadata() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/memories"))
@@ -247,7 +247,7 @@ mod tests {
     }
     #[tokio::test]
     async fn loop_event_is_fail_soft_when_mnemos_is_unreachable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK.lock().await;
         std::env::set_var("MNEMOS_URL", "http://127.0.0.1:9");
         std::env::set_var("MNEMOS_TOKEN", "fixture");
         // must return, not panic, and not hang past the bounded wait

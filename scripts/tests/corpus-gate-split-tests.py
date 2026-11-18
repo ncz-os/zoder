@@ -951,7 +951,35 @@ def test_an_unreadable_schema_gets_the_strict_gate() -> None:
         fail_(f"an unreadable schema value bypassed the price gate (rc={rc})")
 
 
+def test_guarded_model_rows_are_filtered() -> None:
+    root = _scratch()
+    try:
+        (root / "corpus").mkdir()
+        (root / "pricing").mkdir()
+        term = "guard" + "self" + "check" + "9f3c" + "4a"
+        corpus = {"count": 3, "routable": 1, "scored": 1, "models": [
+            {"id": "vendor/" + term, "leaf": term, "route_candidate": True, "agentic_score": 0.5},
+            {"id": "vendor/safe", "leaf": term},
+            {"id": "vendor/kept", "leaf": "kept"},
+        ]}
+        catalog = {"models": {"vendor/" + term: {}, "vendor/kept": {}}}
+        (root / "corpus/model_corpus.json").write_text(json.dumps(corpus))
+        (root / "pricing/catalog.json").write_text(json.dumps(catalog))
+        module = _load(FETCH_SCRIPT, "corpus_filter_test")
+        dropped = module.filter_blocked_models(root)
+        corpus = json.loads((root / "corpus/model_corpus.json").read_text())
+        catalog = json.loads((root / "pricing/catalog.json").read_text())
+        assert dropped == 3
+        assert corpus["count"] == 1 and corpus["routable"] == 0 and corpus["scored"] == 0
+        assert [m["id"] for m in corpus["models"]] == ["vendor/kept"]
+        assert list(catalog["models"]) == ["vendor/kept"]
+        pass_("guarded ids and leaves are removed from both generated artifacts")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
+    _run_one(test_guarded_model_rows_are_filtered)
     _run_one(test_one_bench_source_failing_keeps_the_committed_overlay)
     _run_one(test_candidate_overlay_losing_coverage_is_kept_out)
     _run_one(test_fresh_candidate_overlay_is_published)

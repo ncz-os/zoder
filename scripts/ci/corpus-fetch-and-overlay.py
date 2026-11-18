@@ -48,6 +48,7 @@ keep the "publish" decision in exactly one place.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -260,6 +261,42 @@ def fetch_sources(root: Path, fetch_one=run_source) -> list[dict]:
     return entries
 
 
+def filter_blocked_models(root: Path) -> int:
+    """Remove guarded identifiers from generated public artifacts."""
+    spec = importlib.util.spec_from_file_location(
+        "public_repo_guard", REPO_ROOT / "scripts/ci/public-repo-guard.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    rules = guard.load_denylist()
+
+    def blocked(value: str) -> bool:
+        return bool(guard.scan_text(value, rules, "model"))
+
+    dropped = 0
+    for path in (root / "corpus/model_corpus.json", root / "pricing/catalog.json"):
+        if not path.exists():
+            continue
+        data = json.loads(path.read_text())
+        models = data["models"]
+        if isinstance(models, list):
+            removed = [m for m in models if blocked(m["id"]) or blocked(m["leaf"])]
+            data["models"] = [m for m in models if not (blocked(m["id"]) or blocked(m["leaf"]))]
+            data["count"] = len(data["models"])
+            data["routable"] -= sum(bool(m.get("route_candidate")) for m in removed)
+            data["scored"] -= sum(any(k in m for k in ("agentic_score", "capability", "preference", "elo", "workflows")) for m in removed)
+        else:
+            removed = [key for key in models if blocked(key) or blocked(key.partition("/")[2])]
+            for key in removed:
+                del models[key]
+        if removed:
+            path.write_text(json.dumps(data, indent=2) + "\n")
+        dropped += len(removed)
+    print(f"corpus-fetch: dropped {dropped} model rows")
+    return dropped
+
+
 def read_catalog_count(path: Path) -> int:
     """Number of models in a pricing catalog (0 when absent/unreadable)."""
     try:
@@ -361,6 +398,7 @@ def run_pipeline(root: Path, *, fetch_one=run_source, overlay_builder=run_overla
     status_path = raw / STATUS_NAME
     status_path.unlink(missing_ok=True)
     builder_rc = corpus_builder(root, status_path)
+    filter_blocked_models(root)
     status: dict = {}
     if status_path.exists():
         try:
@@ -385,7 +423,7 @@ def run_pipeline(root: Path, *, fetch_one=run_source, overlay_builder=run_overla
         "added": int(openrouter.get("added") or 0),
         "reason": str(openrouter.get("reason") or ""),
     }
-    catalog_models = int(status.get("catalog_models") or 0)
+    catalog_models = read_catalog_count(pricing_dir / "catalog.json")
     shrink = 0.0
     if previous_catalog_models and catalog_models < previous_catalog_models:
         shrink = (previous_catalog_models - catalog_models) / previous_catalog_models
