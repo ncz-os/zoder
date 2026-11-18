@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-17",
-  "generated": "2026-11-17",
-  "count": 3931,
-  "routable": 77,
-  "scored": 2588,
+  "arena_date": "2026-11-18",
+  "generated": "2026-11-18",
+  "count": 3965,
+  "routable": 79,
+  "scored": 2607,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -7031,6 +7031,60 @@
       "w_swe": 0.984
     },
     {
+      "id": "azure/apac/gpt-6.2-astra",
+      "host": "azure",
+      "leaf": "apac/gpt-6.2-astra",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 9.6,
+        "output_usd_per_mtok": 48.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.48
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "azure/apac/gpt-6.2-sol",
+      "host": "azure",
+      "leaf": "apac/gpt-6.2-sol",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.4,
+        "output_usd_per_mtok": 12.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.12
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
+    },
+    {
       "id": "azure/chat-latest",
       "host": "azure",
       "leaf": "chat-latest",
@@ -8348,6 +8402,60 @@
         }
       },
       "w_swe": 0.984
+    },
+    {
+      "id": "azure/eu/gpt-6.2-astra",
+      "host": "azure",
+      "leaf": "eu/gpt-6.2-astra",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 9.6,
+        "output_usd_per_mtok": 48.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.48
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "azure/eu/gpt-6.2-sol",
+      "host": "azure",
+      "leaf": "eu/gpt-6.2-sol",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.4,
+        "output_usd_per_mtok": 12.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.12
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
     },
     {
       "id": "azure/eu/o1",
@@ -10529,6 +10637,60 @@
       "w_swe": 0.984
     },
     {
+      "id": "azure/gpt-6.2-astra",
+      "host": "azure",
+      "leaf": "gpt-6.2-astra",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.39999999999999997
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "azure/gpt-6.2-sol",
+      "host": "azure",
+      "leaf": "gpt-6.2-sol",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.09999999999999999
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
+    },
+    {
       "id": "azure/gpt-audio",
       "host": "azure",
       "leaf": "gpt-audio",
@@ -12558,6 +12720,60 @@
         }
       },
       "w_swe": 0.984
+    },
+    {
+      "id": "azure/us/gpt-6.2-astra",
+      "host": "azure",
+      "leaf": "us/gpt-6.2-astra",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.8,
+        "output_usd_per_mtok": 44.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.44
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "azure/us/gpt-6.2-sol",
+      "host": "azure",
+      "leaf": "us/gpt-6.2-sol",
+      "family": "azure",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.11
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
     },
     {
       "id": "azure/us/gpt-chat-latest",
@@ -20584,6 +20800,52 @@
       }
     },
     {
+      "id": "bedrock/mantle/anthropic.claude-haiku-5-5",
+      "host": "bedrock",
+      "leaf": "mantle/anthropic.claude-haiku-5-5",
+      "family": "bedrock",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.11,
+        "output_usd_per_mtok": 0.55,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.011
+      },
+      "agentic_score": 0.466,
+      "w_swe": 0.911,
+      "capability": {
+        "terminal_bench": {
+          "acc": 40.0,
+          "date": "2026-10-07",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.93
+      },
+      "arena_coding_elo": 1593.2,
+      "arena_webdev_elo": 1593.2,
+      "preference": {
+        "arena_agent": {
+          "rank": 36,
+          "score": -0.0037,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 40,
+          "rating": 1593.2,
+          "source": "arena.ai",
+          "votes": 7147
+        }
+      }
+    },
+    {
       "id": "bedrock/mantle/anthropic.claude-mythos-5",
       "host": "bedrock",
       "leaf": "mantle/anthropic.claude-mythos-5",
@@ -20848,6 +21110,52 @@
           "rating": 1539.1,
           "source": "arena.ai",
           "votes": 16743
+        }
+      }
+    },
+    {
+      "id": "bedrock/mantle/anthropic.claude-sonnet-5-5",
+      "host": "bedrock",
+      "leaf": "mantle/anthropic.claude-sonnet-5-5",
+      "family": "bedrock",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.11
+      },
+      "agentic_score": 0.751,
+      "w_swe": 1.0,
+      "capability": {
+        "terminal_bench": {
+          "acc": 63.94,
+          "date": "2026-09-28",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.96,
+        "grind": 0.96
+      },
+      "arena_coding_elo": 1772.2,
+      "arena_webdev_elo": 1772.2,
+      "preference": {
+        "arena_agent": {
+          "rank": 4,
+          "score": 0.1529,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 3,
+          "rating": 1772.2,
+          "source": "arena.ai",
+          "votes": 6120
         }
       }
     },
@@ -30979,7 +31287,8 @@
       "economics": {
         "input_usd_per_mtok": 1.5,
         "output_usd_per_mtok": 4.5,
-        "source": "litellm"
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.075
       },
       "agentic_score": 0.833,
       "arena_coding_elo": 1749.8,
@@ -32861,6 +33170,23 @@
         "output_usd_per_mtok": 10.0,
         "source": "litellm",
         "cache_read_usd_per_mtok": 2.0
+      }
+    },
+    {
+      "id": "databricks/system.ai.gemini-4-hydrogen",
+      "host": "databricks",
+      "leaf": "system.ai.gemini-4-hydrogen",
+      "family": "databricks",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 7.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 1.5
       }
     },
     {
@@ -38199,8 +38525,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.14,
-        "output_usd_per_mtok": 0.42,
+        "input_usd_per_mtok": 0.051,
+        "output_usd_per_mtok": 0.5670000000000001,
         "source": "openrouter"
       },
       "agentic_score": 0.49,
@@ -54053,6 +54379,40 @@
       }
     },
     {
+      "id": "global.openai.gpt-6.2-astra",
+      "host": "",
+      "leaf": "global.openai.gpt-6.2-astra",
+      "family": "global.openai.gpt-6.2-astra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.39999999999999997
+      }
+    },
+    {
+      "id": "global.openai.gpt-6.2-sol",
+      "host": "",
+      "leaf": "global.openai.gpt-6.2-sol",
+      "family": "global.openai.gpt-6.2-sol",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.09999999999999999
+      }
+    },
+    {
       "id": "global.openai.gpt-daybreak-blue-5.6-sol",
       "host": "",
       "leaf": "global.openai.gpt-daybreak-blue-5.6-sol",
@@ -59688,7 +60048,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.08,
-        "output_usd_per_mtok": 0.35,
+        "output_usd_per_mtok": 0.44999999999999996,
         "source": "openrouter"
       },
       "agentic_score": 0.049,
@@ -61792,6 +62152,77 @@
         }
       },
       "w_swe": 0.984
+    },
+    {
+      "id": "gpt-6.2-astra",
+      "host": "",
+      "leaf": "gpt-6.2-astra",
+      "family": "gpt-6.2-astra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.39999999999999997
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "gpt-6.2-astra-law",
+      "host": "",
+      "leaf": "gpt-6.2-astra-law",
+      "family": "gpt-6.2-astra-law",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.39999999999999997
+      }
+    },
+    {
+      "id": "gpt-6.2-sol",
+      "host": "",
+      "leaf": "gpt-6.2-sol",
+      "family": "gpt-6.2-sol",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.09999999999999999
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
     },
     {
       "id": "gpt-audio",
@@ -72378,8 +72809,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.39999999999999997,
-        "output_usd_per_mtok": 2.0,
+        "input_usd_per_mtok": 0.44,
+        "output_usd_per_mtok": 2.2,
         "source": "openrouter"
       }
     },
@@ -72451,8 +72882,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.39999999999999997,
-        "output_usd_per_mtok": 2.0,
+        "input_usd_per_mtok": 0.44,
+        "output_usd_per_mtok": 2.2,
         "source": "openrouter"
       }
     },
@@ -72547,8 +72978,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09999999999999999,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.075,
+        "output_usd_per_mtok": 0.19999999999999998,
         "source": "openrouter"
       }
     },
@@ -73400,7 +73831,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.6,
+        "input_usd_per_mtok": 0.8125,
         "output_usd_per_mtok": 3.5,
         "source": "openrouter"
       },
@@ -75861,6 +76292,38 @@
         "input_usd_per_mtok": 0.12,
         "output_usd_per_mtok": 0.39999999999999997,
         "source": "openrouter"
+      }
+    },
+    {
+      "id": "north-mini-code-1.0",
+      "host": "",
+      "leaf": "north-mini-code-1.0",
+      "family": "north-mini-code-1.0",
+      "kind": "chat",
+      "route_candidate": true,
+      "free": true,
+      "paid": false,
+      "gated_reason": null,
+      "economics": {
+        "input_usd_per_mtok": 0.0,
+        "output_usd_per_mtok": 0.0,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "north-small-translate-1.0",
+      "host": "",
+      "leaf": "north-small-translate-1.0",
+      "family": "north-small-translate-1.0",
+      "kind": "chat",
+      "route_candidate": true,
+      "free": true,
+      "paid": false,
+      "gated_reason": null,
+      "economics": {
+        "input_usd_per_mtok": 0.0,
+        "output_usd_per_mtok": 0.0,
+        "source": "litellm"
       }
     },
     {
@@ -82226,6 +82689,60 @@
       "w_swe": 0.977
     },
     {
+      "id": "openai.gpt-6.2-astra",
+      "host": "",
+      "leaf": "openai.gpt-6.2-astra",
+      "family": "openai.gpt-6.2-astra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.39999999999999997
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "openai.gpt-6.2-sol",
+      "host": "",
+      "leaf": "openai.gpt-6.2-sol",
+      "family": "openai.gpt-6.2-sol",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.09999999999999999
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
+    },
+    {
       "id": "openai.gpt-oss-120b-1:0",
       "host": "",
       "leaf": "openai.gpt-oss-120b-1:0",
@@ -84959,6 +85476,174 @@
       }
     },
     {
+      "id": "openai/gpt-6.2-astra",
+      "host": "openai",
+      "leaf": "gpt-6.2-astra",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "openai/gpt-6.2-astra-pro",
+      "host": "openai",
+      "leaf": "gpt-6.2-astra-pro",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.621,
+      "capability": {
+        "terminal_bench": {
+          "acc": 62.12,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.811
+    },
+    {
+      "id": "openai/gpt-6.2-astra-pro:batch",
+      "host": "openai",
+      "leaf": "gpt-6.2-astra-pro:batch",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 4.0,
+        "output_usd_per_mtok": 20.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "openai/gpt-6.2-astra:batch",
+      "host": "openai",
+      "leaf": "gpt-6.2-astra:batch",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 4.0,
+        "output_usd_per_mtok": 20.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "openai/gpt-6.2-sol",
+      "host": "openai",
+      "leaf": "gpt-6.2-sol",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
+    },
+    {
+      "id": "openai/gpt-6.2-sol-pro",
+      "host": "openai",
+      "leaf": "gpt-6.2-sol-pro",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 10.0,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.615,
+      "capability": {
+        "terminal_bench": {
+          "acc": 61.52,
+          "date": "2026-11-17",
+          "harness": "Codex",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.808
+    },
+    {
+      "id": "openai/gpt-6.2-sol-pro:batch",
+      "host": "openai",
+      "leaf": "gpt-6.2-sol-pro:batch",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.0,
+        "output_usd_per_mtok": 5.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "openai/gpt-6.2-sol:batch",
+      "host": "openai",
+      "leaf": "gpt-6.2-sol:batch",
+      "family": "openai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.0,
+        "output_usd_per_mtok": 5.0,
+        "source": "openrouter"
+      }
+    },
+    {
       "id": "openai/gpt-audio",
       "host": "openai",
       "leaf": "gpt-audio",
@@ -85081,8 +85766,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.075,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.018,
+        "output_usd_per_mtok": 0.09,
         "source": "openrouter"
       },
       "agentic_score": 0.5,
@@ -88246,7 +88931,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09,
+        "input_usd_per_mtok": 0.09999999999999999,
         "output_usd_per_mtok": 1.1,
         "source": "openrouter"
       },
@@ -88401,8 +89086,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.26,
-        "output_usd_per_mtok": 2.6,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 2.4,
         "source": "openrouter"
       },
       "agentic_score": 0.429,
@@ -88931,8 +89616,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 1.875,
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 2.2,
         "source": "openrouter"
       },
       "agentic_score": 0.763,
@@ -95129,8 +95814,40 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.24,
-        "output_usd_per_mtok": 0.24,
+        "input_usd_per_mtok": 0.22,
+        "output_usd_per_mtok": 0.22,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "snowflake/llama3.2-1b",
+      "host": "snowflake",
+      "leaf": "llama3.2-1b",
+      "family": "snowflake",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.09999999999999999,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "snowflake/llama3.2-3b",
+      "host": "snowflake",
+      "leaf": "llama3.2-3b",
+      "family": "snowflake",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.15,
         "source": "litellm"
       }
     },
@@ -95163,6 +95880,22 @@
       "economics": {
         "input_usd_per_mtok": 0.24,
         "output_usd_per_mtok": 0.9700000000000001,
+        "source": "litellm"
+      }
+    },
+    {
+      "id": "snowflake/mistral-7b",
+      "host": "snowflake",
+      "leaf": "mistral-7b",
+      "family": "snowflake",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.19999999999999998,
         "source": "litellm"
       }
     },
@@ -95253,9 +95986,10 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.3,
-        "output_usd_per_mtok": 1.2,
-        "source": "litellm"
+        "input_usd_per_mtok": 0.25,
+        "output_usd_per_mtok": 2.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.03
       },
       "agentic_score": 0.74,
       "w_swe": 0.74,
@@ -95282,9 +96016,10 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 0.6,
-        "source": "litellm"
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 0.44,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.01
       },
       "agentic_score": 0.74,
       "w_swe": 0.74,
@@ -98596,6 +99331,40 @@
         "single_pass": 0.78,
         "grind": 0.66
       }
+    },
+    {
+      "id": "together_ai/Qwen/Qwen4-Max",
+      "host": "together_ai",
+      "leaf": "Qwen/Qwen4-Max",
+      "family": "together_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.4249999999999998,
+        "output_usd_per_mtok": 4.2749999999999995,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.07125000000000001
+      },
+      "agentic_score": 0.833,
+      "arena_coding_elo": 1749.8,
+      "arena_webdev_elo": 1749.8,
+      "preference": {
+        "arena_agent": {
+          "rank": 14,
+          "score": 0.0746,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 6,
+          "rating": 1749.8,
+          "source": "arena.ai",
+          "votes": 1814
+        }
+      },
+      "w_swe": 1.0
     },
     {
       "id": "together_ai/arcee-ai/trinity-mini",
@@ -102185,6 +102954,40 @@
         "output_usd_per_mtok": 5.5,
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.055
+      }
+    },
+    {
+      "id": "us.openai.gpt-6.2-astra",
+      "host": "",
+      "leaf": "us.openai.gpt-6.2-astra",
+      "family": "us.openai.gpt-6.2-astra",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 8.8,
+        "output_usd_per_mtok": 44.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.44
+      }
+    },
+    {
+      "id": "us.openai.gpt-6.2-sol",
+      "host": "",
+      "leaf": "us.openai.gpt-6.2-sol",
+      "family": "us.openai.gpt-6.2-sol",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.2,
+        "output_usd_per_mtok": 11.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.11
       }
     },
     {
@@ -112331,8 +113134,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.435,
-        "output_usd_per_mtok": 0.87,
+        "input_usd_per_mtok": 0.48,
+        "output_usd_per_mtok": 1.7999999999999998,
         "source": "openrouter"
       },
       "agentic_score": 0.71,
@@ -113030,8 +113833,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.15,
-        "output_usd_per_mtok": 0.5,
+        "input_usd_per_mtok": 0.0399,
+        "output_usd_per_mtok": 0.0784,
         "source": "openrouter"
       },
       "agentic_score": 0.631,
@@ -114671,8 +115474,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 10.0,
-        "output_usd_per_mtok": 50.0,
+        "input_usd_per_mtok": 8.0,
+        "output_usd_per_mtok": 40.0,
         "source": "openrouter"
       }
     },

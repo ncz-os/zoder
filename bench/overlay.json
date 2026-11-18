@@ -549,6 +549,18 @@
   },
   "w_swe": 0.898
  },
+ "copilot-fusion": {
+  "agentic_score": 0.712,
+  "capability": {
+   "terminal_bench": {
+    "acc": 71.21,
+    "date": "2026-11-17",
+    "harness": "GitHub Copilot",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.856
+ },
  "deepseek-chat-v2-5": {
   "agentic_score": 0.178,
   "capability": {
@@ -1899,6 +1911,30 @@
    }
   },
   "w_swe": 0.984
+ },
+ "gpt-6-2-astra": {
+  "agentic_score": 0.621,
+  "capability": {
+   "terminal_bench": {
+    "acc": 62.12,
+    "date": "2026-11-17",
+    "harness": "Codex",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.811
+ },
+ "gpt-6-2-sol": {
+  "agentic_score": 0.615,
+  "capability": {
+   "terminal_bench": {
+    "acc": 61.52,
+    "date": "2026-11-17",
+    "harness": "Codex",
+    "source": "terminal-bench"
+   }
+  },
+  "w_swe": 0.808
  },
  "gpt-6-astra": {
   "agentic_score": 0.715,
