@@ -10,6 +10,110 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
 
+static TEMPERATURE_REJECTIONS: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+    OnceLock::new();
+static TOKEN_PARAMETER_OVERRIDES: OnceLock<Mutex<HashMap<(String, String), bool>>> =
+    OnceLock::new();
+static COMPATIBILITY_RETRIES: OnceLock<Mutex<std::collections::HashSet<(String, String, String)>>> =
+    OnceLock::new();
+
+/// Whether a provider/model pair accepts a temperature field.
+pub fn model_accepts_temperature(provider_kind: &str, model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+    if provider_kind == "anthropic" {
+        let Some(rest) = model.strip_prefix("claude-") else {
+            return true;
+        };
+        let Some(rest) = ["opus-", "sonnet-", "haiku-", "fable-"]
+            .iter()
+            .find_map(|p| rest.strip_prefix(p))
+        else {
+            return true;
+        };
+        // Version segments are one or two digits; an 8-digit segment is a
+        // date suffix (claude-sonnet-4-20250514), not a minor version.
+        let mut segs = rest.split('-');
+        let Some(major) = segs.next().and_then(|p| p.parse::<u32>().ok()) else {
+            return true;
+        };
+        let minor = segs
+            .next()
+            .filter(|p| p.len() <= 2)
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0);
+        return !(major >= 5 || (major == 4 && minor >= 6));
+    }
+    if matches!(
+        provider_kind,
+        "openai-chat" | "openai-responses" | "azure-openai" | "custom"
+    ) {
+        let m = model.strip_prefix("openai/").unwrap_or(&model);
+        if ["o1", "o3", "o4"].iter().any(|p| {
+            m == *p
+                || m.strip_prefix(p)
+                    .is_some_and(|s| s.starts_with('-') || s.starts_with('_'))
+        }) {
+            return false;
+        }
+        if gpt_5_plus_rest(m).is_some_and(|rest| !rest.starts_with("-chat")) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The part of a `gpt-5`/`gpt-6` family id after the major version, when it
+/// is a real version boundary: empty, `-sol`, `_x`, or a dotted minor such as
+/// `.1-mini`. `gpt-50` and `gpt-4.1` are not in the family.
+fn gpt_5_plus_rest(m: &str) -> Option<&str> {
+    let rest = m
+        .strip_prefix("gpt-")
+        .and_then(|s| s.strip_prefix('5').or_else(|| s.strip_prefix('6')))?;
+    let versioned = rest.is_empty()
+        || rest.starts_with('-')
+        || rest.starts_with('_')
+        || rest
+            .strip_prefix('.')
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    versioned.then_some(rest)
+}
+
+/// A 400 body that rejects a request parameter outright, as opposed to
+/// complaining about its value (for example a temperature out of range).
+fn is_parameter_rejection(lower: &str) -> bool {
+    [
+        "unsupported",
+        "not supported",
+        "not permitted",
+        "does not support",
+        "deprecated",
+        "only the default",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Whether OpenAI-style requests for this provider/model currently send
+/// `max_completion_tokens` (true) or `max_tokens` (false): a learned override
+/// wins over the static model rule, and applies to every provider kind that
+/// speaks the chat-completions wire (an OpenAI-compatible `custom` gateway
+/// learns it too). The static rule only covers the OpenAI kinds.
+fn token_param_is_completion(provider_id: &str, model_id: &str, openai_kind: bool) -> bool {
+    TOKEN_PARAMETER_OVERRIDES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .get(&(provider_id.to_string(), model_id.to_string()))
+        .copied()
+        .unwrap_or_else(|| openai_kind && uses_completion_tokens(model_id))
+}
+
+/// Model-only version of the compatibility check for provider-neutral probes.
+pub fn model_id_accepts_temperature(model_id: &str) -> bool {
+    model_accepts_temperature("anthropic", model_id)
+        && model_accepts_temperature("openai-chat", model_id)
+}
+
 #[cfg(test)]
 mod reliability_deadline_tests {
     use super::*;
@@ -118,6 +222,76 @@ mod reliability_deadline_tests {
     const REASONING_DELTA: &str =
         "data: {\"model\":\"model\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n";
     const DONE: &str = "data: [DONE]\n\n";
+
+    #[tokio::test]
+    async fn provider_retries_once_without_rejected_temperature() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                        let len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse::<usize>()
+                            .unwrap();
+                        if data.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let headers = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let len = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&data[end + 4..end + 4 + len]).unwrap();
+                tx.send(request).await.unwrap();
+                let (status, body) = if attempt == 0 {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"temperature is unsupported"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#,
+                    )
+                };
+                let response = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let (provider, mut request) = fixture(&uri, 5000, 5000);
+        request.model = "retry-temperature-test".into();
+        request.temperature = Some(0.1);
+        request.stream = false;
+        let result = provider.stream_chat(&request, None).await.unwrap();
+        assert_eq!(result.content, "ok");
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert!((first["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!(second.get("temperature").is_none());
+        server.await.unwrap();
+    }
 
     /// A per-model budget must move THIS call's deadline and nothing else: the
     /// cached client another model on the same provider uses keeps its own
@@ -1262,7 +1436,10 @@ fn anthropic_body(req: &ChatRequest) -> serde_json::Value {
         // common case and keeps the JSON identical to what most SDKs send.
         body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
     }
-    if let Some(temp) = req.temperature {
+    if let Some(temp) = req
+        .temperature
+        .filter(|_| model_accepts_temperature("anthropic", &req.model))
+    {
         body["temperature"] = serde_json::json!(temp);
     }
     body
@@ -1418,10 +1595,13 @@ fn responses_body(req: &ChatRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": req.model,
         "input": input,
-        "max_output_tokens": req.max_tokens,
+        "max_output_tokens": req.max_tokens.max(16),
         "stream": req.stream,
     });
-    if let Some(temp) = req.temperature {
+    if let Some(temp) = req
+        .temperature
+        .filter(|_| model_accepts_temperature("openai-responses", &req.model))
+    {
         body["temperature"] = serde_json::json!(temp);
     }
     if let Some(eff) = &req.reasoning_effort {
@@ -2124,13 +2304,34 @@ impl OpenAiProvider {
         // builder. The Azure wire adapter therefore differs from the
         // openai-chat branch ONLY in endpoint + auth header (see
         // [`Self::request`]) — every body field is shared.
+        let openai_kind = matches!(
+            self.kind.as_str(),
+            "openai-chat" | "openai-responses" | "azure-openai"
+        );
+        let completion_limit =
+            token_param_is_completion(&self.provider_id, &req.model, openai_kind);
+        // OpenAI refuses fewer than 16 output tokens; other providers keep
+        // exactly the limit the caller asked for.
+        let token_limit = if openai_kind {
+            req.max_tokens.max(16)
+        } else {
+            req.max_tokens
+        };
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
-            "max_tokens": req.max_tokens,
+            (if completion_limit { "max_completion_tokens" } else { "max_tokens" }): token_limit,
             "stream": req.stream || self.request_stream,
         });
-        if let Some(temp) = req.temperature {
+        let temperature_rejected = TEMPERATURE_REJECTIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .contains(&(self.provider_id.clone(), req.model.clone()));
+        if let Some(temp) = req
+            .temperature
+            .filter(|_| model_accepts_temperature(&self.kind, &req.model) && !temperature_rejected)
+        {
             body["temperature"] = serde_json::json!(temp);
         }
         if let Some(top_p) = req.top_p {
@@ -2427,6 +2628,56 @@ impl OpenAiProvider {
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_else(|error| format!("[{}]", error.message));
+            if code == 400 {
+                let lower = body.to_ascii_lowercase();
+                let key = (self.provider_id.clone(), req.model.clone());
+                if lower.contains("temperature")
+                    && is_parameter_rejection(&lower)
+                    && req.temperature.is_some()
+                    && COMPATIBILITY_RETRIES
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert((key.0.clone(), key.1.clone(), "temperature".into()))
+                {
+                    TEMPERATURE_REJECTIONS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone());
+                    return Box::pin(self.stream_chat_inner(req, sink)).await;
+                }
+                if !self.is_anthropic()
+                    && !self.is_responses()
+                    && is_parameter_rejection(&lower)
+                    && (lower.contains("max_tokens") || lower.contains("max_completion_tokens"))
+                {
+                    // OpenAI's message names both parameters ("'max_tokens' is
+                    // not supported ... use 'max_completion_tokens'"), so flip
+                    // whichever one this request actually sent.
+                    let sent_completion = token_param_is_completion(
+                        &self.provider_id,
+                        &req.model,
+                        matches!(
+                            self.kind.as_str(),
+                            "openai-chat" | "openai-responses" | "azure-openai"
+                        ),
+                    );
+                    if COMPATIBILITY_RETRIES
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .insert((key.0.clone(), key.1.clone(), "token_limit".into()))
+                    {
+                        TOKEN_PARAMETER_OVERRIDES
+                            .get_or_init(Default::default)
+                            .lock()
+                            .unwrap()
+                            .insert(key, !sent_completion);
+                        return Box::pin(self.stream_chat_inner(req, sink)).await;
+                    }
+                }
+            }
             // MiniMax M Plan wall (2026-10-17 quota incident): a 429 whose
             // body is the `rate_limit_error`/2056 envelope is a plan-limit
             // exhaustion, not transient throttling. Mark the error and
@@ -4143,6 +4394,16 @@ the model spent the whole {}-token budget before producing any content",
     }
 }
 
+fn uses_completion_tokens(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    let m = m.strip_prefix("openai/").unwrap_or(&m);
+    ["o1", "o3", "o4"].iter().any(|p| {
+        m == *p
+            || m.strip_prefix(p)
+                .is_some_and(|s| s.starts_with('-') || s.starts_with('_'))
+    }) || gpt_5_plus_rest(m).is_some()
+}
+
 /// Heuristic: turn a `reqwest::header::HeaderMap` + configured `base_url`
 /// into a [`crate::utilization::Provider`] so we know which key the live
 /// snapshot belongs under. The header set is the source of truth — a
@@ -4941,6 +5202,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn known_model_temperature_and_token_parameter_compatibility() {
+        for model in [
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-5-20261101",
+            "gpt-5-nano",
+        ] {
+            let kind = if model.starts_with("claude-") {
+                "anthropic"
+            } else {
+                "openai-chat"
+            };
+            assert!(!model_accepts_temperature(kind, model), "{model}");
+        }
+        assert!(model_accepts_temperature("anthropic", "claude-haiku-4-5"));
+        for m in ["gpt-5.1", "gpt-6.2-sol", "gpt-5-nano", "o3-mini"] {
+            assert!(uses_completion_tokens(m), "{m}");
+        }
+        for m in ["gpt-4.1", "gpt-4o", "gpt-50", "deepseek-chat"] {
+            assert!(!uses_completion_tokens(m), "{m}");
+        }
+        // Date-suffixed ids are not minor versions: Sonnet 4 and Opus 4.1 accept it.
+        assert!(model_accepts_temperature(
+            "anthropic",
+            "claude-sonnet-4-20250514"
+        ));
+        assert!(model_accepts_temperature(
+            "anthropic",
+            "claude-opus-4-1-20250805"
+        ));
+        assert!(model_accepts_temperature(
+            "anthropic",
+            "claude-sonnet-4-5-20250929"
+        ));
+        assert!(!model_accepts_temperature("anthropic", "claude-opus-4-6"));
+        assert!(!model_accepts_temperature(
+            "anthropic",
+            "claude-sonnet-5-5-20261001"
+        ));
+        assert!(!model_accepts_temperature("anthropic", "claude-opus-5"));
+        // Dotted OpenAI generations reject it too; chat-tuned ids and 4.x accept.
+        for m in [
+            "gpt-5.1",
+            "gpt-5.1-mini",
+            "gpt-6.2-sol",
+            "gpt-5-nano",
+            "o3-mini",
+        ] {
+            assert!(!model_accepts_temperature("openai-chat", m), "{m}");
+        }
+        for m in ["gpt-5-chat-latest", "gpt-4.1", "gpt-4o", "gpt-50"] {
+            assert!(model_accepts_temperature("openai-chat", m), "{m}");
+        }
+        assert!(model_accepts_temperature("openai-chat", "deepseek-chat"));
+        assert!(uses_completion_tokens("gpt-5-nano"));
+        assert!(!uses_completion_tokens("gpt-4.1"));
+    }
+
+    #[test]
+    fn openai_chat_body_omits_temperature_and_uses_completion_limit_for_gpt5() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.model = "gpt-5-nano".into();
+        req.max_tokens = 2;
+        let body = p.body(&req);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn token_floor_is_openai_only_and_dotted_gpt_ids_use_completion_tokens() {
+        let p = azure_provider_fixture("openai-chat", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.model = "gpt-5.1".into();
+        req.max_tokens = 4;
+        let body = p.body(&req);
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
+        let p = azure_provider_fixture("custom", Auth::None, None);
+        req.model = "deepseek-chat".into();
+        let body = p.body(&req);
+        assert_eq!(body["max_tokens"], 4);
+    }
+
+    #[test]
+    fn learned_token_parameter_override_applies_to_custom_providers() {
+        let p = azure_provider_fixture("custom", Auth::None, None);
+        let mut req = sampling_req(None, None);
+        req.model = "learned-override-model".into();
+        req.max_tokens = 64;
+        assert!(p.body(&req).get("max_tokens").is_some());
+        TOKEN_PARAMETER_OVERRIDES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert((p.provider_id.clone(), req.model.clone()), true);
+        let body = p.body(&req);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn parameter_rejection_needs_a_rejection_marker_not_just_the_word() {
+        assert!(is_parameter_rejection(
+            "unsupported parameter: 'max_tokens' is not supported with this model. use 'max_completion_tokens' instead."
+        ));
+        assert!(is_parameter_rejection(
+            "`temperature` is deprecated for this model"
+        ));
+        assert!(!is_parameter_rejection(
+            "temperature must be between 0 and 2"
+        ));
+    }
+
+    #[test]
+    fn anthropic_body_omits_temperature_for_all_supported_46_families() {
+        for family in ["opus", "sonnet", "haiku", "fable"] {
+            let mut req = anthropic_unit_req(Some(0.1));
+            req.model = format!("claude-{family}-5-5-20261101");
+            assert!(
+                anthropic_body(&req).get("temperature").is_none(),
+                "{}",
+                req.model
+            );
+        }
+        let mut req = anthropic_unit_req(Some(0.1));
+        req.model = "claude-haiku-4-5".into();
+        assert!((anthropic_body(&req)["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+    }
+
     /// Azure's resolved endpoint URL must include BOTH the deployment
     /// route (the `base_url` is expected to encode it — Azure's URL
     /// contract treats the deployment as a path segment) AND the
@@ -5137,7 +5531,7 @@ mod tests {
 
     fn responses_unit_req() -> ChatRequest {
         ChatRequest {
-            model: "gpt-5".into(),
+            model: "gpt-4.1".into(),
             messages: vec![
                 Message::new("system", "be terse"),
                 Message::new("developer", "answer in one sentence"),
@@ -5190,7 +5584,7 @@ mod tests {
     #[test]
     fn responses_body_uses_max_output_tokens_and_keeps_temperature_stream() {
         let body = responses_body(&responses_unit_req());
-        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["model"], "gpt-4.1");
         assert_eq!(body["max_output_tokens"], 32);
         // `max_tokens` MUST NOT appear — the chat-shaped field name
         // would either be silently ignored or rejected by the
@@ -5201,6 +5595,13 @@ mod tests {
         );
         assert_eq!(body["temperature"], 0.25);
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn responses_body_omits_temperature_for_gpt5() {
+        let mut req = responses_unit_req();
+        req.model = "gpt-5-nano".into();
+        assert!(responses_body(&req).get("temperature").is_none());
     }
 
     #[test]

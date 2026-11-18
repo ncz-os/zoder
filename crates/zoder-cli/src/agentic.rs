@@ -2314,7 +2314,8 @@ async fn dispatch_reviewer_for_model(
         model: model.to_string(),
         messages,
         max_tokens,
-        temperature: model_cfg.and_then(|m| m.temperature).or(Some(0.1)),
+        temperature: zoder_core::provider::model_accepts_temperature(&provider_cfg.kind, model)
+            .then(|| model_cfg.and_then(|m| m.temperature).unwrap_or(0.1)),
         stream: false,
         show_reasoning: false,
         reasoning_effort,

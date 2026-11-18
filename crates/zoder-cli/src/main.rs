@@ -7391,7 +7391,14 @@ async fn cmd_exec_oneshot(cli: &Cli, prompt: Option<String>) -> anyhow::Result<(
             // 0.2 stays the default. Models that publish their own
             // recommendation (NVIDIA specifies 1.0 / 0.95 for Nemotron 3.5)
             // can now state it in config instead of being silently overridden.
-            temperature: Some(model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
+            temperature: eng
+                .cfg
+                .providers
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| zoder_core::provider::model_accepts_temperature(&p.kind, model_id))
+                .unwrap_or(true)
+                .then(|| model_cfg.and_then(|m| m.temperature).unwrap_or(0.2)),
             stream: !cli.no_stream,
             show_reasoning: cli.show_reasoning,
             reasoning_effort: direct.reasoning_effort,

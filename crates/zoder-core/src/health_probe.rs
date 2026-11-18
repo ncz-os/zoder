@@ -40,10 +40,10 @@ pub trait Probe: Send + Sync {
     fn ping(&self, model_id: &str) -> Result<ChatResult, ProviderError>;
 }
 
-/// Cheap default probe payload: 8 completion tokens is enough for the
+/// Cheap default probe payload: 16 completion tokens (OpenAI's minimum) is enough for the
 /// provider to validate auth + model id + a streaming round-trip without
 /// costing more than a fraction of a cent on a metered endpoint.
-pub const PROBE_MAX_TOKENS: u32 = 8;
+pub const PROBE_MAX_TOKENS: u32 = 16;
 
 /// Default ping prompt. Kept tiny and neutral so it works for chat-tuned
 /// models without provoking content filters.
@@ -84,7 +84,7 @@ pub fn probe_request(model_id: &str) -> ChatRequest {
         model: model_id.to_string(),
         messages: vec![crate::provider::Message::new("user", PROBE_PROMPT)],
         max_tokens: PROBE_MAX_TOKENS,
-        temperature: Some(0.0),
+        temperature: crate::provider::model_id_accepts_temperature(model_id).then_some(0.0),
         stream: false,
         show_reasoning: false,
         reasoning_effort: None,
@@ -780,17 +780,26 @@ mod tests {
 
     #[test]
     fn probe_request_is_tiny_and_neutral() {
-        // The probe payload must be tiny (8 tokens) so a daily sweep
+        // The probe payload must be small (16 tokens) so a daily sweep
         // across hundreds of models costs ~zero on a metered endpoint,
         // and the prompt must be neutral so a content-filtered model
         // doesn't refuse it.
         let req = probe_request("test-model");
-        assert_eq!(req.max_tokens, 8);
+        assert_eq!(req.max_tokens, 16);
         assert_eq!(req.model, "test-model");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].content, "ping");
         assert!(!req.stream);
         assert_eq!(req.temperature, Some(0.0));
+    }
+
+    #[test]
+    fn probe_uses_openai_minimum_and_omits_temperature_for_restricted_models() {
+        for model in ["gpt-5-nano", "claude-haiku-5-5"] {
+            let req = probe_request(model);
+            assert!(req.max_tokens >= 16);
+            assert_eq!(req.temperature, None);
+        }
     }
 
     // Suppress unused warnings for items used only in some tests.

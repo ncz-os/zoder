@@ -741,6 +741,13 @@ pub(crate) fn harden_catalog_mode(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn insecure_catalog_mode_message(path: &Path, mode: u32) -> String {
+    format!(
+        "pricing catalog {} rejected — insecure mode {:03o} (must not be group- or world-writable); fix with: chmod 644 {}",
+        path.display(), mode & 0o777, path.display()
+    )
+}
+
 /// The loader's permission gate is Unix-only, so on other platforms there
 /// are no group/world write bits to strip.
 #[cfg(not(unix))]
@@ -863,7 +870,10 @@ impl PricingCatalog {
             use std::os::unix::fs::MetadataExt;
             let bad = 0o020 | 0o002; // S_IWGRP | S_IWOTH
             if meta.mode() & bad != 0 {
-                eprintln!("zoder: warning: pricing catalog {} rejected — insecure mode {:03o} (must not be group- or world-writable); using empty", path.display(), meta.mode() & 0o777);
+                eprintln!(
+                    "zoder: warning: {}; using empty",
+                    insecure_catalog_mode_message(path, meta.mode())
+                );
                 return cat;
             }
         }
@@ -1278,6 +1288,14 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::sync::atomic::{AtomicU32, Ordering as TestOrdering};
+
+    #[test]
+    fn writable_pricing_catalog_error_names_path_and_chmod_fix() {
+        let path = Path::new("/catalog/prices.json");
+        let message = insecure_catalog_mode_message(path, 0o664);
+        assert!(message.contains("/catalog/prices.json"));
+        assert!(message.contains("chmod 644 /catalog/prices.json"));
+    }
 
     fn deepseek_chat() -> ModelPrice {
         ModelPrice {
