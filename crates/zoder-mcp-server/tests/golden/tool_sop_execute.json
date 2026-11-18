@@ -1,0 +1,12 @@
+{
+  "name": "sop_execute",
+  "description": "Manually trigger an SOP by name, optionally with a JSON payload.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string"},
+      "payload": {"type": "string", "description": "Optional JSON string."}
+    },
+    "required": ["name"]
+  }
+}

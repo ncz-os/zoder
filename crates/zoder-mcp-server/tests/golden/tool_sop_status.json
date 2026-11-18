@@ -1,0 +1,11 @@
+{
+  "name": "sop_status",
+  "description": "List SOP runs through the zeroclaw daemon.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "sop_name": {"type": "string", "description": "Optional SOP name filter."},
+      "run_id": {"type": "string", "description": "Optional specific run id; returns its overlay."}
+    }
+  }
+}

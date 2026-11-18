@@ -1,0 +1,13 @@
+{
+  "name": "sop_advance",
+  "description": "Advance a paused SOP checkpoint through zeroclaw's sops/decide RPC.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "name": {"type": "string"},
+      "run_id": {"type": "string"},
+      "decision": {"description": "Approval decision, e.g. \"approve\" or {\"deny\":{}}."}
+    },
+    "required": ["name", "run_id", "decision"]
+  }
+}

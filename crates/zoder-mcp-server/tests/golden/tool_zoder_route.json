@@ -1,0 +1,17 @@
+{
+  "name": "zoder_route",
+  "description": "Select the best free model for the requested routing tier using zoder's router. Routing is tier-based (capability/health); the optional task label is only echoed for traceability. Returns the recommended model, fallback chain, and reasoning. A heuristic task-content classifier is future work.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "task": { "type": "string", "description": "Optional task label for traceability; does not affect routing, which is tier-based." },
+      "tier": {
+        "type": "string",
+        "description": "Routing tier; defaults to auto.",
+        "enum": ["fast", "strong", "codex", "single-pass", "singlepass", "single", "oneshot", "grind", "loop", "auto"],
+        "default": "auto"
+      }
+    },
+    "required": []
+  }
+}

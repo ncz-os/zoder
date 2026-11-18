@@ -1,0 +1,8 @@
+{
+  "name": "sop_list",
+  "description": "List SOP definitions through the zeroclaw daemon.",
+  "input_schema": {
+    "type": "object",
+    "properties": {}
+  }
+}
