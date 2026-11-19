@@ -85,5 +85,4 @@ becomes safely self-improving for P0.3+ onward.
 ## Consequences
 - zoder becomes a faithful open-weight `codex exec` replacement, not a worse copy.
 - The two 12h-supervision junk failure modes are structurally impossible after P0.
-- Ties to ADR 0001: the same execution-safety model is engine-agnostic, so it applies whether
-  the loop drives zeroclaw or goose.
+- Ties to ADR 0001: the same execution-safety model applies to the ZeroClaw engine path.

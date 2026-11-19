@@ -5,12 +5,12 @@ call "waits", and the settings recommended for a busy shared build host.
 
 ## Engine hierarchy
 
-zoder's engine is **Zeroclaw**. `zoder exec` and the author turn of
-`zoder loop` run through the Zeroclaw daemon (`zeroclaw daemon`, reached over
-its Unix socket). **goose is an alternative engine only**: it is used when it
-is selected explicitly with `--engine goose`, typically because Zeroclaw is
-broken on that host. zoder never switches to goose by itself. Every default,
-route and fallback in this document assumes Zeroclaw.
+zoder's engine is **ZeroClaw**. `zoder exec` and the author turn of
+`zoder loop` run through the ZeroClaw daemon (`zeroclaw daemon`, reached over
+its Unix socket). An experimental Goose adapter exists in the code
+(`--engine goose`); it is unsupported, and zoder never selects it by itself.
+Every default,
+route and fallback in this document assumes ZeroClaw.
 
 ## What goes through the daemon and what does not
 

@@ -9,10 +9,10 @@ reasoned "not fixed because".
 
 ## Engine hierarchy
 
-**Zeroclaw is zoder's engine.** `zoder exec` and loop author turns run
-through the Zeroclaw daemon. **goose is an alternative engine only**, used
-when selected explicitly (`--engine goose`), normally because Zeroclaw is
-broken on a host. zoder never switches to goose on its own, and no default,
+**ZeroClaw is zoder's engine.** `zoder exec` and loop author turns run
+through the ZeroClaw daemon. An experimental Goose adapter exists in the
+code (`--engine goose`); it is unsupported. zoder never selects it on its
+own, and no default,
 route or fallback in the fleet configuration points at goose.
 
 ## Fixed
@@ -49,7 +49,7 @@ route or fallback in the fleet configuration points at goose.
 | A rate-limited hosted provider was queried blindly; a 429 was retried into the same limiter and then stopped the reviewer chain | no pre-query health check; explicit pins bypassed health; capacity errors became Fatal | `092743d`, `fa60aa6` | `provider_health_gate_probes_caches_backs_off_on_429_and_skips`, `provider_health_gate_backs_off_on_503_probe_then_recovers_half_open`, `provider_health_gate_bounds_a_slow_probe_and_never_passes_without_fallback` |
 | gemma4-31b reported names bound outside the chunk as undefined (`{label}`, imports of a new file) | the chunk shows no unchanged context | `d8f80ee`, `c704047` (measured: 3/3 -> 1/3 and 3/3 -> 0/3 runs with the FP; seeded 5/5 kept) | `binding_far_above_the_hunk_is_listed`, `hunk_scope_survives_a_tight_budget_and_docs_are_skipped` |
 | Chunked review reported chunk-boundary "undefined X" false positives | the reviewer could not see imports or earlier bindings in the unchanged part of the file, and the result was not verified against the full post-change source | try the whole diff within a single-review budget derived from the configured context window; otherwise carry enclosing scope and imports per hunk and record only source-verified false positives in `filtered_findings` | `multi_chunk_python_context_stops_stub_undefined_findings`, `a_symbol_that_really_is_undefined_is_kept`, `a_local_in_another_function_does_not_disprove_a_finding` |
-| goose loops aborted on the first author timeout (A10; goose is the explicit fallback engine) | goose path never recorded the session id for the watchdog | `7290b9f` | `goose_drive_records_active_session_for_watchdog` |
+| goose loops aborted on the first author timeout (A10; experimental, unsupported goose adapter) | goose path never recorded the session id for the watchdog | `7290b9f` | `goose_drive_records_active_session_for_watchdog` |
 | Saver F1: review refused a single hunk over 9000 bytes | stale installed binary predating hunk splitting | `129f47e` (splitting), deploy | `review_chunks_split_oversized_hunk_when_enabled` |
 | Nightly native build aborted at `sources` and published nothing for two nights; the fleet went stale (2026-10-09/10) | The engine fork's only sync driver was a GitHub Actions schedule, which GitHub silently auto-disables on forks/inactive repositories; it stopped firing, the fork crossed the 36h grace, and the build's hard gate aborted the run | `e451961` (`scripts/ci/zeroclaw-fork-sync.sh`, scheduled GitLab `zeroclaw-fork-sync` job; `native-builds.yml` now names it in the error) | `scripts/tests/zeroclaw-fork-sync-tests.sh`, `nightly-publish-tests.py::test_source_gate_rejects_stale_engine` |
 | `zoder loop` iteration 2+ failed before any output for every fallback candidate (`session/new resume failed: ACP session belongs to a different agent`, -32602) and stopped with "author produced no edits twice in a row" while all models were healthy (fleet reaper loop, 2026-10-21) | the loop kept ONE engine session id and the fallback chain re-sent it to every candidate; Zeroclaw binds a session to the agent alias that minted it, so a model fallback (different agent) rejected the resume pre-output, the CLI counted it as a model failure, and the whole chain was burned | `af682a0` | `continuity_resume_ownership_rejection_starts_fresh_and_completes`, `continuity_session_rejections_are_replaceable`, `continuity_session_is_never_reused_by_another_agent`, `agent_scopes_isolate_sessions_by_agent` |

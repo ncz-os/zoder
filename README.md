@@ -2,8 +2,11 @@
 
 <p align="center"><img src="docs/img/zoder-logo.png" alt="zoder — pair code · dispatch · remember" width="380"></p>
 
-**The full-stack developer's AI pair-coding and headless coding-dispatch system —
-free-first, cost-governed, MNEMOS-first.**
+**zoder is an AI coding stack built on the ZeroClaw agent engine**
+(the install bundles zeroclaw and zerocode).
+Interactive pair-coding, multi-model review, the author → validate →
+adversarial review → fix loop, and headless coding dispatch with no human
+in the loop. Free-first, cost-governed, MNEMOS-first.
 
 ## TL;DR — install in one line
 
@@ -71,14 +74,8 @@ that differ.
 ---
 
 zoder is to [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) what Ubuntu is
-to Debian: a curated, opinionated distribution built on the same engine, aimed at
-a specific audience. ZeroClaw is the general-purpose agent framework; zoder is the
-developer-facing build of it — tuned for two jobs:
-
-1. **Interactive pair-coding** at the terminal (the `zerocode` TUI), and
-2. **Headless, automated coding dispatch** — running zoder as a worker in a
-   *hive* of agents that pick up coding tasks, run them on the cheapest capable
-   model, review, fix, and report cost — with no human in the loop.
+to Debian: a curated build on the same engine, tuned for developers.
+Pair-coding, multi-model review, the fix loop, headless dispatch.
 
 It routes work to **free / open-weight models first**, refuses to silently fall
 back to a paid backend, tracks every call in a local spend ledger, and produces
@@ -280,94 +277,14 @@ a pinned `primary_model`, and free open-weight ingestion via `zoder refresh`.
 
 ---
 
-## Engines: ZeroClaw + Goose (dual-engine)
+## Engine
 
-zoder is an **engine-agnostic governance layer** — the corpus, free-first router,
-policy gate, ledger, and review/fix loop govern *whichever* agent actually runs
-the turn. Engine selection is one flag:
+ZeroClaw is the engine. It runs as a resident daemon. That gives zoder
+resident sessions and tool shells.
 
-```bash
-zoder exec --engine zeroclaw "…"   # default — the ncz-os fleet engine (daemon)
-zoder exec --engine goose    "…"   # Block / Linux-Foundation Goose (goose acp)
-```
-
-Both are **Rust agentic coding engines** (memory-safe, fast, single-binary) and
-both speak the **Agent Client Protocol (ACP)** — so zoder drives them through one
-transport abstraction (Unix-socket for the resident daemon, spawned stdio for
-`goose acp`). But they embody **different design principles**, which is exactly
-why they complement rather than duplicate each other:
-
-| | **ZeroClaw** (default) | **Goose** |
-|---|---|---|
-| Process model | long-running **daemon** (resident sessions, Unix socket) | **per-turn subprocess** (`goose acp`, stdio) |
-| Built for | the ncz-os **fleet**: cost-ledger-native, configurable agents/aliases, hive/worker orchestration, networked session backends (PG/MySQL/Oracle/Db2/MNEMOS) | broad **single-machine** use: huge **MCP-extension** ecosystem, recipes, and ACP-server interop (Zed / JetBrains / VS Code) |
-| Strength | governance, multi-agent fleet, durable networked sessions | provider/extension **breadth**, maturity, community momentum |
-| Backed by | ncz-os (a friendly ZeroClaw fork) | Block → **Agentic AI Foundation (Linux Foundation)** |
-
-**Why dual-engine is a valid strategy (not fragmentation):**
-
-- **The governance is the moat; the engine is pluggable.** zoder's value —
-  free-first routing, the default-deny-paid gate, the corpus, health-aware
-  selection, the cost ledger, the adversarial review/fix loop — is engine-agnostic.
-  Adding Goose *widens the substrate zoder governs*; it does not split it.
-- **Resilience.** The two engines fail independently. When the resident ZeroClaw
-  daemon is mis/un-configured or non-invokable mid-loop, Goose needs no daemon and
-  is an immediate fallback (and vice-versa).
-- **Engine diversity as a correctness signal.** Two independently-architected
-  engines can author + cross-review the same task — engine diversity catches
-  engine-specific failure modes, the same way cross-*family* model reviewers catch
-  model-specific ones. For the hardest tasks, run both and reconcile.
-- **A standards bet, not a Goose bet.** Because the seam is ACP, zoder is really an
-  **ACP orchestrator**: any future ACP agent (Zed's registry, others) plugs in for
-  free. Goose is simply the first second engine that proves the abstraction.
-
-They are **selectable alternatives, not run simultaneously by default** —
-doubling cost buys little on easy/medium work. Simultaneity is opt-in: a
-resilience fallback when one engine is degraded, or an ensemble for the hardest
-tasks.
-
-The [**systems-architecture diagram**](#systems-architecture) below shows both
-engines sitting under zoder's one ACP transport abstraction: `--engine zeroclaw`
-(daemon, ACP over a Unix socket) and `--engine goose` (`goose acp`, ACP over a
-stdio subprocess), governed identically and fed by the free-first provider pool.
-
-### Goose is bundled *core*, not the kitchen sink
-
-zoder builds and ships goose in a **lean core** configuration —
-`cargo build -p goose-cli --bin goose --no-default-features --features rustls-tls`
-— and nothing else. That declines goose's default feature stack: `local-inference`
-(a full local-model runtime — candle + llama-cpp), `aws-providers` (Bedrock/
-SageMaker), `nostr`, goose's own `tui`, `update` (sigstore self-update),
-`otel`/`telemetry`, and `system-keyring`.
-
-**Why core:**
-
-- **zoder never invokes any of it.** It drives goose purely as a *remote-API ACP
-  agent over stdio*: model calls go to the free-first provider pool (not a local
-  GPU), keys come from zoder's config (not the OS keyring), and zoder governs
-  telemetry/updates itself. Those features are dead weight in this role.
-- **Footprint + build honesty.** Core takes the arm64 binary from **242 MB → 65 MB**
-  (−73%) and the from-source build from ~8m → ~3m. The whole zoder stack
-  (zoder ≈ 8 MB + zeroclaw ≈ 19 MB + zerocode ≈ 33 MB ≈ **60 MB**) is smaller than a
-  single default goose.
-- **Smaller surface.** Fewer dependencies and no bundled ML/crypto self-update path
-  — less to audit, faster reproducible builds.
-- **Still a faithful upstream build.** Core is *feature selection*, not a fork:
-  `GOOSE_REF` stays pinned and we patch nothing, so tracking Block/LF goose releases
-  stays cheap. (goose *core*'s own `default` feature set is already empty — `[]`; it
-  is goose-**cli** that stacks the heavy defaults, and those are what we decline.)
-
-**Want the full goose (local inference, code-mode, AWS, …)? Copy it in.** zoder
-spawns whatever `goose` is on `PATH` (`goose acp`), so a heavier build is a pure
-drop-in: build it yourself (`--features local-inference`, …) or install Block's
-official goose, put it ahead on `PATH`, and zoder drives it identically — no zoder
-change. To widen the *bundled* build instead, set `GOOSE_FEATURES` for
-`scripts/package.sh`, and re-run the `acp-client` real-goose integration test after
-widening (it is the gate that the feature set still drives a live turn).
-
-> Verified: goose core's own test suite passes on the lean feature set (1423/1423
-> library tests, ACP module included); the one feature-conditioned snapshot
-> (`code-mode`) passes once that feature is re-enabled.
+An experimental Goose adapter exists in the code; it is not maintained
+or supported, and may be removed. `--engine goose` exists but is
+unsupported (legacy option).
 
 ---
 
@@ -379,33 +296,30 @@ complete coding system.
 
 ![zoder systems architecture](docs/architecture.svg)
 
-**zerocore — the (pluggable) engine.** ZeroClaw's agent/turn engine and its
-OpenAI-compatible provider abstraction is the **default** engine; zoder rides on
+**zerocore — the engine.** ZeroClaw's agent/turn engine and its
+OpenAI-compatible provider abstraction; zoder rides on
 the fork's loop and inherits streaming, retries, timeouts, and sessions instead
 of reimplementing them. This is the part that actually talks to models. Durable
 session history is pluggable: a JSONL file by default, or a **networked database
-backend** (PostgreSQL / MySQL / Oracle / Db2) / **MNEMOS** when configured. As of
-the dual-engine work the engine itself is pluggable too — `--engine goose` drives
-Block/LF **Goose** over ACP instead (see [Engines: ZeroClaw + Goose](#engines-zeroclaw--goose-dual-engine)); zoder's governance is engine-agnostic.
+backend** (PostgreSQL / MySQL / Oracle / Db2) / **MNEMOS** when configured.
 
 **zerocode — the terminal UX.** The interactive pair-coding experience. It
 surfaces cost at the point of decision: a free-vs-paid model picker, per-turn and
 session cost, and a live savings readout (one color for $0 work, another for real
 paid spend).
 
-**zerocode → zodercode — where the TUI is going (roadmap).** `zerocode` today is a
-**single-engine** (ZeroClaw) TUI with **no model selection** — and that is *by
-design*: choosing the model is the CLI's job (`zoder` auto-routes free-first). The
-dual-engine work opens a gap zerocode was never meant to fill — a terminal user
-who wants to **pick the engine and the model directly**, and to see *why* one over
-another. That is **zodercode**, zoder's own dual-engine TUI:
+**zerocode — where the TUI is going (roadmap).** `zerocode` today is a
+ZeroClaw TUI with **no model selection** — and that is *by
+design*: choosing the model is the CLI's job (`zoder` auto-routes free-first).
+A terminal user
+who wants to **pick the model directly**, and to see *why* one over
+another, needs a model-consultant pane. That is **zodercode**,
+zoder's own TUI follow-on:
 
 - **It consumes zerocode; it does not fork it.** zodercode reuses zerocode's ACP
-  chat core (the same client / chat / render layer) and gates the ZeroClaw-specific
-  config panes behind `engine == zeroclaw`. Same posture as `zoder`-the-CLI over
-  zeroclaw: *wrap and extend, don't re-implement.*
-- **Direct engine + direct model choice.** An engine toggle (`zeroclaw` ⇄ `goose`)
-  and an explicit model picker — the deliberate counterpart to the CLI's automatic
+  chat core (the same client / chat / render layer).
+- **Direct model choice.** An explicit model picker — the deliberate counterpart
+  to the CLI's automatic
   routing. The CLI stays the "just do the cheap right thing" path; zodercode is the
   "I know exactly what I want" path.
 - **A model-consultant pane** — the thing neither zerocode nor any upstream agent
@@ -419,10 +333,10 @@ Positioning, stated plainly:
 |---|---|---|
 | `zoder` (CLI) | automatic, free-first, headless / fleet dispatch | **ships today** |
 | `zerocode` (TUI) | single-engine interactive pair-coding UX | **ships today** |
-| `zodercode` (TUI) | dual-engine · direct model choice · model-consultant pane | **roadmap** (skeleton not yet built) |
+| `zodercode` (TUI) | direct model choice · model-consultant pane | **roadmap** (skeleton not yet built) |
 
-zodercode **supersedes zerocode as zoder's branded TUI by *containing* it** — the
-same way `zoder`-the-CLI contains the zeroclaw engine. Until zodercode lands,
+zodercode **supersedes zerocode as zoder's branded TUI by *containing* it**.
+Until zodercode lands,
 `zerocode` is the shipping TUI and nothing here is vaporware-by-omission.
 
 **zoder — the governance + dispatch layer.** The cost- and quality-governance
@@ -674,7 +588,7 @@ The package carries the `zoder` CLI only; `zerocode` and `zeroclaw` come from
 
 ### Container (Docker)
 
-The full stack (zoder + zerocode + zeroclaw + goose) ships as a multi-arch image
+The full stack (zoder + zerocode + zeroclaw) ships as a multi-arch image
 (`linux/amd64` + `linux/arm64`) on GitHub Container Registry, rebuilt weekly.
 This is the supported route on macOS and Windows (Docker Desktop or Podman;
 `podman` takes the same arguments):
@@ -960,7 +874,7 @@ Precedence **per window** (highest first):
    the defaults follow the route instead of being guessed.
 
 The same windows apply to every agentic dispatch (`exec`, `loop`, `rescue`,
-`run`) and to both engines (Zeroclaw and goose).
+`run`) on the ZeroClaw engine.
 
 ### Vendor overlays: `config.<name>.toml`
 

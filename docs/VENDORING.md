@@ -129,7 +129,10 @@ Neither limitation is treated as a requirement for a new Zeroclaw RPC. If the
 existing daemon protocol later exposes session-scoped or non-secret credential
 identity, zoder can bind it without changing this downstream-only policy.
 
-## Vendoring goose (the second engine)
+## Goose vendoring (experimental, unsupported)
+
+The experimental Goose adapter is not maintained or supported, and may be
+removed. The notes below describe the vendoring only.
 
 goose is vendored **differently** from zeroclaw: there is **no source delta at
 all**. We consume Block/LF goose as an upstream binary built from a pinned ref
@@ -142,11 +145,9 @@ commit.
   (`GOOSE_FEATURES` default `rustls-tls`) with `strip`/`thin-lto`/`opt-level=z` via
   `--config` — **242 MB → 65 MB**, ~8m → ~3m. `GOOSE_SRC_DIR=<path>` reuses a
   checkout; `ZODER_SKIP_GOOSE=1` omits goose entirely (lean zeroclaw-only bundle).
-- **Why core, and how to get the full build:** see
-  [Goose is bundled *core*](../README.md#engines-zeroclaw--goose-dual-engine) in
-  the README. Short version: zoder drives goose only as a remote-API `goose acp`
-  agent, so `local-inference`/`aws-providers`/`nostr`/`tui`/`update`/`otel`/
-  `system-keyring` are dead weight. A heavier goose is a **PATH drop-in** (zoder
+- **Legacy build note:** see the [Engine](../README.md#engine) section in
+  the README. Short version: the experimental adapter drives goose only as a `goose acp`
+  agent. A heavier goose is a **PATH drop-in** (zoder
   spawns whatever `goose` is on `PATH`); no zoder change needed.
 - **The gate:** `crates/acp-client`'s real-goose integration test does a live
   handshake + turn against the built binary. Bump `GOOSE_REF` or widen

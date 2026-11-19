@@ -119,7 +119,7 @@ gate red — they're surfaced but don't block.
 
 zoder **pins and manages** the gate tools (cargo-deny, cargo-audit, osv-scanner,
 gitleaks, cyclonedx, govulncheck, pip-audit, …) reproducibly — the same way it pins
-the goose and zeroclaw engines from source. Strict mode requires them; the managed
+the zeroclaw engine from source. Strict mode requires them; the managed
 install keeps "fail-closed" from becoming "can't work because a tool is missing."
 
 ## Roadmap
