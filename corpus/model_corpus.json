@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-21",
-  "generated": "2026-11-21",
-  "count": 4729,
+  "arena_date": "2026-11-22",
+  "generated": "2026-11-22",
+  "count": 4731,
   "routable": 79,
-  "scored": 3047,
+  "scored": 3049,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -66719,6 +66719,36 @@
       }
     },
     {
+      "id": "fireworks_ai/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+      "host": "fireworks_ai",
+      "leaf": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+      "family": "fireworks_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.44999999999999996,
+        "output_usd_per_mtok": 1.7999999999999998,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.009
+      },
+      "agentic_score": 0.7,
+      "w_swe": 0.7,
+      "capability": {
+        "swe_verified": {
+          "acc": 70.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      }
+    },
+    {
       "id": "fireworks_ai/accounts/fireworks/routers/deepseek-v4p1-flash-spot",
       "host": "fireworks_ai",
       "leaf": "accounts/fireworks/routers/deepseek-v4p1-flash-spot",
@@ -67265,6 +67295,36 @@
         "output_usd_per_mtok": 22.5,
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.44999999999999996
+      },
+      "agentic_score": 0.6,
+      "w_swe": 0.6,
+      "capability": {
+        "swe_verified": {
+          "acc": 60.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.8,
+        "grind": 0.52
+      }
+    },
+    {
+      "id": "fireworks_ai/accounts/fireworks/routers/kimi-k3p1-pro-us",
+      "host": "fireworks_ai",
+      "leaf": "accounts/fireworks/routers/kimi-k3p1-pro-us",
+      "family": "fireworks_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.5,
+        "output_usd_per_mtok": 12.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.25
       },
       "agentic_score": 0.6,
       "w_swe": 0.6,
@@ -78639,8 +78699,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 0.09999999999999999,
+        "input_usd_per_mtok": 0.04,
+        "output_usd_per_mtok": 0.049999999999999996,
         "source": "openrouter"
       }
     },
@@ -81360,8 +81420,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.08,
-        "output_usd_per_mtok": 0.11,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       }
     },
@@ -104658,8 +104718,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.017,
-        "output_usd_per_mtok": 0.08499999999999999,
+        "input_usd_per_mtok": 0.075,
+        "output_usd_per_mtok": 0.3,
         "source": "openrouter"
       },
       "agentic_score": 0.5,
@@ -108242,8 +108302,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.195,
-        "output_usd_per_mtok": 1.56,
+        "input_usd_per_mtok": 0.26,
+        "output_usd_per_mtok": 2.6,
         "source": "openrouter"
       },
       "agentic_score": 0.428,
@@ -108772,8 +108832,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 1.96,
+        "input_usd_per_mtok": 0.035,
+        "output_usd_per_mtok": 1.5,
         "source": "openrouter"
       },
       "agentic_score": 0.763,
@@ -117572,8 +117632,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.13199999999999998,
-        "output_usd_per_mtok": 0.5279999999999999,
+        "input_usd_per_mtok": 0.14,
+        "output_usd_per_mtok": 0.58,
         "source": "openrouter"
       },
       "agentic_score": 0.483,
@@ -118378,8 +118438,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.09999999999999999,
-        "output_usd_per_mtok": 0.39999999999999997,
+        "input_usd_per_mtok": 0.075,
+        "output_usd_per_mtok": 0.3,
         "source": "openrouter"
       }
     },
@@ -133784,8 +133844,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 1.19,
-        "output_usd_per_mtok": 3.74,
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
         "source": "openrouter"
       },
       "agentic_score": 0.741,
@@ -133953,8 +134013,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0399,
-        "output_usd_per_mtok": 0.0784,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
       "agentic_score": 0.632,
@@ -135565,7 +135625,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.18050000000000002,
+        "input_usd_per_mtok": 0.18239999999999998,
         "output_usd_per_mtok": 11.0055,
         "source": "openrouter"
       },
@@ -135719,8 +135779,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.0399,
-        "output_usd_per_mtok": 0.0784,
+        "input_usd_per_mtok": 0.0473,
+        "output_usd_per_mtok": 0.07289999999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
