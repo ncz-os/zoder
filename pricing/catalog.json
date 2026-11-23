@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-22",
+  "generated": "2026-11-23",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "abliteration/abliterated-model": {
@@ -9188,10 +9188,10 @@
       }
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.0443,
+      "input_usd_per_mtok": 0.0434,
       "output_usd_per_mtok": 0.3,
       "off_peak": {
-        "input_usd_per_mtok": 0.02215,
+        "input_usd_per_mtok": 0.0217,
         "output_usd_per_mtok": 0.15,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
@@ -9252,11 +9252,11 @@
       }
     },
     "deepseek/deepseek-v4.1-flash-1017": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.6,
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.2,
       "off_peak": {
-        "input_usd_per_mtok": 0.075,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.15,
+        "output_usd_per_mtok": 0.6,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -9280,6 +9280,10 @@
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
+    },
+    "dots-studio/dots-3-note-preview:free": {
+      "input_usd_per_mtok": 0.0,
+      "output_usd_per_mtok": 0.0
     },
     "elorian/glimpse": {
       "input_usd_per_mtok": 0.6,
@@ -13157,15 +13161,15 @@
     },
     "google/gemma-3-27b-it": {
       "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.44999999999999996
+      "output_usd_per_mtok": 0.16
     },
     "google/gemma-3-4b-it": {
       "input_usd_per_mtok": 0.04,
       "output_usd_per_mtok": 0.049999999999999996
     },
     "google/gemma-4-26b-a4b-it": {
-      "input_usd_per_mtok": 0.0675,
-      "output_usd_per_mtok": 0.22499999999999998
+      "input_usd_per_mtok": 0.09,
+      "output_usd_per_mtok": 0.3
     },
     "google/gemma-4-26b-a4b-it:free": {
       "input_usd_per_mtok": 0.0,
@@ -15584,8 +15588,8 @@
       "output_usd_per_mtok": 16.0
     },
     "moonshotai/kimi-k3.1-pro": {
-      "input_usd_per_mtok": 0.253,
-      "output_usd_per_mtok": 8.8
+      "input_usd_per_mtok": 0.2403,
+      "output_usd_per_mtok": 8.402299999999999
     },
     "moonshotai/kimi-k3.1-pro:batch": {
       "input_usd_per_mtok": 0.372,
@@ -17601,16 +17605,16 @@
       "output_usd_per_mtok": 30.0
     },
     "openai/gpt-oss-120b": {
-      "input_usd_per_mtok": 0.09,
-      "output_usd_per_mtok": 0.36
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.25
     },
     "openai/gpt-oss-120b:batch": {
       "input_usd_per_mtok": 0.0296,
       "output_usd_per_mtok": 0.136
     },
     "openai/gpt-oss-20b": {
-      "input_usd_per_mtok": 0.075,
-      "output_usd_per_mtok": 0.3
+      "input_usd_per_mtok": 0.03,
+      "output_usd_per_mtok": 0.13
     },
     "openai/gpt-oss-20b:batch": {
       "input_usd_per_mtok": 0.024,
@@ -18027,6 +18031,248 @@
       "input_usd_per_mtok": 0.0,
       "output_usd_per_mtok": 0.28
     },
+    "perplexity_orchestrator/anthropic/claude-fable-5": {
+      "input_usd_per_mtok": 10.0,
+      "output_usd_per_mtok": 50.0,
+      "cache_read_usd_per_mtok": 1.0
+    },
+    "perplexity_orchestrator/anthropic/claude-fable-5-1": {
+      "input_usd_per_mtok": 10.0,
+      "output_usd_per_mtok": 50.0,
+      "cache_read_usd_per_mtok": 0.25
+    },
+    "perplexity_orchestrator/anthropic/claude-fable-5-2": {
+      "input_usd_per_mtok": 8.0,
+      "output_usd_per_mtok": 40.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "perplexity_orchestrator/anthropic/claude-haiku-4-5": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 5.0,
+      "cache_read_usd_per_mtok": 0.09999999999999999
+    },
+    "perplexity_orchestrator/anthropic/claude-haiku-5-5": {
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.5,
+      "cache_read_usd_per_mtok": 0.01
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-4-5": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-4-6": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-4-7": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-4-8": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-5": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/anthropic/claude-opus-5-5": {
+      "input_usd_per_mtok": 4.0,
+      "output_usd_per_mtok": 20.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "perplexity_orchestrator/anthropic/claude-sonnet-4-5": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0,
+      "cache_read_usd_per_mtok": 0.3
+    },
+    "perplexity_orchestrator/anthropic/claude-sonnet-4-6": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0,
+      "cache_read_usd_per_mtok": 0.3
+    },
+    "perplexity_orchestrator/anthropic/claude-sonnet-5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "perplexity_orchestrator/anthropic/claude-sonnet-5-5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.09999999999999999
+    },
+    "perplexity_orchestrator/google/gemini-3.5-flash": {
+      "input_usd_per_mtok": 1.5,
+      "output_usd_per_mtok": 9.0,
+      "cache_read_usd_per_mtok": 0.15
+    },
+    "perplexity_orchestrator/google/gemini-3.5-flash-lite": {
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 2.5,
+      "cache_read_usd_per_mtok": 0.03
+    },
+    "perplexity_orchestrator/google/gemini-3.6-flash": {
+      "input_usd_per_mtok": 1.5,
+      "output_usd_per_mtok": 7.5,
+      "cache_read_usd_per_mtok": 0.15
+    },
+    "perplexity_orchestrator/google/gemini-3.7-flash": {
+      "input_usd_per_mtok": 0.75,
+      "output_usd_per_mtok": 3.75,
+      "cache_read_usd_per_mtok": 0.075
+    },
+    "perplexity_orchestrator/google/gemini-3.8-flash": {
+      "input_usd_per_mtok": 0.75,
+      "output_usd_per_mtok": 3.75,
+      "cache_read_usd_per_mtok": 0.075
+    },
+    "perplexity_orchestrator/openai/gpt-5": {
+      "input_usd_per_mtok": 1.25,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.125
+    },
+    "perplexity_orchestrator/openai/gpt-5-mini": {
+      "input_usd_per_mtok": 0.25,
+      "output_usd_per_mtok": 2.0,
+      "cache_read_usd_per_mtok": 0.024999999999999998
+    },
+    "perplexity_orchestrator/openai/gpt-5-nano": {
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.39999999999999997,
+      "cache_read_usd_per_mtok": 0.005
+    },
+    "perplexity_orchestrator/openai/gpt-5.1": {
+      "input_usd_per_mtok": 1.25,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.125
+    },
+    "perplexity_orchestrator/openai/gpt-5.2": {
+      "input_usd_per_mtok": 1.75,
+      "output_usd_per_mtok": 14.0,
+      "cache_read_usd_per_mtok": 0.175
+    },
+    "perplexity_orchestrator/openai/gpt-5.3-codex": {
+      "input_usd_per_mtok": 3.5,
+      "output_usd_per_mtok": 28.0,
+      "cache_read_usd_per_mtok": 0.35
+    },
+    "perplexity_orchestrator/openai/gpt-5.4": {
+      "input_usd_per_mtok": 2.5,
+      "output_usd_per_mtok": 15.0,
+      "cache_read_usd_per_mtok": 0.25
+    },
+    "perplexity_orchestrator/openai/gpt-5.4-mini": {
+      "input_usd_per_mtok": 0.75,
+      "output_usd_per_mtok": 4.5,
+      "cache_read_usd_per_mtok": 0.075
+    },
+    "perplexity_orchestrator/openai/gpt-5.4-nano": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 1.25,
+      "cache_read_usd_per_mtok": 0.02
+    },
+    "perplexity_orchestrator/openai/gpt-5.5": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 30.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/openai/gpt-5.6-luna": {
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 1.2,
+      "cache_read_usd_per_mtok": 0.02
+    },
+    "perplexity_orchestrator/openai/gpt-5.6-sol": {
+      "input_usd_per_mtok": 4.0,
+      "output_usd_per_mtok": 20.0,
+      "cache_read_usd_per_mtok": 0.39999999999999997
+    },
+    "perplexity_orchestrator/openai/gpt-5.6-terra": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 12.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "perplexity_orchestrator/openai/gpt-6-astra": {
+      "input_usd_per_mtok": 10.0,
+      "output_usd_per_mtok": 50.0,
+      "cache_read_usd_per_mtok": 1.0
+    },
+    "perplexity_orchestrator/openai/gpt-6-luna": {
+      "input_usd_per_mtok": 0.09999999999999999,
+      "output_usd_per_mtok": 0.5,
+      "cache_read_usd_per_mtok": 0.01
+    },
+    "perplexity_orchestrator/openai/gpt-6-sol": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.19999999999999998
+    },
+    "perplexity_orchestrator/openai/gpt-6.1-sol": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.09999999999999999
+    },
+    "perplexity_orchestrator/openai/gpt-6.1-terra": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 5.0,
+      "cache_read_usd_per_mtok": 0.049999999999999996
+    },
+    "perplexity_orchestrator/openai/gpt-6.2-astra": {
+      "input_usd_per_mtok": 8.0,
+      "output_usd_per_mtok": 40.0,
+      "cache_read_usd_per_mtok": 0.39999999999999997
+    },
+    "perplexity_orchestrator/openai/gpt-6.2-sol": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 10.0,
+      "cache_read_usd_per_mtok": 0.09999999999999999
+    },
+    "perplexity_orchestrator/perplexity/deepseek-v4-pro-0813": {
+      "input_usd_per_mtok": 1.32,
+      "output_usd_per_mtok": 3.9600000000000004,
+      "cache_read_usd_per_mtok": 0.044,
+      "off_peak": {
+        "input_usd_per_mtok": 0.66,
+        "output_usd_per_mtok": 1.98,
+        "window_start_utc_min": 990,
+        "window_end_utc_min": 30,
+        "cache_read_usd_per_mtok": 0.022
+      }
+    },
+    "perplexity_orchestrator/perplexity/glm-5.3": {
+      "input_usd_per_mtok": 1.4,
+      "output_usd_per_mtok": 4.4,
+      "cache_read_usd_per_mtok": 0.26
+    },
+    "perplexity_orchestrator/perplexity/glm-5.3-flash": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.5,
+      "cache_read_usd_per_mtok": 0.03
+    },
+    "perplexity_orchestrator/perplexity/kimi-k3": {
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0,
+      "cache_read_usd_per_mtok": 0.3
+    },
+    "perplexity_orchestrator/xai/grok-4.5": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 6.0,
+      "cache_read_usd_per_mtok": 0.3
+    },
+    "perplexity_orchestrator/xai/grok-4.6": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 6.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
+    "perplexity_orchestrator/xai/grok-4.7": {
+      "input_usd_per_mtok": 2.0,
+      "output_usd_per_mtok": 6.0,
+      "cache_read_usd_per_mtok": 0.5
+    },
     "pinstripes/ps/deepseek-v4-flash": {
       "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.19999999999999998,
@@ -18262,8 +18508,8 @@
       "output_usd_per_mtok": 3.1999999999999997
     },
     "qwen/qwen3.6-35b-a3b": {
-      "input_usd_per_mtok": 0.09999999999999999,
-      "output_usd_per_mtok": 0.8999999999999999
+      "input_usd_per_mtok": 0.049999999999999996,
+      "output_usd_per_mtok": 0.7
     },
     "qwen/qwen3.6-flash": {
       "input_usd_per_mtok": 0.1875,
@@ -22518,8 +22764,8 @@
       "output_usd_per_mtok": 0.8999999999999999
     },
     "z-ai/glm-4.7": {
-      "input_usd_per_mtok": 0.39999999999999997,
-      "output_usd_per_mtok": 1.75
+      "input_usd_per_mtok": 0.6,
+      "output_usd_per_mtok": 2.2
     },
     "z-ai/glm-4.7-flash": {
       "input_usd_per_mtok": 0.060500000000000005,
@@ -22550,8 +22796,8 @@
       "output_usd_per_mtok": 1.4
     },
     "z-ai/glm-5.3-flash": {
-      "input_usd_per_mtok": 0.15,
-      "output_usd_per_mtok": 0.5
+      "input_usd_per_mtok": 0.0399,
+      "output_usd_per_mtok": 0.0784
     },
     "z-ai/glm-5.3-flash:batch": {
       "input_usd_per_mtok": 0.023,
@@ -22773,15 +23019,15 @@
       }
     },
     "~deepseek/deepseek-pro-latest": {
-      "input_usd_per_mtok": 0.0999,
-      "output_usd_per_mtok": 8.0
+      "input_usd_per_mtok": 0.1188,
+      "output_usd_per_mtok": 5.0
     },
     "~deepseek/deepseek-v4-flash-latest": {
-      "input_usd_per_mtok": 0.044,
-      "output_usd_per_mtok": 0.13199999999999998,
+      "input_usd_per_mtok": 0.0434,
+      "output_usd_per_mtok": 0.3,
       "off_peak": {
-        "input_usd_per_mtok": 0.022,
-        "output_usd_per_mtok": 0.066,
+        "input_usd_per_mtok": 0.0217,
+        "output_usd_per_mtok": 0.15,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -22827,8 +23073,8 @@
       "output_usd_per_mtok": 6.0
     },
     "~z-ai/glm-flash-latest": {
-      "input_usd_per_mtok": 0.0473,
-      "output_usd_per_mtok": 0.07289999999999999
+      "input_usd_per_mtok": 0.0399,
+      "output_usd_per_mtok": 0.0784
     },
     "~z-ai/glm-latest": {
       "input_usd_per_mtok": 0.0699,
