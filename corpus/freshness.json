@@ -1,7 +1,7 @@
 {
   "overlay": {
     "age_days": 0,
-    "built_at": "2026-11-23T09:07:27Z",
+    "built_at": "2026-11-24T09:07:21Z",
     "candidate_models_with_score": 212,
     "models_with_score": 212,
     "reason": "",
@@ -10,20 +10,20 @@
   "overlay_age_days": 0,
   "overlay_stale": false,
   "prices": {
-    "catalog_models": 4779,
-    "generated": "2026-11-23",
+    "catalog_models": 4777,
+    "generated": "2026-11-24",
     "litellm": {
-      "models": 4323,
+      "models": 4325,
       "ok": true,
       "reason": ""
     },
     "ok": true,
     "openrouter": {
-      "added": 457,
+      "added": 453,
       "ok": true,
       "reason": ""
     },
-    "previous_catalog_models": 4731
+    "previous_catalog_models": 4779
   },
   "schema": 2,
   "sources": [
@@ -79,5 +79,5 @@
       "reason": ""
     }
   ],
-  "ts": "2026-11-23T09:07:27Z"
+  "ts": "2026-11-24T09:07:21Z"
 }
