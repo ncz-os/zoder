@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-24",
-  "generated": "2026-11-24",
-  "count": 4777,
-  "routable": 80,
-  "scored": 3094,
+  "arena_date": "2026-11-25",
+  "generated": "2026-11-25",
+  "count": 4785,
+  "routable": 79,
+  "scored": 3102,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -56940,8 +56940,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.03,
-        "output_usd_per_mtok": 0.19999999999999998,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       },
       "agentic_score": 0.487,
@@ -57030,22 +57030,6 @@
       "workflows": {
         "single_pass": 0.9,
         "grind": 0.85
-      }
-    },
-    {
-      "id": "dots-studio/dots-3-note-preview:free",
-      "host": "dots-studio",
-      "leaf": "dots-3-note-preview:free",
-      "family": "dots-studio",
-      "kind": "chat",
-      "route_candidate": true,
-      "free": true,
-      "paid": false,
-      "gated_reason": null,
-      "economics": {
-        "input_usd_per_mtok": 0.0,
-        "output_usd_per_mtok": 0.0,
-        "source": "openrouter"
       }
     },
     {
@@ -62987,6 +62971,33 @@
       }
     },
     {
+      "id": "fireworks_ai/accounts/fireworks/models/hy4-flash",
+      "host": "fireworks_ai",
+      "leaf": "accounts/fireworks/models/hy4-flash",
+      "family": "fireworks_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.07,
+        "output_usd_per_mtok": 0.28099999999999997,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.003
+      },
+      "agentic_score": 0.118,
+      "capability": {
+        "terminal_bench": {
+          "acc": 11.82,
+          "date": "2026-11-16",
+          "harness": "mini-swe-agent",
+          "source": "terminal-bench"
+        }
+      },
+      "w_swe": 0.559
+    },
+    {
       "id": "fireworks_ai/accounts/fireworks/models/inkling",
       "host": "fireworks_ai",
       "leaf": "accounts/fireworks/models/inkling",
@@ -66331,6 +66342,40 @@
         "single_pass": 0.78,
         "grind": 0.66
       }
+    },
+    {
+      "id": "fireworks_ai/accounts/fireworks/models/qwen4-max",
+      "host": "fireworks_ai",
+      "leaf": "accounts/fireworks/models/qwen4-max",
+      "family": "fireworks_ai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 4.5,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.075
+      },
+      "agentic_score": 0.83,
+      "arena_coding_elo": 1752.1,
+      "arena_webdev_elo": 1752.1,
+      "preference": {
+        "arena_agent": {
+          "rank": 18,
+          "score": 0.073,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 9,
+          "rating": 1752.1,
+          "source": "arena.ai",
+          "votes": 1794
+        }
+      },
+      "w_swe": 1.0
     },
     {
       "id": "fireworks_ai/accounts/fireworks/models/qwq-32b",
@@ -81535,6 +81580,200 @@
       }
     },
     {
+      "id": "huawei_maas/deepseek-v4.1-flash",
+      "host": "huawei_maas",
+      "leaf": "deepseek-v4.1-flash",
+      "family": "huawei_maas",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.03
+      },
+      "agentic_score": 0.487,
+      "w_swe": 0.965,
+      "capability": {
+        "terminal_bench": {
+          "acc": 38.48,
+          "date": "2026-10-17",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "arena_coding_elo": 1658.6,
+      "arena_webdev_elo": 1658.6,
+      "preference": {
+        "arena_agent": {
+          "rank": 31,
+          "score": 0.0068,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 22,
+          "rating": 1658.6,
+          "source": "arena.ai",
+          "votes": 18638
+        }
+      }
+    },
+    {
+      "id": "huawei_maas/deepseek-v4.1-flash-1017",
+      "host": "huawei_maas",
+      "leaf": "deepseek-v4.1-flash-1017",
+      "family": "huawei_maas",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.006
+      },
+      "agentic_score": 0.487,
+      "w_swe": 0.965,
+      "capability": {
+        "terminal_bench": {
+          "acc": 38.48,
+          "date": "2026-10-17",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.9,
+        "grind": 0.85
+      },
+      "arena_coding_elo": 1658.6,
+      "arena_webdev_elo": 1658.6,
+      "preference": {
+        "arena_agent": {
+          "rank": 31,
+          "score": 0.0068,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 22,
+          "rating": 1658.6,
+          "source": "arena.ai",
+          "votes": 18638
+        }
+      }
+    },
+    {
+      "id": "huawei_maas/glm-5.2",
+      "host": "huawei_maas",
+      "leaf": "glm-5.2",
+      "family": "huawei_maas",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.26
+      },
+      "agentic_score": 0.623,
+      "w_swe": 0.923,
+      "capability": {
+        "scale_seal": {
+          "acc": 43.99,
+          "source": "scale-seal"
+        },
+        "swe_verified": {
+          "acc": 82.8,
+          "cost_per_test": 0.71,
+          "latency_s": 669.7,
+          "source": "vals.ai"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.86,
+        "grind": 0.78
+      },
+      "arena_coding_elo": 1607.4,
+      "arena_webdev_elo": 1607.4,
+      "preference": {
+        "arena_agent": {
+          "rank": 37,
+          "score": -0.0036,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 43,
+          "rating": 1607.4,
+          "source": "arena.ai",
+          "votes": 17818
+        }
+      }
+    },
+    {
+      "id": "huawei_maas/glm-5.3",
+      "host": "huawei_maas",
+      "leaf": "glm-5.3",
+      "family": "huawei_maas",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 1.4,
+        "output_usd_per_mtok": 4.4,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.26
+      },
+      "agentic_score": 0.663,
+      "w_swe": 0.936,
+      "capability": {
+        "swe_verified": {
+          "acc": 95.4,
+          "cost_per_test": 0.3383,
+          "latency_s": 840.8,
+          "source": "vals.ai"
+        },
+        "terminal_bench": {
+          "acc": 41.21,
+          "date": "2026-08-14",
+          "harness": "Claude Code",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.86,
+        "grind": 0.78
+      },
+      "arena_coding_elo": 1623.0,
+      "arena_webdev_elo": 1623.0,
+      "preference": {
+        "arena_agent": {
+          "rank": 35,
+          "score": 0.0019,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 34,
+          "rating": 1623.0,
+          "source": "arena.ai",
+          "votes": 13948
+        }
+      }
+    },
+    {
       "id": "hyperbolic/NousResearch/Hermes-3-Llama-3.1-70B",
       "host": "hyperbolic",
       "leaf": "NousResearch/Hermes-3-Llama-3.1-70B",
@@ -89754,8 +89993,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.27,
-        "output_usd_per_mtok": 0.95,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       },
       "agentic_score": 0.471,
@@ -91661,22 +91900,6 @@
       }
     },
     {
-      "id": "mistralai/mistral-medium-3",
-      "host": "mistralai",
-      "leaf": "mistral-medium-3",
-      "family": "mistralai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.44,
-        "output_usd_per_mtok": 2.2,
-        "source": "openrouter"
-      }
-    },
-    {
       "id": "mistralai/mistral-medium-3-5",
       "host": "mistralai",
       "leaf": "mistral-medium-3-5",
@@ -91730,22 +91953,6 @@
       "economics": {
         "input_usd_per_mtok": 0.75,
         "output_usd_per_mtok": 3.75,
-        "source": "openrouter"
-      }
-    },
-    {
-      "id": "mistralai/mistral-medium-3.1",
-      "host": "mistralai",
-      "leaf": "mistral-medium-3.1",
-      "family": "mistralai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.44,
-        "output_usd_per_mtok": 2.2,
         "source": "openrouter"
       }
     },
@@ -110543,8 +110750,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.049999999999999996,
-        "output_usd_per_mtok": 0.7,
+        "input_usd_per_mtok": 0.09999999999999999,
+        "output_usd_per_mtok": 0.8899999999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
@@ -123054,6 +123261,22 @@
       }
     },
     {
+      "id": "upstage/solar-mini-4-5",
+      "host": "upstage",
+      "leaf": "solar-mini-4-5",
+      "family": "upstage",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.01,
+        "output_usd_per_mtok": 0.04,
+        "source": "openrouter"
+      }
+    },
+    {
       "id": "upstage/solar-mini4",
       "host": "upstage",
       "leaf": "solar-mini4",
@@ -123066,6 +123289,22 @@
       "economics": {
         "input_usd_per_mtok": 0.049999999999999996,
         "output_usd_per_mtok": 0.19999999999999998,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "upstage/solar-pro-4-contributor",
+      "host": "upstage",
+      "leaf": "solar-pro-4-contributor",
+      "family": "upstage",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.09,
+        "output_usd_per_mtok": 0.36,
         "source": "openrouter"
       }
     },
@@ -123516,6 +123755,36 @@
         "output_usd_per_mtok": 19.8,
         "source": "litellm",
         "cache_read_usd_per_mtok": 0.33
+      },
+      "agentic_score": 0.74,
+      "w_swe": 0.74,
+      "capability": {
+        "swe_verified": {
+          "acc": 74.0,
+          "source": "ncz-known-good",
+          "harness": "curated"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.94,
+        "grind": 0.9
+      }
+    },
+    {
+      "id": "us-gov.openai.gpt-5.6-cyber",
+      "host": "",
+      "leaf": "us-gov.openai.gpt-5.6-cyber",
+      "family": "us-gov.openai.gpt-5.6-cyber",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 16.875,
+        "output_usd_per_mtok": 101.25,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 1.6875
       },
       "agentic_score": 0.74,
       "w_swe": 0.74,
@@ -135109,9 +135378,107 @@
       }
     },
     {
+      "id": "xai/grok-4.6-latest",
+      "host": "xai",
+      "leaf": "grok-4.6-latest",
+      "family": "xai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 6.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.5
+      },
+      "agentic_score": 0.591,
+      "w_swe": 0.932,
+      "capability": {
+        "swe_verified": {
+          "acc": 95.6,
+          "cost_per_test": 0.7847,
+          "latency_s": 604.5,
+          "source": "vals.ai"
+        },
+        "terminal_bench": {
+          "acc": 19.7,
+          "date": "2026-08-12",
+          "harness": "Grok Build",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.78,
+        "grind": 0.62
+      },
+      "arena_coding_elo": 1618.1,
+      "arena_webdev_elo": 1618.1,
+      "preference": {
+        "arena_agent": {
+          "rank": 40,
+          "score": -0.0051,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 38,
+          "rating": 1618.1,
+          "source": "arena.ai",
+          "votes": 12088
+        }
+      }
+    },
+    {
       "id": "xai/grok-4.7",
       "host": "xai",
       "leaf": "grok-4.7",
+      "family": "xai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 6.0,
+        "source": "litellm",
+        "cache_read_usd_per_mtok": 0.5
+      },
+      "agentic_score": 0.484,
+      "w_swe": 0.949,
+      "capability": {
+        "terminal_bench": {
+          "acc": 38.79,
+          "date": "2026-09-21",
+          "harness": "Grok Build",
+          "source": "terminal-bench"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.78,
+        "grind": 0.62
+      },
+      "arena_coding_elo": 1639.0,
+      "arena_webdev_elo": 1639.0,
+      "preference": {
+        "arena_agent": {
+          "rank": 28,
+          "score": 0.0128,
+          "source": "arena.ai"
+        },
+        "arena_webdev": {
+          "rank": 29,
+          "rating": 1639.0,
+          "source": "arena.ai",
+          "votes": 9526
+        }
+      }
+    },
+    {
+      "id": "xai/grok-4.7-latest",
+      "host": "xai",
+      "leaf": "grok-4.7-latest",
       "family": "xai",
       "kind": "chat",
       "route_candidate": false,
@@ -135325,42 +135692,6 @@
       }
     },
     {
-      "id": "xiaomi/mimo-v2.5",
-      "host": "xiaomi",
-      "leaf": "mimo-v2.5",
-      "family": "xiaomi",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.39999999999999997,
-        "output_usd_per_mtok": 2.0,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.71,
-      "arena_coding_elo": 1479.3,
-      "arena_webdev_elo": 1479.3,
-      "capability": {
-        "swe_verified": {
-          "acc": 74.0,
-          "cost_per_test": 0.023,
-          "latency_s": 470.8,
-          "source": "vals.ai"
-        }
-      },
-      "preference": {
-        "arena_webdev": {
-          "rank": 83,
-          "rating": 1479.3,
-          "source": "arena.ai",
-          "votes": 21915
-        }
-      },
-      "w_swe": 0.87
-    },
-    {
       "id": "xiaomi/mimo-v2.6-flash",
       "host": "xiaomi",
       "leaf": "mimo-v2.6-flash",
@@ -135400,6 +135731,22 @@
         }
       },
       "w_swe": 0.948
+    },
+    {
+      "id": "xiaomi/mimo-v2.6-flash-mopd",
+      "host": "xiaomi",
+      "leaf": "mimo-v2.6-flash-mopd",
+      "family": "xiaomi",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.5,
+        "output_usd_per_mtok": 1.0,
+        "source": "openrouter"
+      }
     },
     {
       "id": "xiaomi/mimo-v2.6-pro",
@@ -135582,8 +135929,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.13,
-        "output_usd_per_mtok": 0.85,
+        "input_usd_per_mtok": 0.14,
+        "output_usd_per_mtok": 0.86,
         "source": "openrouter"
       },
       "agentic_score": 0.58,
@@ -137507,8 +137854,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.03,
-        "output_usd_per_mtok": 0.19999999999999998,
+        "input_usd_per_mtok": 0.036,
+        "output_usd_per_mtok": 0.5,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
