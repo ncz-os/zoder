@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-11-25",
+  "generated": "2026-11-26",
   "source": "litellm+openrouter (public) + ncz peak-pricing overlay",
   "models": {
     "abliteration/abliterated-model": {
@@ -9188,11 +9188,11 @@
       }
     },
     "deepseek/deepseek-v4-flash-0731": {
-      "input_usd_per_mtok": 0.047,
-      "output_usd_per_mtok": 0.3,
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 0.18,
       "off_peak": {
-        "input_usd_per_mtok": 0.0235,
-        "output_usd_per_mtok": 0.15,
+        "input_usd_per_mtok": 0.03,
+        "output_usd_per_mtok": 0.09,
         "window_start_utc_min": 990,
         "window_end_utc_min": 30
       }
@@ -10419,6 +10419,11 @@
       "output_usd_per_mtok": 0.5,
       "cache_read_usd_per_mtok": 0.03
     },
+    "fireworks_ai/accounts/fireworks/models/glm-5p3-spot": {
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 2.2,
+      "cache_read_usd_per_mtok": 0.13
+    },
     "fireworks_ai/accounts/fireworks/models/gpt-oss-120b": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.6,
@@ -10450,6 +10455,11 @@
       "input_usd_per_mtok": 1.0,
       "output_usd_per_mtok": 4.05,
       "cache_read_usd_per_mtok": 0.16999999999999998
+    },
+    "fireworks_ai/accounts/fireworks/models/inkling-2-small": {
+      "input_usd_per_mtok": 0.3,
+      "output_usd_per_mtok": 1.0,
+      "cache_read_usd_per_mtok": 0.03
     },
     "fireworks_ai/accounts/fireworks/models/internvl3-38b": {
       "input_usd_per_mtok": 0.8999999999999999,
@@ -11281,10 +11291,20 @@
       "output_usd_per_mtok": 6.6000000000000005,
       "cache_read_usd_per_mtok": 0.39
     },
+    "fireworks_ai/accounts/fireworks/routers/glm-5p3-flash-flex": {
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.25,
+      "cache_read_usd_per_mtok": 0.015
+    },
     "fireworks_ai/accounts/fireworks/routers/glm-5p3-flash-us": {
       "input_usd_per_mtok": 0.22499999999999998,
       "output_usd_per_mtok": 0.75,
       "cache_read_usd_per_mtok": 0.045
+    },
+    "fireworks_ai/accounts/fireworks/routers/glm-5p3-flex": {
+      "input_usd_per_mtok": 0.7,
+      "output_usd_per_mtok": 2.2,
+      "cache_read_usd_per_mtok": 0.13
     },
     "fireworks_ai/accounts/fireworks/routers/glm-5p3-spot": {
       "input_usd_per_mtok": 0.7,
@@ -11340,6 +11360,11 @@
       "input_usd_per_mtok": 4.5,
       "output_usd_per_mtok": 22.5,
       "cache_read_usd_per_mtok": 0.44999999999999996
+    },
+    "fireworks_ai/accounts/fireworks/routers/kimi-k3p1-pro-ultrafast": {
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5
     },
     "fireworks_ai/accounts/fireworks/routers/kimi-k3p1-pro-us": {
       "input_usd_per_mtok": 2.5,
@@ -13167,7 +13192,7 @@
     },
     "google/gemma-3-27b-it": {
       "input_usd_per_mtok": 0.08,
-      "output_usd_per_mtok": 0.16
+      "output_usd_per_mtok": 0.44999999999999996
     },
     "google/gemma-3-4b-it": {
       "input_usd_per_mtok": 0.04,
@@ -15431,6 +15456,10 @@
       "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 0.8999999999999999
     },
+    "mistralai/codestral-2508:batch": {
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.44999999999999996
+    },
     "mistralai/devstral-2512": {
       "input_usd_per_mtok": 0.39999999999999997,
       "output_usd_per_mtok": 2.0
@@ -15447,6 +15476,10 @@
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.15
     },
+    "mistralai/ministral-8b-2512:batch": {
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.075
+    },
     "mistralai/mistral-large": {
       "input_usd_per_mtok": 2.0,
       "output_usd_per_mtok": 6.0
@@ -15458,6 +15491,10 @@
     "mistralai/mistral-large-2512": {
       "input_usd_per_mtok": 0.5,
       "output_usd_per_mtok": 1.5
+    },
+    "mistralai/mistral-large-2512:batch": {
+      "input_usd_per_mtok": 0.25,
+      "output_usd_per_mtok": 0.75
     },
     "mistralai/mistral-large-4-0": {
       "input_usd_per_mtok": 0.7,
@@ -15486,6 +15523,10 @@
     "mistralai/mistral-small-2603": {
       "input_usd_per_mtok": 0.15,
       "output_usd_per_mtok": 0.6
+    },
+    "mistralai/mistral-small-2603:batch": {
+      "input_usd_per_mtok": 0.075,
+      "output_usd_per_mtok": 0.3
     },
     "mistralai/mistral-small-3.1-24b-instruct": {
       "input_usd_per_mtok": 0.351,
@@ -16893,7 +16934,7 @@
       "output_usd_per_mtok": 0.19999999999999998
     },
     "nvidia/nemotron-3.5-lightning": {
-      "input_usd_per_mtok": 0.049999999999999996,
+      "input_usd_per_mtok": 0.07,
       "output_usd_per_mtok": 0.19999999999999998
     },
     "nvidia/nemotron-3.5-lightning:free": {
@@ -18504,11 +18545,11 @@
       "output_usd_per_mtok": 1.0
     },
     "qwen/qwen3.5-397b-a17b": {
-      "input_usd_per_mtok": 0.44999999999999996,
-      "output_usd_per_mtok": 3.0
+      "input_usd_per_mtok": 0.5,
+      "output_usd_per_mtok": 3.5999999999999996
     },
     "qwen/qwen3.5-9b": {
-      "input_usd_per_mtok": 0.16999999999999998,
+      "input_usd_per_mtok": 0.09999999999999999,
       "output_usd_per_mtok": 0.25
     },
     "qwen/qwen3.5-flash-02-23": {
@@ -18560,8 +18601,8 @@
       "output_usd_per_mtok": 6.0
     },
     "qwen/qwen3.8-27b": {
-      "input_usd_per_mtok": 0.035,
-      "output_usd_per_mtok": 1.5
+      "input_usd_per_mtok": 0.06,
+      "output_usd_per_mtok": 1.96
     },
     "qwen/qwen3.8-27b:batch": {
       "input_usd_per_mtok": 0.16,
@@ -18868,7 +18909,7 @@
       "output_usd_per_mtok": 0.0
     },
     "reflection/beam-1.0-501b-a23b": {
-      "input_usd_per_mtok": 0.25,
+      "input_usd_per_mtok": 0.3,
       "output_usd_per_mtok": 1.0
     },
     "refuseless/deepseek-v4.1-flash-abliterated": {
@@ -20173,6 +20214,16 @@
       "input_usd_per_mtok": 0.36,
       "output_usd_per_mtok": 0.96
     },
+    "tngtech/deepseek-r1t2-chimera": {
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 2.625,
+      "off_peak": {
+        "input_usd_per_mtok": 0.25,
+        "output_usd_per_mtok": 0.65625,
+        "window_start_utc_min": 990,
+        "window_end_utc_min": 30
+      }
+    },
     "together-ai-21.1b-41b": {
       "input_usd_per_mtok": 0.7999999999999999,
       "output_usd_per_mtok": 0.7999999999999999
@@ -20588,18 +20639,6 @@
     "typesafe/jev-router": {
       "input_usd_per_mtok": -1000000.0,
       "output_usd_per_mtok": -1000000.0
-    },
-    "unbiased/pareto-26.10": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 3.1999999999999997
-    },
-    "unbiased/pareto-26.10-preview": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 3.1999999999999997
-    },
-    "unbiased/pareto-26.9": {
-      "input_usd_per_mtok": 2.5,
-      "output_usd_per_mtok": 7.5
     },
     "undi95/remm-slerp-l2-13b": {
       "input_usd_per_mtok": 0.3,
@@ -22804,8 +22843,8 @@
       "output_usd_per_mtok": 2.2
     },
     "z-ai/glm-4.5-air": {
-      "input_usd_per_mtok": 0.14,
-      "output_usd_per_mtok": 0.86
+      "input_usd_per_mtok": 0.19999999999999998,
+      "output_usd_per_mtok": 1.1
     },
     "z-ai/glm-4.5v": {
       "input_usd_per_mtok": 0.6,
@@ -22852,8 +22891,8 @@
       "output_usd_per_mtok": 1.4
     },
     "z-ai/glm-5.3-flash": {
-      "input_usd_per_mtok": 0.12,
-      "output_usd_per_mtok": 0.38
+      "input_usd_per_mtok": 0.15,
+      "output_usd_per_mtok": 0.5
     },
     "z-ai/glm-5.3-flash:batch": {
       "input_usd_per_mtok": 0.023,
@@ -23075,8 +23114,8 @@
       }
     },
     "~deepseek/deepseek-pro-latest": {
-      "input_usd_per_mtok": 0.0999,
-      "output_usd_per_mtok": 5.0
+      "input_usd_per_mtok": 0.111,
+      "output_usd_per_mtok": 4.4399999999999995
     },
     "~deepseek/deepseek-v4-flash-latest": {
       "input_usd_per_mtok": 0.047,
@@ -23121,8 +23160,8 @@
       "output_usd_per_mtok": 5.0
     },
     "~unbiased/pareto-latest": {
-      "input_usd_per_mtok": 0.7999999999999999,
-      "output_usd_per_mtok": 3.1999999999999997
+      "input_usd_per_mtok": -1000000.0,
+      "output_usd_per_mtok": -1000000.0
     },
     "~x-ai/grok-latest": {
       "input_usd_per_mtok": 2.0,
