@@ -1,10 +1,10 @@
 {
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
-  "arena_date": "2026-11-26",
-  "generated": "2026-11-26",
-  "count": 4792,
+  "arena_date": "2026-11-27",
+  "generated": "2026-11-27",
+  "count": 4795,
   "routable": 79,
-  "scored": 3110,
+  "scored": 3112,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -56695,8 +56695,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.06,
-        "output_usd_per_mtok": 0.18,
+        "input_usd_per_mtok": 0.047,
+        "output_usd_per_mtok": 0.3,
         "source": "openrouter"
       },
       "agentic_score": 0.864,
@@ -56845,8 +56845,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.111,
-        "output_usd_per_mtok": 4.4399999999999995,
+        "input_usd_per_mtok": 0.0999,
+        "output_usd_per_mtok": 5.0,
         "source": "openrouter"
       },
       "agentic_score": 0.536,
@@ -78890,7 +78890,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.08,
-        "output_usd_per_mtok": 0.44999999999999996,
+        "output_usd_per_mtok": 0.16,
         "source": "openrouter"
       },
       "agentic_score": 0.049,
@@ -78914,8 +78914,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.04,
-        "output_usd_per_mtok": 0.049999999999999996,
+        "input_usd_per_mtok": 0.049999999999999996,
+        "output_usd_per_mtok": 0.09999999999999999,
         "source": "openrouter"
       }
     },
@@ -82564,6 +82564,22 @@
       "economics": {
         "input_usd_per_mtok": 0.0,
         "output_usd_per_mtok": 0.0,
+        "source": "openrouter"
+      }
+    },
+    {
+      "id": "inclusionai/lingsante-3.1-air-vl",
+      "host": "inclusionai",
+      "leaf": "lingsante-3.1-air-vl",
+      "family": "inclusionai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 0.18,
         "source": "openrouter"
       }
     },
@@ -89055,8 +89071,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.71,
-        "output_usd_per_mtok": 0.71,
+        "input_usd_per_mtok": 0.59,
+        "output_usd_per_mtok": 0.7899999999999999,
         "source": "openrouter"
       }
     },
@@ -89427,8 +89443,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.35,
-        "output_usd_per_mtok": 1.5,
+        "input_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 1.2,
         "source": "openrouter"
       }
     },
@@ -92931,6 +92947,96 @@
       }
     },
     {
+      "id": "moonshotai/kimi-k2",
+      "host": "moonshotai",
+      "leaf": "kimi-k2",
+      "family": "moonshotai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.5700000000000001,
+        "output_usd_per_mtok": 2.3,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.533,
+      "w_swe": 0.798,
+      "capability": {
+        "aider_polyglot": {
+          "acc": 59.1,
+          "date": "2025-07-17",
+          "source": "aider"
+        },
+        "swe_verified": {
+          "acc": 60.2,
+          "cost_per_test": 0.366,
+          "latency_s": 1632.2,
+          "source": "vals.ai"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.86,
+        "grind": 0.55
+      },
+      "arena_coding_elo": 1321.8,
+      "arena_webdev_elo": 1321.8,
+      "preference": {
+        "arena_webdev": {
+          "rank": 140,
+          "rating": 1321.8,
+          "source": "arena.ai",
+          "votes": 12989
+        }
+      }
+    },
+    {
+      "id": "moonshotai/kimi-k2-0905",
+      "host": "moonshotai",
+      "leaf": "kimi-k2-0905",
+      "family": "moonshotai",
+      "kind": "chat",
+      "route_candidate": false,
+      "free": false,
+      "paid": true,
+      "gated_reason": "paid (non-zero public price)",
+      "economics": {
+        "input_usd_per_mtok": 0.6,
+        "output_usd_per_mtok": 2.5,
+        "source": "openrouter"
+      },
+      "agentic_score": 0.533,
+      "w_swe": 0.798,
+      "capability": {
+        "aider_polyglot": {
+          "acc": 59.1,
+          "date": "2025-07-17",
+          "source": "aider"
+        },
+        "swe_verified": {
+          "acc": 60.2,
+          "cost_per_test": 0.366,
+          "latency_s": 1632.2,
+          "source": "vals.ai"
+        }
+      },
+      "workflows": {
+        "single_pass": 0.86,
+        "grind": 0.55
+      },
+      "arena_coding_elo": 1321.8,
+      "arena_webdev_elo": 1321.8,
+      "preference": {
+        "arena_webdev": {
+          "rank": 140,
+          "rating": 1321.8,
+          "source": "arena.ai",
+          "votes": 12989
+        }
+      }
+    },
+    {
       "id": "moonshotai/kimi-k2.5",
       "host": "moonshotai",
       "leaf": "kimi-k2.5",
@@ -92941,8 +93047,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.5,
-        "output_usd_per_mtok": 2.5,
+        "input_usd_per_mtok": 0.6,
+        "output_usd_per_mtok": 3.0,
         "source": "openrouter"
       },
       "agentic_score": 0.502,
@@ -120866,8 +120972,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.075,
-        "output_usd_per_mtok": 0.3,
+        "input_usd_per_mtok": 0.06,
+        "output_usd_per_mtok": 0.24,
         "source": "openrouter"
       },
       "agentic_score": 0.547,
@@ -135968,8 +136074,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.5,
-        "output_usd_per_mtok": 1.0,
+        "input_usd_per_mtok": 0.35,
+        "output_usd_per_mtok": 0.7,
         "source": "openrouter"
       }
     },
@@ -138108,8 +138214,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.111,
-        "output_usd_per_mtok": 4.4399999999999995,
+        "input_usd_per_mtok": 0.0999,
+        "output_usd_per_mtok": 5.0,
         "source": "openrouter"
       },
       "agentic_score": 0.68,
