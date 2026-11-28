@@ -328,6 +328,7 @@ mod recipe_tests {
     /// rejects the symlink itself via `symlink_metadata` before any
     /// read is attempted, so the entry is skipped (with a stderr
     /// warning) rather than followed.
+    #[cfg(unix)]
     #[test]
     fn recipe_list_skips_symlinked_json_to_dev_null() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -394,6 +395,7 @@ mod recipe_tests {
     /// `recipe show` must refuse a symlinked recipe path with a clear
     /// error rather than following it — same hazard as `list`, applied
     /// to the single-file read path.
+    #[cfg(unix)]
     #[test]
     fn recipe_show_rejects_symlink() {
         let dir = tempfile::tempdir().expect("tempdir");

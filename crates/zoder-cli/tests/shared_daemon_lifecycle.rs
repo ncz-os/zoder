@@ -45,6 +45,8 @@
 //!   deleting the cleanup call site fails them.
 //!
 //! No real model calls, offline.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

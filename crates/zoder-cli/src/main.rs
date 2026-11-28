@@ -6383,7 +6383,7 @@ fn parse_sop_payload(raw: &str) -> anyhow::Result<Value> {
 // canned `result` payloads, then drive the CLI against it.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod sop_tests {
     use super::*;
 
@@ -9263,6 +9263,7 @@ mod stale_socket_cleanup_tests {
     /// removal are all exercised together. A test of `remove_stale_socket`
     /// alone would keep passing if the production path stopped using the
     /// guard.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_production_cleanup_removes_a_stale_socket_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9285,6 +9286,7 @@ mod stale_socket_cleanup_tests {
 
     /// A daemon that is bound but does not answer the handshake keeps its
     /// socket: the probe cannot prove it is dead, so nothing is unlinked.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_production_cleanup_leaves_an_unresponsive_daemon_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9313,6 +9315,7 @@ mod stale_socket_cleanup_tests {
     /// itself from interleaving, so a cleanup that cannot take it has no
     /// business deciding anything. A stale socket left behind costs one
     /// respawn; a live daemon's socket removed costs the daemon.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_production_cleanup_stands_down_when_the_lock_is_held() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10627,6 +10630,7 @@ mod agentic_cost_tests {
     /// call MUST return `known = true` (not the unknown tuple) — the
     /// 3x retry budget was enough to ride out the brief unavailability
     /// and the authoritative answer is the 3rd response.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agentic_cost_retries_then_succeeds_on_third_attempt() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10760,6 +10764,7 @@ mod agentic_cost_tests {
     /// flaky daemon (or a tracker that hadn't flushed in time AND
     /// then crashed) could pin the agentic-turn reconciliation in
     /// repeated retries without ever surfacing the failure.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agentic_cost_returns_unknown_after_exhausted_retries() {
         use std::sync::Arc;
@@ -24989,6 +24994,7 @@ mod events_file_tests {
     /// Regression test: `RoutingContext::load_readonly` must not open the
     /// ledger lock file for writing.  A dry-run routing preview should work
     /// when `~/.zoder` is readable but not writable.
+    #[cfg(unix)]
     #[test]
     fn load_readonly_does_not_require_writable_ledger_dir() {
         use std::os::unix::fs::PermissionsExt;
@@ -25037,6 +25043,7 @@ mod events_file_tests {
     /// passing locally as a non-root user, this one test failing in CI every
     /// time). `unsafe { libc::geteuid() }` has no safety invariants to
     /// violate; it is a pure read of the calling process's own UID.
+    #[cfg(unix)]
     #[test]
     fn load_strict_fails_on_unwritable_ledger_dir() {
         use std::os::unix::fs::PermissionsExt;

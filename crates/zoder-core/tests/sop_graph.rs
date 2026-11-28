@@ -9,6 +9,8 @@
 //! covered by the unit tests in `crates/zoder-core/src/sop_graph.rs`; this
 //! file is the `socket + read_line + write_frame + serde` boundary.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

@@ -18,6 +18,8 @@
 //! `crates/acp-client/src/lib.rs`'s `spawn_cancel_test_daemon` so the
 //! daemon-side test scaffolding is a known good template.
 
+#![cfg(unix)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

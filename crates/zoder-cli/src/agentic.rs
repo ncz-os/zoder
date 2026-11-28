@@ -19771,7 +19771,7 @@ mod review_diff_soundness_tests {
 // `~/.zoder/`.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod review_chunk_fanout_tests {
     //! D5.1: the chunks of ONE reviewer run as chunk 0 first (it pins the
     //! served model and warms the prompt cache) and then with bounded
@@ -20556,7 +20556,7 @@ mod review_chunk_fanout_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod reviewer_chain_dispatch_tests {
     use super::*;
     use crate::agentic::tests::test_engine;
@@ -28016,7 +28016,7 @@ mod loop_review_base_tests {
 // wire, so any future drift in the shared resolver shows up here.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod reviewer_request_settings_tests {
     use super::*;
     use crate::agentic::tests::test_engine;
@@ -29187,6 +29187,7 @@ mod attach_failure_to_result_tests {
     /// file is read-only (blocks an in-place write for a non-root user) and the
     /// sibling temp path is a directory (blocks a temp-file-and-rename write,
     /// even for root).
+    #[cfg(unix)]
     #[test]
     fn a_failed_result_write_is_not_reported_as_attached() {
         use std::os::unix::fs::PermissionsExt;
