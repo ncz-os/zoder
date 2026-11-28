@@ -6894,6 +6894,7 @@ model_provider = "custom.primary"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_home_accepts_absolute_zoder_home_and_default_dotdir() {
         assert_eq!(

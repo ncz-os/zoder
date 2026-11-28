@@ -158,10 +158,34 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     err == libc::EPERM
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: plain handle open, query and close; the handle is never used
+    // after `CloseHandle`.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied means the process exists but is not ours: live.
+            // Anything else (no such pid) means it is gone.
+            return std::io::Error::last_os_error().raw_os_error() == Some(5);
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        // A failed query is treated as alive, like the Unix probe.
+        ok == 0 || code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn pid_alive(_pid: u32) -> bool {
-    // No portable existence probe; be conservative — refuse to prune any
-    // job whose meta-status says `running`, regardless of pid.
     true
 }
 

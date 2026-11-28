@@ -167,6 +167,7 @@ mod tests {
     /// environment must be untouched by it. This is the property that makes
     /// the whole scheme safe: a test that pins `$HOME` for its child cannot
     /// corrupt a sibling test's `fork`.
+    #[cfg(unix)]
     #[test]
     fn applying_overrides_leaves_the_process_environment_alone() {
         let key = "ZODER_CHILD_ENV_PROBE";
@@ -188,6 +189,7 @@ mod tests {
     /// parent has it. `HOME` is used as the probe because the parent
     /// certainly has it — and, crucially, the test never writes to the
     /// process environment itself.
+    #[cfg(unix)]
     #[test]
     fn removed_variables_are_invisible_to_the_child() {
         assert!(
@@ -219,6 +221,7 @@ mod tests {
     /// the inherited environment. `Command` inherits the parent's
     /// environment by default, and an empty `ChildEnv` adds nothing to
     /// and removes nothing from it.
+    #[cfg(unix)]
     #[test]
     fn an_empty_override_set_leaves_the_child_environment_intact() {
         let path_before = std::env::var_os("PATH").expect("the parent has a PATH");
@@ -358,6 +361,7 @@ mod tests {
     /// The spawn-half is the load-bearing part. On the pre-fix code,
     /// the hermetic-git guard's `libc::setenv` raced exactly this
     /// window and produced `EFAULT` on the sibling's `execve`.
+    #[cfg(unix)]
     #[test]
     fn child_env_overrides_do_not_disturb_concurrent_spawns() {
         const SPAWNERS: usize = 4;

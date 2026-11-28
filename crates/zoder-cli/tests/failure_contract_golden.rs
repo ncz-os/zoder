@@ -56,11 +56,16 @@ const EXIT_UNCONTRACTED: i32 = 1;
 fn zoder_binary() -> PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let dep_dir = exe.parent().expect("deps dir");
-    let candidate = dep_dir.join("..").join("zoder");
+    let candidate = dep_dir
+        .join("..")
+        .join(format!("zoder{}", std::env::consts::EXE_SUFFIX));
     if candidate.exists() {
         return candidate;
     }
-    let candidate = dep_dir.join("..").join("release").join("zoder");
+    let candidate = dep_dir
+        .join("..")
+        .join("release")
+        .join(format!("zoder{}", std::env::consts::EXE_SUFFIX));
     if candidate.exists() {
         return candidate;
     }

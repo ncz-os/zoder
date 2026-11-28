@@ -58,3 +58,6 @@ zoder-test-support = { path = "../test-support" }
 # `reqwest::Client`. Wiremock is already a workspace dev-dep used by the
 # `tests/provider.rs` integration tests in zoder-core.
 wiremock.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

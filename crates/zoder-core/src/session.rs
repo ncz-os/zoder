@@ -529,7 +529,10 @@ impl LockGuard {
                 }
                 // Someone else holds it — wait, break-if-confirmed-
                 // abandoned, or time out.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
                     // Defensive stale break: if the lockfile's mtime
                     // is older than LOCK_STALE_SECS AND the PID
                     // recorded inside it no longer exists, a previous

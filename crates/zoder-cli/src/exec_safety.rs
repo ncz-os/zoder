@@ -2726,6 +2726,7 @@ mod tests {
     /// for: if someone changes the SBPL and accidentally drops the
     /// deny-default line, this test fails on every host (macOS, Linux,
     /// CI), not only on the developer's laptop.
+    #[cfg(unix)]
     #[test]
     fn seatbelt_profile_default_options_contain_deny_default_and_workdir_allow() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4595,6 +4596,7 @@ mod tests {
     /// `RulesetError::PathFd` that is hard to triage post-hoc). A
     /// well-formed ruleset is a precondition for the `apply_*` helper
     /// to succeed; this test pins the absolute-path invariant.
+    #[cfg(unix)]
     #[test]
     fn landlock_ruleset_all_paths_are_absolute() {
         let dir = tempfile::tempdir().expect("tempdir");

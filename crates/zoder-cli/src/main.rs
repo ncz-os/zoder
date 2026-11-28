@@ -9210,6 +9210,7 @@ mod stale_socket_cleanup_tests {
     /// the path and the entry is a DIFFERENT one. Unlinking it would sever
     /// every future `connect(2)` from a live daemon — the socket stays bound
     /// in the kernel, but nothing can reach it any more.
+    #[cfg(unix)]
     #[test]
     fn remove_stale_socket_leaves_a_replaced_socket_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9407,6 +9408,7 @@ mod ephemeral_daemon_reap_tests {
     /// This is the canonical "daemon finished, but we never called
     /// waitpid" case — the kernel keeps the PID in zombie state
     /// until something reaps it.
+    #[cfg(unix)]
     #[test]
     fn reap_ephemeral_daemons_reaps_finished_child() {
         reap_ephemeral_daemons(); // drain prior tests

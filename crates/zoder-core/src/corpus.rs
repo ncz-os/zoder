@@ -2287,6 +2287,7 @@ mod corpus_io_tests {
     // `read_to_string` on a directory would either fail with a noisy OS error
     // (Linux) or, in the FIFO case, hang forever -- the exact symptom the
     // defect calls out.
+    #[cfg(unix)]
     #[test]
     fn load_rejects_non_regular_path_with_clear_error() {
         let _env = AliasEnvGuard::none();

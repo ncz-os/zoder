@@ -1232,6 +1232,7 @@ mod tests {
         assert!(!probe[1].is_managed());
     }
 
+    #[cfg(unix)]
     #[test]
     fn probe_tools_marks_present_when_path_finds_it() {
         let lookup = ToolLookup::from_default_bundle();
