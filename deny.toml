@@ -1,7 +1,9 @@
 # cargo-deny config for the ncz-os Rust quality gate. Schema v2.
 [advisories]
 version = 2
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono is flagged unmaintained and no patched release exists as of 2026-11-28; revisit when a maintained release appears" },
+]
 
 [licenses]
 version = 2
