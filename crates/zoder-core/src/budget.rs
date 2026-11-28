@@ -929,7 +929,7 @@ mod cap_trip_sets_host_cooldown {
 
     use super::*;
     use crate::host_cooldown::{
-        clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown,
+        clear_cooldown, cooldown_active, cooldown_path_for, read_cooldown, read_cooldown_at,
         trip_monthly_cap_cooldown, REASON_DAILY_CAP, REASON_MONTHLY_CAP, REASON_WEEKLY_CAP,
     };
     use crate::pricing::ModelPrice;
@@ -1055,7 +1055,7 @@ mod cap_trip_sets_host_cooldown {
             BudgetVerdict::Confirm(m) => assert!(m.contains("daily cap"), "got {m:?}"),
             other => panic!("expected the daily cap to trip, got {other:?}"),
         }
-        let marker = read_cooldown(&ledger)
+        let marker = read_cooldown_at(&ledger, now)
             .expect("reading the marker must not fail")
             .expect("a daily cap trip must leave a host cooldown marker beside the ledger");
         assert_eq!(marker.reason, REASON_DAILY_CAP);
@@ -1079,7 +1079,7 @@ mod cap_trip_sets_host_cooldown {
             BudgetVerdict::Confirm(m) => assert!(m.contains("weekly cap"), "got {m:?}"),
             other => panic!("expected the weekly cap to trip, got {other:?}"),
         }
-        let marker = read_cooldown(&ledger)
+        let marker = read_cooldown_at(&ledger, now)
             .expect("reading the marker must not fail")
             .expect("a weekly cap trip must leave a host cooldown marker beside the ledger");
         assert_eq!(marker.reason, REASON_WEEKLY_CAP);
