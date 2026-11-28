@@ -25546,7 +25546,7 @@ data: [DONE]\n\n";
 // D4.4 / D4.5: `zoder review` refuses a truncated diff, and reports an empty
 // diff as its own `empty_diff` result instead of an approval.
 // ---------------------------------------------------------------------------
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod review_refusal_tests {
     use super::*;
     use clap::Parser;
@@ -25852,7 +25852,7 @@ mod review_refusal_tests {
 // Free-route / metered ledger accounting: the reviewer dispatch path must
 // bill from the provider's billing posture, not the catalog.
 // ---------------------------------------------------------------------------
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod reviewer_ledger_billing_tests {
     use super::reviewer_chain_dispatch_tests::{write_corpus, HomeGuard};
     use crate::Cli;
