@@ -445,9 +445,18 @@ fn seed_over_budget_home(home: &Path) {
   "health_path": "{}"
 }}
 "#,
-            home.join("model_corpus.json").display().to_string().replace('\\\\', "/"),
-            home.join("ledger.jsonl").display().to_string().replace('\\\\', "/"),
-            home.join("health.json").display().to_string().replace('\\\\', "/"),
+            home.join("model_corpus.json")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+            home.join("ledger.jsonl")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+            home.join("health.json")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
         ),
     )
     .expect("write over-budget config");
