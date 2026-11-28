@@ -28,7 +28,60 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(not(unix))]
+use unix_stub::UnixStream;
+
+/// Tokio has no Unix-domain socket type on Windows. This stand-in keeps the
+/// transport enums identical on every target: it can never be constructed
+/// (`connect` always fails), so the socket transport reports an error there
+/// and the child-process transport is the one that works.
+#[cfg(not(unix))]
+mod unix_stub {
+    use std::io;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    pub struct UnixStream(());
+
+    impl UnixStream {
+        pub async fn connect(_path: impl AsRef<Path>) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unix domain sockets are not supported on this platform",
+            ))
+        }
+    }
+
+    impl AsyncRead for UnixStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+        }
+    }
+
+    impl AsyncWrite for UnixStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::Unsupported.into()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
 use tokio::process::Child;
 
 tokio::task_local! {
