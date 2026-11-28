@@ -12,3 +12,11 @@
 # the pin. Non-x86 targets are deliberately untouched.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# Windows gives the main thread 1 MiB where Linux gives 8 MiB, and zoder
+# overflows it at startup. Reserve 16 MiB at link time (GNU and MSVC linkers).
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,16777216"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:16777216"]
