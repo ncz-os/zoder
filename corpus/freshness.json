@@ -1,7 +1,7 @@
 {
   "overlay": {
     "age_days": 0,
-    "built_at": "2026-11-28T02:42:51Z",
+    "built_at": "2026-11-28T03:16:41Z",
     "candidate_models_with_score": 212,
     "models_with_score": 212,
     "reason": "",
@@ -23,7 +23,7 @@
       "ok": true,
       "reason": ""
     },
-    "previous_catalog_models": 4795
+    "previous_catalog_models": 4797
   },
   "schema": 2,
   "sources": [
@@ -79,5 +79,5 @@
       "reason": ""
     }
   ],
-  "ts": "2026-11-28T02:42:51Z"
+  "ts": "2026-11-28T03:16:41Z"
 }
