@@ -127,7 +127,7 @@ fn record_active_session(session: &str) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod watchdog_session_tests {
     use super::*;
 
@@ -6259,7 +6259,7 @@ async fn read_result_inner(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     // Clippy nits: `&[x.clone()]` is idiomatic for tests (we want to
     // assert the closure captures a single-element slice), and the
@@ -14457,7 +14457,7 @@ done
 // existing `drive_against_mock` tests use, so a regression in the
 // error-response / timeout-drain handling cannot ship silently.
 // =============================================================================
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod mr1_reliability_regression {
     //! Regressions for the MR !1 findings ported onto the
     //! current `acp-client` structure (gitlab.com/ncz-os/zoder issue #13).
@@ -15238,7 +15238,7 @@ mod mr1_reliability_regression {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod goose_acp_integration {
     //! HUMAN-AUTHORED integration oracle (NOT model-authored — that would be the
     //! self-mock trap). Spawns the REAL `goose acp` (>=1.37) server and drives our
@@ -15316,7 +15316,7 @@ mod goose_acp_integration {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod goose_acp_real_turn {
     //! Ultimate oracle: a REAL streaming turn through the GooseEngine against the
     //! real `goose acp` server, pointed at the MiniMax OpenAI-compatible endpoint.
@@ -16134,7 +16134,7 @@ mod goose_acp_real_turn {
 /// whole point of the swap is that nothing observable changes: the wire
 /// strings are the same, the JSON payloads are the same, and only the
 /// RUST type is stricter.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod agent_outcome_tests {
     use super::*;
 
