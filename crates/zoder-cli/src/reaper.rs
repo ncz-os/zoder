@@ -123,6 +123,10 @@
 //! engine still printed it, because the warning fired on "the round counter ran
 //! out", not on "the reap found work".
 
+// The /proc based process scan and daemon exemptions are Linux-only; elsewhere
+// they compile but have no callers.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -2450,6 +2454,7 @@ fn reap(plan: &ReapPlan, grace: Duration) -> ReapOutcome {
             if confirm_identity(candidate, uid) != Identity::Same {
                 // Gone, or the pid belongs to somebody else. No signal was sent,
                 // and the log must not claim otherwise.
+                #[cfg_attr(not(target_os = "linux"), allow(clippy::drop_non_drop))]
                 drop(pin);
                 outcome.skipped.push(entry(candidate, ReapSignal::Term));
                 continue;
@@ -6762,6 +6767,6 @@ mod tests {
 }
 
 // Fault-injection harness (ZD-20); it shares the test lock above.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[path = "reaper_fault_tests.rs"]
 mod reaper_fault_tests;
