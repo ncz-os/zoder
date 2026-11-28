@@ -4467,6 +4467,9 @@ mod tests {
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS and BSD hand an accepted stream the listener's non-blocking mode;
+                        // the fixture reads it with a blocking timeout.
+                        let _ = stream.set_nonblocking(false);
                         seen.fetch_add(1, Ordering::SeqCst);
                         {
                             use std::io::{BufRead, BufReader, Write};
@@ -4901,6 +4904,9 @@ mod tests {
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS and BSD hand an accepted stream the listener's non-blocking mode;
+                        // the fixture reads it with a blocking timeout.
+                        let _ = stream.set_nonblocking(false);
                         let _ = serve_one_cancel_stream(stream, &ack, &seen);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

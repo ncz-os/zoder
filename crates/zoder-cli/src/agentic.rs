@@ -15941,6 +15941,9 @@ must reap the direct shell on the timeout branch)"
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS and BSD hand an accepted stream the listener's non-blocking mode;
+                        // the fixture reads it with a blocking timeout.
+                        let _ = stream.set_nonblocking(false);
                         // The read times out, so the thread is never stuck on a
                         // client that has gone quiet.
                         let _ =
