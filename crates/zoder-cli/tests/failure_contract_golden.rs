@@ -792,6 +792,7 @@ fn bind_engine_provider_ref(home: &Path) {
     std::fs::write(&path, body.to_string()).expect("rewrite config.json");
 }
 
+#[cfg(unix)]
 #[test]
 fn unconfirmed_cancel_rescue_is_stable() {
     // A daemon that never acknowledges session/cancel, plus a rescue

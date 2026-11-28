@@ -164,6 +164,7 @@ fn red_gate_prints_the_human_report_before_exiting_non_zero() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn gate_root_runs_the_steps_inside_that_root() {
     // D4.7: `PathEnv::run_command` never set `current_dir`, so

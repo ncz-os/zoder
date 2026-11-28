@@ -364,6 +364,7 @@ mod tests {
     /// A real second PROCESS holding the slot blocks this process's waiter;
     /// when the child dies (kill), the flock is released by the kernel and
     /// the waiter proceeds — a crashed process cannot leak a slot.
+    #[cfg(unix)]
     #[tokio::test]
     async fn second_process_holder_blocks_then_killed_holder_frees_slot() {
         let dir = tempfile::tempdir().unwrap();
