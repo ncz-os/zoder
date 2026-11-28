@@ -2,9 +2,9 @@
   "source": "public: litellm+openrouter pricing + public bench overlay + ncz known-good swe overlay",
   "arena_date": "2026-11-28",
   "generated": "2026-11-28",
-  "count": 4797,
+  "count": 4796,
   "routable": 78,
-  "scored": 3112,
+  "scored": 3111,
   "models": [
     {
       "id": "abliteration/abliterated-model",
@@ -56760,7 +56760,7 @@
       "gated_reason": "paid (non-zero public price)",
       "economics": {
         "input_usd_per_mtok": 0.045599999999999995,
-        "output_usd_per_mtok": 0.3,
+        "output_usd_per_mtok": 0.27,
         "source": "openrouter"
       },
       "agentic_score": 0.864,
@@ -110988,8 +110988,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.08499999999999999,
-        "output_usd_per_mtok": 0.125,
+        "input_usd_per_mtok": 0.06599999999999999,
+        "output_usd_per_mtok": 0.09699999999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.7,
@@ -113193,7 +113193,7 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.25,
+        "input_usd_per_mtok": 0.3,
         "output_usd_per_mtok": 1.0,
         "source": "openrouter"
       },
@@ -136657,35 +136657,6 @@
       }
     },
     {
-      "id": "z-ai/glm-5.2:batch",
-      "host": "z-ai",
-      "leaf": "glm-5.2:batch",
-      "family": "z-ai",
-      "kind": "chat",
-      "route_candidate": false,
-      "free": false,
-      "paid": true,
-      "gated_reason": "paid (non-zero public price)",
-      "economics": {
-        "input_usd_per_mtok": 0.322,
-        "output_usd_per_mtok": 0.989,
-        "source": "openrouter"
-      },
-      "agentic_score": 0.68,
-      "w_swe": 0.68,
-      "capability": {
-        "swe_verified": {
-          "acc": 68.0,
-          "source": "ncz-known-good",
-          "harness": "curated"
-        }
-      },
-      "workflows": {
-        "single_pass": 0.86,
-        "grind": 0.78
-      }
-    },
-    {
       "id": "z-ai/glm-5.3",
       "host": "z-ai",
       "leaf": "glm-5.3",
@@ -138359,8 +138330,8 @@
       "paid": true,
       "gated_reason": "paid (non-zero public price)",
       "economics": {
-        "input_usd_per_mtok": 0.18239999999999998,
-        "output_usd_per_mtok": 11.0055,
+        "input_usd_per_mtok": 0.1453,
+        "output_usd_per_mtok": 12.289399999999999,
         "source": "openrouter"
       },
       "agentic_score": 0.6,
