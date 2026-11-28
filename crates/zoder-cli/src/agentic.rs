@@ -8565,6 +8565,8 @@ async fn run_check_watched_with_env(
     // target — a single source of truth pins both, with no
     // TOCTOU window where the policy protects one tree and the
     // spawn runs in a different one.
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .current_dir(&plan.cwd)
         .stdin(Stdio::null())
@@ -8572,7 +8574,6 @@ async fn run_check_watched_with_env(
         // whole subtree on timeout (shell + any descendants the command
         // forks). Tokio translates `process_group(0)` to setpgid(pid, 0) on
         // Unix, giving us a clean per-child group without an extra fork.
-        .process_group(0)
         // SB2: reap the direct shell on the timeout/IO-error branch. The
         // `join` future below moves `child` into `wait_with_output()`; on
         // the `tokio::time::timeout` Elapsed branch that future is dropped

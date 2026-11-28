@@ -2329,7 +2329,7 @@ fn teardown_rounds(plan: &ReapPlan, grace: Duration, socket: &Path) -> TeardownR
 /// instead of merely adjacent. Kernels without pidfd (pre-5.3) fall back to
 /// plain pid signalling, where the identity re-check is all we have.
 struct PidFd {
-    fd: libc::c_int,
+    fd: i32,
 }
 
 impl PidFd {
@@ -2579,6 +2579,10 @@ fn current_uid() -> u32 {
 /// Without this the signal kills zoder outright — no cancel, no reap, and the
 /// agent's children are reparented to init (ppid 1) exactly as in that
 /// incident.
+#[cfg(not(unix))]
+fn install_signal_handler(_plan: ReapPlan) {}
+
+#[cfg(unix)]
 fn install_signal_handler(plan: ReapPlan) {
     use std::sync::Arc;
     use tokio::signal::unix::{signal, SignalKind};

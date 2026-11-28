@@ -9056,6 +9056,12 @@ fn usable_or_creatable(dir: &Path) -> bool {
 /// current_dir` — turning a permission detail on the config dir into "engine
 /// unavailable" instead of falling through to `$HOME` and then `/`, which is
 /// the whole point of having a chain.
+#[cfg(not(unix))]
+fn usable_as_child_cwd(dir: &Path) -> bool {
+    dir.is_dir()
+}
+
+#[cfg(unix)]
 fn usable_as_child_cwd(dir: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     if !dir.is_dir() {
