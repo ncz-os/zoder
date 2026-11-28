@@ -232,7 +232,7 @@ pub async fn fetch_sop_graph(socket: &Path, run_id: &str) -> anyhow::Result<SopG
         bail!("fetch_sop_graph: run_id is empty");
     }
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = acp_client::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to cost engine at {}", socket.display()))?;
         let (read_half, mut write_half) = tokio::io::split(stream);
@@ -283,7 +283,7 @@ pub async fn fetch_sop_overlay(socket: &Path, run_id: &str) -> anyhow::Result<So
         bail!("fetch_sop_overlay: run_id is empty");
     }
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = acp_client::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to cost engine at {}", socket.display()))?;
         let (read_half, mut write_half) = tokio::io::split(stream);
@@ -348,7 +348,7 @@ pub async fn fetch_sop_graph_report(
     // and so a daemon restart between the two requests can't produce a
     // torn view.
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = acp_client::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to cost engine at {}", socket.display()))?;
         let (read_half, mut write_half) = tokio::io::split(stream);

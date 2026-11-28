@@ -100,7 +100,7 @@ pub async fn fetch_engine_cost(
     agent: Option<&str>,
 ) -> anyhow::Result<CostSummary> {
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = acp_client::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to cost engine at {}", socket.display()))?;
         let (read_half, mut write_half) = tokio::io::split(stream);

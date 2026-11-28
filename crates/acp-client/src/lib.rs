@@ -29,9 +29,9 @@ use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
-use tokio::net::UnixStream;
+pub use tokio::net::UnixStream;
 #[cfg(not(unix))]
-use unix_stub::UnixStream;
+pub use unix_stub::UnixStream;
 
 /// Tokio has no Unix-domain socket type on Windows. This stand-in keeps the
 /// transport enums identical on every target: it can never be constructed

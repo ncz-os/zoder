@@ -175,7 +175,7 @@ pub async fn fetch_catalog_models(
         .as_deref()
         .ok_or_else(|| anyhow!("provider {} has no engine_provider_ref", provider.id))?;
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = acp_client::UnixStream::connect(socket)
             .await
             .with_context(|| format!("connecting to catalog engine at {}", socket.display()))?;
         let (read_half, mut write_half) = tokio::io::split(stream);
