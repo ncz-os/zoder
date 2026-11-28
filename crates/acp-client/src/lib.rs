@@ -48,6 +48,11 @@ mod unix_stub {
     pub struct UnixStream(());
 
     impl UnixStream {
+        /// Placeholder halves for the never-polled dummy transports.
+        pub fn pair() -> io::Result<(Self, Self)> {
+            Ok((UnixStream(()), UnixStream(())))
+        }
+
         pub async fn connect(_path: impl AsRef<Path>) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -4961,13 +4966,13 @@ fn dummy_reader() -> TransportReader {
     // `tokio::io::empty()` returns an `Empty` reader that always yields
     // EOF; we route it through `Unix` so the enum variant is generic. It
     // will never be polled.
-    let (a, _b) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    let (a, _b) = UnixStream::pair().expect("unix stream pair");
     TransportReader::Unix(tokio::io::split(a).0)
 }
 
 /// Symmetric placeholder for [`TransportWriter`].
 fn dummy_writer() -> TransportWriter {
-    let (a, _b) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    let (a, _b) = UnixStream::pair().expect("unix stream pair");
     TransportWriter::Unix(tokio::io::split(a).1)
 }
 
