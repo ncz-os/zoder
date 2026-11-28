@@ -391,6 +391,14 @@ pub(crate) const SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// a continuous stream of sub-cap frames.
 pub(crate) const MAX_CUMULATIVE_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// True when a non-blocking `fs2` lock attempt failed because another holder
+/// has the lock. `fs2` reports contention as `WouldBlock` on Unix but as
+/// `ERROR_LOCK_VIOLATION` on Windows, so the kind alone is not enough.
+pub fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 /// Convert an `EngineKind` into the canonical scope prefix the
 /// persistence layer uses. Kept here (rather than in `session_store`)
 /// so the wire layer can build the scope key without taking a

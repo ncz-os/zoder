@@ -662,7 +662,7 @@ fn lock_exclusive_bounded(file: &File, lock_path: &Path) -> std::io::Result<()> 
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if crate::is_lock_contended(&error) => {}
             Err(error) => return Err(error),
         }
         let now = std::time::Instant::now();

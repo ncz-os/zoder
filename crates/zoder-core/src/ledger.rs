@@ -1253,7 +1253,7 @@ fn lock_bounded(file: &File, path: &Path, mode: LockMode, holder: &str) -> anyho
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if acp_client::is_lock_contended(&error) => {}
             Err(error) => {
                 return Err(anyhow::Error::from(error)
                     .context(format!("locking ledger at {}", path.display())))
@@ -1672,7 +1672,7 @@ impl Ledger {
                             let owner = open_lock_file(&owner_path)?;
                             match owner.try_lock_exclusive() {
                                 Ok(()) => abandoned.push((offset, bytes, owner_path, owner)),
-                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                                Err(error) if acp_client::is_lock_contended(&error) => {}
                                 Err(error) => return Err(error.into()),
                             }
                         }

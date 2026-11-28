@@ -9770,7 +9770,7 @@ impl AgenticCostScope {
                     drop(active);
                     let _ = std::fs::remove_file(path);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if zoder_core::engine_rpc::is_lock_contended(&error) => {
                     overlapped_on_start = true;
                 }
                 Err(error) => return Err(error.into()),

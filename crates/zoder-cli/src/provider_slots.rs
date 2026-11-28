@@ -97,7 +97,7 @@ fn try_take(dir: &Path, limit: usize) -> std::io::Result<Option<File>> {
             .open(&path)?;
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(Some(file)),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if zoder_core::engine_rpc::is_lock_contended(&e) => continue,
             Err(e) => return Err(e),
         }
     }

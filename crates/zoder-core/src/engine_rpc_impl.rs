@@ -350,7 +350,7 @@ impl DaemonLock {
             };
             match attempt {
                 Ok(()) => return Ok(DaemonLock { file }),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e) if acp_client::is_lock_contended(&e) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(anyhow!(
                             "the daemon lock at {} stayed busy for {:?}",
